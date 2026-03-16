@@ -1044,6 +1044,41 @@ class LiveEngineV0:
                 )
                 continue
 
+            # ADR-090 follow-up: skip stale CANCEL when order is absent from
+            # current snapshot. Race: planner builds actions from old snapshot,
+            # then AccountSync refreshes mid-tick, then dispatch runs stale actions.
+            # Scoped to grid-planner reasons only (GRID_TRIM/GRID_SHIFT/GRID_RESIZE).
+            # TP-managed CANCELs (TP_SLOT_TAKEOVER/TP_RENEW/TP_CLOSE) have their
+            # own atomicity guards and must not be filtered here.
+            _GRID_CANCEL_REASONS = {"GRID_TRIM", "GRID_SHIFT", "GRID_RESIZE"}
+            if (
+                action.action_type == ActionType.CANCEL
+                and action.order_id is not None
+                and action.reason in _GRID_CANCEL_REASONS
+                and self._last_account_snapshot is not None
+            ):
+                live_order_ids = {
+                    o.order_id
+                    for o in self._last_account_snapshot.open_orders
+                    if o.symbol == action.symbol
+                }
+                if action.order_id not in live_order_ids:
+                    logger.debug(
+                        "CANCEL_SKIP_STALE_ACTION symbol=%s order_id=%s reason=%s",
+                        action.symbol,
+                        action.order_id,
+                        action.reason,
+                    )
+                    live_actions.append(
+                        LiveAction(
+                            action=action,
+                            status=LiveActionStatus.SKIPPED,
+                            block_reason=BlockReason.CANCEL_ALREADY_FAILED,
+                            intent=RiskIntent.CANCEL,
+                        )
+                    )
+                    continue
+
             live_action = self._process_action(action, snapshot.ts)
             live_actions.append(live_action)
 

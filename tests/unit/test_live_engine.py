@@ -6152,3 +6152,108 @@ class TestCancelFailedSuppression:
         assert len(engine._cancel_failed_ids) == 0
         assert "CANCEL_FAILED_IDS_PRUNED" in caplog.text
         assert "pruned=1" in caplog.text
+
+    # 11. test_stale_cancel_skipped_after_sync — ADR-090 follow-up
+    def test_stale_cancel_skipped_after_sync(
+        self,
+        mock_paper_engine: MagicMock,
+        noop_port: NoOpExchangePort,
+        sample_snapshot: Snapshot,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Stale CANCEL skipped when order absent from current snapshot.
+
+        Simulates the planner→sync→dispatch race: planner builds CANCEL from
+        stale snapshot, then sync refreshes (order gone), then dispatch skips it.
+        """
+        monkeypatch.setenv("GRINDER_ACCOUNT_SYNC_ENABLED", "1")
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        engine = LiveEngineV0(mock_paper_engine, noop_port, config)
+
+        stale_cid = "grinder_d_BTCUSDT_1_1000000_88"
+
+        # Inject a CANCEL action via paper engine (simulates stale planner output)
+        cancel = ExecutionAction(
+            action_type=ActionType.CANCEL,
+            order_id=stale_cid,
+            symbol="BTCUSDT",
+            reason="GRID_TRIM",
+        )
+        mock_paper_engine.process_snapshot.return_value = MagicMock(actions=[cancel])
+
+        # Set _last_account_snapshot to a fresh snapshot that does NOT contain the order.
+        # This simulates: sync ran mid-tick, order is gone from exchange.
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=(),
+            ts=5000000,
+            source="test",
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            output = engine.process_snapshot(sample_snapshot)
+
+        cancel_results = [
+            la for la in output.live_actions if la.action.action_type == ActionType.CANCEL
+        ]
+        assert len(cancel_results) == 1
+        assert cancel_results[0].status == LiveActionStatus.SKIPPED
+        assert cancel_results[0].block_reason == BlockReason.CANCEL_ALREADY_FAILED
+        assert "CANCEL_SKIP_STALE_ACTION" in caplog.text
+
+    # 12. test_legitimate_cancel_dispatches_when_order_present — ADR-090 follow-up
+    def test_legitimate_cancel_dispatches_when_order_present(
+        self,
+        mock_paper_engine: MagicMock,
+        noop_port: NoOpExchangePort,
+        sample_snapshot: Snapshot,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Legitimate CANCEL dispatches when order is present in current snapshot."""
+        monkeypatch.setenv("GRINDER_ACCOUNT_SYNC_ENABLED", "1")
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        engine = LiveEngineV0(mock_paper_engine, noop_port, config)
+
+        live_cid = "grinder_d_BTCUSDT_1_1000000_99"
+
+        cancel = ExecutionAction(
+            action_type=ActionType.CANCEL,
+            order_id=live_cid,
+            symbol="BTCUSDT",
+            reason="GRID_TRIM",
+        )
+        mock_paper_engine.process_snapshot.return_value = MagicMock(actions=[cancel])
+
+        # Snapshot DOES contain the order — cancel is legitimate.
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=(
+                OpenOrderSnap(
+                    order_id=live_cid,
+                    symbol="BTCUSDT",
+                    side="BUY",
+                    order_type="LIMIT",
+                    price=Decimal("50000"),
+                    qty=Decimal("0.001"),
+                    filled_qty=Decimal("0"),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=5000000,
+                ),
+            ),
+            ts=5000000,
+            source="test",
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            output = engine.process_snapshot(sample_snapshot)
+
+        cancel_results = [
+            la for la in output.live_actions if la.action.action_type == ActionType.CANCEL
+        ]
+        assert len(cancel_results) == 1
+        # NOT skipped — dispatched normally
+        assert cancel_results[0].status != LiveActionStatus.SKIPPED
+        assert "CANCEL_SKIP_STALE_ACTION" not in caplog.text
