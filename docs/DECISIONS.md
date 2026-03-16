@@ -4307,13 +4307,14 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
   - Incident verdict: FIXED and LIVE-VERIFIED. Ceremony A3c (2026-03-16, `main @ 86f9810`): `INFLIGHT_FILL_DETECTED` observed on real instant BUY fill, no repeated same-price BUY churn, `fill→TP` path proven, `PLACEMENT_CAPPED` not observed, cleanup/verify CLEAN. Follow-up: duplicate cancel `-2011` (P1 operational gap).
 - **Follow-up: duplicate cancel `-2011` fix (P1, 2026-03-16):**
   - **Incident:** Ceremony A3c produced 4 Binance `-2011` (Unknown order) errors from duplicate CANCEL dispatches for the same CID.
-  - **Root cause (three mechanisms proven from log + code):**
+  - **Root cause (four mechanisms proven from log + code):**
     1. **Same-tick duplicate:** grid_planner (`GRID_TRIM`) and cycle_layer (`TP_SLOT_TAKEOVER`) both emit CANCEL for the same CID. Concatenated at engine action assembly with no dedup. Dispatch loop processes sequentially — first CANCEL succeeds, second hits `-2011`.
     2. **Cross-sync blacklist wipe:** `_cancel_failed_ids.clear()` was unconditional on every AccountSync. If Binance propagation lag keeps the order visible in the fresh REST snapshot, planner re-generates CANCEL for it, blacklist is empty, `-2011` fires again.
     3. **Planner→sync→dispatch stale-action race (proven by ceremony A4):** Planner builds actions from stale `_last_account_snapshot`. AccountSync fires mid-tick, refreshes snapshot (order gone), prunes blacklist. Dispatch loop runs stale CANCEL — order absent from exchange, `-2011`. A4 had 4 errors from this mechanism (`CANCEL_SKIP_DUPLICATE=0` proved same-tick dedup was not the source).
-  - **Fix (three changes):**
-    1. **Same-tick CANCEL dedup:** per-tick `cancel_dispatched_this_tick: set[str]` in dispatch loop. Second CANCEL for same CID → SKIPPED with `CANCEL_SKIP_DUPLICATE` log.
+    4. **Cross-tick successful-cancel re-dispatch (proven by ceremony A5):** CANCEL succeeds on tick N (200 OK). Snapshot not refreshed yet. Planner re-generates same CANCEL on tick N+1. Per-tick dedup set was reset. Stale-action filter passed (order still in snapshot). `-2011` on tick N+1. A5 had 1 error from this mechanism.
+  - **Fix (four changes):**
+    1. **Per-sync-cycle CANCEL dedup:** instance-level `_cancel_dispatched_pending_sync: set[str]` (promoted from per-tick local var). Persists across ticks within one sync cycle. Cleared on AccountSync refresh. Closes mechanisms 1 (same-tick) and 4 (cross-tick).
     2. **Selective blacklist prune:** replaced unconditional `clear()` with set intersection against fresh snapshot `open_orders`. CIDs still visible in snapshot → kept in blacklist. CIDs absent → pruned. Log event changed from `CANCEL_FAILED_IDS_CLEARED` to `CANCEL_FAILED_IDS_PRUNED`.
-    3. **Stale-action filter:** before dispatching CANCEL, verify `order_id` still present in current `_last_account_snapshot.open_orders` for that symbol. If absent, skip with `CANCEL_SKIP_STALE_ACTION` log. Closes the planner→sync→dispatch race.
+    3. **Stale-action filter:** before dispatching CANCEL, verify `order_id` still present in current `_last_account_snapshot.open_orders` for that symbol. If absent, skip with `CANCEL_SKIP_STALE_ACTION` log. Closes mechanism 3.
   - **BlockReason:** reuses existing `CANCEL_ALREADY_FAILED` — same semantic (redundant cancel), no contract expansion.
-  - **Tests:** 6 new tests: same-tick dedup, different CIDs not deduped, blacklist survives sync when CID visible, blacklist pruned when CID absent, stale cancel skipped after sync, legitimate cancel dispatches when order present. 2 existing tests updated for selective prune.
+  - **Tests:** 8 new tests: same-tick dedup, different CIDs not deduped, blacklist survives sync when CID visible, blacklist pruned when CID absent, stale cancel skipped after sync, legitimate cancel dispatches when order present, cross-tick cancel dedup, dedup set cleared on sync. 2 existing tests updated for selective prune.

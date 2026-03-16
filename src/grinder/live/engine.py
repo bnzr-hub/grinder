@@ -501,6 +501,9 @@ class LiveEngineV0:
         self._inflight_shift: dict[str, _InflightShift] = {}
         self._inflight_deferred_logged: set[str] = set()  # BUG-3: log once per latch
         self._cancel_failed_ids: set[str] = set()  # BUG-4: skip re-cancel on -2011
+        # ADR-090 follow-up: cross-tick CANCEL dedup within one sync cycle.
+        # Cleared on AccountSync refresh (snapshot reflects cancel result).
+        self._cancel_dispatched_pending_sync: set[str] = set()
         self._account_sync_generation: int = 0
         # ADR-089: rolling steady-state log throttle (1 per 100 zero-action ticks per symbol)
         self._rolling_steady_state_count: dict[str, int] = {}
@@ -936,11 +939,11 @@ class LiveEngineV0:
         # If PLACE failed, skip paired TP_SLOT_TAKEOVER CANCEL (same correlation_id).
         tp_close_place_ok: dict[str, bool] = {}
 
-        # ADR-090 follow-up: same-tick CANCEL dedup.
-        # Planner (GRID_TRIM) and cycle_layer (TP_SLOT_TAKEOVER) can both emit
-        # CANCEL for the same CID — concatenated at line 862, no dedup.
-        # First CANCEL succeeds, second hits Binance -2011.
-        cancel_dispatched_this_tick: set[str] = set()
+        # ADR-090 follow-up: per-sync-cycle CANCEL dedup (mechanisms 1+4).
+        # Same-tick: planner + cycle_layer both emit CANCEL for same CID.
+        # Cross-tick: successful CANCEL on tick N, planner re-generates on tick N+1
+        # (snapshot not refreshed yet). Both caught by instance-level set,
+        # cleared on AccountSync refresh.
 
         for raw_action in raw_actions:
             # PaperOutput.actions is list[dict], but tests may pass ExecutionAction directly
@@ -1022,11 +1025,11 @@ class LiveEngineV0:
                 )
                 continue
 
-            # ADR-090 follow-up: skip CANCEL if same CID already dispatched this tick.
+            # ADR-090 follow-up: skip CANCEL if same CID already dispatched this sync cycle.
             if (
                 action.action_type == ActionType.CANCEL
                 and action.order_id is not None
-                and action.order_id in cancel_dispatched_this_tick
+                and action.order_id in self._cancel_dispatched_pending_sync
             ):
                 logger.debug(
                     "CANCEL_SKIP_DUPLICATE symbol=%s order_id=%s reason=%s",
@@ -1090,13 +1093,13 @@ class LiveEngineV0:
             ):
                 self._cancel_failed_ids.add(action.order_id)
 
-            # ADR-090 follow-up: record dispatched CANCEL CID for same-tick dedup.
+            # ADR-090 follow-up: record dispatched CANCEL CID for per-sync-cycle dedup.
             if (
                 action.action_type == ActionType.CANCEL
                 and action.order_id is not None
                 and live_action.status in (LiveActionStatus.EXECUTED, LiveActionStatus.FAILED)
             ):
-                cancel_dispatched_this_tick.add(action.order_id)
+                self._cancel_dispatched_pending_sync.add(action.order_id)
 
             # Track TP_CLOSE PLACE result by correlation_id
             if action.reason == "TP_CLOSE" and action.action_type == ActionType.PLACE:
@@ -1611,6 +1614,10 @@ class LiveEngineV0:
                     self._account_sync_generation,
                 )
                 self._cancel_failed_ids = surviving
+
+            # ADR-090 follow-up: clear cross-tick cancel dedup set on sync refresh.
+            # Snapshot now reflects any successfully dispatched cancels.
+            self._cancel_dispatched_pending_sync.clear()
 
         # Evidence writing (env-gated, safe-by-default)
         if result.snapshot is not None:

@@ -6257,3 +6257,85 @@ class TestCancelFailedSuppression:
         # NOT skipped — dispatched normally
         assert cancel_results[0].status != LiveActionStatus.SKIPPED
         assert "CANCEL_SKIP_STALE_ACTION" not in caplog.text
+
+    # 13. test_cross_tick_cancel_dedup — ADR-090 follow-up (mechanism 4)
+    def test_cross_tick_cancel_dedup(
+        self,
+        mock_paper_engine: MagicMock,
+        noop_port: NoOpExchangePort,
+        sample_snapshot: Snapshot,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Cross-tick dedup: CANCEL dispatched on tick N is skipped on tick N+1.
+
+        Mechanism 4: successful CANCEL on tick N, planner re-generates same CID
+        on tick N+1 (snapshot not refreshed yet). Instance-level dedup set catches it.
+        """
+        monkeypatch.setenv("GRINDER_ACCOUNT_SYNC_ENABLED", "1")
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        engine = LiveEngineV0(mock_paper_engine, noop_port, config)
+
+        cid = "grinder_d_BTCUSDT_1_1000000_77"
+
+        cancel = ExecutionAction(
+            action_type=ActionType.CANCEL,
+            order_id=cid,
+            symbol="BTCUSDT",
+            reason="GRID_TRIM",
+        )
+
+        # Tick 1: CANCEL dispatches normally
+        mock_paper_engine.process_snapshot.return_value = MagicMock(actions=[cancel])
+        output1 = engine.process_snapshot(sample_snapshot)
+        cancel_r1 = [
+            la for la in output1.live_actions if la.action.action_type == ActionType.CANCEL
+        ]
+        assert len(cancel_r1) == 1
+        assert cancel_r1[0].status != LiveActionStatus.SKIPPED
+
+        # CID is now in the per-sync-cycle dedup set
+        assert cid in engine._cancel_dispatched_pending_sync
+
+        # Tick 2: same CANCEL → dedup-skipped (no sync refresh between ticks)
+        with caplog.at_level(logging.DEBUG):
+            output2 = engine.process_snapshot(sample_snapshot)
+        cancel_r2 = [
+            la for la in output2.live_actions if la.action.action_type == ActionType.CANCEL
+        ]
+        assert len(cancel_r2) == 1
+        assert cancel_r2[0].status == LiveActionStatus.SKIPPED
+        assert cancel_r2[0].block_reason == BlockReason.CANCEL_ALREADY_FAILED
+        assert "CANCEL_SKIP_DUPLICATE" in caplog.text
+
+    # 14. test_cancel_dedup_cleared_on_sync — ADR-090 follow-up (mechanism 4)
+    def test_cancel_dedup_cleared_on_sync(
+        self,
+        mock_paper_engine: MagicMock,
+        noop_port: NoOpExchangePort,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Per-sync-cycle dedup set is cleared on AccountSync refresh."""
+        engine = self._make_engine(mock_paper_engine, noop_port, monkeypatch)
+
+        # Pre-populate dedup set (simulates dispatched CANCEL)
+        engine._cancel_dispatched_pending_sync.add("grinder_d_BTCUSDT_1_1000000_88")
+        assert len(engine._cancel_dispatched_pending_sync) == 1
+
+        # Trigger sync refresh
+        syncer = engine._account_syncer
+        assert syncer is not None
+        syncer.sync.return_value = MagicMock(  # type: ignore[attr-defined]
+            error=None,
+            snapshot=AccountSnapshot(
+                positions=(),
+                open_orders=(),
+                ts=6000000,
+                source="test",
+            ),
+            mismatches=[],
+        )
+        engine._tick_account_sync()
+
+        # Dedup set cleared
+        assert len(engine._cancel_dispatched_pending_sync) == 0
