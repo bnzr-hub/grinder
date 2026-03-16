@@ -4304,4 +4304,4 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
   - Disappearance heuristic remains the primary fill detection path for orders that survive at least one REST snapshot.
   - Inflight CID tracking is the first-fill path for orders that fill within the sync interval.
   - 12 new tests (T63-T74): inflight BUY/SELL fill, multi-cycle no-churn, survived order, early-check, cap fires, side isolation, reconciliation decrements, ANCHOR_RESET cleanup, healthy init, healthy replacement.
-  - Incident verdict: FAILED. No further fill ceremonies until this PR merges and is live-verified.
+  - Incident verdict: FIXED and LIVE-VERIFIED. Ceremony A3c (2026-03-16, `main @ 86f9810`): `INFLIGHT_FILL_DETECTED` observed on real instant BUY fill, no repeated same-price BUY churn, `fill→TP` path proven, `PLACEMENT_CAPPED` not observed, cleanup/verify CLEAN. Follow-up: duplicate cancel `-2011` (P1 operational gap).
