@@ -936,6 +936,12 @@ class LiveEngineV0:
         # If PLACE failed, skip paired TP_SLOT_TAKEOVER CANCEL (same correlation_id).
         tp_close_place_ok: dict[str, bool] = {}
 
+        # ADR-090 follow-up: same-tick CANCEL dedup.
+        # Planner (GRID_TRIM) and cycle_layer (TP_SLOT_TAKEOVER) can both emit
+        # CANCEL for the same CID — concatenated at line 862, no dedup.
+        # First CANCEL succeeds, second hits Binance -2011.
+        cancel_dispatched_this_tick: set[str] = set()
+
         for raw_action in raw_actions:
             # PaperOutput.actions is list[dict], but tests may pass ExecutionAction directly
             if isinstance(raw_action, dict):
@@ -1016,6 +1022,28 @@ class LiveEngineV0:
                 )
                 continue
 
+            # ADR-090 follow-up: skip CANCEL if same CID already dispatched this tick.
+            if (
+                action.action_type == ActionType.CANCEL
+                and action.order_id is not None
+                and action.order_id in cancel_dispatched_this_tick
+            ):
+                logger.debug(
+                    "CANCEL_SKIP_DUPLICATE symbol=%s order_id=%s reason=%s",
+                    action.symbol,
+                    action.order_id,
+                    action.reason,
+                )
+                live_actions.append(
+                    LiveAction(
+                        action=action,
+                        status=LiveActionStatus.SKIPPED,
+                        block_reason=BlockReason.CANCEL_ALREADY_FAILED,
+                        intent=RiskIntent.CANCEL,
+                    )
+                )
+                continue
+
             live_action = self._process_action(action, snapshot.ts)
             live_actions.append(live_action)
 
@@ -1026,6 +1054,14 @@ class LiveEngineV0:
                 and live_action.status == LiveActionStatus.FAILED
             ):
                 self._cancel_failed_ids.add(action.order_id)
+
+            # ADR-090 follow-up: record dispatched CANCEL CID for same-tick dedup.
+            if (
+                action.action_type == ActionType.CANCEL
+                and action.order_id is not None
+                and live_action.status in (LiveActionStatus.EXECUTED, LiveActionStatus.FAILED)
+            ):
+                cancel_dispatched_this_tick.add(action.order_id)
 
             # Track TP_CLOSE PLACE result by correlation_id
             if action.reason == "TP_CLOSE" and action.action_type == ActionType.PLACE:
@@ -1525,14 +1561,21 @@ class LiveEngineV0:
             self._last_account_snapshot = result.snapshot
             # PR-P0-RACE-1: monotonic generation counter for convergence guards
             self._account_sync_generation += 1
-            # BUG-4: clear cancel-failed blacklist — fresh snapshot replaces stale state
+            # BUG-4 + ADR-090 follow-up: selective prune of cancel-failed blacklist.
+            # Keep CIDs that are still visible in fresh snapshot (Binance propagation
+            # lag — cancel returned -2011 but order still appears in REST).
+            # Remove CIDs that are absent from fresh snapshot (order is gone).
             if self._cancel_failed_ids:
+                live_order_ids = {o.order_id for o in result.snapshot.open_orders}
+                surviving = self._cancel_failed_ids & live_order_ids
+                pruned_count = len(self._cancel_failed_ids) - len(surviving)
                 logger.info(
-                    "CANCEL_FAILED_IDS_CLEARED count=%d gen=%d",
-                    len(self._cancel_failed_ids),
+                    "CANCEL_FAILED_IDS_PRUNED pruned=%d surviving=%d gen=%d",
+                    pruned_count,
+                    len(surviving),
                     self._account_sync_generation,
                 )
-                self._cancel_failed_ids.clear()
+                self._cancel_failed_ids = surviving
 
         # Evidence writing (env-gated, safe-by-default)
         if result.snapshot is not None:

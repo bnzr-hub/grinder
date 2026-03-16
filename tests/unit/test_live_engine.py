@@ -5810,30 +5810,43 @@ class TestCancelFailedSuppression:
         engine._cancel_failed_ids.add("grinder_d_BTCUSDT_1_1000000_99")
         assert "grinder_d_BTCUSDT_1_1000000_99" in engine._cancel_failed_ids
 
-    # 2. test_cancel_failed_ids_cleared_on_sync
-    def test_cancel_failed_ids_cleared_on_sync(
+    # 2. test_cancel_failed_ids_pruned_on_sync
+    def test_cancel_failed_ids_pruned_on_sync(
         self,
         mock_paper_engine: MagicMock,
         noop_port: NoOpExchangePort,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """AccountSync refresh clears _cancel_failed_ids."""
+        """AccountSync refresh prunes _cancel_failed_ids: absent CIDs removed, present kept."""
         engine = self._make_engine(mock_paper_engine, noop_port, monkeypatch)
 
-        # Populate blacklist
-        engine._cancel_failed_ids.add("order_1")
-        engine._cancel_failed_ids.add("order_2")
+        # Populate blacklist with two CIDs
+        engine._cancel_failed_ids.add("order_gone")
+        engine._cancel_failed_ids.add("order_still_visible")
         assert len(engine._cancel_failed_ids) == 2
 
-        # Simulate account sync refresh — syncer uses .sync() not .tick()
+        # Simulate sync: fresh snapshot shows order_still_visible but NOT order_gone
         syncer = engine._account_syncer
         assert syncer is not None
         syncer.sync.return_value = MagicMock(  # type: ignore[attr-defined]
             error=None,
             snapshot=AccountSnapshot(
                 positions=(),
-                open_orders=(),
+                open_orders=(
+                    OpenOrderSnap(
+                        order_id="order_still_visible",
+                        symbol="BTCUSDT",
+                        side="BUY",
+                        order_type="LIMIT",
+                        price=Decimal("50000"),
+                        qty=Decimal("0.001"),
+                        filled_qty=Decimal("0"),
+                        reduce_only=False,
+                        status="NEW",
+                        ts=2000000,
+                    ),
+                ),
                 ts=2000000,
                 source="test",
             ),
@@ -5843,9 +5856,13 @@ class TestCancelFailedSuppression:
         with caplog.at_level(logging.INFO):
             engine._tick_account_sync()
 
-        assert len(engine._cancel_failed_ids) == 0
-        assert "CANCEL_FAILED_IDS_CLEARED" in caplog.text
-        assert "count=2" in caplog.text
+        # order_gone: absent from snapshot → pruned
+        assert "order_gone" not in engine._cancel_failed_ids
+        # order_still_visible: present in snapshot → kept
+        assert "order_still_visible" in engine._cancel_failed_ids
+        assert "CANCEL_FAILED_IDS_PRUNED" in caplog.text
+        assert "pruned=1" in caplog.text
+        assert "surviving=1" in caplog.text
 
     # 3. test_cancel_failed_not_cleared_without_snapshot
     def test_cancel_failed_not_cleared_without_snapshot(
@@ -5892,7 +5909,7 @@ class TestCancelFailedSuppression:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Sync refresh with empty blacklist → no CANCEL_FAILED_IDS_CLEARED log."""
+        """Sync refresh with empty blacklist → no CANCEL_FAILED_IDS_PRUNED log."""
         engine = self._make_engine(mock_paper_engine, noop_port, monkeypatch)
         assert len(engine._cancel_failed_ids) == 0
 
@@ -5912,7 +5929,7 @@ class TestCancelFailedSuppression:
         with caplog.at_level(logging.INFO):
             engine._tick_account_sync()
 
-        assert "CANCEL_FAILED_IDS_CLEARED" not in caplog.text
+        assert "CANCEL_FAILED_IDS_PRUNED" not in caplog.text
 
     # 6. test_cancel_already_failed_skipped_in_action_loop
     def test_cancel_already_failed_skipped_in_action_loop(
@@ -5954,3 +5971,184 @@ class TestCancelFailedSuppression:
         assert len(cancel_results) == 1, f"Expected 1 CANCEL result, got {len(cancel_results)}"
         assert cancel_results[0].status == LiveActionStatus.SKIPPED
         assert cancel_results[0].block_reason == BlockReason.CANCEL_ALREADY_FAILED
+
+    # 7. test_same_tick_cancel_dedup — ADR-090 follow-up
+    def test_same_tick_cancel_dedup(
+        self,
+        mock_paper_engine: MagicMock,
+        noop_port: NoOpExchangePort,
+        sample_snapshot: Snapshot,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Same CID CANCEL from two sources in one tick → second SKIPPED.
+
+        Simulates planner GRID_TRIM + cycle_layer TP_SLOT_TAKEOVER both targeting
+        the same order_id. First CANCEL dispatches, second is dedup-skipped.
+        """
+        monkeypatch.setenv("GRINDER_ACCOUNT_SYNC_ENABLED", "1")
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        engine = LiveEngineV0(mock_paper_engine, noop_port, config)
+
+        cid = "grinder_d_BTCUSDT_1_1000000_77"
+
+        # Two CANCEL actions for the same CID, different reasons
+        cancel_trim = ExecutionAction(
+            action_type=ActionType.CANCEL,
+            order_id=cid,
+            symbol="BTCUSDT",
+            reason="GRID_TRIM",
+        )
+        cancel_takeover = ExecutionAction(
+            action_type=ActionType.CANCEL,
+            order_id=cid,
+            symbol="BTCUSDT",
+            reason="TP_SLOT_TAKEOVER",
+        )
+        mock_paper_engine.process_snapshot.return_value = MagicMock(
+            actions=[cancel_trim, cancel_takeover]
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            output = engine.process_snapshot(sample_snapshot)
+
+        cancel_results = [
+            la for la in output.live_actions if la.action.action_type == ActionType.CANCEL
+        ]
+        assert len(cancel_results) == 2, f"Expected 2 CANCEL results, got {len(cancel_results)}"
+
+        # First CANCEL dispatches normally (EXECUTED or FAILED — NoOp port)
+        assert cancel_results[0].status != LiveActionStatus.SKIPPED
+
+        # Second CANCEL is dedup-skipped
+        assert cancel_results[1].status == LiveActionStatus.SKIPPED
+        assert cancel_results[1].block_reason == BlockReason.CANCEL_ALREADY_FAILED
+        assert "CANCEL_SKIP_DUPLICATE" in caplog.text
+
+    # 8. test_different_cid_cancels_not_deduped — ADR-090 follow-up
+    def test_different_cid_cancels_not_deduped(
+        self,
+        mock_paper_engine: MagicMock,
+        noop_port: NoOpExchangePort,
+        sample_snapshot: Snapshot,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Different CIDs → both CANCELs dispatch normally, no false dedup."""
+        monkeypatch.setenv("GRINDER_ACCOUNT_SYNC_ENABLED", "1")
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        engine = LiveEngineV0(mock_paper_engine, noop_port, config)
+
+        cancel_a = ExecutionAction(
+            action_type=ActionType.CANCEL,
+            order_id="grinder_d_BTCUSDT_1_1000000_10",
+            symbol="BTCUSDT",
+            reason="GRID_TRIM",
+        )
+        cancel_b = ExecutionAction(
+            action_type=ActionType.CANCEL,
+            order_id="grinder_d_BTCUSDT_2_1000000_20",
+            symbol="BTCUSDT",
+            reason="GRID_TRIM",
+        )
+        mock_paper_engine.process_snapshot.return_value = MagicMock(actions=[cancel_a, cancel_b])
+
+        output = engine.process_snapshot(sample_snapshot)
+
+        cancel_results = [
+            la for la in output.live_actions if la.action.action_type == ActionType.CANCEL
+        ]
+        assert len(cancel_results) == 2
+        # Both dispatched, neither skipped
+        for cr in cancel_results:
+            assert cr.status != LiveActionStatus.SKIPPED
+
+    # 9. test_blacklist_survives_sync_when_cid_still_visible — ADR-090 follow-up
+    def test_blacklist_survives_sync_when_cid_still_visible(
+        self,
+        mock_paper_engine: MagicMock,
+        noop_port: NoOpExchangePort,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Blacklist entry survives sync when CID is still in fresh snapshot.
+
+        This is the Mechanism B fix: unconditional clear() allowed cross-sync
+        cancel repeats. Selective prune keeps the entry if the order is still
+        visible (Binance propagation lag).
+        """
+        engine = self._make_engine(mock_paper_engine, noop_port, monkeypatch)
+
+        cid_lagging = "grinder_d_BTCUSDT_1_1000000_55"
+        engine._cancel_failed_ids.add(cid_lagging)
+
+        # Fresh snapshot still shows the order (Binance propagation lag)
+        syncer = engine._account_syncer
+        assert syncer is not None
+        syncer.sync.return_value = MagicMock(  # type: ignore[attr-defined]
+            error=None,
+            snapshot=AccountSnapshot(
+                positions=(),
+                open_orders=(
+                    OpenOrderSnap(
+                        order_id=cid_lagging,
+                        symbol="BTCUSDT",
+                        side="BUY",
+                        order_type="LIMIT",
+                        price=Decimal("50000"),
+                        qty=Decimal("0.001"),
+                        filled_qty=Decimal("0"),
+                        reduce_only=False,
+                        status="NEW",
+                        ts=3000000,
+                    ),
+                ),
+                ts=3000000,
+                source="test",
+            ),
+            mismatches=[],
+        )
+
+        with caplog.at_level(logging.INFO):
+            engine._tick_account_sync()
+
+        # CID still in snapshot → blacklist entry survives
+        assert cid_lagging in engine._cancel_failed_ids
+        assert "CANCEL_FAILED_IDS_PRUNED" in caplog.text
+        assert "surviving=1" in caplog.text
+
+    # 10. test_blacklist_pruned_when_cid_absent — ADR-090 follow-up
+    def test_blacklist_pruned_when_cid_absent(
+        self,
+        mock_paper_engine: MagicMock,
+        noop_port: NoOpExchangePort,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Blacklist entry removed when CID is absent from fresh snapshot."""
+        engine = self._make_engine(mock_paper_engine, noop_port, monkeypatch)
+
+        cid_gone = "grinder_d_BTCUSDT_1_1000000_66"
+        engine._cancel_failed_ids.add(cid_gone)
+
+        # Fresh snapshot does NOT contain this CID
+        syncer = engine._account_syncer
+        assert syncer is not None
+        syncer.sync.return_value = MagicMock(  # type: ignore[attr-defined]
+            error=None,
+            snapshot=AccountSnapshot(
+                positions=(),
+                open_orders=(),
+                ts=4000000,
+                source="test",
+            ),
+            mismatches=[],
+        )
+
+        with caplog.at_level(logging.INFO):
+            engine._tick_account_sync()
+
+        # CID absent from snapshot → blacklist entry removed
+        assert cid_gone not in engine._cancel_failed_ids
+        assert len(engine._cancel_failed_ids) == 0
+        assert "CANCEL_FAILED_IDS_PRUNED" in caplog.text
+        assert "pruned=1" in caplog.text
