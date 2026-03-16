@@ -1186,6 +1186,10 @@ class BinanceFuturesPort:
 
         return None
 
+    def orders_remaining(self) -> int | None:
+        """Remaining order budget (PR-P0-RACE-1)."""
+        return self.config.max_orders_per_run - self.config._orders_this_run
+
     def reset(self) -> None:
         """Reset internal state (for testing and new runs)."""
         self._order_counter = 0

@@ -119,6 +119,10 @@ class ExchangePort(Protocol):
         """
         ...
 
+    def orders_remaining(self) -> int | None:
+        """Remaining order budget, or None if unlimited (PR-P0-RACE-1)."""
+        ...
+
 
 class NoOpExchangePort:
     """Stub exchange port that tracks orders in memory.
@@ -284,6 +288,10 @@ class NoOpExchangePort:
         client_order_id: str,  # noqa: ARG002
     ) -> dict[str, str] | None:
         """Stub: not supported."""
+        return None
+
+    def orders_remaining(self) -> int | None:
+        """Stub: unlimited budget."""
         return None
 
     def reset(self) -> None:

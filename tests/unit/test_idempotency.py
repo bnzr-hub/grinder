@@ -664,6 +664,9 @@ class TestRetryIdempotencyIntegration:
             ) -> dict[str, str] | None:
                 return None
 
+            def orders_remaining(self) -> int | None:
+                return None
+
         inner = CountingPort()
         port = IdempotentExchangePort(inner=inner, store=store)
 
@@ -738,6 +741,9 @@ class TestRetryIdempotencyIntegration:
                 symbol: str,  # noqa: ARG002
                 client_order_id: str,  # noqa: ARG002
             ) -> dict[str, str] | None:
+                return None
+
+            def orders_remaining(self) -> int | None:
                 return None
 
         inner = FailOncePort()
@@ -945,6 +951,9 @@ class TestIdempotentPortWithCircuitBreaker:
             ) -> dict[str, str] | None:
                 return None
 
+            def orders_remaining(self) -> int | None:
+                return None
+
         config = CircuitBreakerConfig(failure_threshold=2, open_interval_s=30.0)
         breaker = CircuitBreaker(config=config, clock=clock)
 
@@ -1019,6 +1028,9 @@ class TestIdempotentPortWithCircuitBreaker:
                 symbol: str,  # noqa: ARG002
                 client_order_id: str,  # noqa: ARG002
             ) -> dict[str, str] | None:
+                return None
+
+            def orders_remaining(self) -> int | None:
                 return None
 
         config = CircuitBreakerConfig(

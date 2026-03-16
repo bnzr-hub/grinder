@@ -27,7 +27,7 @@ from grinder.controller.regime import Regime
 from grinder.core import OrderSide
 from grinder.execution.types import ActionType, ExecutionAction
 from grinder.policies.grid.adaptive import AdaptiveGridConfig, compute_step_bps
-from grinder.reconcile.identity import DEFAULT_PREFIX, parse_client_order_id
+from grinder.reconcile.identity import DEFAULT_PREFIX, is_tp_order, parse_client_order_id
 
 if TYPE_CHECKING:
     from grinder.account.contracts import OpenOrderSnap
@@ -80,6 +80,7 @@ class GridPlanResult:
         actual_count: Number of matched exchange orders.
         diff_missing: Desired but not on exchange.
         diff_extra: On exchange but not in desired.
+        diff_extra_tp: TP orders in extra (not cancelled, INV-9b).
         diff_mismatch: Matched but price/qty differs.
         effective_spacing_bps: Actual spacing used.
         natr_fallback: True if NATR unavailable, using static.
@@ -90,6 +91,7 @@ class GridPlanResult:
     actual_count: int = 0
     diff_missing: int = 0
     diff_extra: int = 0
+    diff_extra_tp: int = 0
     diff_mismatch: int = 0
     effective_spacing_bps: float = 0.0
     natr_fallback: bool = False
@@ -115,6 +117,19 @@ class _DiffResult:
     missing_keys: list[str]
 
 
+@dataclass
+class _RollingLadderState:
+    """Rolling ladder state per symbol (spec doc-26 SS 4.1).
+
+    Volatile (in-memory only). Created on first planner tick in rolling mode.
+    Updated on grid fill events (net_offset only). Destroyed on restart.
+    """
+
+    anchor_price: Decimal  # mid_price when grid was first built this session
+    step_price: Decimal  # round_to_tick(anchor_price * spacing_bps / 10000)
+    net_offset: int = 0  # +1 per grid SELL fill, -1 per grid BUY fill
+
+
 def _round_to_tick(price: Decimal, tick_size: Decimal) -> Decimal:
     """Round price DOWN to nearest tick increment."""
     if tick_size <= 0:
@@ -134,6 +149,94 @@ class LiveGridPlannerV1:
         # Hysteresis cache: per-symbol last plan center + timestamp
         self._last_plan_center: dict[str, Decimal] = {}
         self._last_plan_ts_ms: dict[str, int] = {}
+        # Rolling ladder state: per-symbol (doc-26, PR-ROLLING-GRID-V1A)
+        self._rolling_state: dict[str, _RollingLadderState] = {}
+        # INV-9: TP slot reservations (planner-local).
+        # symbol -> {"BUY": count, "SELL": count, "age": int}.
+        # Created on fill tick, cleared when TP visible in open_orders or
+        # after MAX_RESERVATION_AGE plan() calls (INV-9b, cross-tick).
+        self._tp_slot_reservations: dict[str, dict[str, int]] = {}
+        self._max_reservation_age: int = 50  # plan() calls before force-clear
+
+    def init_rolling_state(self, symbol: str, anchor_price: Decimal, spacing_bps: float) -> None:
+        """Initialize rolling ladder state for symbol (doc-26 SS 4.1).
+
+        Called on first planner tick in rolling mode (auto-init from plan()),
+        or externally for restart re-anchor.
+        """
+        tick = self._config.tick_size or Decimal("0.01")
+        step = _round_to_tick(anchor_price * Decimal(str(spacing_bps)) / Decimal("10000"), tick)
+        if step <= 0:
+            step = tick  # safety: never zero step
+        self._rolling_state[symbol] = _RollingLadderState(
+            anchor_price=anchor_price, step_price=step
+        )
+
+    def reset_rolling_state(self, symbol: str) -> None:
+        """Clear rolling state for symbol. Next plan() re-inits from fresh mid.
+
+        Clears planner-owned state: anchor, step, net_offset, reservations.
+        Engine must separately clear engine-owned transient state
+        (_prev_rolling_orders, _rolling_pending_cancels for symbol).
+
+        Part of INV-10 ANCHOR_RESET contract (ADR-088).
+        """
+        self._rolling_state.pop(symbol, None)
+        self._tp_slot_reservations.pop(symbol, None)
+
+    def apply_fill_offset(self, symbol: str, side: str) -> None:
+        """Update net_offset after grid fill detection (doc-26 SS 6.1/6.2).
+
+        BUY fill: net_offset -= 1.  SELL fill: net_offset += 1.
+        No-op if rolling state not initialized for symbol.
+
+        INV-9: also reserves a slot on the opposite side for the TP order
+        that cycle layer will generate. Reservation is planner-local.
+        INV-9b: reservation persists until TP is visible in open_orders
+        (cross-tick protection against WS/REST propagation lag), or until
+        max_reservation_age is exceeded (handles failed TP placements).
+        """
+        st = self._rolling_state.get(symbol)
+        if st is None:
+            return
+        if side.upper() == "BUY":
+            st.net_offset -= 1
+            tp_side = "SELL"
+        else:
+            st.net_offset += 1
+            tp_side = "BUY"
+        # INV-9: reserve slot for TP on opposite side
+        res = self._tp_slot_reservations.setdefault(symbol, {"BUY": 0, "SELL": 0, "age": 0})
+        res[tp_side] += 1
+        res["age"] = 0  # reset age on new fill
+
+    def _clear_reservation_if_ready(self, symbol: str) -> None:
+        """INV-9b: clear TP reservation on age timeout only.
+
+        Reservation persists across ticks until age exceeds
+        max_reservation_age (TP failed/rejected or REST lag resolved).
+
+        Primary cross-tick protection is TP inclusion in open_orders
+        (price matching). Reservation is defense-in-depth for the gap
+        between fill detection and TP visibility in REST snapshot.
+
+        Age-only policy avoids false-clear when existing TP from a prior
+        fill is visible but new reservation is for a different slot
+        (multi-fill case, Contract 2a). See ADR-086.
+        """
+        res = self._tp_slot_reservations.get(symbol)
+        if res is None:
+            return
+
+        res["age"] = res.get("age", 0) + 1
+
+        # Force-clear on age timeout (handles failed TP placements)
+        if res["age"] > self._max_reservation_age:
+            self._tp_slot_reservations.pop(symbol, None)
+
+    def get_rolling_state(self, symbol: str) -> _RollingLadderState | None:
+        """Read-only access to current rolling state (for tests/logging)."""
+        return self._rolling_state.get(symbol)
 
     def plan(
         self,
@@ -146,6 +249,7 @@ class LiveGridPlannerV1:
         natr_last_ts: int = 0,
         regime: Regime = Regime.RANGE,
         suppress_increase: bool = False,
+        rolling_mode: bool = False,
     ) -> GridPlanResult:
         """Compute grid plan by diffing desired vs exchange orders.
 
@@ -159,6 +263,8 @@ class LiveGridPlannerV1:
             regime: Market regime (default RANGE).
             suppress_increase: If True, filter out PLACE/REPLACE actions
                 (cancel-only mode for non-ACTIVE states, PR-INV-2).
+            rolling_mode: If True, use rolling ladder state instead of
+                mid-price anchor (doc-26, PR-ROLLING-GRID-V1A).
 
         Returns:
             GridPlanResult with actions and diff statistics.
@@ -178,19 +284,35 @@ class LiveGridPlannerV1:
                 natr_fallback=natr_fallback,
             )
 
-        desired = self._build_desired_grid(mid_price, effective_spacing_bps, cfg.tick_size)
-
-        # Step C+D: Match exchange orders to desired levels
-        diff = self._match_orders(open_orders, desired, mid_price)
-
-        # Step E: Hysteresis (anti-churn, I3)
-        if self._should_skip_rebalance(symbol, mid_price, effective_spacing_bps, diff):
-            return GridPlanResult(
-                desired_count=len(desired),
-                actual_count=len(diff.matched_keys),
-                effective_spacing_bps=effective_spacing_bps,
-                natr_fallback=natr_fallback,
-            )
+        if rolling_mode:
+            # Rolling mode (doc-26): auto-init state on first tick
+            if symbol not in self._rolling_state:
+                self.init_rolling_state(symbol, mid_price, effective_spacing_bps)
+                # INV-10 (ADR-088): anchor_price = raw mid_price (not rounded).
+                logger.info(
+                    "ANCHOR_INIT symbol=%s anchor=%s spacing_bps=%.1f",
+                    symbol,
+                    mid_price,
+                    effective_spacing_bps,
+                )
+            # INV-9b: clear reservation when TP visible or aged out.
+            # Must run BEFORE _build_rolling_grid so that once TP is on exchange,
+            # the slot is occupied via price-matching (not reservation skip).
+            self._clear_reservation_if_ready(symbol)
+            desired = self._build_rolling_grid(symbol)
+            diff = self._match_orders_by_price(open_orders, desired, mid_price)
+            # No hysteresis in rolling mode — grid doesn't track mid_price
+        else:
+            desired = self._build_desired_grid(mid_price, effective_spacing_bps, cfg.tick_size)
+            diff = self._match_orders(open_orders, desired, mid_price)
+            # Step E: Hysteresis (anti-churn, I3) — only in mid-anchored mode
+            if self._should_skip_rebalance(symbol, mid_price, effective_spacing_bps, diff):
+                return GridPlanResult(
+                    desired_count=len(desired),
+                    actual_count=len(diff.matched_keys),
+                    effective_spacing_bps=effective_spacing_bps,
+                    natr_fallback=natr_fallback,
+                )
 
         # Step F: Generate actions
         actions = self._generate_actions(symbol, diff, desired, mid_price)
@@ -199,16 +321,19 @@ class LiveGridPlannerV1:
         if suppress_increase:
             actions = [a for a in actions if a.action_type == ActionType.CANCEL]
 
-        # Update hysteresis cache
-        self._last_plan_center[symbol] = mid_price
-        self._last_plan_ts_ms[symbol] = ts_ms
+        # Update hysteresis cache (only in mid-anchored mode)
+        if not rolling_mode:
+            self._last_plan_center[symbol] = mid_price
+            self._last_plan_ts_ms[symbol] = ts_ms
 
+        tp_extra = sum(1 for o in diff.extra_orders if is_tp_order(o.order_id))
         return GridPlanResult(
             actions=actions,
             desired_count=len(desired),
             actual_count=len(diff.matched_keys) - len(diff.mismatch_orders),
             diff_missing=len(diff.missing_keys),
             diff_extra=len(diff.extra_orders),
+            diff_extra_tp=tp_extra,
             diff_mismatch=len(diff.mismatch_orders),
             effective_spacing_bps=effective_spacing_bps,
             natr_fallback=natr_fallback,
@@ -334,8 +459,10 @@ class LiveGridPlannerV1:
                 )
             )
 
-        # Extra → CANCEL
+        # Extra → CANCEL (skip TP orders — managed by cycle layer, INV-9b)
         for order in diff.extra_orders:
+            if is_tp_order(order.order_id):
+                continue
             actions.append(
                 ExecutionAction(
                     action_type=ActionType.CANCEL,
@@ -345,8 +472,10 @@ class LiveGridPlannerV1:
                 )
             )
 
-        # Mismatch → CANCEL + PLACE
+        # Mismatch → CANCEL + PLACE (skip TP orders, INV-9b)
         for order, desired_level in diff.mismatch_orders:
+            if is_tp_order(order.order_id):
+                continue
             price_diff = float(abs(order.price - desired_level.price) / mid_price) * 10000
             reason = "GRID_SHIFT" if price_diff > cfg.price_epsilon_bps else "GRID_RESIZE"
             actions.append(
@@ -370,6 +499,133 @@ class LiveGridPlannerV1:
             )
 
         return actions
+
+    def _build_rolling_grid(
+        self,
+        symbol: str,
+    ) -> list[_DesiredLevel]:
+        """Build desired grid from rolling ladder state (doc-26 SS 5.1).
+
+        Additive formula:
+            ec = anchor_price + net_offset * step_price
+            BUY[i]  = round_to_tick(ec - i * step_price)
+            SELL[i] = round_to_tick(ec + i * step_price)
+
+        INV-9: On fill ticks, innermost levels on the TP side are skipped
+        to reserve slots for TP orders. Reservation is per-tick and clamped
+        to [0, N]. desired_grid_count = (N - sell_skip) + (N - buy_skip).
+        """
+        cfg = self._config
+        st = self._rolling_state[symbol]
+        tick = cfg.tick_size or Decimal("0.01")
+        ec = st.anchor_price + st.net_offset * st.step_price
+        levels: list[_DesiredLevel] = []
+
+        # INV-9: read TP slot reservations (planner-local, one-tick)
+        res = self._tp_slot_reservations.get(symbol, {"BUY": 0, "SELL": 0})
+        buy_skip = min(res.get("BUY", 0), cfg.levels)
+        sell_skip = min(res.get("SELL", 0), cfg.levels)
+
+        # Max level distance cap (PR-VERIF-KNOBS-1)
+        cap_bps = cfg.max_level_distance_bps
+        if cap_bps is not None and cap_bps > 0:
+            cap_factor = Decimal(str(cap_bps)) / Decimal("10000")
+            cap_low = ec * (Decimal("1") - cap_factor)
+            cap_high = ec * (Decimal("1") + cap_factor)
+        else:
+            cap_low = None
+            cap_high = None
+
+        for i in range(1, cfg.levels + 1):
+            buy_price = _round_to_tick(ec - i * st.step_price, tick)
+            sell_price = _round_to_tick(ec + i * st.step_price, tick)
+
+            # Skip levels outside cap (PR-VERIF-KNOBS-1)
+            if cap_low is not None and buy_price < cap_low:
+                continue
+            if cap_high is not None and sell_price > cap_high:
+                continue
+
+            # INV-9: skip innermost levels reserved for TP
+            if i > buy_skip:
+                levels.append(
+                    _DesiredLevel(key=f"BUY:L{i}", side=OrderSide.BUY, level_id=i, price=buy_price)
+                )
+            if i > sell_skip:
+                levels.append(
+                    _DesiredLevel(
+                        key=f"SELL:L{i}", side=OrderSide.SELL, level_id=i, price=sell_price
+                    )
+                )
+
+        return levels
+
+    def _match_orders_by_price(
+        self,
+        open_orders: tuple[OpenOrderSnap, ...],
+        desired: list[_DesiredLevel],
+        ref_price: Decimal,
+    ) -> _DiffResult:
+        """Match exchange orders to desired levels by (side, price) (doc-26 SS 9.2).
+
+        Replaces level_id matching for rolling mode. Each exchange order can
+        match at most one desired level (closest price within epsilon wins).
+        """
+        cfg = self._config
+        matched_keys: set[str] = set()
+        extra_orders: list[OpenOrderSnap] = []
+        mismatch_orders: list[tuple[OpenOrderSnap, _DesiredLevel]] = []
+        used_orders: set[str] = set()
+
+        # Filter to grinder orders only (same I6 invariant as _match_orders)
+        grinder_orders: list[OpenOrderSnap] = []
+        for order in open_orders:
+            parsed = parse_client_order_id(order.order_id)
+            if parsed is not None and parsed.prefix.startswith(DEFAULT_PREFIX.rstrip("_")):
+                grinder_orders.append(order)
+
+        # For each desired level, find best-matching unmatched exchange order
+        for desired_level in desired:
+            best_match: OpenOrderSnap | None = None
+            best_diff = float("inf")
+            for order in grinder_orders:
+                if order.order_id in used_orders:
+                    continue
+                if order.side.upper() != desired_level.side.value:
+                    continue
+                price_diff_bps = (
+                    float(abs(order.price - desired_level.price) / ref_price) * 10000
+                    if ref_price > 0
+                    else float("inf")
+                )
+                if price_diff_bps <= cfg.price_epsilon_bps and price_diff_bps < best_diff:
+                    best_diff = price_diff_bps
+                    best_match = order
+
+            if best_match is not None:
+                used_orders.add(best_match.order_id)
+                matched_keys.add(desired_level.key)
+                # Check qty match
+                qty_diff = (
+                    float(abs(best_match.qty - cfg.size_per_level) / cfg.size_per_level) * 100
+                    if cfg.size_per_level > 0
+                    else 0.0
+                )
+                if qty_diff > cfg.qty_epsilon_pct:
+                    mismatch_orders.append((best_match, desired_level))
+
+        # Remaining grinder orders = extra
+        for order in grinder_orders:
+            if order.order_id not in used_orders:
+                extra_orders.append(order)
+
+        missing_keys = [d.key for d in desired if d.key not in matched_keys]
+        return _DiffResult(
+            matched_keys=matched_keys,
+            extra_orders=extra_orders,
+            mismatch_orders=mismatch_orders,
+            missing_keys=missing_keys,
+        )
 
     def _build_desired_grid(
         self,

@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import signal
 import sys
@@ -892,10 +893,36 @@ async def _drain_pending_tasks() -> None:
         await asyncio.gather(*pending, return_exceptions=True)
 
 
+def _configure_logging() -> None:
+    """Configure root logger from GRINDER_LOG_LEVEL env var.
+
+    Ownership: run_trading.py is the canonical entrypoint for the trading loop.
+    It owns logging setup because no other code path should configure the root
+    logger — library modules use ``logging.getLogger(__name__)`` and inherit.
+    ``force=True`` ensures this config wins even if a library import triggered
+    a default ``lastResort`` handler, which is acceptable because run_trading.py
+    is always the top-level process owner.
+    """
+    raw = os.environ.get("GRINDER_LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, raw, None)
+    if not isinstance(level, int):
+        print(f"  WARNING: invalid GRINDER_LOG_LEVEL={raw!r}, falling back to INFO")
+        level = logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        stream=sys.stderr,
+        force=True,
+    )
+
+
 def main() -> None:  # noqa: PLR0915
     global _ha_enabled  # noqa: PLW0603
 
     args = build_parser().parse_args()
+
+    # ADR-089: native logging config — must be before any engine/connector construction.
+    _configure_logging()
 
     # Fixture network airgap (PR-NETLOCK-1) — must be before ANY network-touching code
     if args.fixture:

@@ -440,6 +440,10 @@ class IdempotentExchangePort:
             client_order_id=client_order_id,
         )
 
+    def orders_remaining(self) -> int | None:
+        """Passthrough to inner port (PR-P0-RACE-1)."""
+        return self.inner.orders_remaining()
+
     def reset(self) -> None:
         """Reset inner port and stats (for testing)."""
         if hasattr(self.inner, "reset"):

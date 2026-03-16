@@ -69,6 +69,7 @@ from grinder.execution.smart_order_router import (
 )
 from grinder.execution.sor_metrics import get_sor_metrics
 from grinder.execution.types import ActionType, ExecutionAction
+from grinder.live.grid_planner import GridPlanResult
 from grinder.live.live_metrics import get_live_engine_metrics
 from grinder.live.place_tracker import correlate_recent_places
 from grinder.ml.fill_model_loader import extract_online_features
@@ -90,7 +91,7 @@ from grinder.risk.emergency_exit import EmergencyExitExecutor
 from grinder.risk.emergency_exit_metrics import get_emergency_exit_metrics
 
 if TYPE_CHECKING:
-    from grinder.account.contracts import AccountSnapshot
+    from grinder.account.contracts import AccountSnapshot, OpenOrderSnap
     from grinder.contracts import Snapshot
     from grinder.execution.port import ExchangePort
     from grinder.features.engine import FeatureEngine
@@ -115,6 +116,27 @@ _TP_CLOSE_RETRYABLE_CODES = frozenset({-4118})
 
 _TP_CLOSE_MAX_RETRIES = 3  # 3 retry attempts AFTER initial failure
 _TP_CLOSE_RETRY_COOLDOWN_MS = 10_000  # 10s between retry attempts
+
+# PR-P0-RACE-1: Convergence guard constants
+_CONVERGENCE_TIMEOUT_MS = 30_000  # 30s safety valve for inflight latch
+
+
+@dataclass
+class _InflightShift:
+    """Tracks a dispatched grid shift awaiting AccountSync convergence."""
+
+    sync_gen: int  # _account_sync_generation at dispatch time
+    place_count: int  # PLACEs dispatched
+    ts_ms: int  # wall-clock for timeout
+
+
+@dataclass(frozen=True)
+class _InflightPlacedOrder:
+    """Tracks a dispatched PLACE awaiting first REST sync confirmation (ADR-090)."""
+
+    symbol: str
+    side: str  # "BUY" or "SELL"
+    sync_gen: int  # _account_sync_generation at dispatch time
 
 
 def _extract_binance_error_code(error: str | None) -> int | None:
@@ -146,6 +168,7 @@ class BlockReason(Enum):
     MAX_POSITION_EXCEEDED = "MAX_POSITION_EXCEEDED"
     TP_RENEW_PLACE_FAILED = "TP_RENEW_PLACE_FAILED"
     TP_CLOSE_PLACE_FAILED = "TP_CLOSE_PLACE_FAILED"
+    CANCEL_ALREADY_FAILED = "CANCEL_ALREADY_FAILED"
 
 
 class LiveActionStatus(Enum):
@@ -471,6 +494,28 @@ class LiveEngineV0:
         # key: correlation_id, value: (action, retry_count, last_attempt_ts_ms)
         # retry_count 0 = enqueued (not yet retried), exhausted at >= _TP_CLOSE_MAX_RETRIES
         self._tp_close_retries: dict[str, tuple[ExecutionAction, int, int]] = {}
+        # PR-P0-RACE-1: Convergence guards
+        self._converge_first_enabled = parse_bool(
+            "GRINDER_LIVE_CONVERGE_FIRST", default=True, strict=False
+        )
+        self._inflight_shift: dict[str, _InflightShift] = {}
+        self._inflight_deferred_logged: set[str] = set()  # BUG-3: log once per latch
+        self._cancel_failed_ids: set[str] = set()  # BUG-4: skip re-cancel on -2011
+        self._account_sync_generation: int = 0
+        # ADR-089: rolling steady-state log throttle (1 per 100 zero-action ticks per symbol)
+        self._rolling_steady_state_count: dict[str, int] = {}
+        # PR-ROLLING-GRID-V1B: rolling grid mode (doc-26, safe-by-default)
+        self._rolling_grid_enabled = parse_bool(
+            "GRINDER_LIVE_ROLLING_GRID", default=False, strict=False
+        )
+        # Rolling fill detection state (engine-owned, no cycle_layer private access)
+        self._prev_rolling_orders: dict[str, dict[str, OpenOrderSnap]] = {}
+        self._rolling_pending_cancels: dict[str, int] = {}  # order_id -> ts_ms
+        # ADR-090: inflight CID fill detection + unreconciled placement cap
+        self._inflight_placed_cids: dict[str, _InflightPlacedOrder] = {}
+        self._unreconciled_place_count: dict[str, dict[str, int]] = {}
+        # INV-10 (ADR-088): ANCHOR_RESET_BLOCKED throttle (log once per reason)
+        self._anchor_reset_blocked_logged: set[str] = set()  # "{symbol}:{reason}"
         if self._emergency_exit_enabled:
             # Duck-type check: port must have cancel_all_orders + place_market_order + get_positions
             port = self._exchange_port
@@ -493,6 +538,10 @@ class LiveEngineV0:
         logger.info(
             "Reduce-only enforcement: %s",
             "enabled" if self._reduce_only_enforcement else "disabled",
+        )
+        logger.info(
+            "Rolling grid mode: %s",
+            "enabled" if self._rolling_grid_enabled else "disabled",
         )
 
     def _resolve_auto_threshold(self) -> None:
@@ -620,8 +669,16 @@ class LiveEngineV0:
                 kill_switch_active=self._config.kill_switch_active,
             )
 
+        # PR-ROLLING-GRID-V1B: compute effective rolling mode for this tick
+        rolling = self._rolling_grid_enabled and self._is_live_planner_enabled()
+
         # Freeze check: skip grid planner when position open (prevents GRID_SHIFT churn)
-        grid_frozen = self._freeze_grid_in_position and self._has_open_position(snapshot.symbol)
+        # In rolling mode, freeze is disabled — fill-driven shifts must pass through.
+        # Safety: rolling planner's additive formula is bounded (no mid-driven rebuilds).
+        if rolling:
+            grid_frozen = False
+        else:
+            grid_frozen = self._freeze_grid_in_position and self._has_open_position(snapshot.symbol)
         if grid_frozen:
             logger.warning(
                 "GRID_FREEZE_IN_POSITION symbol=%s — skipping planner + replenish",
@@ -630,14 +687,16 @@ class LiveEngineV0:
 
         # PR-ANTI-CHURN-2: detect freeze→unfreeze transition, reset anchor so
         # anti-churn allows full grid rebuild on first tick after position closes.
-        was_frozen = self._was_grid_frozen.get(snapshot.symbol, False)
-        if was_frozen and not grid_frozen:
-            self._grid_anchor_mid.pop(snapshot.symbol, None)
-            logger.warning(
-                "GRID_UNFREEZE symbol=%s — anchor reset, planner will recenter grid",
-                snapshot.symbol,
-            )
-        self._was_grid_frozen[snapshot.symbol] = grid_frozen
+        # Not needed in rolling mode (no mid-anchor tracking).
+        if not rolling:
+            was_frozen = self._was_grid_frozen.get(snapshot.symbol, False)
+            if was_frozen and not grid_frozen:
+                self._grid_anchor_mid.pop(snapshot.symbol, None)
+                logger.warning(
+                    "GRID_UNFREEZE symbol=%s — anchor reset, planner will recenter grid",
+                    snapshot.symbol,
+                )
+            self._was_grid_frozen[snapshot.symbol] = grid_frozen
 
         # Budget exhaustion latch: skip planner when order budget is dead
         budget_dead = self._order_budget_exhausted
@@ -646,6 +705,109 @@ class LiveEngineV0:
                 "ORDER_BUDGET_EXHAUSTED symbol=%s — planner suppressed",
                 snapshot.symbol,
             )
+
+        # PR-ROLLING-GRID-V1B: detect grid fills and update rolling offset
+        # BEFORE planner runs, so planner uses updated effective_center.
+        if rolling and not budget_dead:
+            self._cleanup_rolling_pending_cancels(snapshot.ts)
+            grid_fills = self._detect_grid_fills_for_rolling(snapshot.symbol)
+            planner = self._grid_planners.get(snapshot.symbol) if self._grid_planners else None
+            if planner and grid_fills:
+                for _oid, side in grid_fills:
+                    planner.apply_fill_offset(snapshot.symbol, side)
+                rs = planner.get_rolling_state(snapshot.symbol)
+                logger.info(
+                    "ROLLING_FILL_OFFSET symbol=%s fills=%d net_offset=%s",
+                    snapshot.symbol,
+                    len(grid_fills),
+                    rs.net_offset if rs else "N/A",
+                )
+
+        # INV-10 (ADR-088): ANCHOR_RESET — re-anchor if exchange truly empty + flat
+        # + no inflight + no pending cancels. Same-tick: reset now, plan() re-inits
+        # from fresh mid_price in _plan_grid() on this same tick.
+        if rolling and not budget_dead and not grid_frozen:
+            _ra_planner = self._grid_planners.get(snapshot.symbol) if self._grid_planners else None
+            if _ra_planner and _ra_planner.get_rolling_state(snapshot.symbol) is not None:
+                # INV-10 fix: inflight blocks reset ONLY while account sync
+                # hasn't refreshed since dispatch (no_fresh_inflight_latch).
+                # Once sync refreshes, REST is the source of truth: if REST
+                # shows 0 orders, exchange is truly empty.
+                _inflight_blocking = False
+                if snapshot.symbol in self._inflight_shift:
+                    _if_entry = self._inflight_shift[snapshot.symbol]
+                    _inflight_blocking = self._account_sync_generation <= _if_entry.sync_gen
+                if not self._has_grinder_orders(snapshot.symbol) and not _inflight_blocking:
+                    _pos_qty = self._get_position_qty(snapshot.symbol)
+                    _pending_count = self._count_pending_cancels_for_symbol(snapshot.symbol)
+
+                    if _pos_qty is None:
+                        _key = f"{snapshot.symbol}:POSITION_UNKNOWN"
+                        if _key not in self._anchor_reset_blocked_logged:
+                            logger.warning(
+                                "ANCHOR_RESET_BLOCKED symbol=%s reason=POSITION_UNKNOWN",
+                                snapshot.symbol,
+                            )
+                            self._anchor_reset_blocked_logged.add(_key)
+                    elif _pos_qty != 0:
+                        _key = f"{snapshot.symbol}:POSITION_OPEN"
+                        if _key not in self._anchor_reset_blocked_logged:
+                            logger.warning(
+                                "ANCHOR_RESET_BLOCKED symbol=%s reason=POSITION_OPEN pos_qty=%s",
+                                snapshot.symbol,
+                                _pos_qty,
+                            )
+                            self._anchor_reset_blocked_logged.add(_key)
+                    elif _pending_count > 0:
+                        _key = f"{snapshot.symbol}:PENDING_CANCELS"
+                        if _key not in self._anchor_reset_blocked_logged:
+                            logger.warning(
+                                "ANCHOR_RESET_BLOCKED symbol=%s reason=PENDING_CANCELS count=%d",
+                                snapshot.symbol,
+                                _pending_count,
+                            )
+                            self._anchor_reset_blocked_logged.add(_key)
+                    else:
+                        # All 5 conditions met → ANCHOR_RESET (same-tick)
+                        old_rs = _ra_planner.get_rolling_state(snapshot.symbol)
+                        assert old_rs is not None  # guarded by line 719 check
+                        logger.warning(
+                            "ANCHOR_RESET symbol=%s old_anchor=%s old_offset=%d "
+                            "new_mid=%s reason=EXCHANGE_EMPTY_FLAT",
+                            snapshot.symbol,
+                            old_rs.anchor_price,
+                            old_rs.net_offset,
+                            snapshot.mid_price,
+                        )
+                        # Planner-owned cleanup
+                        _ra_planner.reset_rolling_state(snapshot.symbol)
+                        # Engine-owned cleanup
+                        self._prev_rolling_orders.pop(snapshot.symbol, None)
+                        self._clear_pending_cancels_for_symbol(snapshot.symbol)
+                        self._inflight_deferred_logged.discard(snapshot.symbol)
+                        # ADR-090: clear inflight CIDs and reconciliation counter
+                        self._inflight_placed_cids = {
+                            c: i
+                            for c, i in self._inflight_placed_cids.items()
+                            if i.symbol != snapshot.symbol
+                        }
+                        self._unreconciled_place_count.pop(snapshot.symbol, None)
+                        # Clear all throttle keys for this symbol on success
+                        self._anchor_reset_blocked_logged.discard(
+                            f"{snapshot.symbol}:POSITION_OPEN"
+                        )
+                        self._anchor_reset_blocked_logged.discard(
+                            f"{snapshot.symbol}:PENDING_CANCELS"
+                        )
+                        self._anchor_reset_blocked_logged.discard(
+                            f"{snapshot.symbol}:POSITION_UNKNOWN"
+                        )
+                else:
+                    # Orders present or inflight active → clear blocked-log latch
+                    # (state changed, next empty+blocked cycle should re-log)
+                    self._anchor_reset_blocked_logged.discard(f"{snapshot.symbol}:POSITION_OPEN")
+                    self._anchor_reset_blocked_logged.discard(f"{snapshot.symbol}:PENDING_CANCELS")
+                    self._anchor_reset_blocked_logged.discard(f"{snapshot.symbol}:POSITION_UNKNOWN")
 
         # Step 1: Get actions -- either from LiveGridPlannerV1 or PaperEngine
         if grid_frozen or budget_dead:
@@ -657,9 +819,19 @@ class LiveEngineV0:
         elif self._is_live_planner_enabled():
             # PR-L2: Exchange-truth grid planner replaces PaperEngine for action generation.
             # PaperEngine is NOT called (avoids ghost state mutation, doc-25 I1).
-            raw_actions = self._plan_grid(snapshot)
+            plan_result = self._plan_grid(snapshot, rolling_mode=rolling)
+            raw_actions = plan_result.actions
             # Anti-churn: suppress GRID_SHIFT if mid hasn't moved enough from anchor
-            raw_actions = self._filter_grid_shift(snapshot.symbol, snapshot.mid_price, raw_actions)
+            # Skipped in rolling mode — no mid-driven shifts to suppress.
+            if not rolling:
+                raw_actions = self._filter_grid_shift(
+                    snapshot.symbol, snapshot.mid_price, raw_actions
+                )
+            # PR-P0-RACE-1: convergence guards (sync-gate, cancel-first, budget)
+            # Scoped to planner path ONLY — cycle layer (TP/replenish) appended AFTER.
+            raw_actions = self._apply_convergence_guards(
+                snapshot.symbol, raw_actions, plan_result, snapshot.ts
+            )
             paper_output = _DeferredPaperOutput(
                 ts=snapshot.ts, symbol=snapshot.symbol, actions=raw_actions
             )
@@ -681,18 +853,34 @@ class LiveEngineV0:
                 ts_ms=snapshot.ts,
                 pos_qty=pos_qty,
             )
-            # Filter out replenish when grid frozen (TP reduce-only still allowed)
-            if grid_frozen and cycle_actions:
+            # Filter out replenish when grid frozen OR rolling mode
+            # Rolling: planner diff handles level restoration, replenish would duplicate.
+            if (grid_frozen or rolling) and cycle_actions:
                 cycle_actions = [a for a in cycle_actions if a.reason != "REPLENISH"]
             if cycle_actions:
                 logger.info("Cycle layer %s: %d TP actions", snapshot.symbol, len(cycle_actions))
                 raw_actions = raw_actions + cycle_actions
+                # INV-9: defense-in-depth overlap guard (anomaly detector).
+                # Suppresses grid PLACEs that overlap with TP PLACEs on same side.
+                # Expected fire count: ZERO. Firing = bug evidence.
+                if rolling:
+                    raw_actions = self._filter_tp_grid_overlap(raw_actions, snapshot.symbol)
                 paper_output = _DeferredPaperOutput(
                     ts=snapshot.ts, symbol=snapshot.symbol, actions=raw_actions
                 )
 
+        # PR-ROLLING-GRID-V1B: register ALL cancels for rolling fill detection
+        # Must run AFTER cycle_layer to capture TP_SLOT_TAKEOVER CANCELs.
+        if rolling:
+            self._register_rolling_cancels(raw_actions, snapshot.ts)
+
         # Replenish-on-TP-fill: detect position decrease → add BUY below + SELL above
-        if self._is_cycle_layer_enabled() and self._last_account_snapshot is not None:
+        # Bypassed in rolling mode — planner diff handles slot restoration.
+        if (
+            self._is_cycle_layer_enabled()
+            and self._last_account_snapshot is not None
+            and not rolling
+        ):
             pos_qty_for_anchor = self._get_position_qty(snapshot.symbol)
             self._update_grid_anchors(snapshot.symbol, pos_qty_for_anchor)
             tp_fill_event = self._detect_tp_fill_event(snapshot.symbol, pos_qty_for_anchor)
@@ -804,8 +992,40 @@ class LiveEngineV0:
                 )
                 continue
 
+            # BUG-4: skip CANCEL for order_ids that already returned -2011.
+            # Stale snapshot may still show the order → planner re-generates CANCEL →
+            # Binance returns -2011 → repeat every tick until sync refreshes.
+            if (
+                action.action_type == ActionType.CANCEL
+                and action.order_id is not None
+                and action.order_id in self._cancel_failed_ids
+            ):
+                # ADR-089: explicit log for skipped cancel (previously silent)
+                logger.debug(
+                    "CANCEL_SKIP_ALREADY_FAILED symbol=%s order_id=%s",
+                    snapshot.symbol,
+                    action.order_id,
+                )
+                live_actions.append(
+                    LiveAction(
+                        action=action,
+                        status=LiveActionStatus.SKIPPED,
+                        block_reason=BlockReason.CANCEL_ALREADY_FAILED,
+                        intent=RiskIntent.CANCEL,
+                    )
+                )
+                continue
+
             live_action = self._process_action(action, snapshot.ts)
             live_actions.append(live_action)
+
+            # BUG-4: track failed CANCELs for -2011 suppression
+            if (
+                action.action_type == ActionType.CANCEL
+                and action.order_id is not None
+                and live_action.status == LiveActionStatus.FAILED
+            ):
+                self._cancel_failed_ids.add(action.order_id)
 
             # Track TP_CLOSE PLACE result by correlation_id
             if action.reason == "TP_CLOSE" and action.action_type == ActionType.PLACE:
@@ -979,31 +1199,215 @@ class LiveEngineV0:
             return False
         return self._is_live_planner_enabled()
 
-    def _plan_grid(self, snapshot: Snapshot) -> list[ExecutionAction]:
+    # --- Rolling grid fill detection (PR-ROLLING-GRID-V1B) ---
+
+    _ROLLING_CANCEL_TTL_MS = 30_000  # 30s, same as cycle_layer._CANCEL_TTL_MS
+
+    def _detect_grid_fills_for_rolling(self, symbol: str) -> list[tuple[str, str]]:  # noqa: PLR0912
+        """Detect grid fills by snapshot diff for rolling offset update.
+
+        Rolling fill classification contract:
+        - Fill = grid order (strategy_id="d") in prev but not current
+          AND not in pending cancels.
+        - Not fill = our cancel, TP_SLOT_TAKEOVER cancel, TP order,
+          non-grid strategy order, restart bootstrap.
+        - Limitation: disappearance heuristic, not trade evidence check.
+
+        Returns list of (order_id, side) for each detected grid fill.
+        Does NOT generate TP actions — cycle layer handles that separately.
+        """
+        snap = self._last_account_snapshot
+        if snap is None:
+            return []
+
+        current: dict[str, OpenOrderSnap] = {}
+        for o in snap.open_orders:
+            if o.symbol != symbol:
+                continue
+            parsed = parse_client_order_id(o.order_id)
+            if parsed is None:
+                continue
+            # Only grid orders (strategy_id="d") participate in rolling offset.
+            # TP orders (strategy_id="tp") and any future non-grid strategies
+            # are excluded — their disappearance must NOT shift net_offset.
+            if parsed.strategy_id != DEFAULT_STRATEGY_ID:
+                continue
+            current[o.order_id] = o
+
+        # ADR-090: Inflight CID reconciliation (see Reconciliation Contract).
+        # Each dispatched PLACE is reconciled on the first post-dispatch sync:
+        #   - CID in current REST -> survived (on book) -> decrement unreconciled
+        #   - CID absent from REST -> inflight fill -> decrement unreconciled + emit fill
+        # Note: all_open_ids is unfiltered (no parse_client_order_id gate) because
+        # inflight CID survival is identity-based, not strategy-based.
+        all_open_ids: set[str] = set()
+        for o in snap.open_orders:
+            if o.symbol == symbol:
+                all_open_ids.add(o.order_id)
+
+        fills: list[tuple[str, str]] = []
+        expired_cids: list[str] = []
+        for cid, info in self._inflight_placed_cids.items():
+            if info.symbol != symbol:
+                continue
+            if self._account_sync_generation <= info.sync_gen:
+                continue  # sync hasn't refreshed since dispatch -- too early
+            # Reconciliation: decrement unreconciled counter for BOTH outcomes
+            sym_counts = self._unreconciled_place_count.get(symbol, {})
+            if info.side in sym_counts and sym_counts[info.side] > 0:
+                sym_counts[info.side] -= 1
+            expired_cids.append(cid)
+            if cid in all_open_ids:
+                pass  # survived -- normal disappearance heuristic tracks from here
+            else:
+                fills.append((cid, info.side))
+                logger.info(
+                    "INFLIGHT_FILL_DETECTED symbol=%s cid=%s side=%s "
+                    "dispatch_gen=%d current_gen=%d",
+                    symbol,
+                    cid,
+                    info.side,
+                    info.sync_gen,
+                    self._account_sync_generation,
+                )
+        for cid in expired_cids:
+            del self._inflight_placed_cids[cid]
+
+        prev = self._prev_rolling_orders.get(symbol, {})
+
+        for oid, snap_order in prev.items():
+            if oid in current:
+                continue  # still open
+            if oid in self._rolling_pending_cancels:
+                del self._rolling_pending_cancels[oid]  # consumed
+                continue
+            fills.append((oid, snap_order.side))
+
+        self._prev_rolling_orders[symbol] = current
+        return fills
+
+    def _register_rolling_cancels(self, actions: list[ExecutionAction], ts_ms: int) -> None:
+        """Register CANCEL actions as pending for rolling fill detection."""
+        for a in actions:
+            if a.action_type == ActionType.CANCEL and a.order_id:
+                self._rolling_pending_cancels[a.order_id] = ts_ms
+
+    def _cleanup_rolling_pending_cancels(self, ts_ms: int) -> None:
+        """Remove expired pending cancel entries (30s TTL, same as cycle_layer)."""
+        expired = [
+            oid
+            for oid, reg_ts in self._rolling_pending_cancels.items()
+            if ts_ms - reg_ts > self._ROLLING_CANCEL_TTL_MS
+        ]
+        for oid in expired:
+            del self._rolling_pending_cancels[oid]
+
+    def _filter_tp_grid_overlap(
+        self, actions: list[ExecutionAction], symbol: str
+    ) -> list[ExecutionAction]:
+        """INV-9 defense-in-depth: suppress grid PLACEs overlapping TP PLACEs.
+
+        Anomaly guard. Expected fire count: ZERO. Firing in production is
+        bug evidence requiring investigation.
+
+        Detection uses reduce_only as structural discriminator:
+        - TP PLACE: reduce_only=True (cycle_layer.py:278)
+        - Grid PLACE: reduce_only=False (planner default)
+
+        Fail-open: if planner config unavailable, returns actions unchanged.
+        """
+        # Resolve epsilon from planner config (SSOT: LiveGridConfig.price_epsilon_bps)
+        planner = self._grid_planners.get(symbol) if self._grid_planners else None
+        if planner is None:
+            logger.warning(
+                "TP_GRID_OVERLAP_GUARD_SKIP symbol=%s reason=no_planner_config",
+                symbol,
+            )
+            return actions
+
+        epsilon_bps = planner._config.price_epsilon_bps
+
+        # Collect TP PLACE targets: (side, price)
+        tp_places: list[tuple[OrderSide, Decimal]] = []
+        for a in actions:
+            if (
+                a.action_type == ActionType.PLACE
+                and a.reduce_only
+                and a.side is not None
+                and a.price is not None
+                and a.symbol == symbol
+            ):
+                tp_places.append((a.side, a.price))
+
+        if not tp_places:
+            return actions
+
+        # Use mid_price as reference for bps calculation
+        ref_price = max(p for _, p in tp_places)  # safe nonzero approximation
+
+        filtered: list[ExecutionAction] = []
+        for a in actions:
+            if (
+                a.action_type == ActionType.PLACE
+                and not a.reduce_only
+                and a.side is not None
+                and a.price is not None
+                and a.symbol == symbol
+            ):
+                # Check overlap with any TP PLACE on same side
+                overlap = False
+                for tp_side, tp_price in tp_places:
+                    if a.side != tp_side:
+                        continue
+                    delta_bps = (
+                        float(abs(a.price - tp_price) / ref_price) * 10000
+                        if ref_price > 0
+                        else float("inf")
+                    )
+                    if delta_bps <= epsilon_bps:
+                        overlap = True
+                        logger.warning(
+                            "TP_GRID_OVERLAP_SUPPRESSED symbol=%s side=%s "
+                            "grid_price=%s tp_price=%s delta_bps=%.2f "
+                            "reason=DEFENSE_IN_DEPTH",
+                            symbol,
+                            a.side.value if a.side else "?",
+                            a.price,
+                            tp_price,
+                            delta_bps,
+                        )
+                        break
+                if overlap:
+                    continue
+            filtered.append(a)
+        return filtered
+
+    def _plan_grid(self, snapshot: Snapshot, rolling_mode: bool = False) -> GridPlanResult:
         """Generate grid actions from LiveGridPlannerV1 (PR-L2).
 
         Uses last AccountSync snapshot for exchange truth.
-        Returns empty list if no snapshot yet (safe startup).
+        Returns empty GridPlanResult if no snapshot yet (safe startup).
+
+        PR-P0-RACE-1: returns full GridPlanResult (not just .actions) so
+        convergence guards can inspect diff_extra.
         """
         assert self._grid_planners is not None
 
         planner = self._grid_planners.get(snapshot.symbol)
         if planner is None:
             logger.debug("No grid planner for %s, skipping", snapshot.symbol)
-            return []
+            return GridPlanResult()
 
         if self._last_account_snapshot is None:
             logger.debug("No account snapshot yet, planner returns 0 actions (safe startup)")
-            return []
+            return GridPlanResult()
 
         # Filter open orders for this symbol only.
-        # PR-INV-3: Exclude TP orders from planner diff (managed by cycle layer).
-        # TP orders (grinder_tp_...) parse as valid grinder orders and would be
-        # matched/cancelled by the planner without this filter.
+        # INV-9b: TP orders are now INCLUDED so the planner can match them
+        # to desired levels (prevents cross-tick grid/TP overlap). The planner
+        # skips CANCEL/REPLACE for TP orders (managed by cycle layer).
         open_orders = tuple(
-            o
-            for o in self._last_account_snapshot.open_orders
-            if o.symbol == snapshot.symbol and not is_tp_order(o.order_id)
+            o for o in self._last_account_snapshot.open_orders if o.symbol == snapshot.symbol
         )
 
         # Extract NATR from FeatureEngine (PR-L0)
@@ -1029,27 +1433,67 @@ class LiveEngineV0:
             natr_bps=natr_bps,
             natr_last_ts=natr_last_ts,
             suppress_increase=suppress_increase,
+            rolling_mode=rolling_mode,
         )
 
         if plan_result.actions:
+            # Reset steady-state counter when actions resume
+            self._rolling_steady_state_count.pop(snapshot.symbol, None)
             # P0-2d: promote to WARNING when debug active (visible without logging.basicConfig)
             log_fn = logger.warning if self._debug_open_orders else logger.info
-            log_fn(
-                "PLANNER_ACTIONS_SUMMARY %s: desired=%d actual=%d missing=%d extra=%d "
-                "mismatch=%d spacing=%.1f bps natr_fallback=%s actions=%d mid=%.2f",
-                snapshot.symbol,
-                plan_result.desired_count,
-                plan_result.actual_count,
-                plan_result.diff_missing,
-                plan_result.diff_extra,
-                plan_result.diff_mismatch,
-                plan_result.effective_spacing_bps,
-                plan_result.natr_fallback,
-                len(plan_result.actions),
-                float(snapshot.mid_price),
-            )
+            # INV-10: rolling mode appends ec= and anchor= to log (non-rolling unchanged)
+            rs = planner.get_rolling_state(snapshot.symbol) if rolling_mode else None
+            if rs is not None:
+                ec_val = rs.anchor_price + rs.net_offset * rs.step_price
+                log_fn(
+                    "PLANNER_ACTIONS_SUMMARY %s: desired=%d actual=%d missing=%d "
+                    "extra=%d extra_tp=%d mismatch=%d spacing=%.1f bps "
+                    "natr_fallback=%s actions=%d mid=%s ec=%s anchor=%s",
+                    snapshot.symbol,
+                    plan_result.desired_count,
+                    plan_result.actual_count,
+                    plan_result.diff_missing,
+                    plan_result.diff_extra,
+                    plan_result.diff_extra_tp,
+                    plan_result.diff_mismatch,
+                    plan_result.effective_spacing_bps,
+                    plan_result.natr_fallback,
+                    len(plan_result.actions),
+                    snapshot.mid_price,
+                    ec_val,
+                    rs.anchor_price,
+                )
+            else:
+                log_fn(
+                    "PLANNER_ACTIONS_SUMMARY %s: desired=%d actual=%d missing=%d "
+                    "extra=%d extra_tp=%d mismatch=%d spacing=%.1f bps "
+                    "natr_fallback=%s actions=%d mid=%s",
+                    snapshot.symbol,
+                    plan_result.desired_count,
+                    plan_result.actual_count,
+                    plan_result.diff_missing,
+                    plan_result.diff_extra,
+                    plan_result.diff_extra_tp,
+                    plan_result.diff_mismatch,
+                    plan_result.effective_spacing_bps,
+                    plan_result.natr_fallback,
+                    len(plan_result.actions),
+                    snapshot.mid_price,
+                )
+        elif rolling_mode:
+            # ADR-089: throttled steady-state log for rolling mode (1 per 100 ticks)
+            count = self._rolling_steady_state_count.get(snapshot.symbol, 0) + 1
+            self._rolling_steady_state_count[snapshot.symbol] = count
+            if count % 100 == 1:
+                logger.debug(
+                    "ROLLING_STEADY_STATE symbol=%s tick=%d desired=%d actual=%d",
+                    snapshot.symbol,
+                    count,
+                    plan_result.desired_count,
+                    plan_result.actual_count,
+                )
 
-        return plan_result.actions
+        return plan_result
 
     def _tick_account_sync(self) -> None:  # noqa: PLR0912
         """Run one account sync cycle (read-only).
@@ -1079,6 +1523,16 @@ class LiveEngineV0:
             self._position_notional_usd = AccountSyncer.compute_position_notional(result.snapshot)
             # PR-L2: Store full snapshot for LiveGridPlannerV1 (open_orders as exchange truth)
             self._last_account_snapshot = result.snapshot
+            # PR-P0-RACE-1: monotonic generation counter for convergence guards
+            self._account_sync_generation += 1
+            # BUG-4: clear cancel-failed blacklist — fresh snapshot replaces stale state
+            if self._cancel_failed_ids:
+                logger.info(
+                    "CANCEL_FAILED_IDS_CLEARED count=%d gen=%d",
+                    len(self._cancel_failed_ids),
+                    self._account_sync_generation,
+                )
+                self._cancel_failed_ids.clear()
 
         # Evidence writing (env-gated, safe-by-default)
         if result.snapshot is not None:
@@ -1265,6 +1719,48 @@ class LiveEngineV0:
             if p.symbol == symbol:
                 return p.qty
         return Decimal("0")
+
+    def _has_grinder_orders(self, symbol: str) -> bool:
+        """Check if exchange has any grinder-owned orders for symbol.
+
+        Used by INV-10 ANCHOR_RESET condition (ADR-088).
+        """
+        snap = self._last_account_snapshot
+        if snap is None:
+            return False
+        for o in snap.open_orders:
+            if o.symbol != symbol:
+                continue
+            parsed = parse_client_order_id(o.order_id)
+            if parsed is not None and parsed.prefix.startswith(DEFAULT_PREFIX.rstrip("_")):
+                return True
+        return False
+
+    def _count_pending_cancels_for_symbol(self, symbol: str) -> int:
+        """Count rolling pending cancel entries for a specific symbol.
+
+        Used by INV-10 ANCHOR_RESET condition (ADR-088).
+        """
+        count = 0
+        for oid in self._rolling_pending_cancels:
+            parsed = parse_client_order_id(oid)
+            if parsed is not None and parsed.symbol == symbol:
+                count += 1
+        return count
+
+    def _clear_pending_cancels_for_symbol(self, symbol: str) -> None:
+        """Remove rolling pending cancel entries for a specific symbol.
+
+        Multi-symbol safe: only clears entries matching the given symbol.
+        Part of INV-10 ANCHOR_RESET engine-side cleanup (ADR-088).
+        """
+        stale = [
+            oid
+            for oid in self._rolling_pending_cancels
+            if (parsed := parse_client_order_id(oid)) is not None and parsed.symbol == symbol
+        ]
+        for oid in stale:
+            del self._rolling_pending_cancels[oid]
 
     def _detect_tp_fill_event(self, symbol: str, pos_qty: Decimal | None) -> bool:
         """Detect TP fill event: position magnitude decreased.
@@ -1504,6 +2000,160 @@ class LiveEngineV0:
                 sell_anchor_val,
                 spacing_bps,
             )
+        return actions
+
+    def _apply_convergence_guards(  # noqa: PLR0912
+        self,
+        symbol: str,
+        actions: list[ExecutionAction],
+        plan_result: GridPlanResult,
+        ts_ms: int,
+    ) -> list[ExecutionAction]:
+        """PR-P0-RACE-1: convergence guards for planner/grid-shift path.
+
+        Three independent guards:
+        1. Sync-gated planner: skip planner until AccountSync refreshes after dispatch.
+        2. Cancel-first on extras: if diff_extra > 0, only CANCEL actions pass.
+        3. Budget pre-check: if PLACEs > budget remaining, entire shift deferred.
+
+        Scope: ONLY planner/grid actions. Cycle layer (TP/replenish) is
+        appended AFTER this method and is never filtered by it.
+
+        Returns filtered actions list.
+        """
+        if not self._converge_first_enabled:
+            return actions
+
+        if not actions:
+            # INV-10 fix: clear stale inflight latch when planner confirms convergence.
+            # actions=[] means planner found no diff — orders match desired state.
+            # Precondition: this method is only called from the live planner path
+            # (line 806), not the budget_dead/grid_frozen path. So actions=[]
+            # genuinely means "planner found no diff", not suppression.
+            # If sync has refreshed since dispatch, convergence is confirmed.
+            inflight = self._inflight_shift.get(symbol)
+            if inflight is not None and self._account_sync_generation > inflight.sync_gen:
+                self._inflight_shift.pop(symbol, None)
+                self._inflight_deferred_logged.discard(symbol)
+                # ADR-089: explicit log when stale inflight cleared on convergence
+                logger.info(
+                    "INFLIGHT_STALE_CLEARED symbol=%s sync_gen=%d inflight_gen=%d",
+                    symbol,
+                    self._account_sync_generation,
+                    inflight.sync_gen,
+                )
+            return actions
+
+        # Guard 1: Inflight latch — wait for sync refresh after dispatch
+        convergence_cleared = False
+        inflight = self._inflight_shift.get(symbol)
+        if inflight is not None:
+            # Check timeout first (30s safety valve)
+            elapsed = ts_ms - inflight.ts_ms
+            if elapsed > _CONVERGENCE_TIMEOUT_MS:
+                logger.warning(
+                    "INFLIGHT_GENERATION_TIMEOUT symbol=%s elapsed_ms=%d",
+                    symbol,
+                    elapsed,
+                )
+                self._inflight_shift.pop(symbol, None)
+                self._inflight_deferred_logged.discard(symbol)
+                convergence_cleared = True
+            elif self._account_sync_generation <= inflight.sync_gen:
+                # Sync hasn't refreshed since dispatch → skip planner entirely.
+                # BUG-3 fix: log only once per latch cycle, not every WS tick.
+                if symbol not in self._inflight_deferred_logged:
+                    logger.info(
+                        "GRID_SHIFT_DEFERRED reason=INFLIGHT_GENERATION symbol=%s "
+                        "sync_gen=%d inflight_gen=%d",
+                        symbol,
+                        self._account_sync_generation,
+                        inflight.sync_gen,
+                    )
+                    self._inflight_deferred_logged.add(symbol)
+                return []
+            elif plan_result.diff_extra == 0 or (
+                plan_result.diff_extra > 0 and plan_result.diff_extra == plan_result.diff_extra_tp
+            ):
+                # Converged: no non-TP extras after fresh sync → clear latch.
+                # TP extras are intentional (INV-9b) and do not block convergence.
+                self._inflight_shift.pop(symbol, None)
+                self._inflight_deferred_logged.discard(symbol)
+                convergence_cleared = True
+            # else: sync refreshed but non-TP extras > 0 → fall through to Guard 2
+
+        # Guard 2: Cancel-first on extras (no inflight, latch just cleared, or post-timeout)
+        # INV-9b: TP extras are intentional (not cancelled) — only grid extras block.
+        non_tp_extras = plan_result.diff_extra - plan_result.diff_extra_tp
+        if non_tp_extras > 0:
+            filtered = [a for a in actions if a.action_type == ActionType.CANCEL]
+            logger.warning(
+                "PLACEMENT_DEFERRED reason=ACCOUNT_SYNC_NOT_CONVERGED "
+                "symbol=%s extras=%d tp_extras=%d open=%d desired=%d",
+                symbol,
+                plan_result.diff_extra,
+                plan_result.diff_extra_tp,
+                plan_result.actual_count,
+                plan_result.desired_count,
+            )
+            return filtered
+
+        # Guard 3: Budget pre-check
+        place_count = sum(1 for a in actions if a.action_type == ActionType.PLACE)
+        budget = self._exchange_port.orders_remaining()
+        if budget is not None and place_count > 0 and budget < place_count:
+            reason = "ORDER_BUDGET_EXHAUSTED" if budget <= 0 else "ORDER_BUDGET_NEAR_EXHAUSTION"
+            logger.warning(
+                "GRID_SHIFT_DEFERRED reason=%s symbol=%s budget_remaining=%d shift_cost=%d",
+                reason,
+                symbol,
+                budget,
+                place_count,
+            )
+            return []
+
+        # Guard 4 (ADR-090): Unreconciled placement hard cap.
+        if self._rolling_grid_enabled and self._grid_planners:
+            planner = self._grid_planners.get(symbol)
+            if planner is not None:
+                cap = planner._config.levels * 2
+                sym_counts = self._unreconciled_place_count.get(symbol, {})
+                suppressed_sides: set[str] = set()
+                for side_str in ("BUY", "SELL"):
+                    if sym_counts.get(side_str, 0) >= cap:
+                        suppressed_sides.add(side_str)
+                if suppressed_sides:
+                    actions = [
+                        a
+                        for a in actions
+                        if not (
+                            a.action_type == ActionType.PLACE
+                            and a.side is not None
+                            and a.side.value in suppressed_sides
+                        )
+                    ]
+                    logger.warning(
+                        "PLACEMENT_CAPPED symbol=%s suppressed_sides=%s unreconciled=%s cap=%d",
+                        symbol,
+                        suppressed_sides,
+                        sym_counts,
+                        cap,
+                    )
+
+        # All guards passed — record inflight if PLACEs dispatched.
+        # BUG-3 fix: after convergence just cleared, skip re-latch for pure
+        # shifts (cancel_count >= place_count). This avoids the re-latch cycle
+        # where every sync clears the latch, planner shifts, and re-latches.
+        # Net-new PLACEs (initial placement, fill recovery) still latch.
+        cancel_count = sum(1 for a in actions if a.action_type == ActionType.CANCEL)
+        is_pure_shift = cancel_count >= place_count > 0
+        if place_count > 0 and not (convergence_cleared and is_pure_shift):
+            self._inflight_shift[symbol] = _InflightShift(
+                sync_gen=self._account_sync_generation,
+                place_count=place_count,
+                ts_ms=ts_ms,
+            )
+
         return actions
 
     def _filter_grid_shift(
@@ -2016,6 +2666,17 @@ class LiveEngineV0:
                 if action.action_type == ActionType.PLACE:
                     cid_sent = action.client_order_id or live_action.order_id or ""
                     self._recent_places.append((cid_sent, int(time.time() * 1000), action.symbol))
+                    # ADR-090: track dispatched PLACE CID for inflight fill detection
+                    if self._rolling_grid_enabled and action.side is not None:
+                        self._inflight_placed_cids[cid_sent] = _InflightPlacedOrder(
+                            symbol=action.symbol,
+                            side=action.side.value,
+                            sync_gen=self._account_sync_generation,
+                        )
+                        sym_counts = self._unreconciled_place_count.setdefault(
+                            action.symbol, {"BUY": 0, "SELL": 0}
+                        )
+                        sym_counts[action.side.value] += 1
                 return live_action
             except ConnectorNonRetryableError as e:
                 # Non-retryable: fail immediately

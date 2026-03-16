@@ -1338,12 +1338,77 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
   - Failed TP PLACEs retried 3x (10s cooldown, `-4118` only) via engine retry queue
   - Known limitation: successful retry does not fire compensating CANCEL. Extra grid order may be reconciled by planner on unfreeze under existing planner behavior; not guaranteed by this PR. Follow-up live evidence required
   - Non-goal: no Prometheus counters - logs only (`TP_SLOT_TAKEOVER_SKIPPED`, `TP_CLOSE_RETRY_QUEUED`, `_OK`, `_EXHAUSTED`). Counters deferred to observability PR
+- **Converge-first planner + budget-burn stop** (PR-P0-RACE-1, ADR-084):
+  - Three guards scoped to planner/grid-shift path ONLY (cycle layer TP/replenish unaffected):
+    1. Sync-gated planner: skip planner until AccountSync refreshes after dispatch (`_account_sync_generation` counter). BUG-3: log throttled (once per latch cycle), pure shifts skip re-latch.
+    2. Cancel-first on extras: if `non_tp_extras > 0` (INV-9b: `diff_extra - diff_extra_tp`), only CANCEL actions pass (PLACEs deferred). TP extras are intentional.
+    3. Budget pre-check: if `orders_remaining() <= 0` or PLACEs > budget, entire shift deferred (no partial execution)
+  - Convergence = `non_tp_extras == 0` after fresh AccountSync (INV-9b: TP extras do not block)
+  - Inflight latch: 30s timeout safety valve (clears sync-wait but cancel-only still applies if extras present). BUG-3: no re-latch for pure shifts after convergence clear.
+  - `ExchangePort.orders_remaining() -> int | None`: clean public API (NoOp returns None = unlimited)
+  - Env: `GRINDER_LIVE_CONVERGE_FIRST` (bool, default `True`, safe-by-default)
+  - Logs: `GRID_SHIFT_DEFERRED`, `PLACEMENT_DEFERRED`, `INFLIGHT_GENERATION_TIMEOUT`, `ORDER_BUDGET_EXHAUSTED`, `ORDER_BUDGET_NEAR_EXHAUSTION`
+  - Run #18 motivation: budget usage drops from 100+ (exhausted in 2min) to ~36 (stable grid)
 - **Verification knobs** (PR-VERIF-KNOBS-1):
   - `GRINDER_LIVE_ADAPTIVE_SPACING_ENABLED` (bool, default True): disables NATR-driven spacing when False
   - `GRINDER_LIVE_MAX_LEVEL_DISTANCE_BPS` (int, default 0=None): cap max distance from mid; levels beyond are skipped (not clamped)
   - Wired into `LiveGridConfig.adaptive_enabled` and `LiveGridConfig.max_level_distance_bps`
   - Cap logic in `_build_desired_grid()`: reduces `desired_count` naturally
   - Backward-compatible: defaults preserve existing behavior
+- **Rolling Infinite Grid** (ADR-085):
+  - **Status:** V1F implemented -- anchor/initial placement contract (INV-10, ADR-088). Live verification pending.
+  - **Spec:** `docs/26_ROLLING_INFINITE_GRID_SPEC.md`
+  - **Problem:** Current mid-anchored grid rebuilds entirely on price movement (20 actions/shift, budget burn). Grid fills don't advance the ladder.
+  - **Solution:** Rolling infinite ladder where grid fills shift `effective_center` by `+/- step_price`. Fill produces 2 grid actions (1 CANCEL + 1 PLACE, inner level reserved for TP) instead of full rebuild.
+  - **Key invariants:** cardinality (N_buy + N_sell constant), spacing (uniform step_price), rolling shift (net_offset tracks fill direction), no global rebuild on fill, TP isolation (TP fills don't shift), TP slot exclusion (INV-9).
+  - **State model:** `_RollingLadderState(anchor_price, step_price, net_offset)` -- volatile, re-anchor on restart.
+  - **Feature flag:** `GRINDER_LIVE_ROLLING_GRID` (bool, default `False`, safe-by-default). Wired in engine.
+  - **V1A (planner):** `_RollingLadderState`, `_build_rolling_grid()`, `_match_orders_by_price()`, `plan(rolling_mode=True)`. Planner-only, 18 tests.
+  - **V1B (engine wiring):** `GRINDER_LIVE_ROLLING_GRID` env var gates rolling mode. Engine-owned fill detection (`_prev_rolling_orders`, `_rolling_pending_cancels`). Freeze/replenish/anti-churn bypassed. 17 engine integration tests (35 total).
+  - **V1C (TP slot ownership, ADR-086, INV-9):** Fill-tick reservation prevents planner from placing grid at TP price on same tick.
+    - **Live verification exposed cross-tick overlap** (run4): TP SELL@70843.30 + grid SELL@70843.40 coexisted 45 sync cycles. Root cause: engine filtered TP orders from planner's `open_orders` (PR-INV-3), so planner couldn't see or match TPs.
+  - **V1D (cross-tick TP slot protection, ADR-086 update, INV-9b):** Two-layer fix:
+    1. **Primary:** TP orders included in planner's `open_orders` (removed `is_tp_order` filter from engine). Planner matches TP to desired level → no grid PLACE at TP price. Planner skips CANCEL/REPLACE for TP orders (managed by cycle layer).
+    2. **Secondary:** Reservation persists across ticks until age-out (`max_reservation_age=50`). Age-only clearance avoids multi-fill false-clear (Contract 2a). Defense-in-depth for REST-lag gap between fill detection and TP visibility.
+    - **INV-9 formula:** `desired_grid_count = (N - sell_reservation) + (N - buy_reservation)` on fill ticks.
+    - **Slot state model:** `{grid, tp, reserved, vacant}`. Ownership applies only to occupied slots.
+    - **Convergence target:** `grid + tp = 2*N` (not absolute runtime invariant — transient deviation expected).
+    - **Saturation:** reservation clamps at `min(fill_count, N)` per side. Excess TPs self-heal via TTL.
+    - **Defense-in-depth:** `_filter_tp_grid_overlap()` in engine. Same-tick anomaly guard (expected fire count: ZERO). Uses `reduce_only` discriminator. Fail-open when config missing.
+    - **`diff_extra_tp` (INV-9b follow-up):** `GridPlanResult.diff_extra_tp` counts TP orders in extras. Convergence guard uses `non_tp_extras = diff_extra - diff_extra_tp` — TP extras are intentional (not cancelled), only grid extras block PLACEs. T43 validates.
+    - 22 slot ownership tests (T21-T42) + T43, 67 rolling grid tests total.
+  - **V1E (convergence guard + cancel-spin fixes, BUG-3/BUG-4):** Live run8 exposed two operational bugs:
+    - **BUG-3 (GRID_SHIFT_DEFERRED churn):** Inflight latch re-created on every sync cycle. Mechanism: PLACE → latch(gen=N) → sync → latch clears → planner SHIFT → new latch(gen=N+1) → repeat. Each latch blocks ~100 WS ticks. Fix: (a) log throttle — `GRID_SHIFT_DEFERRED` logged once per latch cycle, not every tick; (b) no re-latch for pure shifts (cancel_count >= place_count) after convergence clear. Net-new PLACEs still latch.
+    - **BUG-4 (CANCEL_2011 spin):** Stale snapshot shows already-cancelled order → planner generates CANCEL → Binance returns -2011 → repeats every tick until sync refresh. Fix: `_cancel_failed_ids` blacklist. Failed CANCELs recorded; blacklisted order_ids skipped in action loop. Cleared on AccountSync refresh (`_account_sync_generation` increment).
+    - **Logs:** `CANCEL_FAILED_IDS_CLEARED count={} gen={}` (on sync refresh). `BlockReason.CANCEL_ALREADY_FAILED` (SKIPPED status).
+    - 4 BUG-3 tests (log throttle, reset after sync, pure shift no-relatch, net-new relatch) + 5 BUG-4 tests (populated, cleared on sync, persists without sync, error path, empty no-log).
+  - **V1F (anchor/initial placement contract, ADR-088, INV-10):** Live runs (run9-run13) exposed grid asymmetry after external cleanup. Root cause: no re-anchor mechanism when exchange empties while engine is running.
+    - **ANCHOR_RESET:** 5-condition contract (rolling_state_exists, no_grinder_orders, no_fresh_inflight_latch, position_flat, no_pending_cancels). Same-tick: `reset_rolling_state()` → `_plan_grid()` reinits from fresh `mid_price`.
+    - **no_fresh_inflight_latch:** inflight blocks only while `account_sync_generation <= inflight.sync_gen`. Stale inflight does not block reset after sync refresh. Live verification exposed stranded inflight bug: `_apply_convergence_guards()` returned early on `actions=[]` without clearing stale inflight latch. Fix: (a) clear stale inflight on empty-actions path when sync has refreshed; (b) ANCHOR_RESET condition uses staleness check instead of presence check.
+    - **Part A safety invariant:** `_apply_convergence_guards()` is only called from the live planner path (engine.py line 806), not the `budget_dead`/`grid_frozen` path. `actions=[]` in this context genuinely means "planner found no diff", not suppression.
+    - **SSOT:** `anchor_price = snapshot.mid_price` (raw Decimal, not tick-rounded).
+    - **Two-layer cleanup:** planner-owned (anchor, step, offset, reservations) + engine-owned (prev_orders, pending_cancels, throttle keys).
+    - **BLOCKED throttle:** `ANCHOR_RESET_BLOCKED` logged once per reason per episode. Three blocked reasons: POSITION_OPEN, POSITION_UNKNOWN, PENDING_CANCELS.
+    - **PLANNER_ACTIONS_SUMMARY:** rolling mode appends `ec=` and `anchor=` to log.
+    - **ADR-089 log events:** `ROLLING_STEADY_STATE` (DEBUG, throttled 1/100 ticks, when actions=0 in rolling mode), `INFLIGHT_STALE_CLEARED` (INFO, when stale inflight cleared on convergence), `CANCEL_SKIP_ALREADY_FAILED` (DEBUG, when cancel skipped due to prior -2011). Unit-test-proven (18 tests). Not reachable in fixture mode; intended for live forensics. `INFLIGHT_STALE_CLEARED` is additionally **live-proven** (minimum ceremony 2026-03-15, sync_gen=2 > inflight_gen=1).
+    - **ADR-089 operator tool:** `scripts/exchange_state.py` — check/cleanup/verify exchange state. Pre-flight and post-run canonical commands. Read-only commands (check/verify) bypass `ALLOW_MAINNET_TRADE` config gate via `setdefault`; `SafeMode.READ_ONLY` is the write guard.
+    - **Runbook:** `docs/runbooks/34_ROLLING_LIVE_VERIFICATION.md` — canonical ceremony for rolling live verification.
+    - **Minimum live acceptance: PASSED** (2026-03-15). Proven: ANCHOR_INIT, order placement (2x POST 200 OK), 0 errors, clean shutdown (300s, 3073 ticks), post-run status=CLEAN. Full rolling-path acceptance (ANCHOR_RESET, fill→TP, ROLLING_FILL_OFFSET) remains open.
+    - 19 anchor contract tests (T44-T62), 95 rolling grid tests total.
+  - **V1G (inflight fill detection, ADR-090, INV-11):** Live ceremony A2 (2026-03-15) exposed P0 safety bug: 13 BUY orders in 60s, 11 filled instantly, $1,571 accumulated with zero fills detected. Root cause: disappearance heuristic requires order to appear in at least one REST snapshot — orders filling within one sync interval (~5s) are structurally invisible.
+    - **Inflight CID tracking:** dispatched PLACE CIDs tracked in `_inflight_placed_cids`. After sync refresh, CID absent from REST = inflight fill detected. CID present = survived, handed to disappearance heuristic.
+    - **Reconciliation contract:** every dispatched PLACE increments `_unreconciled_place_count` once; first post-dispatch sync decrements exactly once, regardless of survival or inflight fill.
+    - **Guard 4:** unreconciled placement cap (`levels * 2`). Defense-in-depth — fires only if both fill detection paths fail simultaneously.
+    - **New log events:** `INFLIGHT_FILL_DETECTED` (INFO, operational path), `PLACEMENT_CAPPED` (WARNING, anomaly).
+    - **ANCHOR_RESET cleanup:** `_inflight_placed_cids` filtered + `_unreconciled_place_count` popped alongside existing state cleanup.
+    - 12 inflight fill detection tests (T63-T74), 116 rolling grid tests total.
+  - **Fill detection:** Rolling fill = disappeared order with `strategy_id="d"` (grid) AND not in pending cancels. TP (`strategy_id="tp"`) and all non-grid strategies do NOT shift offset. Two detection paths:
+    1. **Inflight CID reconciliation (ADR-090):** dispatched PLACE CID tracked in `_inflight_placed_cids`. First post-dispatch REST sync resolves fate: CID present = survived (handed to disappearance heuristic); CID absent = inflight fill (emits `INFLIGHT_FILL_DETECTED`). Closes the instant-fill blind spot.
+    2. **Disappearance heuristic:** order in `_prev_rolling_orders` but not in current REST snapshot = fill. Covers fills that happen after the order appeared in at least one snapshot.
+    - Known limitation: exchange-side non-trade cancels of grid orders (ADL, margin) treated as fills. Resets on restart.
+  - **Unreconciled placement cap (ADR-090, Guard 4):** `_unreconciled_place_count[symbol][side]` tracks PLACEs awaiting reconciliation. Incremented on dispatch, decremented on first post-dispatch sync (both survived + filled outcomes). Cap = `levels * 2`. Fires `PLACEMENT_CAPPED` (WARNING) when threshold reached — defense-in-depth for broken fill detection.
+  - **Obsoletes in rolling mode:** cycle-layer replenish, TP_FILL_REPLENISH, mid-driven GRID_SHIFT, anti-churn, grid freeze.
+  - **Migration:** spec -> V1A planner -> V1B engine -> V1C slot ownership -> V1D cross-tick fix -> V1E convergence guards -> V1F anchor contract -> live verification -> cleanup.
 
 - **AccountSync visibility instrumentation** (PR-P0-2):
   - `GRINDER_ACCOUNT_SYNC_DEBUG_OPEN_ORDERS=1` (default 0): one flag enables both raw logging + correlation
@@ -1353,7 +1418,7 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
   - CANCEL -2011 diagnostic log: order_id + parsed identity (before map_binance_error raises)
   - Pure helper `correlate_recent_places()` in `place_tracker.py` for testability
   - DRY: `_PORT_NAME = "futures"` class constant replaces hardcoded strings in BinanceFuturesPort
-  - Debug logs emitted at WARNING level to be visible without `logging.basicConfig()` (run_trading.py has no log config; Python defaults to WARNING)
+  - Debug logs emitted at WARNING level to be visible without `logging.basicConfig()` (historical — run_trading.py now has native logging config via ADR-089; WARNING promotion kept for backward compat when debug active)
   - Debug-only, default off, no behavioral changes
   - P0-2b: on missing orders, `GET /fapi/v1/order` by origClientOrderId (bounded by `GRINDER_ACCOUNT_SYNC_DEBUG_LOOKUP_LIMIT`, default 5, dedup per clientOrderId, set cap 100)
   - Logs: `ORDER_LOOKUP clientOrderId=... status=FILLED/CANCELED/...` or `ORDER_LOOKUP_NOT_FOUND clientOrderId=... code=-2013/-2011` or `ORDER_LOOKUP_ERROR clientOrderId=... status=429/...`

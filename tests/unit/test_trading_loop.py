@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time as time_module
 from decimal import Decimal
 from typing import TYPE_CHECKING
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING
 import pytest
 import scripts.run_trading as run_trading_mod
 from scripts.run_trading import (
+    _configure_logging,
     build_connector,
     build_engine,
     build_exchange_port,
@@ -523,3 +525,44 @@ class TestHAGatingLoop:
 
         # Engine was initialized but no snapshots processed (all skipped by HA gating)
         assert get_sor_metrics().engine_initialized is True
+
+
+# --- ADR-089: _configure_logging tests ---
+
+
+class TestConfigureLogging:
+    """ADR-089: native logging config via GRINDER_LOG_LEVEL."""
+
+    def test_default_level_info(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Default (no env var) → INFO level on root logger."""
+        monkeypatch.delenv("GRINDER_LOG_LEVEL", raising=False)
+        _configure_logging()
+        assert logging.getLogger().level == logging.INFO
+
+    def test_explicit_debug(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """GRINDER_LOG_LEVEL=DEBUG → DEBUG level on root logger."""
+        monkeypatch.setenv("GRINDER_LOG_LEVEL", "DEBUG")
+        _configure_logging()
+        assert logging.getLogger().level == logging.DEBUG
+
+    def test_explicit_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """GRINDER_LOG_LEVEL=WARNING → WARNING level on root logger."""
+        monkeypatch.setenv("GRINDER_LOG_LEVEL", "WARNING")
+        _configure_logging()
+        assert logging.getLogger().level == logging.WARNING
+
+    def test_invalid_falls_back_to_info(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Invalid value → fallback to INFO + warning printed."""
+        monkeypatch.setenv("GRINDER_LOG_LEVEL", "BANANA")
+        _configure_logging()
+        assert logging.getLogger().level == logging.INFO
+        captured = capsys.readouterr()
+        assert "invalid GRINDER_LOG_LEVEL" in captured.out
+
+    def test_case_insensitive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """GRINDER_LOG_LEVEL=debug (lowercase) → DEBUG."""
+        monkeypatch.setenv("GRINDER_LOG_LEVEL", "debug")
+        _configure_logging()
+        assert logging.getLogger().level == logging.DEBUG
