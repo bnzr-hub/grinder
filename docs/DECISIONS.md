@@ -4318,3 +4318,4 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
     3. **Stale-action filter:** before dispatching CANCEL, verify `order_id` still present in current `_last_account_snapshot.open_orders` for that symbol. If absent, skip with `CANCEL_SKIP_STALE_ACTION` log. Closes mechanism 3.
   - **BlockReason:** reuses existing `CANCEL_ALREADY_FAILED` — same semantic (redundant cancel), no contract expansion.
   - **Tests:** 8 new tests: same-tick dedup, different CIDs not deduped, blacklist survives sync when CID visible, blacklist pruned when CID absent, stale cancel skipped after sync, legitimate cancel dispatches when order present, cross-tick cancel dedup, dedup set cleared on sync. 2 existing tests updated for selective prune.
+  - **Verdict:** FIXED and LIVE-VERIFIED. Ceremony A6 (2026-03-16, `main @ 6c1850e`): `CANCEL_2011_DIAG=0`, `Non-retryable error on CANCEL=0`, 4650 ticks / 90s, 2 fills detected, 2 successful cancels, cleanup/verify CLEAN.
