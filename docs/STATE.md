@@ -1356,7 +1356,7 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
   - Cap logic in `_build_desired_grid()`: reduces `desired_count` naturally
   - Backward-compatible: defaults preserve existing behavior
 - **Rolling Infinite Grid** (ADR-085):
-  - **Status:** V1F implemented -- anchor/initial placement contract (INV-10, ADR-088). Live verification pending.
+  - **Status:** Legacy/experimental. V1F implemented -- anchor/initial placement contract (INV-10, ADR-088). Live-verified up to BUG-4 follow-up (ceremony A6). **No longer target architecture** -- superseded conceptually by doc-27 (Two-Sided Rolling Window Grid). Existing code remains operational; no removal planned in this phase.
   - **Spec:** `docs/26_ROLLING_INFINITE_GRID_SPEC.md`
   - **Problem:** Current mid-anchored grid rebuilds entirely on price movement (20 actions/shift, budget burn). Grid fills don't advance the ladder.
   - **Solution:** Rolling infinite ladder where grid fills shift `effective_center` by `+/- step_price`. Fill produces 2 grid actions (1 CANCEL + 1 PLACE, inner level reserved for TP) instead of full rebuild.
@@ -1413,6 +1413,15 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
   - **Unreconciled placement cap (ADR-090, Guard 4):** `_unreconciled_place_count[symbol][side]` tracks PLACEs awaiting reconciliation. Incremented on dispatch, decremented on first post-dispatch sync (both survived + filled outcomes). Cap = `levels * 2`. Fires `PLACEMENT_CAPPED` (WARNING) when threshold reached — defense-in-depth for broken fill detection.
   - **Obsoletes in rolling mode:** cycle-layer replenish, TP_FILL_REPLENISH, mid-driven GRID_SHIFT, anti-churn, grid freeze.
   - **Migration:** spec -> V1A planner -> V1B engine -> V1C slot ownership -> V1D cross-tick fix -> V1E convergence guards -> V1F anchor contract -> live verification -> cleanup.
+
+- **Two-Sided Rolling Window Grid** (doc-27):
+  - **Status:** Proposed. Spec only -- no code exists yet.
+  - **Spec:** `docs/27_TWO_SIDED_ROLLING_WINDOW_GRID_SPEC.md`
+  - **Supersedes conceptually:** doc-26 (Rolling Infinite Grid, ADR-085) as target grid architecture.
+  - **Key differences from doc-26:** explicit entry/exit separation, inventory lot ledger, one-sided branch mode, bounded entry window, flat-only recenter, deterministic state machine.
+  - **Architectural choices (v1):** strict one-sided branch, flat-only recenter, forbidden mixed inventory, exits outside rolling window, soft recenter on flat normalization.
+  - **Implementation plan:** PR1 (spec) -> PR2 (state machine) -> PR3 (reconciliation) -> PR4 (execution) -> PR5 (paper/shadow) -> PR6 (live ceremony).
+  - **No code changes until PR2.**
 
 - **AccountSync visibility instrumentation** (PR-P0-2):
   - `GRINDER_ACCOUNT_SYNC_DEBUG_OPEN_ORDERS=1` (default 0): one flag enables both raw logging + correlation
