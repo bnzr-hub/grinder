@@ -338,8 +338,10 @@ Actions:
 2. Create paired `SELL exit` at `entry_price + 1 step`
 3. Remove filled buy-entry from window
 4. Add new farthest buy-entry one step lower than current lowest
-5. Remove farthest sell-entry from opposite side
+5. **Remove ALL sell-entry orders** (strict one-sided branch per D1)
 6. mode -> `LONG_BRANCH`
+
+Post-condition: entry window contains only buy-entries. No sell-entries exist.
 
 ### 11.2 FLAT + EntryFilled(SELL)
 
@@ -350,23 +352,27 @@ Actions:
 2. Create paired `BUY exit` at `entry_price - 1 step`
 3. Remove filled sell-entry from window
 4. Add new farthest sell-entry one step higher than current highest
-5. Remove farthest buy-entry from opposite side
+5. **Remove ALL buy-entry orders** (strict one-sided branch per D1)
 6. mode -> `SHORT_BRANCH`
+
+Post-condition: entry window contains only sell-entries. No buy-entries exist.
 
 ### 11.3 LONG_BRANCH + EntryFilled(BUY)
 
-Preconditions: no short lots exist, filled order is valid buy-entry.
+Preconditions: mode == LONG_BRANCH, no short lots exist, filled order is valid buy-entry.
 
 Actions:
 1. Create another `LONG lot`
 2. Create paired `SELL exit` one step above its entry
-3. Add new farthest buy-entry lower
-4. Remove farthest sell-entry upper (if any remain from window)
+3. Remove filled buy-entry from window
+4. Add new farthest buy-entry one step lower than current lowest
 5. mode remains `LONG_BRANCH`
+
+Note: no opposite-side removal needed -- sell-entries were already fully removed on branch entry (11.1).
 
 ### 11.4 SHORT_BRANCH + EntryFilled(SELL)
 
-Symmetric to 11.3.
+Symmetric to 11.3. No opposite-side removal needed -- buy-entries were already fully removed on branch entry (11.2).
 
 ### 11.5 LONG_BRANCH + ExitFilled(SELL)
 
@@ -527,6 +533,37 @@ If any invariant breaks:
 * never create duplicate inventory from same fill
 * never drop exits due to window roll
 * reconciliation must be idempotent
+
+### 17.4 Missing entry order in reconciliation
+
+An entry order that the engine expects to be OPEN but is absent from the exchange snapshot:
+
+* **without fill evidence:** do NOT create an inventory lot. Mark order as `MISSING_UNCERTAIN`.
+  Log warning. May re-place entry if window position still valid.
+* **with fill evidence (trade record or position delta):** create inventory lot (idempotent).
+  Treat as normal fill path.
+* **never assume fill without evidence** -- silent lot creation from missing orders is forbidden (I8).
+
+### 17.5 Missing exit order for open lot
+
+An exit order that the engine expects to be OPEN but is absent from the exchange snapshot,
+while its paired inventory lot is still OPEN:
+
+* **critical severity** -- lot is open and unprotected.
+* trigger immediate exit re-placement at the lot's exit price.
+* if re-placement fails: escalate to operator alert. Repeated failure may trigger emergency flatten.
+* this is the highest-priority reconciliation repair (a lot without an exit is unbounded risk).
+
+### 17.6 Uncertain/missing order after restart
+
+On engine restart, reconstruct state from exchange snapshot:
+
+* for every open order on exchange: classify as entry or exit by CID prefix / metadata.
+* for every open lot inferred from position: verify paired exit exists. If missing, repair (17.5).
+* for orders that cannot be classified: mark `MISSING_UNCERTAIN`, do NOT cancel or assume ownership.
+  Operator must resolve via cleanup path.
+* **invariant:** restart must not create phantom lots or orphan exits. Reconstruction must be
+  fully deterministic from the snapshot (I6, I7).
 
 ---
 
