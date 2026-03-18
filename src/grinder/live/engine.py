@@ -558,7 +558,8 @@ class LiveEngineV0:
         self._grid_v2_started = False
         self._grid_v2_seed_actions: list[ExecutionAction] = []
         self._grid_v2_pending_cancels: dict[str, int] = {}  # cid → ts_ms
-        self._grid_v2_awaiting_sync = False  # PR6: skip fill detection until account sync refreshes
+        self._grid_v2_awaiting_sync = False  # PR6: skip fill detection until seed CIDs visible
+        self._grid_v2_pending_seed_cids: frozenset[str] = frozenset()  # PR6: CIDs to confirm
         if self._grid_v2_enabled:
             if not self._grid_v2_symbol:
                 raise ValueError(
@@ -613,9 +614,19 @@ class LiveEngineV0:
             max_inventory_notional_usd=Decimal(
                 os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL", "1000")
             ),
-            price_tick_size=Decimal(os.environ.get("GRINDER_GRID_V2_TICK_SIZE", "0.01")),
+            price_tick_size=self._resolve_grid_v2_tick_size(),
         )
         return GridV2Bridge(config, self._grid_v2_symbol)
+
+    def _resolve_grid_v2_tick_size(self) -> Decimal:
+        """Resolve tick size for grid_v2 symbol. Fail-closed if missing."""
+        env_val = os.environ.get("GRINDER_GRID_V2_TICK_SIZE", "")
+        if env_val:
+            return Decimal(env_val)
+        raise ValueError(
+            f"GRINDER_GRID_V2_TICK_SIZE required for grid_v2 symbol={self._grid_v2_symbol}. "
+            "Set it to the exchange tick size (e.g., 0.10 for BTCUSDT futures)."
+        )
 
     def _grid_v2_try_startup(self, snapshot: Snapshot) -> None:
         """Attempt grid_v2 bridge startup on first tick with account data.
@@ -669,10 +680,13 @@ class LiveEngineV0:
             seed = bridge.startup_fresh(snapshot.mid_price, snapshot.ts)
             self._grid_v2_seed_actions = list(seed)
             self._grid_v2_started = True
-            # PR6: skip fill detection until first account sync AFTER seed dispatch.
+            # PR6: skip fill detection until seed CIDs appear in account snapshot.
             # Seeds are not on exchange yet; registry-vs-exchange diff would be all
             # false positives until account sync confirms orders are visible.
             self._grid_v2_awaiting_sync = True
+            self._grid_v2_pending_seed_cids = frozenset(
+                ea.client_order_id for ea in seed if ea.client_order_id is not None
+            )
 
     def _grid_v2_exchange_cids(self, symbol: str) -> set[str]:
         """Get current grid_v2 CIDs on exchange from last account snapshot."""
@@ -1950,13 +1964,27 @@ class LiveEngineV0:
             self._position_notional_usd = AccountSyncer.compute_position_notional(result.snapshot)
             # PR-L2: Store full snapshot for LiveGridPlannerV1 (open_orders as exchange truth)
             self._last_account_snapshot = result.snapshot
-            # PR6: clear awaiting-sync flag — seed orders should now be visible
-            if self._grid_v2_awaiting_sync:
-                self._grid_v2_awaiting_sync = False
-                logger.info(
-                    "GRID_V2_AWAITING_SYNC_CLEARED gen=%d",
-                    self._account_sync_generation + 1,
-                )
+            # PR6: clear awaiting-sync flag only when ALL seed CIDs are visible
+            # in the account snapshot. If seeds aren't visible yet, keep skipping
+            # fill detection to prevent false fills.
+            if self._grid_v2_awaiting_sync and self._grid_v2_pending_seed_cids:
+                visible_cids = {o.order_id for o in result.snapshot.open_orders}
+                missing = self._grid_v2_pending_seed_cids - visible_cids
+                if not missing:
+                    confirmed_count = len(self._grid_v2_pending_seed_cids)
+                    self._grid_v2_awaiting_sync = False
+                    self._grid_v2_pending_seed_cids = frozenset()
+                    logger.info(
+                        "GRID_V2_AWAITING_SYNC_CLEARED gen=%d seeds_confirmed=%d",
+                        self._account_sync_generation + 1,
+                        confirmed_count,
+                    )
+                else:
+                    logger.debug(
+                        "GRID_V2_AWAITING_SYNC_PENDING missing=%d/%d",
+                        len(missing),
+                        len(self._grid_v2_pending_seed_cids),
+                    )
             # PR-P0-RACE-1: monotonic generation counter for convergence guards
             self._account_sync_generation += 1
             # BUG-4 + ADR-090 follow-up: selective prune of cancel-failed blacklist.

@@ -400,6 +400,7 @@ class TestEngineShadowMutualExclusion:
         monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
         monkeypatch.setenv("GRINDER_GRID_V2_SHADOW", "1")
         monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
 
         engine = LiveEngineV0(
             paper_engine=MagicMock(),
