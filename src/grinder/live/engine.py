@@ -323,12 +323,12 @@ def classify_intent(
 
 
 # Binance error codes that indicate the order might actually exist on exchange
-# (duplicate CID after network retry, order already processing, etc).
-# These are NOT safe to clean from registry — must quarantine.
+# Only -2010 is genuinely ambiguous: "New order rejected" can mean
+# duplicate CID after network retry where the first attempt succeeded.
+# All other codes (-2019 margin, -1111 precision, etc) are definitive rejects.
 _AMBIGUOUS_EXCHANGE_CODES: frozenset[int] = frozenset(
     {
         -2010,  # "New order rejected" — can be duplicate CID after retry
-        -2019,  # "Margin is insufficient" — can race with position change
     }
 )
 

@@ -1415,7 +1415,7 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
   - **Migration:** spec -> V1A planner -> V1B engine -> V1C slot ownership -> V1D cross-tick fix -> V1E convergence guards -> V1F anchor contract -> live verification -> cleanup.
 
 - **Two-Sided Rolling Window Grid** (doc-27):
-  - **Status:** PR6 delivered + post-ceremony hardening. Live ceremony PASSED (2026-03-18). 26 shadow tests (13 classes) + 51 bridge tests (26 classes) + 99 adapter tests (16 classes) + 78 SM tests, all passing.
+  - **Status:** PR6 delivered + post-ceremony hardening. Live ceremony PASSED (2026-03-18). 26 shadow tests (13 classes) + 52 bridge tests (26 classes) + 99 adapter tests (16 classes) + 78 SM tests, all passing.
   - **Spec:** `docs/27_TWO_SIDED_ROLLING_WINDOW_GRID_SPEC.md` (sections 1-25, including PR2 21.1-21.16, PR3 22.1-22.11, PR4 23.1-23.9, PR5 24.1-24.5, PR6 25.1-25.3).
   - **Supersedes conceptually:** doc-26 (Rolling Infinite Grid, ADR-085) as target grid architecture.
   - **Key differences from doc-26:** explicit entry/exit separation, inventory lot ledger, one-sided branch mode, bounded entry window, flat-only recenter, deterministic state machine.
