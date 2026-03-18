@@ -112,7 +112,7 @@ class LiveConnectorConfig:
 
     mode: SafeMode = SafeMode.READ_ONLY
     symbols: list[str] = field(default_factory=list)
-    ws_url: str = "wss://testnet.binance.vision/ws"  # Testnet by default (safe)
+    ws_url: str | None = None  # Explicit WS URL override (None = derive from use_testnet)
     use_testnet: bool = True
     timeout_config: TimeoutConfig = field(default_factory=TimeoutConfig)
     retry_policy: RetryPolicy = field(default_factory=lambda: RetryPolicy(max_attempts=3))

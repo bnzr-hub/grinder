@@ -633,7 +633,8 @@ class TestLiveConnectorConfig:
         config = LiveConnectorConfig()
         assert config.mode == SafeMode.READ_ONLY
         assert config.symbols == []
-        assert "testnet" in config.ws_url  # Safe testnet URL by default
+        assert config.ws_url is None  # No explicit override by default
+        assert config.use_testnet is True  # Testnet by default (safe)
 
     def test_config_with_symbols(self) -> None:
         """Config accepts symbol list."""

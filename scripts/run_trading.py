@@ -70,7 +70,6 @@ from typing import TYPE_CHECKING, Any
 
 from grinder.connectors.binance_ws import (
     BINANCE_WS_FUTURES_MAINNET,
-    BINANCE_WS_MAINNET,
     FakeWsTransport,
 )
 from grinder.connectors.live_connector import (
@@ -415,15 +414,15 @@ def build_connector(
             messages = [line.strip() for line in f if line.strip()]
         ws_transport = FakeWsTransport(messages=messages, delay_ms=100)
 
-    if use_testnet:
-        ws_url = "wss://testnet.binance.vision/ws"
-    elif exchange_port == "futures":
+    # Explicit ws_url only for futures mainnet (fstream).
+    # Testnet and spot mainnet are handled by BinanceWsConfig via use_testnet flag.
+    ws_url: str | None = None
+    if not use_testnet and exchange_port == "futures":
         ws_url = BINANCE_WS_FUTURES_MAINNET
-    else:
-        ws_url = BINANCE_WS_MAINNET
 
     net_label = "testnet" if use_testnet else ("futures" if exchange_port == "futures" else "spot")
-    print(f"  Market data WS: {ws_url} ({net_label})")
+    effective = ws_url or ("testnet" if use_testnet else "spot-mainnet")
+    print(f"  Market data WS: {effective} ({net_label})")
 
     config = LiveConnectorConfig(
         mode=mode,
