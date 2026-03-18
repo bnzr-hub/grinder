@@ -1372,9 +1372,13 @@ floating-point products of `reference_price * (1 ± step_pct * i)`. These must
 be quantized to exchange tick size before dispatch.
 
 - `GridV2Config.price_tick_size` (default `0.01`, BTCUSDT = `0.10`).
-- Quantization via `ROUND_HALF_UP` in `bridge._quantize_price()`.
+- Side-aware quantization in `bridge._quantize_price(price, side)`:
+  - BUY: `ROUND_DOWN` (less aggressive entry).
+  - SELL: `ROUND_UP` (less aggressive exit).
+  - None/unknown: `ROUND_HALF_UP` (fallback).
 - Applied in `_to_execution_actions()` for all PLACE actions.
-- Environment variable: `GRINDER_GRID_V2_TICK_SIZE`.
+- Environment variable: `GRINDER_GRID_V2_TICK_SIZE` (**required** when
+  `GRINDER_GRID_V2_ENABLED=true`; engine fails closed if missing).
 
 ### 25.2 Awaiting-Sync Gate
 
@@ -1382,11 +1386,15 @@ After `startup_fresh()`, seed CIDs are in the registry but not yet visible on
 the exchange (REST snapshot hasn't refreshed). Fill detection must be skipped
 until the first account sync confirms orders are visible.
 
-- `_grid_v2_awaiting_sync` flag: set `True` on fresh start, cleared by
-  `_tick_account_sync()` on first successful snapshot.
+- `_grid_v2_awaiting_sync` flag: set `True` on fresh start.
+- `_grid_v2_pending_seed_cids`: stores CIDs from seed actions.
+- Cleared by `_tick_account_sync()` only when **all** seed CIDs are present
+  in the account snapshot `open_orders`. If any seed CID is missing, the flag
+  stays `True` and fill detection remains skipped.
 - While set: fill and cancel-ack detection are skipped (same as startup-tick
-  skip, but extended until account sync).
-- Log marker: `GRID_V2_AWAITING_SYNC_CLEARED gen=N`.
+  skip, but extended until seed visibility confirmed).
+- Log markers: `GRID_V2_AWAITING_SYNC_CLEARED gen=N seeds_confirmed=K`,
+  `GRID_V2_AWAITING_SYNC_PENDING missing=M/K`.
 
 ### 25.3 Ceremony Results (2026-03-18)
 

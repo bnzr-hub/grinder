@@ -1244,21 +1244,26 @@ class TestAwaitingSyncSeedVisibility:
                 )
             )
 
-        # Simulate account sync with seeds visible
-        engine._last_account_snapshot = AccountSnapshot(
+        # Wire mock syncer that returns snapshot with seed CIDs visible
+        from grinder.account.syncer import AccountSyncer, SyncResult  # noqa: PLC0415
+
+        mock_syncer = MagicMock(spec=AccountSyncer)
+        seeds_snapshot = AccountSnapshot(
             positions=(),
             open_orders=tuple(open_orders),
             ts=_BASE_TS + 5000,
             source="test",
         )
-        # Directly invoke the check logic (simulating _tick_account_sync)
-        visible_cids = {o.order_id for o in engine._last_account_snapshot.open_orders}
-        missing = engine._grid_v2_pending_seed_cids - visible_cids
-        assert not missing, "All seed CIDs should be visible"
+        mock_syncer.sync.return_value = SyncResult(snapshot=seeds_snapshot)
+        mock_syncer.compute_position_notional = AccountSyncer.compute_position_notional
+        engine._account_syncer = mock_syncer
 
-        # Clear the flag as _tick_account_sync would
-        engine._grid_v2_awaiting_sync = False
-        engine._grid_v2_pending_seed_cids = frozenset()
+        # Invoke real _tick_account_sync — should clear awaiting_sync
+        engine._tick_account_sync()
+        assert engine._grid_v2_awaiting_sync is False, (
+            "awaiting_sync must be cleared by _tick_account_sync when seeds visible"
+        )
+        assert engine._grid_v2_pending_seed_cids == frozenset()
 
         # Tick 2: fill detection should now be active
         snap2 = Snapshot(
