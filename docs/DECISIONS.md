@@ -4331,3 +4331,4 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Architectural choices (v1, binding):** (1) strict one-sided branch = YES; (2) flat-only recenter = YES; (3) mixed inventory forbidden = YES; (4) exits outside rolling window = YES; (5) flat normalization = soft recenter (Option B).
 - **Migration plan:** PR1 (spec only, no code) → PR2 (pure state machine + 20 acceptance tests) → PR3 (reconciliation adapter) → PR4 (execution integration) → PR5 (paper/shadow verification) → PR6 (small live ceremony).
 - **Truth-first:** This is a spec direction, not an implementation. Nothing is replaced in code until PR2+. The old engine continues to run.
+- **PR2 delivered:** Pure state machine (`src/grinder/grid_v2/state.py`, 814 lines). 78 tests across 22 classes. Section 21 (21.1-21.16) added to doc-27 spec as binding contract clarifications. Zero changes to existing code. No exchange interaction.

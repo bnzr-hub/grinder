@@ -655,3 +655,268 @@ Before live-approval, must prove:
 
 * minimal size (1-2 levels, small qty)
 * strict proof bundle (same format as ADR-090 ceremonies)
+
+---
+
+## 21. PR2 contract clarifications
+
+The subsections below close contract gaps discovered during PR2 design review.
+They are normative for the pure state machine implementation.
+
+### 21.1 Flat normalization contract
+
+When the last open lot is closed (rules 11.5/11.6), the state machine transitions to
+`mode = FLAT` and **clears the entry window** (buy/sell price tuples become empty,
+`reference_price` preserved for audit).
+
+The state machine does not hold market data and cannot determine a new reference price.
+The caller (execution/reconciliation layer, PR3+) must send an explicit
+`RecenterRequested(new_reference_price, ts)` to rebuild the entry window.
+
+**State-level inactivity guarantee:** After full unwind, the entry window is empty.
+Any `EntryFilled` event is rejected by 21.6 (price not in active window) because
+there are no active entries. No separate "inactive" flag needed — empty window = inactive.
+
+This is the PR2 interpretation of D5 ("soft recenter"). The "soft" refers to
+rebuilding the window symmetrically around a new reference, not to automatic
+triggering. Triggering is the caller's responsibility.
+
+### 21.2 OperatorCleanup semantics
+
+`OperatorCleanup` is a **full state reset** event. Its semantics in the pure
+state machine:
+
+1. All `open_lots` → status `CLOSED` (each gets a new closed copy)
+2. All `OPEN` exit orders → status `CANCELED`
+3. Entry window → cleared (empty buy/sell tuples, reference preserved)
+4. Mode → `FLAT`
+5. `emergency_stopped` → `False`
+6. Emits individual `CANCEL_ENTRY` for each entry price + individual `CANCEL_EXIT`
+   for each open exit order
+
+**Difference from EmergencyStopTriggered:**
+
+| | EmergencyStop | OperatorCleanup |
+|---|---|---|
+| open lots | preserved (still open) | all closed |
+| exit orders | preserved (I2: exits protect lots) | all canceled |
+| entry orders | canceled (no new exposure) | canceled |
+| mode | unchanged | FLAT |
+| emergency_stopped | True | False |
+| purpose | freeze (stop bleeding) | full reset (clean slate) |
+
+### 21.3 Deterministic ordering contract
+
+All collection fields in `GridV2Snapshot` have a fixed ordering guarantee:
+
+| Field | Order | Rationale |
+|-------|-------|-----------|
+| `buy_entry_prices` | descending (closest to ref first) | natural for "next to fill" priority |
+| `sell_entry_prices` | ascending (closest to ref first) | natural for "next to fill" priority |
+| `open_lots` | chronological (oldest first, by `opened_at_ts`) | FIFO for exit pairing |
+| `closed_lots` | chronological (oldest first) | audit trail order |
+| `exit_orders` | same order as their paired lots | 1:1 correspondence |
+| `actions` (in TransitionResult) | `PLACE_EXIT` → `CANCEL_ENTRY` → `PLACE_ENTRY` (`CANCEL_EXIT` before `CANCEL_ENTRY` where applicable) | external intents only; internal state mutations not represented |
+
+### 21.4 Idempotency contract
+
+| Event | Duplicate condition | Behavior |
+|-------|-------------------|----------|
+| `EntryFilled(order_id=X)` | lot with `source_entry_order_id=X` already exists (open or closed) | rejected, snapshot unchanged |
+| `ExitFilled(exit_order_id=X)` | exit order with id=X already has status `FILLED` | rejected, snapshot unchanged |
+| `ExitFilled` after `OperatorCleanup` | lot already `CLOSED` | rejected, snapshot unchanged |
+| `RecenterRequested` with same reference | mode=FLAT, no lots | accepted — **snapshot-idempotent** (same window produced), but **action stream is NOT a no-op** (emits CANCEL/PLACE) |
+| `EmergencyStopTriggered` repeated | already `emergency_stopped=True` | accepted, no-op (snapshot unchanged, no actions) |
+| `OperatorCleanup` repeated | FLAT + no open lots + no open exits + empty window + not emergency_stopped | accepted, no-op (snapshot unchanged, no actions) |
+
+### 21.5 ExitFilled pair-integrity contract
+
+`ExitFilled(exit_order_id=X, lot_id=Y)` must satisfy ALL three conditions:
+
+1. Lot with `lot_id=Y` exists in `open_lots`
+2. Exit order with `exit_order_id=X` exists in `exit_orders`
+3. The exit order's `lot_id` field == `Y` AND the lot's `exit_order_id` field == `X`
+
+If any condition fails, the event is **rejected, snapshot unchanged**.
+
+| Failure | Reason |
+|---------|--------|
+| lot_id not found | `UNKNOWN_LOT_ID` |
+| exit_order_id not found | `UNKNOWN_EXIT_ORDER_ID` |
+| exit_order.lot_id != event.lot_id | `EXIT_LOT_MISMATCH` |
+| lot.exit_order_id != event.exit_order_id | `LOT_EXIT_MISMATCH` |
+| lot.status == CLOSED | `LOT_ALREADY_CLOSED` (idempotent, per 21.4) |
+| exit_order.status == FILLED | `EXIT_ALREADY_FILLED` (idempotent, per 21.4) |
+
+### 21.6 EntryFilled active-entry validation
+
+`EntryFilled(side=S, price=P)` is accepted only if `P` exists in the
+**currently active entry window** for side `S`:
+
+* `BUY` fill: `P` must be in `entry_window.buy_entry_prices`
+* `SELL` fill: `P` must be in `entry_window.sell_entry_prices`
+
+If `P` is not in the active window → **reject, snapshot unchanged**,
+reason = `PRICE_NOT_IN_ACTIVE_WINDOW`.
+
+No "synthetic fill acceptance" in PR2. Only fills matching active entries
+are valid. Stale/reconciled fills are deferred to PR3.
+
+### 21.7 OperatorCleanup lot closure ordering
+
+Lots closed by `OperatorCleanup` are appended to `closed_lots` in their
+existing `open_lots` chronological order (oldest first). This preserves
+the audit trail invariant from 21.3.
+
+**Snapshot-only limitation:** `GridV2Snapshot` alone does NOT distinguish
+cleanup-closed lots from exit-closed lots. Both have `status=CLOSED`.
+Distinguishing requires caller/event history. No new enum value in PR2.
+
+### 21.8 RecenterRequested full window replacement
+
+`RecenterRequested(new_reference_price=P)` performs a **full replacement**
+of the entry window:
+
+1. If any entries remain in the old window: emit `CANCEL_ENTRY(side, price)` for each old entry first.
+2. `buy_entry_prices` and `sell_entry_prices` are **completely rebuilt**
+   from `P` using the standard symmetric placement (section 9).
+3. No incremental merge or reuse of old entries.
+4. Emit one `PLACE_ENTRY` per new level in the rebuilt window.
+
+**Action sequence:** `[CANCEL_ENTRY for old entries, ..., PLACE_ENTRY for new entries, ...]`
+If old window was empty (normal post-unwind case per 21.1): only `PLACE_ENTRY` emitted.
+
+The entry window after recenter is identical to `create_initial()` output
+for the same reference price.
+
+### 21.9 Action identity contract (PR2)
+
+**CANCEL_ENTRY identity = `(side, price)`.** No exchange CID or order ID.
+CID mapping deferred to PR3.
+
+**CANCEL_EXIT identity = `order_id` field = exit_order_id from state machine's ExitOrder.**
+CID mapping to exchange deferred to PR3.
+
+**PLACE_EXIT identity = `lot_id` + `side` + `price` + `qty`.**
+
+**PLACE_ENTRY identity = `side` + `price` + `qty`.**
+
+### 21.10 Projected notional formula (risk guard)
+
+`projected_inventory_notional_usd = sum(lot.qty * lot.entry_price for lot in open_lots) + event.qty * event.price`
+
+If `projected > config.max_inventory_notional_usd` → reject EntryFilled.
+All arithmetic uses Decimal. No rounding. Comparison is strict `>`.
+
+### 21.11 ActionIntent reason contract
+
+Closed set of `reason` strings for `ActionIntent`:
+
+| Kind | reason | When |
+|------|--------|------|
+| `PLACE_EXIT` | `"PAIRED_EXIT_FOR_LOT"` | exit order for new lot (11.1-11.4) |
+| `PLACE_ENTRY` | `"FILL_REPLACEMENT"` | new farthest entry replacing filled level |
+| `PLACE_ENTRY` | `"RECENTER"` | entry from recenter rebuild |
+| `CANCEL_ENTRY` | `"BRANCH_SUPPRESS"` | opposite-side suppression on branch entry (D1) |
+| `CANCEL_ENTRY` | `"EMERGENCY_STOP"` | entry canceled by emergency stop |
+| `CANCEL_ENTRY` | `"OPERATOR_CLEANUP"` | entry canceled by cleanup |
+| `CANCEL_ENTRY` | `"RECENTER_REPLACE"` | old entry removed before recenter rebuild |
+| `CANCEL_EXIT` | `"OPERATOR_CLEANUP"` | exit canceled by cleanup |
+
+`TransitionResult.reject_reason` closed set:
+
+| reject_reason | When |
+|---------------|------|
+| `"PRICE_NOT_IN_ACTIVE_WINDOW"` | EntryFilled at unknown/inactive price (21.6) |
+| `"MAX_INVENTORY_LEVELS"` | at lot count cap |
+| `"MAX_INVENTORY_NOTIONAL_USD"` | at notional cap (21.10) |
+| `"DUPLICATE_ENTRY_FILL"` | same order_id already sourced a lot (I8) |
+| `"BRANCH_INCOMPATIBLE"` | BUY in SHORT or SELL in LONG (I4) |
+| `"UNKNOWN_LOT_ID"` | ExitFilled for nonexistent lot (21.5) |
+| `"UNKNOWN_EXIT_ORDER_ID"` | ExitFilled for nonexistent exit (21.5) |
+| `"EXIT_LOT_MISMATCH"` | exit.lot_id != event.lot_id (21.5) |
+| `"LOT_EXIT_MISMATCH"` | lot.exit_order_id != event.exit_order_id (21.5) |
+| `"LOT_ALREADY_CLOSED"` | lot already CLOSED (21.4) |
+| `"EXIT_ALREADY_FILLED"` | exit already FILLED (21.4) |
+| `"RECENTER_NOT_FLAT"` | recenter when mode != FLAT |
+| `"RECENTER_LOTS_OPEN"` | recenter with open lots |
+| `"RECENTER_EXITS_OPEN"` | recenter with open exits |
+| `"EMERGENCY_STOPPED"` | event blocked by emergency stop |
+| `"INVALID_QUANTITY"` | EntryFilled or ExitFilled with qty <= 0 |
+
+### 21.12 Config validation contract
+
+`GridV2Config.__post_init__` must raise `ValueError` if:
+
+| Condition | Error |
+|-----------|-------|
+| `grid_step_pct <= 0` | "grid_step_pct must be positive" |
+| `entry_levels_per_side <= 0` | "entry_levels_per_side must be positive" |
+| `order_size <= 0` | "order_size must be positive" |
+| `max_inventory_levels <= 0` | "max_inventory_levels must be positive" |
+| `max_inventory_notional_usd <= 0` | "max_inventory_notional_usd must be positive" |
+
+Fail-closed: invalid config = `ValueError` at construction time. Single SSOT: `__post_init__`.
+
+### 21.13 ExitFilled.qty contract (PR2)
+
+`ExitFilled.qty` must be `> 0`. If `<= 0` → reject with `INVALID_QUANTITY`.
+
+In PR2, all closes are full closes. **`event.qty` is ignored for closure semantics
+and is NOT stored anywhere in snapshot state.** The state machine closes the lot
+using `lot.qty` as the authoritative quantity. The closed lot retains its original
+`lot.qty` unchanged.
+
+`event.qty` validation against `lot.qty` is deferred to PR3 (reconciliation scope).
+The lot is always fully closed regardless of `event.qty` value (as long as > 0).
+
+### 21.14 OperatorCleanup economic semantics
+
+`OperatorCleanup` is a **state reset**, not an economic event.
+
+* Lots closed by cleanup have `status=CLOSED` but **no corresponding `ExitFilled` event**.
+* Cleanup-closed lots do NOT represent realized PnL.
+* The `closed_lots` tuple is an **operational audit trail**, not a PnL source.
+* Realized PnL tracking (if needed) must use only lots closed by `ExitFilled` events.
+* In PR2, there is no PnL tracking. This contract exists to prevent future misuse.
+
+### 21.15 Constructor snapshot validation contract
+
+`GridV2StateMachine.__init__(config, snapshot)` validates snapshot invariants
+**immediately at construction time**. If the snapshot violates any invariant,
+the constructor raises `GridV2InvariantError`.
+
+Validated invariants:
+
+| Check | Invariant |
+|-------|-----------|
+| `len(entry_window.buy_entry_prices) <= config.entry_levels_per_side` | I1 (bounded window) |
+| `len(entry_window.sell_entry_prices) <= config.entry_levels_per_side` | I1 |
+| every open lot has a paired OPEN exit order in `exit_orders` | I3 |
+| mode == FLAT implies no open lots | I4 (branch-mode consistency) |
+| mode == LONG_BRANCH implies all open lots are LONG side | I4 |
+| mode == SHORT_BRANCH implies all open lots are SHORT side | I4 |
+
+This is the same `_check_invariants()` used after every non-rejected transition.
+Fail-closed: invalid snapshot = `GridV2InvariantError` at construction time.
+
+**Single validation path:** `create_initial()` constructs its snapshot and then
+passes it through `__init__()` (which calls `_check_invariants()`). There is
+exactly one code path for snapshot validation — `__init__` — and all construction
+routes go through it. No bypass.
+
+### 21.16 Emergency stop event gate contract
+
+When `emergency_stopped == True`, the state machine applies the following event gate:
+
+| Event | Behavior | Rationale |
+|-------|----------|-----------|
+| `EntryFilled` | **rejected** (`EMERGENCY_STOPPED`) | no new exposure |
+| `RecenterRequested` | **rejected** (`EMERGENCY_STOPPED`) | no window rebuild while frozen |
+| `ExitFilled` | **accepted and applied** | exits must close lots even under emergency; I2 |
+| `OperatorCleanup` | **accepted and applied** | full reset is always allowed |
+| `EmergencyStopTriggered` | **no-op** (already stopped) | idempotent per 21.4 |
+
+This gate is checked **before** event-specific dispatch. The key design
+constraint: emergency stop freezes new exposure but never blocks position
+reduction. Open lots with paired exits must remain closeable.
