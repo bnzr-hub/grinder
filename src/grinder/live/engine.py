@@ -560,7 +560,8 @@ class LiveEngineV0:
         self._grid_v2_pending_cancels: dict[str, int] = {}  # cid → ts_ms
         self._grid_v2_awaiting_sync = False  # PR6: skip fill detection until seed CIDs visible
         self._grid_v2_pending_seed_cids: frozenset[str] = frozenset()  # PR6: CIDs to confirm
-        self._grid_v2_pending_place_cids: set[str] = set()  # dispatched PLACEs not yet visible
+        # cid → sync_gen at dispatch. Released after visibility OR 2 sync cycles grace.
+        self._grid_v2_pending_place_cids: dict[str, int] = {}
         if self._grid_v2_enabled:
             if not self._grid_v2_symbol:
                 raise ValueError(
@@ -715,26 +716,35 @@ class LiveEngineV0:
                 if bridge is not None and bridge.adapter.is_ours(a.order_id):
                     self._grid_v2_pending_cancels[a.order_id] = ts
 
-    def _grid_v2_register_pending_places(
-        self,
-        actions: list[ExecutionAction],
-    ) -> None:
-        """Track PLACE CIDs about to be dispatched.
-
-        These CIDs are in the adapter registry but may not yet be visible
-        on the exchange. Fill detection excludes them until account sync
-        confirms visibility.
-        """
+    def _grid_v2_clean_failed_place(self, cid: str) -> None:
+        """Remove a FAILED/BLOCKED/SKIPPED PLACE CID from registry and pending."""
+        self._grid_v2_pending_place_cids.pop(cid, None)
         bridge = self._grid_v2_bridge
         if bridge is None:
             return
-        for a in actions:
-            if (
-                a.action_type == ActionType.PLACE
-                and a.client_order_id
-                and bridge.adapter.is_ours(a.client_order_id)
-            ):
-                self._grid_v2_pending_place_cids.add(a.client_order_id)
+        parsed_cid = bridge.adapter.parse_cid(cid)
+        if parsed_cid is None:
+            return
+        from grinder.grid_v2.adapter import GridV2OrderKind  # noqa: PLC0415
+
+        if parsed_cid.kind == GridV2OrderKind.ENTRY:
+            bridge.adapter.confirm_cancel_entry(cid)
+        else:
+            bridge.adapter.confirm_cancel_exit(cid)
+        logger.info(
+            "GRID_V2_FAILED_PLACE_CLEANED cid=%s kind=%s",
+            cid,
+            parsed_cid.kind.value,
+        )
+
+    def _grid_v2_register_pending_place(self, cid: str) -> None:
+        """Track an EXECUTED PLACE CID until visible on exchange.
+
+        Stores current account_sync_generation so the CID can be released
+        after a bounded grace period (2 sync cycles) even if never visible
+        (e.g. immediate fill before first snapshot).
+        """
+        self._grid_v2_pending_place_cids[cid] = self._account_sync_generation
 
     def _grid_v2_process_cancel_acks(self, symbol: str, _ts: int) -> None:
         """Detect confirmed cancels and route through bridge.on_cancel_ack().
@@ -793,7 +803,7 @@ class LiveEngineV0:
         # Exclude pending cancels — those are cancel-acks, not fills.
         # Exclude pending places — those haven't appeared on exchange yet.
         filled_cids = (
-            disappeared - set(self._grid_v2_pending_cancels) - self._grid_v2_pending_place_cids
+            disappeared - set(self._grid_v2_pending_cancels) - set(self._grid_v2_pending_place_cids)
         )
         if not filled_cids:
             return []
@@ -1259,10 +1269,8 @@ class LiveEngineV0:
             self._register_rolling_cancels(raw_actions, snapshot.ts)
 
         # PR4 (doc-27): register grid_v2 cancels for cancel-ack tracking
-        # + register grid_v2 PLACE CIDs as pending until visible on exchange
         if self._is_grid_v2_active(snapshot.symbol):
             self._grid_v2_register_pending_cancels(raw_actions, snapshot.ts)
-            self._grid_v2_register_pending_places(raw_actions)
 
         # Replenish-on-TP-fill: detect position decrease → add BUY below + SELL above
         # Bypassed in rolling mode — planner diff handles slot restoration.
@@ -1487,29 +1495,22 @@ class LiveEngineV0:
             ):
                 self._cancel_failed_ids.add(action.order_id)
 
-            # Grid V2: on PLACE failure, remove CID from pending-place and
-            # clean from adapter registry to prevent false-fill cascade.
+            # Grid V2 PLACE lifecycle: register pending on EXECUTED,
+            # clean registry on FAILED/BLOCKED/SKIPPED.
             if (
                 action.action_type == ActionType.PLACE
                 and action.client_order_id is not None
-                and live_action.status == LiveActionStatus.FAILED
                 and self._grid_v2_bridge is not None
                 and self._grid_v2_bridge.adapter.is_ours(action.client_order_id)
             ):
-                self._grid_v2_pending_place_cids.discard(action.client_order_id)
-                parsed_cid = self._grid_v2_bridge.adapter.parse_cid(action.client_order_id)
-                if parsed_cid is not None:
-                    from grinder.grid_v2.adapter import GridV2OrderKind  # noqa: PLC0415
-
-                    if parsed_cid.kind == GridV2OrderKind.ENTRY:
-                        self._grid_v2_bridge.adapter.confirm_cancel_entry(action.client_order_id)
-                    else:
-                        self._grid_v2_bridge.adapter.confirm_cancel_exit(action.client_order_id)
-                    logger.info(
-                        "GRID_V2_FAILED_PLACE_CLEANED cid=%s kind=%s",
-                        action.client_order_id,
-                        parsed_cid.kind.value,
-                    )
+                if live_action.status == LiveActionStatus.EXECUTED:
+                    self._grid_v2_register_pending_place(action.client_order_id)
+                elif live_action.status in (
+                    LiveActionStatus.FAILED,
+                    LiveActionStatus.BLOCKED,
+                    LiveActionStatus.SKIPPED,
+                ):
+                    self._grid_v2_clean_failed_place(action.client_order_id)
 
             # ADR-090 follow-up: record dispatched CANCEL CID for per-sync-cycle dedup.
             if (
@@ -2036,16 +2037,24 @@ class LiveEngineV0:
                         len(missing),
                         len(self._grid_v2_pending_seed_cids),
                     )
-            # Clear pending-place CIDs that are now visible on exchange.
+            # Clear pending-place CIDs: visible on exchange OR grace expired.
+            # Grace = 2 sync cycles. After grace, CID released for fill detection
+            # (handles immediate-fill before first snapshot visibility).
             if self._grid_v2_pending_place_cids:
                 visible_cids = {o.order_id for o in result.snapshot.open_orders}
-                confirmed = self._grid_v2_pending_place_cids & visible_cids
-                if confirmed:
-                    self._grid_v2_pending_place_cids -= confirmed
+                gen = self._account_sync_generation + 1  # gen about to be set
+                expired: list[str] = []
+                for cid, dispatch_gen in list(self._grid_v2_pending_place_cids.items()):
+                    if cid in visible_cids or (gen - dispatch_gen) >= 2:
+                        expired.append(cid)
+                if expired:
+                    for cid in expired:
+                        del self._grid_v2_pending_place_cids[cid]
                     logger.debug(
-                        "GRID_V2_PENDING_PLACES_CLEARED count=%d remaining=%d",
-                        len(confirmed),
+                        "GRID_V2_PENDING_PLACES_CLEARED count=%d remaining=%d gen=%d",
+                        len(expired),
                         len(self._grid_v2_pending_place_cids),
+                        gen,
                     )
             # PR-P0-RACE-1: monotonic generation counter for convergence guards
             self._account_sync_generation += 1

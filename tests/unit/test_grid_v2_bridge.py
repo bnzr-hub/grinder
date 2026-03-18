@@ -1328,18 +1328,19 @@ class TestSideAwareQuantization:
 
 
 class TestPendingPlaceCidVisibility:
-    """P0: New PLACE CIDs not yet visible on exchange must not be treated as fills."""
+    """Pending-place CID visibility gate + grace expiry + failure cleanup."""
 
     def test_pending_place_not_treated_as_fill(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Newly placed CID in pending set → excluded from fill detection."""
+        """CID in pending-place set → excluded from fill detection."""
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
         from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
         from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.grid_v2.adapter import EntryRegistration  # noqa: PLC0415
         from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
         from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
 
@@ -1349,14 +1350,13 @@ class TestPendingPlaceCidVisibility:
 
         port = MagicMock()
         port.place_order.return_value = "ORDER_1"
-
         engine = LiveEngineV0(
             paper_engine=MagicMock(),
             exchange_port=port,
             config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
         )
 
-        # Tick 1: fresh startup
+        # Fresh startup + clear awaiting sync
         engine._last_account_snapshot = AccountSnapshot(
             positions=(), open_orders=(), ts=_BASE_TS, source="test"
         )
@@ -1371,11 +1371,21 @@ class TestPendingPlaceCidVisibility:
             last_qty=Decimal("1"),
         )
         engine.process_snapshot(snap)
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
 
-        # Clear awaiting_sync (simulate account sync showing seeds)
         bridge = engine._grid_v2_bridge
         assert bridge is not None
-        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+
+        # Add a CID to registry + pending (simulating post-fill PLACE dispatch)
+        new_cid = bridge.adapter.generate_entry_cid(_BASE_TS + 10000)
+        bridge.adapter.registry._entries[new_cid] = EntryRegistration(
+            cid=new_cid, side=OrderSide.BUY, price=Decimal("49500")
+        )
+        engine._grid_v2_pending_place_cids[new_cid] = engine._account_sync_generation
+
+        # Tick: snapshot does NOT have the new CID
+        seed_cids = [c for c in bridge.adapter.registry.all_entry_cids if c != new_cid]
         open_orders = []
         for cid in seed_cids:
             reg = bridge.adapter.registry.lookup_entry(cid)
@@ -1392,30 +1402,15 @@ class TestPendingPlaceCidVisibility:
                     filled_qty=Decimal(0),
                     reduce_only=False,
                     status="NEW",
-                    ts=_BASE_TS + 5000,
+                    ts=_BASE_TS + 10000,
                 )
             )
         engine._last_account_snapshot = AccountSnapshot(
             positions=(),
             open_orders=tuple(open_orders),
-            ts=_BASE_TS + 5000,
+            ts=_BASE_TS + 10000,
             source="test",
         )
-        engine._grid_v2_awaiting_sync = False
-        engine._grid_v2_pending_seed_cids = frozenset()
-
-        # Simulate: a fill happened, bridge generated new PLACE actions with new CIDs.
-        # The new CIDs are in registry and in pending_place_cids.
-        from grinder.grid_v2.adapter import EntryRegistration  # noqa: PLC0415
-
-        new_cid = bridge.adapter.generate_entry_cid(_BASE_TS + 10000)
-        bridge.adapter.registry._entries[new_cid] = EntryRegistration(
-            cid=new_cid, side=OrderSide.BUY, price=Decimal("49500")
-        )
-        engine._grid_v2_pending_place_cids.add(new_cid)
-
-        # Tick 2: account snapshot does NOT have the new CID yet.
-        # Without the fix, this CID would be detected as "disappeared" → false fill.
         snap2 = Snapshot(
             ts=_BASE_TS + 10000,
             symbol="BTCUSDT",
@@ -1428,22 +1423,23 @@ class TestPendingPlaceCidVisibility:
         )
         output2 = engine.process_snapshot(snap2)
 
-        # The new CID should NOT have been treated as a fill
         fill_actions = [
             a for a in output2.live_actions if a.action.reason and "PLACE_EXIT" in a.action.reason
         ]
         assert len(fill_actions) == 0, "Pending-place CID must not trigger false fill"
 
-    def test_failed_place_cleaned_from_registry(
+    def test_grace_expiry_releases_never_visible_cid(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Failed PLACE CID gets cleaned from registry → no reject cascade."""
+        """P0: After 2 sync cycles, pending CID released for fill detection."""
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.account.syncer import AccountSyncer, SyncResult  # noqa: PLC0415
         from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
         from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.grid_v2.adapter import EntryRegistration  # noqa: PLC0415
         from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
         from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
 
@@ -1453,7 +1449,6 @@ class TestPendingPlaceCidVisibility:
 
         port = MagicMock()
         port.place_order.return_value = "ORDER_1"
-
         engine = LiveEngineV0(
             paper_engine=MagicMock(),
             exchange_port=port,
@@ -1475,27 +1470,93 @@ class TestPendingPlaceCidVisibility:
             last_qty=Decimal("1"),
         )
         engine.process_snapshot(snap)
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
 
         bridge = engine._grid_v2_bridge
         assert bridge is not None
 
-        # Record initial entry count (6 seeds: 3 buy + 3 sell)
-        initial_entry_count = bridge.adapter.registry.entry_count
-
-        # Simulate: add a CID to registry (as resolve_actions would do for a
-        # new PLACE_ENTRY). We need to manually register since generate_entry_cid
-        # only creates the string, not the registry mapping.
-        from grinder.grid_v2.adapter import EntryRegistration  # noqa: PLC0415
-
+        # Add CID to registry + pending at current gen
         new_cid = bridge.adapter.generate_entry_cid(_BASE_TS + 10000)
         bridge.adapter.registry._entries[new_cid] = EntryRegistration(
             cid=new_cid, side=OrderSide.BUY, price=Decimal("49500")
         )
-        assert bridge.adapter.registry.entry_count == initial_entry_count + 1
+        dispatch_gen = engine._account_sync_generation
+        engine._grid_v2_pending_place_cids[new_cid] = dispatch_gen
 
-        # Simulate PLACE failure: engine cleans up via confirm_cancel_entry
-        removed = bridge.adapter.confirm_cancel_entry(new_cid)
-        assert removed is not None, "CID should have been in registry"
+        # Simulate 2 account syncs with CID never visible (empty open_orders)
+        mock_syncer = MagicMock(spec=AccountSyncer)
+        mock_syncer.compute_position_notional = AccountSyncer.compute_position_notional
+        engine._account_syncer = mock_syncer
 
-        # After cleanup, registry should be back to initial count
-        assert bridge.adapter.registry.entry_count == initial_entry_count
+        for i in range(2):
+            empty_snap = AccountSnapshot(
+                positions=(), open_orders=(), ts=_BASE_TS + 20000 + i * 5000, source="test"
+            )
+            mock_syncer.sync.return_value = SyncResult(snapshot=empty_snap)
+            engine._tick_account_sync()
+
+        # After 2 sync cycles, CID should be released from pending
+        assert new_cid not in engine._grid_v2_pending_place_cids, (
+            "CID must be released after grace period"
+        )
+
+    def test_failed_place_cleaned_via_engine(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """P1/P2: FAILED PLACE goes through _grid_v2_clean_failed_place."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.grid_v2.adapter import EntryRegistration  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        port = MagicMock()
+        port.place_order.return_value = "ORDER_1"
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        initial_count = bridge.adapter.registry.entry_count
+
+        # Add CID to registry
+        new_cid = bridge.adapter.generate_entry_cid(_BASE_TS + 10000)
+        bridge.adapter.registry._entries[new_cid] = EntryRegistration(
+            cid=new_cid, side=OrderSide.BUY, price=Decimal("49500")
+        )
+        assert bridge.adapter.registry.entry_count == initial_count + 1
+
+        # Call production cleanup function
+        engine._grid_v2_clean_failed_place(new_cid)
+
+        # Registry should be cleaned
+        assert bridge.adapter.registry.entry_count == initial_count
+        assert new_cid not in engine._grid_v2_pending_place_cids
