@@ -501,6 +501,9 @@ class LiveEngineV0:
         self._inflight_shift: dict[str, _InflightShift] = {}
         self._inflight_deferred_logged: set[str] = set()  # BUG-3: log once per latch
         self._cancel_failed_ids: set[str] = set()  # BUG-4: skip re-cancel on -2011
+        # ADR-090 follow-up: cross-tick CANCEL dedup within one sync cycle.
+        # Cleared on AccountSync refresh (snapshot reflects cancel result).
+        self._cancel_dispatched_pending_sync: set[str] = set()
         self._account_sync_generation: int = 0
         # ADR-089: rolling steady-state log throttle (1 per 100 zero-action ticks per symbol)
         self._rolling_steady_state_count: dict[str, int] = {}
@@ -936,6 +939,12 @@ class LiveEngineV0:
         # If PLACE failed, skip paired TP_SLOT_TAKEOVER CANCEL (same correlation_id).
         tp_close_place_ok: dict[str, bool] = {}
 
+        # ADR-090 follow-up: per-sync-cycle CANCEL dedup (mechanisms 1+4).
+        # Same-tick: planner + cycle_layer both emit CANCEL for same CID.
+        # Cross-tick: successful CANCEL on tick N, planner re-generates on tick N+1
+        # (snapshot not refreshed yet). Both caught by instance-level set,
+        # cleared on AccountSync refresh.
+
         for raw_action in raw_actions:
             # PaperOutput.actions is list[dict], but tests may pass ExecutionAction directly
             if isinstance(raw_action, dict):
@@ -1016,6 +1025,63 @@ class LiveEngineV0:
                 )
                 continue
 
+            # ADR-090 follow-up: skip CANCEL if same CID already dispatched this sync cycle.
+            if (
+                action.action_type == ActionType.CANCEL
+                and action.order_id is not None
+                and action.order_id in self._cancel_dispatched_pending_sync
+            ):
+                logger.debug(
+                    "CANCEL_SKIP_DUPLICATE symbol=%s order_id=%s reason=%s",
+                    action.symbol,
+                    action.order_id,
+                    action.reason,
+                )
+                live_actions.append(
+                    LiveAction(
+                        action=action,
+                        status=LiveActionStatus.SKIPPED,
+                        block_reason=BlockReason.CANCEL_ALREADY_FAILED,
+                        intent=RiskIntent.CANCEL,
+                    )
+                )
+                continue
+
+            # ADR-090 follow-up: skip stale CANCEL when order is absent from
+            # current snapshot. Race: planner builds actions from old snapshot,
+            # then AccountSync refreshes mid-tick, then dispatch runs stale actions.
+            # Scoped to grid-planner reasons only (GRID_TRIM/GRID_SHIFT/GRID_RESIZE).
+            # TP-managed CANCELs (TP_SLOT_TAKEOVER/TP_RENEW/TP_CLOSE) have their
+            # own atomicity guards and must not be filtered here.
+            _GRID_CANCEL_REASONS = {"GRID_TRIM", "GRID_SHIFT", "GRID_RESIZE"}
+            if (
+                action.action_type == ActionType.CANCEL
+                and action.order_id is not None
+                and action.reason in _GRID_CANCEL_REASONS
+                and self._last_account_snapshot is not None
+            ):
+                live_order_ids = {
+                    o.order_id
+                    for o in self._last_account_snapshot.open_orders
+                    if o.symbol == action.symbol
+                }
+                if action.order_id not in live_order_ids:
+                    logger.debug(
+                        "CANCEL_SKIP_STALE_ACTION symbol=%s order_id=%s reason=%s",
+                        action.symbol,
+                        action.order_id,
+                        action.reason,
+                    )
+                    live_actions.append(
+                        LiveAction(
+                            action=action,
+                            status=LiveActionStatus.SKIPPED,
+                            block_reason=BlockReason.CANCEL_ALREADY_FAILED,
+                            intent=RiskIntent.CANCEL,
+                        )
+                    )
+                    continue
+
             live_action = self._process_action(action, snapshot.ts)
             live_actions.append(live_action)
 
@@ -1026,6 +1092,14 @@ class LiveEngineV0:
                 and live_action.status == LiveActionStatus.FAILED
             ):
                 self._cancel_failed_ids.add(action.order_id)
+
+            # ADR-090 follow-up: record dispatched CANCEL CID for per-sync-cycle dedup.
+            if (
+                action.action_type == ActionType.CANCEL
+                and action.order_id is not None
+                and live_action.status in (LiveActionStatus.EXECUTED, LiveActionStatus.FAILED)
+            ):
+                self._cancel_dispatched_pending_sync.add(action.order_id)
 
             # Track TP_CLOSE PLACE result by correlation_id
             if action.reason == "TP_CLOSE" and action.action_type == ActionType.PLACE:
@@ -1525,14 +1599,25 @@ class LiveEngineV0:
             self._last_account_snapshot = result.snapshot
             # PR-P0-RACE-1: monotonic generation counter for convergence guards
             self._account_sync_generation += 1
-            # BUG-4: clear cancel-failed blacklist — fresh snapshot replaces stale state
+            # BUG-4 + ADR-090 follow-up: selective prune of cancel-failed blacklist.
+            # Keep CIDs that are still visible in fresh snapshot (Binance propagation
+            # lag — cancel returned -2011 but order still appears in REST).
+            # Remove CIDs that are absent from fresh snapshot (order is gone).
             if self._cancel_failed_ids:
+                live_order_ids = {o.order_id for o in result.snapshot.open_orders}
+                surviving = self._cancel_failed_ids & live_order_ids
+                pruned_count = len(self._cancel_failed_ids) - len(surviving)
                 logger.info(
-                    "CANCEL_FAILED_IDS_CLEARED count=%d gen=%d",
-                    len(self._cancel_failed_ids),
+                    "CANCEL_FAILED_IDS_PRUNED pruned=%d surviving=%d gen=%d",
+                    pruned_count,
+                    len(surviving),
                     self._account_sync_generation,
                 )
-                self._cancel_failed_ids.clear()
+                self._cancel_failed_ids = surviving
+
+            # ADR-090 follow-up: clear cross-tick cancel dedup set on sync refresh.
+            # Snapshot now reflects any successfully dispatched cancels.
+            self._cancel_dispatched_pending_sync.clear()
 
         # Evidence writing (env-gated, safe-by-default)
         if result.snapshot is not None:

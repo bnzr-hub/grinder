@@ -2,6 +2,9 @@
 
 See ADR-045 for design decisions.
 
+Strategy reservations:
+- "g" is reserved for grid_v2 (see doc-27 section 22.1).
+
 This module provides:
 - OrderIdentityConfig: Configuration for order identity (prefix, strategy, allowlist)
 - ParsedOrderId: Parsed components of a clientOrderId
