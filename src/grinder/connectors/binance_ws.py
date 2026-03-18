@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 # Binance WebSocket endpoints
 BINANCE_WS_TESTNET = "wss://testnet.binance.vision/ws"
 BINANCE_WS_MAINNET = "wss://stream.binance.com:9443/ws"
+BINANCE_WS_FUTURES_MAINNET = "wss://fstream.binance.com/ws"
 
 
 class WsTransport(ABC):
