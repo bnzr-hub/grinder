@@ -71,12 +71,12 @@ class TestCidScheme:
     def test_generate_entry_cid_format(self) -> None:
         a = _adapter()
         cid = a.generate_entry_cid(_BASE_TS)
-        assert cid.startswith("grinder_g_BTCUSDT_e0_")
+        assert cid.startswith("g_g_BTCUSDT_e0_")
 
     def test_generate_exit_cid_format(self) -> None:
         a = _adapter()
         cid = a.generate_exit_cid(_BASE_TS)
-        assert cid.startswith("grinder_g_BTCUSDT_x0_")
+        assert cid.startswith("g_g_BTCUSDT_x0_")
 
     def test_parse_entry_roundtrip(self) -> None:
         a = _adapter()
@@ -113,7 +113,7 @@ class TestCidScheme:
         a = _adapter()
         cid = a.generate_entry_cid(_BASE_TS)
         assert a.is_ours(cid) is True
-        config = OrderIdentityConfig(strategy_id="g")
+        config = OrderIdentityConfig(strategy_id="g", prefix="g_")
         assert is_ours(cid, config) is True
 
     def test_is_ours_rejects_foreign(self) -> None:
@@ -132,8 +132,8 @@ class TestCidScheme:
         assert a.parse_cid("") is None
 
     def test_overflow_raises(self) -> None:
-        a = _adapter(symbol="SHIBUSDT")  # max_seq = 999
-        for _ in range(1000):
+        a = _adapter(symbol="A" * 16)  # max_seq = 9
+        for _ in range(10):
             a.generate_entry_cid(_BASE_TS)
         with pytest.raises(ValueError, match="overflow"):
             a.generate_entry_cid(_BASE_TS)
@@ -617,7 +617,7 @@ class TestReconciliation:
         a = _adapter()
         sm = _sm()
         # A g CID on exchange but not in registry
-        foreign_cid = "grinder_g_BTCUSDT_e999_1710000_0"
+        foreign_cid = "g_g_BTCUSDT_e999_1710000_0"
         result = a.reconcile(sm.snapshot, frozenset({foreign_cid}), _BASE_TS)
         unexpected = [m for m in result.mismatches if m.kind == GridV2MismatchKind.UNEXPECTED_ORDER]
         assert len(unexpected) == 1
@@ -804,7 +804,7 @@ class TestSeqRecovery:
         a.generate_entry_cid(_BASE_TS)  # seq=6
         # Create a new adapter and reconstruct with that CID
         a2 = _adapter()
-        entry_cid = "grinder_g_BTCUSDT_e5_1710000_0"
+        entry_cid = "g_g_BTCUSDT_e5_1710000_0"
         orders = [(entry_cid, OrderSide.BUY, Decimal("49750"), _ORDER_SIZE)]
         a2.reconstruct_snapshot(orders, Decimal(0), _REF_PRICE, _BASE_TS)
         # Next entry CID should have seq >= 6
@@ -1005,10 +1005,16 @@ class TestEdgeCases:
         GridV2StateMachine(_config(), snap)
 
     def test_compute_max_seq_7char(self) -> None:
-        assert _compute_max_seq("BTCUSDT") == 9999  # 5-char level_id, 4 digits
+        # budget: 36 - 18 - 7 = 11 char level_id, 10 digits
+        assert _compute_max_seq("BTCUSDT") == 9999999999
 
     def test_compute_max_seq_8char(self) -> None:
-        assert _compute_max_seq("SHIBUSDT") == 999  # 4-char level_id, 3 digits
+        # budget: 36 - 18 - 8 = 10 char level_id, 9 digits
+        assert _compute_max_seq("SHIBUSDT") == 999999999
+
+    def test_compute_max_seq_12char(self) -> None:
+        # budget: 36 - 18 - 12 = 6 char level_id, 5 digits
+        assert _compute_max_seq("FARTCOINUSDT") == 99999
 
 
 class TestCrossSymbolIsolation:
