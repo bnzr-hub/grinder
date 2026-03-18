@@ -137,7 +137,18 @@ Additional proof requirements:
   - git status --short
   - проверка отсутствия изменений вне docs/ (и при необходимости README.md).
 
-## 10) MAX_STRICT Mode (Default)
+## 10) Review Protocol (Deep)
+1) No code edits in review mode.
+2) Two-pass review is mandatory: happy-path + adversarial-path.
+3) For every fail-closed mode, prove no post-step action generators can emit actions.
+4) Mandatory code trace to dispatch points (not only tests).
+5) Mandatory negative tests for each blocking invariant.
+6) Output findings strictly P0 -> P1 -> P2 with file:line, impact/risk, exact fix, recheck.
+7) Merge approved only if P0=0 and P1=0.
+8) Include "Missed-risk check": what could be missed and how it was checked.
+9) If external reviewer finds a P0, run mandatory boundary re-pass over the same module.
+
+## 11) MAX_STRICT Mode (Default)
 
 For this repository, Codex operates in MAX_STRICT mode by default.
 
@@ -150,7 +161,7 @@ For this repository, Codex operates in MAX_STRICT mode by default.
 - Any drift between PR claims, proof, and SSOT docs (`STATE/DECISIONS/specs`) is blocking until fixed.
 - No trust-based approvals: only verifiable facts, raw outputs, and `file:line` anchors.
 
-## 11) Codex Role: PR Writer (High-Skill)
+## 12) Codex Role: PR Writer (High-Skill)
 
 Codex is not only a reviewer; Codex is also a strong PR writer.
 
