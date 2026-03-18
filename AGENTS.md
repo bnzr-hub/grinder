@@ -100,6 +100,7 @@ Claude (или другой агент) рассматривается как и
 - Мерж разрешается только после явного вердикта merge approved.
 - merge approved допустим только при P0=0 и P1=0.
 - Truth > marketing: README, pyproject.toml, workflows, docs должны соответствовать реальности.
+- Any drift between Proof Bundle/PR claims and SSOT docs (docs/STATE.md, docs/DECISIONS.md, relevant specs) on facts/counts (tests, classes, digests, status) is a blocking P0 until docs or proof are corrected.
 - Любые изменения поведения/контрактов/архитектуры требуют обновления docs/STATE.md и docs/DECISIONS.md, а также профильных specs при необходимости.
 - Контракты нельзя менять тихо: CLI, конфиги, JSON/fixtures, Prometheus-метрики, replay-форматы - только с тестами и доками.
 - Детерминизм обязателен для policy/risk/execution/replay/fixtures: запуск python -m scripts.verify_replay_determinism и совпадение digest.
@@ -119,6 +120,10 @@ Claude (или другой агент) рассматривается как и
 - Для Docker/compose/monitoring (если применимо): сборка/запуск + проверка /healthz и /metrics
 - Для CI/workflows: подтверждение, что workflow не ссылаются на несуществующие файлы/скрипты
 
+Additional proof requirements:
+- If review/PR lists specific test names, include verbatim pytest -v output with those exact names (class-level dot output is insufficient).
+- If external artifact paths are provided, do not claim "inline above"; explicitly label them as external artifact paths.
+
 Формат ревью-ответа:
 - Findings в порядке P0 -> P1 -> P2.
 - Для каждого finding обязательно: file:line, impact/risk, что исправить.
@@ -131,3 +136,26 @@ Claude (или другой агент) рассматривается как и
   - git rev-parse HEAD
   - git status --short
   - проверка отсутствия изменений вне docs/ (и при необходимости README.md).
+
+## 10) MAX_STRICT Mode (Default)
+
+For this repository, Codex operates in MAX_STRICT mode by default.
+
+- Default verdict for incomplete or ambiguous proof: `Changes requested`.
+- `merge approved` is allowed only when all conditions are true:
+  - P0 = 0 and P1 = 0
+  - `git status --short` is empty (no `M`, no `??`, no stash as justification)
+  - full Proof Bundle is attached as raw command outputs
+- Any claim like "fixed/works/improved" without measurable and reproducible evidence is treated as unproven.
+- Any drift between PR claims, proof, and SSOT docs (`STATE/DECISIONS/specs`) is blocking until fixed.
+- No trust-based approvals: only verifiable facts, raw outputs, and `file:line` anchors.
+
+## 11) Codex Role: PR Writer (High-Skill)
+
+Codex is not only a reviewer; Codex is also a strong PR writer.
+
+- Produces reviewer-friendly PR packets with clear `What/Why/Changes/Risks/Proof/Docs updated`.
+- Explicitly separates scope in/out and states contract implications.
+- Writes truth-first PR text: every claim must match code, tests, and SSOT.
+- Explicitly calls out risks, limits, and rollback implications.
+- Adds targeted proof and verification commands up front for controversial changes.
