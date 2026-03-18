@@ -37,6 +37,7 @@ Operational runbooks for GRINDER trading system.
 | [30_ACCOUNT_SYNC_FIRE_DRILL](30_ACCOUNT_SYNC_FIRE_DRILL.md) | Account sync fire drill (Launch-15) |
 | [31_FILL_PROB_ROLLOUT](31_FILL_PROB_ROLLOUT.md) | Fill probability enforcement setup and config (Track C) |
 | [32_MAINNET_ROLLOUT_FILL_PROB](32_MAINNET_ROLLOUT_FILL_PROB.md) | Mainnet rollout ceremony for fill-prob enforcement (Track C) |
+| [35_GRID_V2_SHADOW_VERIFICATION](35_GRID_V2_SHADOW_VERIFICATION.md) | Grid V2 shadow verification procedure (doc-27 PR5) |
 
 ## Quick Reference
 

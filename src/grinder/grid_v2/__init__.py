@@ -17,6 +17,11 @@ from grinder.grid_v2.bridge import (
     FillResult,
     GridV2Bridge,
 )
+from grinder.grid_v2.shadow import (
+    GridV2ShadowRunner,
+    ShadowActionSummary,
+    ShadowResult,
+)
 from grinder.grid_v2.state import (
     BranchMode,
     EmergencyStopTriggered,
@@ -47,12 +52,15 @@ __all__ = [
     "GridV2Mismatch",
     "GridV2MismatchKind",
     "GridV2OrderRegistry",
+    "GridV2ShadowRunner",
     "GridV2Snapshot",
     "GridV2StateMachine",
     "OperatorCleanup",
     "RecenterRequested",
     "ReconciliationResult",
     "ResolvedAction",
+    "ShadowActionSummary",
+    "ShadowResult",
     "TransitionResult",
     "TranslatedFill",
 ]

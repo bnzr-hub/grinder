@@ -646,10 +646,15 @@ Before live-approval, must prove:
 * repair paths for failed exits
 * safety gates (risk rules)
 
-### PR5 -- Paper/live shadow verification
+### PR5 -- Paper/live shadow verification [DONE]
 
-* run alongside existing engine
-* no real-risk ceremony yet
+* `GridV2ShadowRunner` runs alongside legacy engine on same snapshots
+* Isolated bridge (not shared with primary), no dispatch side effects
+* `ShadowResult` with divergence detection (count/type mismatch)
+* Mutual exclusion: shadow only when primary OFF
+* Fail-open: shadow errors logged, never propagated
+* Section 24 (24.1-24.5) added to spec
+* 26 tests across 13 classes, all passing
 
 ### PR6 -- Small live ceremony
 
@@ -1297,3 +1302,58 @@ class CancelAckResult:
    are unconditionally skipped for the grid_v2 symbol — grid_v2 owns its own fill
    detection and exit placement. This applies in both active and blocked states,
    ensuring fail-closed cannot be circumvented by legacy action generators.
+
+## 24. Shadow / Paper Verification (PR5)
+
+Shadow mode runs grid_v2 computation alongside the legacy engine on the same
+snapshots, without affecting live dispatch. Purpose: validate grid_v2 behavior
+before PR6 live ceremony.
+
+### 24.1 Shadow Runner Contract
+
+- `GridV2ShadowRunner` owns an **isolated** `GridV2Bridge` instance (not shared
+  with engine's primary bridge).
+- Shadow **never** produces `ExecutionAction` objects that reach the dispatch
+  pipeline. All output is `ShadowResult` (observability-only).
+- Shadow errors are **fail-open**: caught and logged, never propagated to the
+  live engine path.
+
+### 24.2 Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GRINDER_GRID_V2_SHADOW` | `false` | Enable shadow runner |
+| `GRINDER_GRID_V2_SYMBOL` | (required) | Symbol to shadow |
+| `GRINDER_GRID_V2_STEP_PCT` | `0.005` | Grid step (shared with primary) |
+| `GRINDER_GRID_V2_ENTRY_LEVELS` | `3` | Entry levels per side |
+| `GRINDER_GRID_V2_ORDER_SIZE` | `0.001` | Order size |
+| `GRINDER_GRID_V2_MAX_INV_LEVELS` | `3` | Max inventory levels |
+| `GRINDER_GRID_V2_MAX_INV_NOTIONAL` | `1000` | Max inventory notional USD |
+
+### 24.3 Mutual Exclusion
+
+Shadow and primary grid_v2 are **mutually exclusive**:
+- If `GRINDER_GRID_V2_ENABLED=true`, shadow is **not** created (even if
+  `GRINDER_GRID_V2_SHADOW=true`). Primary owns the symbol.
+- Shadow only runs when primary is OFF.
+
+### 24.4 Shadow Tick Lifecycle
+
+1. Shadow startup mirrors primary logic: reconstruct / fresh / non-flat blocked.
+2. On each tick, `_grid_v2_shadow_tick()` runs **after** legacy action generation
+   is complete (including cycle layer, replenish) and **before** dispatch.
+3. Shadow computes what grid_v2 WOULD do (fill detection via registry-vs-exchange
+   diff on shadow's isolated bridge).
+4. `ShadowResult` logged with divergence classification:
+   - `none`: action counts and types match.
+   - `count_mismatch`: different number of actions.
+   - `type_mismatch`: same count but different action types.
+   - `shadow_blocked`: shadow startup failed or not complete.
+
+### 24.5 Invariants
+
+- **I-S1**: Shadow bridge is a separate instance. Shadow state mutations do not
+  affect engine's primary path.
+- **I-S2**: Shadow never injects actions into `raw_actions` or `live_actions`.
+- **I-S3**: Shadow fail-closed (non-flat/no-orders) does not block legacy dispatch.
+- **I-S4**: Shadow errors are caught (try/except), logged, and do not propagate.

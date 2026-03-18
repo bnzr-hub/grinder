@@ -71,6 +71,7 @@ from grinder.execution.sor_metrics import get_sor_metrics
 from grinder.execution.types import ActionType, ExecutionAction
 from grinder.grid_v2.adapter import GRID_V2_STRATEGY_ID
 from grinder.grid_v2.bridge import GridV2Bridge
+from grinder.grid_v2.shadow import GridV2ShadowRunner
 from grinder.grid_v2.state import GridV2Config, LotSide
 from grinder.live.grid_planner import GridPlanResult
 from grinder.live.live_metrics import get_live_engine_metrics
@@ -568,6 +569,36 @@ class LiveEngineV0:
                 self._grid_v2_symbol,
             )
 
+        # PR5 (doc-27): Grid V2 shadow mode — run grid_v2 in parallel without dispatch.
+        # Mutually exclusive with primary grid_v2 (shadow only runs when primary is OFF).
+        self._grid_v2_shadow_enabled = parse_bool(
+            "GRINDER_GRID_V2_SHADOW", default=False, strict=False
+        )
+        self._grid_v2_shadow: GridV2ShadowRunner | None = None
+        if self._grid_v2_shadow_enabled and not self._grid_v2_enabled:
+            if not self._grid_v2_symbol:
+                self._grid_v2_symbol = os.environ.get("GRINDER_GRID_V2_SYMBOL", "")
+            if self._grid_v2_symbol:
+                shadow_config = GridV2Config(
+                    grid_step_pct=Decimal(os.environ.get("GRINDER_GRID_V2_STEP_PCT", "0.005")),
+                    entry_levels_per_side=int(os.environ.get("GRINDER_GRID_V2_ENTRY_LEVELS", "3")),
+                    order_size=Decimal(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE", "0.001")),
+                    max_inventory_levels=int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "3")),
+                    max_inventory_notional_usd=Decimal(
+                        os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL", "1000")
+                    ),
+                )
+                self._grid_v2_shadow = GridV2ShadowRunner(shadow_config, self._grid_v2_symbol)
+                logger.info(
+                    "GRID_V2_SHADOW_ENABLED symbol=%s",
+                    self._grid_v2_symbol,
+                )
+            else:
+                logger.warning(
+                    "GRID_V2_SHADOW_DISABLED reason=missing_symbol "
+                    "(GRINDER_GRID_V2_SHADOW=true but GRINDER_GRID_V2_SYMBOL is empty)"
+                )
+
     # --- Grid V2 runtime methods (doc-27 section 23, PR4) ---
 
     def _create_grid_v2_bridge(self) -> GridV2Bridge:
@@ -770,6 +801,46 @@ class LiveEngineV0:
             and self._grid_v2_started
             and self._grid_v2_bridge.reconstruction_ok
             and symbol == self._grid_v2_symbol
+        )
+
+    # --- Grid V2 shadow methods (doc-27 section 24, PR5) ---
+
+    def _grid_v2_shadow_tick(
+        self,
+        snapshot: Any,
+        legacy_actions: list[ExecutionAction] | Any,
+    ) -> None:
+        """Run shadow grid_v2 tick. Fail-open: errors logged, never propagated."""
+        shadow = self._grid_v2_shadow
+        if shadow is None:
+            return
+
+        acct = self._last_account_snapshot
+        if acct is None:
+            return
+
+        # Shadow startup (same logic as primary, on isolated bridge)
+        if not shadow.started:
+            g_orders: list[tuple[str, OrderSide, Decimal, Decimal]] = []
+            for o in acct.open_orders:
+                if o.symbol != self._grid_v2_symbol:
+                    continue
+                parsed = parse_client_order_id(o.order_id)
+                if parsed is not None and parsed.strategy_id == GRID_V2_STRATEGY_ID:
+                    g_orders.append((o.order_id, OrderSide(o.side), o.price, o.qty))
+
+            pos_qty = self._get_position_qty(self._grid_v2_symbol) or Decimal(0)
+            shadow.try_startup(g_orders, pos_qty, snapshot.mid_price, snapshot.ts)
+
+        # Collect exchange CIDs and pending cancels for shadow fill detection
+        exchange_cids = frozenset(self._grid_v2_exchange_cids(self._grid_v2_symbol))
+        # Shadow doesn't have its own pending cancels (never dispatches).
+        # Pass empty set — shadow fill detection is approximate.
+        shadow.on_snapshot(
+            legacy_actions=legacy_actions if isinstance(legacy_actions, list) else [],
+            exchange_cids=exchange_cids,
+            pending_cancel_cids=frozenset(),
+            ts=snapshot.ts,
         )
 
     def _resolve_auto_threshold(self) -> None:
@@ -1195,6 +1266,11 @@ class LiveEngineV0:
         # Step 2: Process actions
         live_actions: list[LiveAction] = []
         raw_actions = paper_output.actions if hasattr(paper_output, "actions") else []
+
+        # PR5 (doc-27): Grid V2 shadow tick — run AFTER legacy actions are final,
+        # BEFORE dispatch. Shadow never modifies raw_actions or live_actions.
+        if self._grid_v2_shadow is not None and snapshot.symbol == self._grid_v2_symbol:
+            self._grid_v2_shadow_tick(snapshot, raw_actions)
 
         # PR-P0-TP-CLOSE-ATOMIC: retry failed TP_CLOSE PLACEs from previous ticks
         retry_results = self._process_tp_close_retries(snapshot.symbol, snapshot.ts)
