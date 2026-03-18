@@ -1415,7 +1415,7 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
   - **Migration:** spec -> V1A planner -> V1B engine -> V1C slot ownership -> V1D cross-tick fix -> V1E convergence guards -> V1F anchor contract -> live verification -> cleanup.
 
 - **Two-Sided Rolling Window Grid** (doc-27):
-  - **Status:** PR3 delivered. Reconciliation adapter implemented (`src/grinder/grid_v2/adapter.py`). 87 adapter tests + 78 SM tests, all passing.
+  - **Status:** PR3 delivered. Reconciliation adapter implemented (`src/grinder/grid_v2/adapter.py`). 99 adapter tests (16 classes) + 78 SM tests, all passing.
   - **Spec:** `docs/27_TWO_SIDED_ROLLING_WINDOW_GRID_SPEC.md` (sections 1-22, including PR2 contract 21.1-21.16, PR3 contract 22.1-22.11).
   - **Supersedes conceptually:** doc-26 (Rolling Infinite Grid, ADR-085) as target grid architecture.
   - **Key differences from doc-26:** explicit entry/exit separation, inventory lot ledger, one-sided branch mode, bounded entry window, flat-only recenter, deterministic state machine.
