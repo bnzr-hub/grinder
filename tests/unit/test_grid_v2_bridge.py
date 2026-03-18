@@ -375,6 +375,52 @@ class TestReconstructionDeterministic:
         assert b2.adapter.registry.entry_count == b3.adapter.registry.entry_count
 
 
+class TestPriceQuantization:
+    """PR6: Prices must be quantized to exchange tick size."""
+
+    def test_seed_prices_quantized(self) -> None:
+        """Fresh startup seed actions have prices quantized to tick_size."""
+        cfg = _config()
+        b = _bridge(config=cfg)
+        seed = b.startup_fresh(_REF_PRICE, _BASE_TS)
+        for ea in seed:
+            assert ea.price is not None
+            # price / tick_size should be an integer (no remainder)
+            remainder = ea.price % cfg.price_tick_size
+            assert remainder == 0, f"price={ea.price} not quantized to tick={cfg.price_tick_size}"
+
+    def test_fill_generated_actions_quantized(self) -> None:
+        """Actions from fill processing have quantized prices."""
+        b, seed = _fresh_bridge()
+        # Simulate an entry fill → should generate PLACE_EXIT with quantized price
+        cid = seed[0].client_order_id
+        assert cid is not None
+        entry_reg = b.adapter.registry.lookup_entry(cid)
+        assert entry_reg is not None
+        result = b.on_fill(cid, entry_reg.side, entry_reg.price, _ORDER_SIZE, _BASE_TS)
+        for ea in result.execution_actions:
+            if ea.price is not None:
+                remainder = ea.price % b._config.price_tick_size
+                assert remainder == 0, f"price={ea.price} not quantized"
+
+    def test_custom_tick_size(self) -> None:
+        """Non-default tick_size is respected."""
+        cfg = GridV2Config(
+            grid_step_pct=_STEP,
+            entry_levels_per_side=1,
+            order_size=_ORDER_SIZE,
+            max_inventory_levels=10,
+            max_inventory_notional_usd=Decimal("100000"),
+            price_tick_size=Decimal("0.1"),
+        )
+        b = GridV2Bridge(cfg, "BTCUSDT")
+        seed = b.startup_fresh(_REF_PRICE, _BASE_TS)
+        for ea in seed:
+            assert ea.price is not None
+            remainder = ea.price % Decimal("0.1")
+            assert remainder == 0, f"price={ea.price} not quantized to 0.1"
+
+
 class TestSwitchDisabledLegacyUnchanged:
     """REQ-007: Legacy path unchanged when switch is disabled.
 
@@ -440,6 +486,7 @@ class TestSwitchEnabledEmptySymbol:
 
         monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
         monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
 
         engine = LiveEngineV0(
             paper_engine=MagicMock(),
@@ -470,6 +517,7 @@ class TestEngineFreshStartupDispatch:
 
         monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
         monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
 
         paper = MagicMock()
         port = MagicMock()
@@ -531,6 +579,7 @@ class TestEngineNonFlatFailClosed:
 
         monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
         monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
 
         engine = LiveEngineV0(
             paper_engine=MagicMock(),
@@ -598,6 +647,7 @@ class TestEngineCancelAckRouting:
 
         monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
         monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
 
         port = MagicMock()
         port.place_order.return_value = "ORDER_1"
@@ -627,6 +677,9 @@ class TestEngineCancelAckRouting:
             last_qty=Decimal("1"),
         )
         engine.process_snapshot(snap)
+        # Simulate account sync clearing the awaiting-sync flag (PR6)
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
 
         # Seed actions were dispatched
         assert engine._grid_v2_started is True
@@ -711,6 +764,7 @@ class TestEngineCancelAckRouting:
 
         monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
         monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
 
         port = MagicMock()
         port.place_order.return_value = "ORDER_1"
@@ -740,6 +794,9 @@ class TestEngineCancelAckRouting:
             last_qty=Decimal("1"),
         )
         engine.process_snapshot(snap)
+        # Simulate account sync clearing the awaiting-sync flag (PR6)
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
 
         # Pick a seeded entry CID and register it as pending cancel
         target_cid = next(iter(bridge.adapter.registry.all_entry_cids))
@@ -919,6 +976,7 @@ class TestEngineBlockedBypassesCycleLayer:
 
         monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
         monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
         # Enable cycle layer to ensure it's gated
         monkeypatch.setenv("GRINDER_CYCLE_LAYER_ENABLED", "1")
 
@@ -983,6 +1041,7 @@ class TestEngineBlockedBypassesReplenish:
 
         monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
         monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
         monkeypatch.setenv("GRINDER_CYCLE_LAYER_ENABLED", "1")
 
         engine = LiveEngineV0(
@@ -1038,3 +1097,231 @@ class TestEngineBlockedBypassesReplenish:
 
         executed = [a for a in output2.live_actions if a.status.value == "EXECUTED"]
         assert len(executed) == 0, "Blocked grid_v2 must not dispatch replenish actions"
+
+
+class TestAwaitingSyncSeedVisibility:
+    """P0: awaiting_sync must not clear until seed CIDs are visible in snapshot."""
+
+    def test_sync_without_seeds_stays_blocked(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Account sync with empty open_orders → awaiting_sync stays True."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.10")
+
+        port = MagicMock()
+        port.place_order.return_value = "ORDER_1"
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # Tick 1: fresh startup
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        assert engine._grid_v2_awaiting_sync is True
+        assert len(engine._grid_v2_pending_seed_cids) > 0
+
+        # Simulate account sync with EMPTY open_orders (seeds not visible yet)
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS + 5000, source="test"
+        )
+
+        # Tick 2: fill detection should still be skipped
+        snap2 = Snapshot(
+            ts=_BASE_TS + 5000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output2 = engine.process_snapshot(snap2)
+
+        # awaiting_sync should still be True (seeds not visible)
+        assert engine._grid_v2_awaiting_sync is True
+        # No false fill actions should have been generated
+        grid_v2_actions = [
+            a
+            for a in output2.live_actions
+            if a.action.reason
+            and "grid_v2" in a.action.reason
+            and a.action.reason != "grid_v2_PLACE_ENTRY"
+        ]
+        assert len(grid_v2_actions) == 0, "Must not detect false fills while awaiting sync"
+
+    def test_sync_with_seeds_clears_flag(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Account sync with seed CIDs visible → awaiting_sync cleared, fills resume."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.10")
+        monkeypatch.setenv("GRINDER_ACCOUNT_SYNC_ENABLED", "0")
+
+        port = MagicMock()
+        port.place_order.return_value = "ORDER_1"
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # Tick 1: fresh startup
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        assert engine._grid_v2_awaiting_sync is True
+        seed_cids = engine._grid_v2_pending_seed_cids
+
+        # Build open orders containing ALL seed CIDs
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+        open_orders = []
+        for cid in seed_cids:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            open_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 5000,
+                )
+            )
+
+        # Wire mock syncer that returns snapshot with seed CIDs visible
+        from grinder.account.syncer import AccountSyncer, SyncResult  # noqa: PLC0415
+
+        mock_syncer = MagicMock(spec=AccountSyncer)
+        seeds_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(open_orders),
+            ts=_BASE_TS + 5000,
+            source="test",
+        )
+        mock_syncer.sync.return_value = SyncResult(snapshot=seeds_snapshot)
+        mock_syncer.compute_position_notional = AccountSyncer.compute_position_notional
+        engine._account_syncer = mock_syncer
+
+        # Invoke real _tick_account_sync — should clear awaiting_sync
+        engine._tick_account_sync()
+        assert engine._grid_v2_awaiting_sync is False, (
+            "awaiting_sync must be cleared by _tick_account_sync when seeds visible"
+        )
+        assert engine._grid_v2_pending_seed_cids == frozenset()
+
+        # Tick 2: fill detection should now be active
+        snap2 = Snapshot(
+            ts=_BASE_TS + 5000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap2)
+        assert engine._grid_v2_awaiting_sync is False
+
+
+class TestTickSizeRequired:
+    """P1-2: GRINDER_GRID_V2_TICK_SIZE required when grid_v2 enabled."""
+
+    def test_missing_tick_size_raises(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.delenv("GRINDER_GRID_V2_TICK_SIZE", raising=False)
+
+        with pytest.raises(ValueError, match="GRINDER_GRID_V2_TICK_SIZE required"):
+            LiveEngineV0(
+                paper_engine=MagicMock(),
+                exchange_port=MagicMock(),
+                config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+            )
+
+
+class TestSideAwareQuantization:
+    """P1-1: BUY rounds down, SELL rounds up."""
+
+    def test_buy_rounds_down(self) -> None:
+        b = _bridge()
+        # 50000.005 with tick 0.01 → BUY should round DOWN to 50000.00
+        result = b._quantize_price(Decimal("50000.005"), OrderSide.BUY)
+        assert result == Decimal("50000.00")
+
+    def test_sell_rounds_up(self) -> None:
+        b = _bridge()
+        # 50000.005 with tick 0.01 → SELL should round UP to 50000.01
+        result = b._quantize_price(Decimal("50000.005"), OrderSide.SELL)
+        assert result == Decimal("50000.01")
+
+    def test_exact_tick_no_change(self) -> None:
+        b = _bridge()
+        # Already on tick boundary
+        result = b._quantize_price(Decimal("50000.01"), OrderSide.BUY)
+        assert result == Decimal("50000.01")

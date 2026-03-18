@@ -66,6 +66,7 @@ class GridV2Config:
     order_size: Decimal
     max_inventory_levels: int
     max_inventory_notional_usd: Decimal
+    price_tick_size: Decimal = Decimal("0.01")  # PR6: exchange tick size for price quantization
 
     def __post_init__(self) -> None:
         if self.grid_step_pct <= 0:
@@ -78,6 +79,8 @@ class GridV2Config:
             raise ValueError("max_inventory_levels must be positive")
         if self.max_inventory_notional_usd <= 0:
             raise ValueError("max_inventory_notional_usd must be positive")
+        if self.price_tick_size <= 0:
+            raise ValueError("price_tick_size must be positive")
 
 
 @dataclass(frozen=True)

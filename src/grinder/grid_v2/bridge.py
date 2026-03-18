@@ -347,6 +347,26 @@ class GridV2Bridge:
 
     # --- Action conversion ---
 
+    def _quantize_price(self, price: Decimal, side: OrderSide | None) -> Decimal:
+        """Quantize price to exchange tick size (PR6).
+
+        Side-aware rounding:
+        - BUY: ROUND_DOWN (less aggressive, safer entry)
+        - SELL: ROUND_UP (less aggressive, safer exit)
+        - None/unknown: ROUND_HALF_UP (fallback)
+        """
+        from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP  # noqa: PLC0415
+        from decimal import Decimal as _D  # noqa: PLC0415
+
+        tick = self._config.price_tick_size
+        if side is not None and side.value == "BUY":
+            rounding = ROUND_DOWN
+        elif side is not None and side.value == "SELL":
+            rounding = ROUND_UP
+        else:
+            rounding = ROUND_HALF_UP
+        return (price / tick).quantize(_D("1"), rounding=rounding) * tick
+
     def _to_execution_actions(
         self,
         resolved: tuple[ResolvedAction, ...] | Sequence[ResolvedAction],
@@ -360,7 +380,7 @@ class GridV2Bridge:
                         action_type=ActionType.PLACE,
                         symbol=self._symbol,
                         side=ra.side,
-                        price=ra.price,
+                        price=self._quantize_price(ra.price, ra.side),
                         quantity=ra.qty,
                         client_order_id=ra.cid,
                         reason=f"grid_v2_{ra.kind.value}",
