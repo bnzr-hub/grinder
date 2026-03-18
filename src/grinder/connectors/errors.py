@@ -69,9 +69,16 @@ class ConnectorNonRetryableError(ConnectorIOError):
     """Error that should not be retried.
 
     Examples: 4xx responses, authentication failures, validation errors.
+
+    Attributes:
+        pre_send: True if error occurred before any HTTP request was sent.
+            Local validation errors (symbol, notional, order count) set this
+            to True. Exchange-returned errors (4xx from Binance) leave it False.
     """
 
-    pass
+    def __init__(self, *args: object, pre_send: bool = False) -> None:
+        super().__init__(*args)
+        self.pre_send = pre_send
 
 
 class IdempotencyConflictError(ConnectorError):

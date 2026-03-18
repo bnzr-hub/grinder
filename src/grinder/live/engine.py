@@ -203,6 +203,7 @@ class LiveAction:
     block_reason: BlockReason | None = None
     order_id: str | None = None
     error: str | None = None
+    pre_send: bool = False  # True if error occurred before HTTP request
     attempts: int = 1
     intent: RiskIntent | None = None
 
@@ -1498,8 +1499,8 @@ class LiveEngineV0:
             # Grid V2 PLACE lifecycle:
             # - EXECUTED → pending (visibility gate until snapshot confirms)
             # - BLOCKED/SKIPPED → never sent to exchange, safe to clean
-            # - FAILED (any reason) → ambiguous (order might exist on exchange
-            #   even with NON_RETRYABLE — e.g. duplicate CID after network retry)
+            # - FAILED + pre_send → local validation before HTTP, safe to clean
+            # - FAILED + !pre_send → ambiguous (post-HTTP error, order might exist)
             #   Quarantine as pending; snapshot resolves via visibility or grace.
             if (
                 action.action_type == ActionType.PLACE
@@ -1515,10 +1516,13 @@ class LiveEngineV0:
                 ):
                     # Never sent to exchange — safe to clean immediately
                     self._grid_v2_clean_failed_place(action.client_order_id)
+                elif live_action.status == LiveActionStatus.FAILED and live_action.pre_send:
+                    # Local validation error before HTTP (symbol, notional, order count).
+                    # Order was never sent — safe to clean immediately.
+                    self._grid_v2_clean_failed_place(action.client_order_id)
                 elif live_action.status == LiveActionStatus.FAILED:
-                    # All FAILED → quarantine. Even NON_RETRYABLE could be a
-                    # duplicate-CID rejection after a network retry where the
-                    # first attempt actually succeeded. Snapshot will resolve.
+                    # Post-HTTP error — ambiguous. Order might exist on exchange
+                    # (e.g. duplicate CID, network error after send). Quarantine.
                     self._grid_v2_register_pending_place(action.client_order_id)
                     logger.warning(
                         "GRID_V2_FAILED_PLACE_QUARANTINED cid=%s reason=%s",
@@ -3239,10 +3243,12 @@ class LiveEngineV0:
             except ConnectorNonRetryableError as e:
                 # Non-retryable: fail immediately
                 error_msg = str(e)
+                _pre_send = getattr(e, "pre_send", False)
                 logger.error(
-                    "Non-retryable error on %s: %s",
+                    "Non-retryable error on %s: %s (pre_send=%s)",
                     action.action_type.value,
                     error_msg,
+                    _pre_send,
                 )
                 # Latch: order budget exhausted → suppress planner on future ticks
                 if "Order count limit reached" in error_msg and not self._order_budget_exhausted:
@@ -3257,6 +3263,7 @@ class LiveEngineV0:
                     error=error_msg,
                     attempts=attempt,
                     intent=intent,
+                    pre_send=_pre_send,
                 )
             except ConnectorTransientError as e:
                 # Transient: retry with backoff

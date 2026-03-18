@@ -1795,3 +1795,131 @@ class TestPendingPlaceIntegration:
                 bridge.adapter.registry.lookup_entry(failed_cid) is not None
                 or bridge.adapter.registry.lookup_exit(failed_cid) is not None
             ), f"FAILED CID {failed_cid} must remain in adapter registry"
+
+
+class TestPreSendClassification:
+    """P0: pre_send FAILED → clean immediately, post-send FAILED → quarantine."""
+
+    def test_pre_send_failed_cleans_registry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Local validation error (pre_send=True) → CID cleaned from registry."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.errors import ConnectorNonRetryableError  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def place_then_presend_fail(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            if call_count["n"] > 6:  # seeds succeed, then pre-send fail
+                raise ConnectorNonRetryableError("notional too small", pre_send=True)
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = place_then_presend_fail
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # Fresh startup
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+
+        # Clear pending seeds
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        # Simulate fill: remove first seed
+        remaining = []
+        for cid in seed_cids[1:]:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            remaining.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 10000,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(remaining),
+            ts=_BASE_TS + 10000,
+            source="test",
+        )
+
+        # Tick 2: fill → PLACE actions → some fail with pre_send=True
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output2 = engine.process_snapshot(snap2)
+
+        # Find pre-send FAILED PLACEs
+        pre_send_failed = [
+            a
+            for a in output2.live_actions
+            if a.action.action_type == ActionType.PLACE
+            and a.status.value == "FAILED"
+            and a.pre_send
+            and a.action.client_order_id
+            and bridge.adapter.is_ours(a.action.client_order_id)
+        ]
+
+        # At least one pre-send failure should exist
+        assert len(pre_send_failed) > 0, "Need at least one pre-send FAILED PLACE"
+
+        # pre_send FAILED CIDs should be cleaned from registry (not quarantined)
+        for fa in pre_send_failed:
+            ps_cid = fa.action.client_order_id
+            assert ps_cid is not None
+            assert ps_cid not in engine._grid_v2_pending_place_cids, (
+                f"pre_send CID {ps_cid} must NOT be quarantined"
+            )
+            assert bridge.adapter.registry.lookup_entry(ps_cid) is None, (
+                f"pre_send CID {ps_cid} must be cleaned from registry"
+            )
