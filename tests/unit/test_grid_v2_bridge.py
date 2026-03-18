@@ -1325,3 +1325,177 @@ class TestSideAwareQuantization:
         # Already on tick boundary
         result = b._quantize_price(Decimal("50000.01"), OrderSide.BUY)
         assert result == Decimal("50000.01")
+
+
+class TestPendingPlaceCidVisibility:
+    """P0: New PLACE CIDs not yet visible on exchange must not be treated as fills."""
+
+    def test_pending_place_not_treated_as_fill(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Newly placed CID in pending set → excluded from fill detection."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        port = MagicMock()
+        port.place_order.return_value = "ORDER_1"
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # Tick 1: fresh startup
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+
+        # Clear awaiting_sync (simulate account sync showing seeds)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+        open_orders = []
+        for cid in seed_cids:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            open_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 5000,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(open_orders),
+            ts=_BASE_TS + 5000,
+            source="test",
+        )
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+
+        # Simulate: a fill happened, bridge generated new PLACE actions with new CIDs.
+        # The new CIDs are in registry and in pending_place_cids.
+        from grinder.grid_v2.adapter import EntryRegistration  # noqa: PLC0415
+
+        new_cid = bridge.adapter.generate_entry_cid(_BASE_TS + 10000)
+        bridge.adapter.registry._entries[new_cid] = EntryRegistration(
+            cid=new_cid, side=OrderSide.BUY, price=Decimal("49500")
+        )
+        engine._grid_v2_pending_place_cids.add(new_cid)
+
+        # Tick 2: account snapshot does NOT have the new CID yet.
+        # Without the fix, this CID would be detected as "disappeared" → false fill.
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output2 = engine.process_snapshot(snap2)
+
+        # The new CID should NOT have been treated as a fill
+        fill_actions = [
+            a for a in output2.live_actions if a.action.reason and "PLACE_EXIT" in a.action.reason
+        ]
+        assert len(fill_actions) == 0, "Pending-place CID must not trigger false fill"
+
+    def test_failed_place_cleaned_from_registry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Failed PLACE CID gets cleaned from registry → no reject cascade."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        port = MagicMock()
+        port.place_order.return_value = "ORDER_1"
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # Fresh startup
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        # Record initial entry count (6 seeds: 3 buy + 3 sell)
+        initial_entry_count = bridge.adapter.registry.entry_count
+
+        # Simulate: add a CID to registry (as resolve_actions would do for a
+        # new PLACE_ENTRY). We need to manually register since generate_entry_cid
+        # only creates the string, not the registry mapping.
+        from grinder.grid_v2.adapter import EntryRegistration  # noqa: PLC0415
+
+        new_cid = bridge.adapter.generate_entry_cid(_BASE_TS + 10000)
+        bridge.adapter.registry._entries[new_cid] = EntryRegistration(
+            cid=new_cid, side=OrderSide.BUY, price=Decimal("49500")
+        )
+        assert bridge.adapter.registry.entry_count == initial_entry_count + 1
+
+        # Simulate PLACE failure: engine cleans up via confirm_cancel_entry
+        removed = bridge.adapter.confirm_cancel_entry(new_cid)
+        assert removed is not None, "CID should have been in registry"
+
+        # After cleanup, registry should be back to initial count
+        assert bridge.adapter.registry.entry_count == initial_entry_count
