@@ -463,6 +463,37 @@ def _load_symbol_constraints() -> dict[str, SymbolConstraints] | None:
     return None
 
 
+def _validate_futures_preflight_or_exit(
+    symbols: list[str],
+    exchange_port: str,
+    fixture_path: str | None,
+) -> None:
+    """Validate symbols exist on futures venue. Fail-closed.
+
+    No-op unless exchange_port=="futures" and fixture_path is None.
+    Exits with code 1 if constraints unavailable or symbols missing.
+    """
+    if exchange_port != "futures" or fixture_path is not None:
+        return
+
+    constraints = _load_symbol_constraints()
+    if constraints is None:
+        print(
+            "ERROR: Cannot load futures exchangeInfo for symbol validation. "
+            "Futures mode requires symbol constraints to verify WS venue compatibility. "
+            "Check var/cache/exchange_info_futures.json or network access."
+        )
+        sys.exit(1)
+    missing = [s for s in symbols if s not in constraints]
+    if missing:
+        print(
+            f"ERROR: symbols {missing} not found in futures exchangeInfo. "
+            f"Cannot subscribe to futures WS for unknown symbols. "
+            f"Available: {len(constraints)} symbols."
+        )
+        sys.exit(1)
+
+
 def _build_grid_planners(
     symbols: list[str],
     symbol_constraints: dict[str, SymbolConstraints] | None,
@@ -930,7 +961,7 @@ def _configure_logging() -> None:
     )
 
 
-def main() -> None:  # noqa: PLR0912, PLR0915
+def main() -> None:  # noqa: PLR0915
     global _ha_enabled  # noqa: PLW0603
 
     args = build_parser().parse_args()
@@ -1011,26 +1042,8 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # Register readyz callback so /metrics emits grinder_readyz_ready gauge (PR-ALERTS-0)
     set_ready_fn(is_trading_ready)
 
-    # P1: Validate symbols are available on the chosen market-data venue.
-    # For futures, check against constraint provider (futures exchangeInfo).
-    # Fail-closed: unknown symbol on futures = immediate exit with actionable error.
-    if args.exchange_port == "futures" and not args.fixture:
-        constraints = _load_symbol_constraints()
-        if constraints is None:
-            print(
-                "ERROR: Cannot load futures exchangeInfo for symbol validation. "
-                "Futures mode requires symbol constraints to verify WS venue compatibility. "
-                "Check var/cache/exchange_info_futures.json or network access."
-            )
-            sys.exit(1)
-        missing = [s for s in symbols if s not in constraints]
-        if missing:
-            print(
-                f"ERROR: symbols {missing} not found in futures exchangeInfo. "
-                f"Cannot subscribe to futures WS for unknown symbols. "
-                f"Available: {len(constraints)} symbols."
-            )
-            sys.exit(1)
+    # Futures preflight: validate symbols exist on futures venue (fail-closed).
+    _validate_futures_preflight_or_exit(symbols, args.exchange_port, args.fixture)
 
     connector = build_connector(
         symbols,
