@@ -1415,16 +1415,17 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
   - **Migration:** spec -> V1A planner -> V1B engine -> V1C slot ownership -> V1D cross-tick fix -> V1E convergence guards -> V1F anchor contract -> live verification -> cleanup.
 
 - **Two-Sided Rolling Window Grid** (doc-27):
-  - **Status:** PR5 delivered. Shadow verification implemented (`src/grinder/grid_v2/shadow.py`). 26 shadow tests (13 classes) + 33 bridge tests (19 classes) + 99 adapter tests (16 classes) + 78 SM tests, all passing.
-  - **Spec:** `docs/27_TWO_SIDED_ROLLING_WINDOW_GRID_SPEC.md` (sections 1-24, including PR2 contract 21.1-21.16, PR3 contract 22.1-22.11, PR4 contract 23.1-23.9, PR5 shadow 24.1-24.5).
+  - **Status:** PR6 delivered. Live ceremony PASSED (2026-03-18). 26 shadow tests (13 classes) + 36 bridge tests (19+3 classes) + 99 adapter tests (16 classes) + 78 SM tests, all passing.
+  - **Spec:** `docs/27_TWO_SIDED_ROLLING_WINDOW_GRID_SPEC.md` (sections 1-25, including PR2 21.1-21.16, PR3 22.1-22.11, PR4 23.1-23.9, PR5 24.1-24.5, PR6 25.1-25.3).
   - **Supersedes conceptually:** doc-26 (Rolling Infinite Grid, ADR-085) as target grid architecture.
   - **Key differences from doc-26:** explicit entry/exit separation, inventory lot ledger, one-sided branch mode, bounded entry window, flat-only recenter, deterministic state machine.
   - **Architectural choices (v1):** strict one-sided branch, flat-only recenter, forbidden mixed inventory, exits outside rolling window, soft recenter on flat normalization.
-  - **Implementation plan:** PR1 (spec) -> **PR2 (state machine) [DONE]** -> **PR3 (reconciliation adapter) [DONE]** -> **PR4 (runtime bridge) [DONE]** -> **PR5 (shadow verification) [DONE]** -> PR6 (live ceremony).
+  - **Implementation plan:** PR1 (spec) -> **PR2 (state machine) [DONE]** -> **PR3 (reconciliation adapter) [DONE]** -> **PR4 (runtime bridge) [DONE]** -> **PR5 (shadow verification) [DONE]** -> **PR6 (live ceremony) [DONE]**.
   - **PR2 scope:** Pure deterministic state machine only. No exchange interaction, no live execution, no reconciliation adapter. Zero changes to existing code.
   - **PR3 scope:** Reconciliation adapter (CID scheme, order registry, fill translation, action resolution, reconciliation detection, snapshot reconstruction). No exchange I/O. No dispatch. Detection only. Strategy `g` reserved for grid_v2.
   - **PR4 scope:** Runtime bridge (`GridV2Bridge`) + engine wiring. Bridge wires adapter + state machine into ExecutionAction pipeline (binding runtime contract, startup fail-closed, fill/cancel lifecycle). Engine integration: `GRINDER_GRID_V2_ENABLED`/`GRINDER_GRID_V2_SYMBOL` env vars, bridge construction at init, startup on first account sync, fill detection via registry-vs-exchange diff, grid_v2 action generation branch. Section 23 (23.1-23.9) added to doc-27.
   - **PR5 scope:** Shadow verification (`GridV2ShadowRunner`). Isolated bridge runs grid_v2 in parallel on same snapshots without dispatch. `GRINDER_GRID_V2_SHADOW` env var. Mutual exclusion with primary. Fail-open error handling. Divergence detection (count/type mismatch). Section 24 (24.1-24.5) added to doc-27.
+  - **PR6 scope:** Live ceremony (2026-03-18). Price quantization (`price_tick_size` in GridV2Config, `GRINDER_GRID_V2_TICK_SIZE`). Awaiting-sync gate (`_grid_v2_awaiting_sync` flag skips fill detection until account sync). BTCUSDT 1-level 0.002 BTC, 180s, 16167 ticks, 0 errors, FLAT, cleanup CLEAN. Section 25 (25.1-25.3) added to doc-27.
 
 - **AccountSync visibility instrumentation** (PR-P0-2):
   - `GRINDER_ACCOUNT_SYNC_DEBUG_OPEN_ORDERS=1` (default 0): one flag enables both raw logging + correlation

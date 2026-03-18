@@ -375,6 +375,52 @@ class TestReconstructionDeterministic:
         assert b2.adapter.registry.entry_count == b3.adapter.registry.entry_count
 
 
+class TestPriceQuantization:
+    """PR6: Prices must be quantized to exchange tick size."""
+
+    def test_seed_prices_quantized(self) -> None:
+        """Fresh startup seed actions have prices quantized to tick_size."""
+        cfg = _config()
+        b = _bridge(config=cfg)
+        seed = b.startup_fresh(_REF_PRICE, _BASE_TS)
+        for ea in seed:
+            assert ea.price is not None
+            # price / tick_size should be an integer (no remainder)
+            remainder = ea.price % cfg.price_tick_size
+            assert remainder == 0, f"price={ea.price} not quantized to tick={cfg.price_tick_size}"
+
+    def test_fill_generated_actions_quantized(self) -> None:
+        """Actions from fill processing have quantized prices."""
+        b, seed = _fresh_bridge()
+        # Simulate an entry fill → should generate PLACE_EXIT with quantized price
+        cid = seed[0].client_order_id
+        assert cid is not None
+        entry_reg = b.adapter.registry.lookup_entry(cid)
+        assert entry_reg is not None
+        result = b.on_fill(cid, entry_reg.side, entry_reg.price, _ORDER_SIZE, _BASE_TS)
+        for ea in result.execution_actions:
+            if ea.price is not None:
+                remainder = ea.price % b._config.price_tick_size
+                assert remainder == 0, f"price={ea.price} not quantized"
+
+    def test_custom_tick_size(self) -> None:
+        """Non-default tick_size is respected."""
+        cfg = GridV2Config(
+            grid_step_pct=_STEP,
+            entry_levels_per_side=1,
+            order_size=_ORDER_SIZE,
+            max_inventory_levels=10,
+            max_inventory_notional_usd=Decimal("100000"),
+            price_tick_size=Decimal("0.1"),
+        )
+        b = GridV2Bridge(cfg, "BTCUSDT")
+        seed = b.startup_fresh(_REF_PRICE, _BASE_TS)
+        for ea in seed:
+            assert ea.price is not None
+            remainder = ea.price % Decimal("0.1")
+            assert remainder == 0, f"price={ea.price} not quantized to 0.1"
+
+
 class TestSwitchDisabledLegacyUnchanged:
     """REQ-007: Legacy path unchanged when switch is disabled.
 
@@ -627,6 +673,8 @@ class TestEngineCancelAckRouting:
             last_qty=Decimal("1"),
         )
         engine.process_snapshot(snap)
+        # Simulate account sync clearing the awaiting-sync flag (PR6)
+        engine._grid_v2_awaiting_sync = False
 
         # Seed actions were dispatched
         assert engine._grid_v2_started is True
@@ -740,6 +788,8 @@ class TestEngineCancelAckRouting:
             last_qty=Decimal("1"),
         )
         engine.process_snapshot(snap)
+        # Simulate account sync clearing the awaiting-sync flag (PR6)
+        engine._grid_v2_awaiting_sync = False
 
         # Pick a seeded entry CID and register it as pending cancel
         target_cid = next(iter(bridge.adapter.registry.all_entry_cids))

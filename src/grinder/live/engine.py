@@ -558,6 +558,7 @@ class LiveEngineV0:
         self._grid_v2_started = False
         self._grid_v2_seed_actions: list[ExecutionAction] = []
         self._grid_v2_pending_cancels: dict[str, int] = {}  # cid → ts_ms
+        self._grid_v2_awaiting_sync = False  # PR6: skip fill detection until account sync refreshes
         if self._grid_v2_enabled:
             if not self._grid_v2_symbol:
                 raise ValueError(
@@ -587,6 +588,7 @@ class LiveEngineV0:
                     max_inventory_notional_usd=Decimal(
                         os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL", "1000")
                     ),
+                    price_tick_size=Decimal(os.environ.get("GRINDER_GRID_V2_TICK_SIZE", "0.01")),
                 )
                 self._grid_v2_shadow = GridV2ShadowRunner(shadow_config, self._grid_v2_symbol)
                 logger.info(
@@ -611,6 +613,7 @@ class LiveEngineV0:
             max_inventory_notional_usd=Decimal(
                 os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL", "1000")
             ),
+            price_tick_size=Decimal(os.environ.get("GRINDER_GRID_V2_TICK_SIZE", "0.01")),
         )
         return GridV2Bridge(config, self._grid_v2_symbol)
 
@@ -666,6 +669,10 @@ class LiveEngineV0:
             seed = bridge.startup_fresh(snapshot.mid_price, snapshot.ts)
             self._grid_v2_seed_actions = list(seed)
             self._grid_v2_started = True
+            # PR6: skip fill detection until first account sync AFTER seed dispatch.
+            # Seeds are not on exchange yet; registry-vs-exchange diff would be all
+            # false positives until account sync confirms orders are visible.
+            self._grid_v2_awaiting_sync = True
 
     def _grid_v2_exchange_cids(self, symbol: str) -> set[str]:
         """Get current grid_v2 CIDs on exchange from last account snapshot."""
@@ -1111,9 +1118,10 @@ class LiveEngineV0:
         # PR4 (doc-27): Grid V2 startup + fill processing + cancel-ack routing
         if self._grid_v2_enabled and snapshot.symbol == self._grid_v2_symbol:
             self._grid_v2_try_startup(snapshot)
-            # Skip fill/cancel-ack detection on startup tick: seed CIDs aren't on
-            # exchange yet, so registry-vs-exchange diff would be all false positives.
-            if not self._grid_v2_seed_actions:
+            # Skip fill/cancel-ack detection while awaiting first account sync after
+            # fresh start: seed CIDs aren't on exchange yet, so registry-vs-exchange
+            # diff would be all false positives. Flag cleared by _tick_account_sync().
+            if not self._grid_v2_seed_actions and not self._grid_v2_awaiting_sync:
                 self._grid_v2_process_cancel_acks(snapshot.symbol, snapshot.ts)
                 grid_v2_fill_actions = self._grid_v2_process_fills(
                     snapshot.symbol,
@@ -1914,7 +1922,7 @@ class LiveEngineV0:
 
         return plan_result
 
-    def _tick_account_sync(self) -> None:  # noqa: PLR0912
+    def _tick_account_sync(self) -> None:  # noqa: PLR0912, PLR0915
         """Run one account sync cycle (read-only).
 
         Fetches snapshot, detects mismatches, records metrics.
@@ -1942,6 +1950,13 @@ class LiveEngineV0:
             self._position_notional_usd = AccountSyncer.compute_position_notional(result.snapshot)
             # PR-L2: Store full snapshot for LiveGridPlannerV1 (open_orders as exchange truth)
             self._last_account_snapshot = result.snapshot
+            # PR6: clear awaiting-sync flag — seed orders should now be visible
+            if self._grid_v2_awaiting_sync:
+                self._grid_v2_awaiting_sync = False
+                logger.info(
+                    "GRID_V2_AWAITING_SYNC_CLEARED gen=%d",
+                    self._account_sync_generation + 1,
+                )
             # PR-P0-RACE-1: monotonic generation counter for convergence guards
             self._account_sync_generation += 1
             # BUG-4 + ADR-090 follow-up: selective prune of cancel-failed blacklist.
