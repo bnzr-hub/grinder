@@ -4322,7 +4322,7 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 
 ### ADR-091: Grid Architecture Shift — Two-Sided Rolling Window Grid (2026-03-17)
 
-- **Status:** Proposed (spec only). No code exists yet. Existing doc-26 code remains operational.
+- **Status:** Proposed, partially implemented (PR2 state machine + PR3 adapter delivered; no execution integration yet). Existing doc-26 code remains operational.
 - **Spec:** `docs/27_TWO_SIDED_ROLLING_WINDOW_GRID_SPEC.md`
 - **Supersedes (as target architecture):** doc-26 / ADR-085 rolling/infinite-grid line (V1A-V1G). Doc-26 reclassified as **legacy/experimental**.
 - **Decision:** The rolling/infinite-grid line (doc-26, ADR-085, V1A-V1G) is replaced as target architecture by the **Two-Sided Rolling Window Grid** v1.
@@ -4332,3 +4332,4 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Migration plan:** PR1 (spec only, no code) → PR2 (pure state machine + 20 acceptance tests) → PR3 (reconciliation adapter) → PR4 (execution integration) → PR5 (paper/shadow verification) → PR6 (small live ceremony).
 - **Truth-first:** This is a spec direction, not an implementation. Nothing is replaced in code until PR2+. The old engine continues to run.
 - **PR2 delivered:** Pure state machine (`src/grinder/grid_v2/state.py`, 814 lines). 78 tests across 22 classes. Section 21 (21.1-21.16) added to doc-27 spec as binding contract clarifications. Zero changes to existing code. No exchange interaction.
+- **PR3 delivered:** Reconciliation adapter (`src/grinder/grid_v2/adapter.py`). 87 tests across 14 classes. Section 22 (22.1-22.11) added to doc-27 spec. CID scheme (strategy `g`), bidirectional order registry, fill translation, action resolution, reconciliation detection, snapshot reconstruction (8 fail-closed rules). Core invariant: translation never mutates registry. No exchange I/O, no dispatch. Comment-only touch to `reconcile/identity.py` (strategy reservation).

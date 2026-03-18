@@ -920,3 +920,229 @@ When `emergency_stopped == True`, the state machine applies the following event 
 This gate is checked **before** event-specific dispatch. The key design
 constraint: emergency stop freezes new exposure but never blocks position
 reduction. Open lots with paired exits must remain closeable.
+
+---
+
+## 22. PR3 contract clarifications (reconciliation adapter)
+
+### 22.1 CID scheme contract
+
+Single strategy_id `g`.
+
+**Strategy reservation**: `g` is reserved exclusively for grid_v2 in this
+repository. No other module or strategy may use `g` as a strategy_id.
+This reservation MUST be recorded in `reconcile/identity.py` module docstring.
+
+Entry/exit type encoded in `level_id` prefix:
+
+| Order type | level_id | Example CID | Length |
+|-----------|----------|-------------|--------|
+| Entry | `e{seq}` | `grinder_g_BTCUSDT_e999_1710000000_0` | 35 |
+| Exit | `x{seq}` | `grinder_g_SHIBUSDT_x999_1710000000_0` | 36 |
+
+Reuses `generate_client_order_id()` and `parse_client_order_id()` from
+`reconcile/identity.py` unchanged. `is_ours()` works with
+`OrderIdentityConfig(strategy_id="g")`.
+
+**Symbol-scoped ownership**: The adapter is instantiated per symbol. CID
+ownership requires BOTH strategy_id=`g` AND symbol matching the adapter's
+configured symbol. A `BTCUSDT` adapter treats `grinder_g_ETHUSDT_e0_...`
+as foreign (not ours), even though the strategy_id matches. This prevents
+cross-symbol confusion in multi-symbol runtime.
+
+**Length budget**:
+
+```
+Fixed overhead = 24 chars  (grinder_ + g + 4 separators + 10-digit ts + 1-digit seq)
+Variable budget = symbol + level_id <= 12 chars
+
+Symbol len | Max level_id | Max numeric seq | Entries per kind
+7 (BTCUSDT)  | 5 chars (e9999) | 9999           | 10,000
+8 (SHIBUSDT) | 4 chars (e999)  | 999            | 1,000
+```
+
+CID seq field always `0` in `generate_client_order_id(... seq=0)`.
+Uniqueness comes from monotonic counter in `level_id`, not from seq field.
+
+**Seq overflow**: adapter raises `ValueError` if counter exceeds max for
+the configured symbol length. Fail-closed.
+
+### 22.2 Order registry contract
+
+Bidirectional mapping between exchange CIDs and state machine entities:
+
+| Direction | Key | Value |
+|-----------|-----|-------|
+| CID -> entry | `cid` | `(side, price)` |
+| CID -> exit | `cid` | `(exit_order_id, lot_id)` |
+| entry -> CID | `(side, price)` | `cid` |
+| exit -> CID | `exit_order_id` | `cid` |
+
+**Invariants**:
+- No duplicate CIDs (register raises `ValueError`)
+- No duplicate reverse keys: `(side, price)` for entries, `exit_order_id`
+  for exits (register raises `ValueError`). Prevents silent overwrite of
+  the reverse map that would orphan older registrations.
+- Remove cleans both directions
+- Registry is the adapter's only mutable state
+
+### 22.3 Registry mutation policy
+
+**Core principle: translation is pure. Translation never mutates registry.**
+
+`translate_fill()` and `resolve_actions(CANCEL_*)` are read-only operations
+on the registry. They return CIDs / translated events but never register or
+deregister anything.
+
+**Exhaustive list of registry mutation operations:**
+
+| Operation | Method | When called |
+|-----------|--------|-------------|
+| Register entry | `resolve_actions(PLACE_ENTRY)` | action resolution creates new entry CID |
+| Register exit | `resolve_actions(PLACE_EXIT)` | action resolution creates new exit CID |
+| Register entries (batch) | `seed_entry_window()` | initial window setup |
+| Remove entry (fill confirmed) | `confirm_entry_fill(cid)` | caller, after SM.apply(EntryFilled) succeeds |
+| Remove exit (fill confirmed) | `confirm_exit_fill(cid)` | caller, after SM.apply(ExitFilled) succeeds |
+| Remove entry (cancel confirmed) | `confirm_cancel_entry(cid)` | caller, after exchange ack |
+| Remove exit (cancel confirmed) | `confirm_cancel_exit(cid)` | caller, after exchange ack |
+| Full reset + rebuild | `reconstruct_snapshot()` | restart path |
+
+No other code path may mutate the registry.
+
+**Rationale**: Without caller confirmation, early removal causes:
+- Late fills at "removed" CIDs -> false `ValueError` on `translate_fill`
+- False `ENTRY/EXIT_MISSING_ON_EXCHANGE` noise in reconciliation
+- Reverse map `(side, price) -> cid` stale or blocked
+- Registry stops being truth layer between state machine and exchange
+
+### 22.4 Fill translation contract
+
+| Input CID | Registry lookup | Result |
+|-----------|----------------|--------|
+| Not ours (foreign) | -- | `None` (ignored) |
+| Entry CID, in registry | found | `TranslatedFill(EntryFilled(...))` |
+| Exit CID, in registry | found | `TranslatedFill(ExitFilled(...))` |
+| Our CID, NOT in registry | not found | `ValueError` (stale fill) |
+
+**No registry mutation.** Caller must call `confirm_entry_fill(cid)` or
+`confirm_exit_fill(cid)` after successful SM application.
+
+`EntryFilled.order_id` = the CID itself. This flows through to state machine:
+`lot_id = f"lot-{cid}"`, `exit_order_id = f"exit-{cid}"`.
+
+**Duplicate fill semantics**: The adapter is stateless with respect to fills.
+Calling `translate_fill` with the same CID twice produces the same event
+both times (as long as the registration exists). Deduplication is the state
+machine's responsibility (I8 / `DUPLICATE_ENTRY_FILL`, `EXIT_ALREADY_FILLED`).
+The adapter MUST NOT silently suppress duplicates.
+
+### 22.5 Action resolution contract
+
+| ActionIntentKind | Adapter action | Registry side effect |
+|-----------------|----------------|---------------------|
+| `PLACE_ENTRY` | generate entry CID | **register** `cid -> (side, price)` |
+| `PLACE_EXIT` | generate exit CID, derive IDs | **register** `cid -> (exit_order_id, lot_id)` |
+| `CANCEL_ENTRY` | look up CID by `(side, price)` | **no mutation** (returns CID only) |
+| `CANCEL_EXIT` | look up CID by `exit_order_id` | **no mutation** (returns CID only) |
+
+`CANCEL_*` raises `ValueError` if CID not found in registry.
+
+**Exit ID derivation**: `action.lot_id = "lot-{X}"` ->
+`exit_order_id = "exit-{X}"` where `X = lot_id.removeprefix("lot-")`.
+Matches state machine convention in `state.py`.
+
+### 22.6 Reconciliation detection contract
+
+| Mismatch kind | Severity | Condition |
+|--------------|----------|-----------|
+| `ENTRY_MISSING_ON_EXCHANGE` | WARNING | entry CID in registry but not on exchange |
+| `EXIT_MISSING_ON_EXCHANGE` | CRITICAL | exit CID in registry but not on exchange (17.5) |
+| `UNEXPECTED_ORDER` | WARNING | our CID on exchange but not in registry |
+
+Non-g CIDs on exchange are ignored (not our orders).
+
+### 22.7 Snapshot reconstruction contract (restart path)
+
+**Inputs**: exchange open orders + position quantity + reference price + timestamp.
+
+**Algorithm**:
+
+1. Parse each order CID -> classify as entry (e-prefix) or exit (x-prefix)
+2. Skip non-g CIDs (not ours)
+3. Entry orders -> rebuild entry window (buy descending, sell ascending)
+4. Each exit order -> infer one open lot:
+   - Exit SELL -> lot is LONG, `entry_price = exit_price / (1 + grid_step_pct)`
+   - Exit BUY -> lot is SHORT, `entry_price = exit_price / (1 - grid_step_pct)`
+5. Mode: FLAT (no lots), LONG_BRANCH (all long), SHORT_BRANCH (all short)
+6. Cross-validate against position (fail-closed, see 22.8)
+7. Validate through `GridV2StateMachine.__init__()` (21.15 single validation path)
+8. Reset registry (clear) and register all discovered CIDs
+9. Recover seq counters (see 22.10)
+
+### 22.8 Reconstruction fail-closed rules
+
+Every rule is `ValueError`. No silent degradation, no truncation.
+
+| # | Condition | Error |
+|---|-----------|-------|
+| F1 | Mixed lot sides (some LONG, some SHORT) | I4 violation |
+| F2 | Position non-flat (!= 0) but no exit orders found | unprotected position |
+| F3 | Position flat (== 0) but exit orders exist | inconsistent state |
+| F4 | Position sign mismatches lot direction | direction mismatch |
+| F5 | Duplicate exit orders for same inferred lot | ambiguous lot mapping |
+| F6 | Duplicate entry orders for same (side, price) | registry one-to-one violation |
+| F7 | Entry count for either side exceeds config.entry_levels_per_side | window overflow |
+| F8 | All order CIDs truly unparseable (non-empty input, zero classified, zero parseable by base identity parser). Cross-symbol g-CIDs that parse but are filtered by symbol scope do NOT trigger F8. | unclassifiable orders |
+
+**Position quantity divergence**: `abs(position_qty)` vs
+`sum(lot.qty for lot in inferred_lots)` is **explicitly ignored in PR3**.
+The adapter validates direction only, not magnitude. Quantity reconciliation
+is deferred to PR4+. No warning emitted (no warning channel in return type).
+
+**Return type**: `GridV2Snapshot` only. No warnings, no degraded mode.
+Reconstruction either succeeds (valid snapshot) or raises `ValueError`.
+
+### 22.9 Adapter lifecycle
+
+```
+create_initial(config, ref, ts) -> sm
+adapter.seed_entry_window(sm.snapshot.entry_window, ts) -> initial CIDs
+    |
+[exchange fill] -> adapter.translate_fill(...) -> EntryFilled/ExitFilled
+    |
+sm.apply(event) -> TransitionResult (if not rejected)
+    |
+adapter.confirm_entry_fill(cid) / confirm_exit_fill(cid)
+    |
+adapter.resolve_actions(result.actions, ts) -> CIDs for execution (PR4)
+    |
+[exchange confirms cancel] -> adapter.confirm_cancel_entry/exit(cid)
+    |
+[periodically] adapter.reconcile(sm.snapshot, exchange_open_cids, ts)
+    |
+[restart] adapter.reconstruct_snapshot(...) -> new snapshot + registry rebuilt
+```
+
+### 22.10 Restart seq recovery contract
+
+On `reconstruct_snapshot()`, the adapter:
+
+1. Clears registry (full reset)
+2. Registers all discovered entry and exit CIDs
+3. Scans all discovered CIDs, parses the numeric suffix from level_id
+4. Sets `_entry_seq = max(parsed_entry_indices) + 1` (or 0 if none)
+5. Sets `_exit_seq = max(parsed_exit_indices) + 1` (or 0 if none)
+
+This prevents CID collision with still-open orders on the exchange.
+
+**Overflow policy**: If `max_seen + 1` exceeds the symbol-dependent limit,
+`reconstruct_snapshot` raises `ValueError`. Fail-closed.
+
+### 22.11 Stale fill handling (PR3 scope)
+
+When a fill arrives for a CID in our registry, the adapter translates it.
+The state machine may reject it (`PRICE_NOT_IN_ACTIVE_WINDOW`).
+The adapter does **not** force acceptance. Detection only.
+
+When a fill arrives for a CID that is ours but NOT in registry,
+`translate_fill` raises `ValueError`. Remediation deferred to PR4+.
