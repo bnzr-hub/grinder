@@ -219,10 +219,13 @@ class LiveConnectorV0(DataConnector):
         self._ws_connector: BinanceWsConnector | None = None
         self._ws_config: BinanceWsConfig | None = None
         if self._config.symbols:
+            # Pass ws_url as override so BinanceWsConfig uses the exact URL
+            # chosen by the caller (spot, futures, or testnet).
             self._ws_config = BinanceWsConfig(
                 symbols=list(self._config.symbols),
                 use_testnet=self._config.use_testnet,
                 timeout=self._config.timeout_config,
+                ws_url_override=self._config.ws_url if self._config.ws_url else None,
             )
             self._ws_connector = BinanceWsConnector(
                 config=self._ws_config,

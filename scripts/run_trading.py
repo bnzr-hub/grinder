@@ -1017,15 +1017,21 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # Fail-closed: unknown symbol on futures = immediate exit with actionable error.
     if args.exchange_port == "futures" and not args.fixture:
         constraints = _load_symbol_constraints()
-        if constraints:
-            missing = [s for s in symbols if s not in constraints]
-            if missing:
-                print(
-                    f"ERROR: symbols {missing} not found in futures exchangeInfo. "
-                    f"Cannot subscribe to futures WS for unknown symbols. "
-                    f"Available: {len(constraints)} symbols."
-                )
-                sys.exit(1)
+        if constraints is None:
+            print(
+                "ERROR: Cannot load futures exchangeInfo for symbol validation. "
+                "Futures mode requires symbol constraints to verify WS venue compatibility. "
+                "Check var/cache/exchange_info_futures.json or network access."
+            )
+            sys.exit(1)
+        missing = [s for s in symbols if s not in constraints]
+        if missing:
+            print(
+                f"ERROR: symbols {missing} not found in futures exchangeInfo. "
+                f"Cannot subscribe to futures WS for unknown symbols. "
+                f"Available: {len(constraints)} symbols."
+            )
+            sys.exit(1)
 
     connector = build_connector(
         symbols,

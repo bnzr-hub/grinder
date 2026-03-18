@@ -39,7 +39,11 @@ from scripts.run_trading import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-from grinder.connectors.binance_ws import BINANCE_WS_MAINNET, FakeWsTransport
+from grinder.connectors.binance_ws import (
+    BINANCE_WS_FUTURES_MAINNET,
+    BINANCE_WS_MAINNET,
+    FakeWsTransport,
+)
 from grinder.connectors.live_connector import (
     LiveConnectorConfig,
     LiveConnectorV0,
@@ -121,6 +125,45 @@ class TestBuildConnector:
         connector = build_connector(["BTCUSDT"], SafeMode.READ_ONLY, None, use_testnet=False)
         assert connector._config.use_testnet is False
         assert connector._config.ws_url == BINANCE_WS_MAINNET
+
+    def test_futures_port_uses_futures_ws(self) -> None:
+        """exchange_port=futures → fstream WS URL in both config and ws_config."""
+        connector = build_connector(
+            ["BTCUSDT"],
+            SafeMode.READ_ONLY,
+            None,
+            use_testnet=False,
+            exchange_port="futures",
+        )
+        assert connector._config.ws_url == BINANCE_WS_FUTURES_MAINNET
+        # Critical: verify the EFFECTIVE URL used by BinanceWsConnector
+        assert connector._ws_config is not None
+        assert connector._ws_config.ws_url == BINANCE_WS_FUTURES_MAINNET
+
+    def test_noop_port_uses_spot_ws(self) -> None:
+        """exchange_port=noop → spot WS URL (legacy default)."""
+        connector = build_connector(
+            ["BTCUSDT"],
+            SafeMode.READ_ONLY,
+            None,
+            use_testnet=False,
+            exchange_port="noop",
+        )
+        assert connector._config.ws_url == BINANCE_WS_MAINNET
+        assert connector._ws_config is not None
+        assert connector._ws_config.ws_url == BINANCE_WS_MAINNET
+
+    def test_testnet_overrides_futures(self) -> None:
+        """Testnet flag takes precedence over futures port."""
+        connector = build_connector(
+            ["BTCUSDT"],
+            SafeMode.READ_ONLY,
+            None,
+            use_testnet=True,
+            exchange_port="futures",
+        )
+        assert connector._ws_config is not None
+        assert connector._ws_config.ws_url == "wss://testnet.binance.vision/ws"
 
 
 class TestBuildEngine:
