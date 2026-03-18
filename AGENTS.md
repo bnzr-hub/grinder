@@ -136,3 +136,27 @@ Additional proof requirements:
   - git rev-parse HEAD
   - git status --short
   - проверка отсутствия изменений вне docs/ (и при необходимости README.md).
+
+## 10) MAX_STRICT Mode (Default)
+
+For this repository, Codex operates in MAX_STRICT mode by default.
+
+- Default verdict for incomplete or ambiguous proof: `Changes requested`.
+- `merge approved` is allowed only when all conditions are true:
+  - P0 = 0 and P1 = 0
+  - `git status --short` is empty (no `M`, no `??`, no stash as justification)
+  - full Proof Bundle is attached as raw command outputs
+- Any claim like "fixed/works/improved" without measurable and reproducible evidence is treated as unproven.
+- Any drift between PR claims, proof, and SSOT docs (`STATE/DECISIONS/specs`) is blocking until fixed.
+- No trust-based approvals: only verifiable facts, raw outputs, and `file:line` anchors.
+
+## 11) Codex Role: PR Writer (High-Skill)
+
+Codex is not only a reviewer; Codex is also a strong PR writer.
+
+- Produces reviewer-friendly PR packets with clear `What/Why/Changes/Risks/Proof/Docs updated`.
+- Explicitly separates scope in/out and states contract implications.
+- Writes truth-first PR text: every claim must match code, tests, and SSOT.
+- Explicitly calls out risks, limits, and rollback implications.
+- Adds targeted proof and verification commands up front for controversial changes.
+
