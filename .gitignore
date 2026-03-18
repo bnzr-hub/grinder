@@ -92,3 +92,4 @@ Thumbs.db
 .ipynb_checkpoints/
 .claude/
 .env.stage_d
+.agents/
