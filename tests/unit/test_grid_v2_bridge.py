@@ -1766,27 +1766,32 @@ class TestPendingPlaceIntegration:
             last_price=Decimal("50000"),
             last_qty=Decimal("1"),
         )
-        engine.process_snapshot(snap2)
+        output2 = engine.process_snapshot(snap2)
 
-        # Failed PLACEs with MAX_RETRIES should NOT have been cleaned from registry
-        # (ambiguous — order might be on exchange)
-        failed_place_actions = (
-            [
-                a
-                for a in engine._last_output.live_actions
-                if a.action.action_type == ActionType.PLACE
-                and a.status.value == "FAILED"
-                and a.action.client_order_id
-                and bridge.adapter.is_ours(a.action.client_order_id)
-            ]
-            if hasattr(engine, "_last_output")
-            else []
+        # Find FAILED PLACEs that are ours
+        failed_place_actions = [
+            a
+            for a in output2.live_actions
+            if a.action.action_type == ActionType.PLACE
+            and a.status.value == "FAILED"
+            and a.action.client_order_id
+            and bridge.adapter.is_ours(a.action.client_order_id)
+        ]
+
+        # Mandatory: at least one FAILED PLACE must exist (otherwise test is vacuous)
+        assert len(failed_place_actions) > 0, (
+            "Test requires at least one FAILED grid_v2 PLACE to verify quarantine"
         )
 
-        # The key assertion: ambiguous FAILED CIDs should be in pending (not cleaned)
+        # All FAILED PLACEs should be quarantined in pending (not cleaned from registry)
         for fa in failed_place_actions:
-            cid = fa.action.client_order_id
-            if cid and fa.block_reason and fa.block_reason.value == "MAX_RETRIES_EXCEEDED":
-                assert cid in engine._grid_v2_pending_place_cids, (
-                    f"Ambiguous FAILED CID {cid} must stay in pending, not cleaned"
-                )
+            failed_cid = fa.action.client_order_id
+            assert failed_cid is not None
+            assert failed_cid in engine._grid_v2_pending_place_cids, (
+                f"FAILED CID {failed_cid} (reason={fa.block_reason}) must stay in pending"
+            )
+            # CID should still be in adapter registry (not cleaned)
+            assert (
+                bridge.adapter.registry.lookup_entry(failed_cid) is not None
+                or bridge.adapter.registry.lookup_exit(failed_cid) is not None
+            ), f"FAILED CID {failed_cid} must remain in adapter registry"
