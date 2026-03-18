@@ -1146,3 +1146,154 @@ The adapter does **not** force acceptance. Detection only.
 
 When a fill arrives for a CID that is ours but NOT in registry,
 `translate_fill` raises `ValueError`. Remediation deferred to PR4+.
+
+---
+
+## 23. PR4: Runtime bridge contract
+
+`GridV2Bridge` wires `GridV2Adapter` + `GridV2StateMachine` into the
+live engine's action generation phase. No direct exchange I/O — produces
+`ExecutionAction` instances for the existing dispatch pipeline.
+
+Symbol-scoped: one bridge per trading symbol.
+
+### 23.1 Binding runtime contract (strict call order)
+
+Every exchange fill MUST be processed in this exact order:
+
+1. Exchange fact received (fill or cancel ack)
+2. `adapter.translate_fill(cid, side, price, qty, ts)` — read-only on registry
+3. `sm.apply(translated.event)` → `TransitionResult`
+4. **Only if not rejected**: `adapter.confirm_entry_fill(cid)` or `confirm_exit_fill(cid)`
+5. `adapter.resolve_actions(result.actions, ts)` → `ResolvedAction` tuples
+6. Bridge converts to `ExecutionAction` tuples for dispatch pipeline
+7. **Only after exchange cancel ack**: `adapter.confirm_cancel_entry/exit(cid)`
+
+No other code path may mutate the adapter registry.
+No dispatch before successful startup reconstruction.
+
+### 23.2 Startup fail-closed contract
+
+The bridge blocks all operations (`on_fill`, `on_cancel_ack`, `reconcile`)
+until startup reconstruction succeeds. Two startup paths:
+
+| Path | Method | When |
+|------|--------|------|
+| Fresh start | `startup_fresh(ref_price, ts)` | No exchange orders, first run |
+| Reconstruction | `startup(exchange_orders, pos_qty, ref_price, ts)` | Restart with existing orders |
+
+`startup()` catches `ValueError` from adapter reconstruction and sets
+`failed_reason`. All subsequent calls raise `RuntimeError` with
+`GRID_V2_DISPATCH_BLOCKED`.
+
+`startup_fresh()` creates initial state machine, seeds entry window via
+adapter, and returns `ExecutionAction` tuples for initial PLACE_ENTRY orders.
+
+### 23.3 Fill lifecycle
+
+`on_fill(cid, side, price, qty, ts)` → `FillResult`:
+
+| Input | Outcome |
+|-------|---------|
+| Foreign CID (not ours) | `FillResult(translated=None, rejected=False)` — ignored |
+| Entry CID, SM accepts | Confirm fill, resolve actions (PLACE_EXIT + window shifts), return ExecutionActions |
+| Exit CID, SM accepts | Confirm fill, resolve actions (window shifts), return ExecutionActions |
+| Any CID, SM rejects | `FillResult(rejected=True, reject_reason=...)` — no confirm, no actions |
+
+### 23.4 Cancel ack lifecycle
+
+`on_cancel_ack(cid)` → `CancelAckResult`:
+
+Called only after exchange confirms the cancel. Removes CID from registry.
+Foreign/unknown CIDs return `removed=False`.
+
+### 23.5 Reconciliation
+
+`reconcile(exchange_open_cids, ts)` → detection only, no mutation.
+Delegates to `adapter.reconcile()`. Logs mismatches at WARNING/CRITICAL.
+Returns empty tuple (no remediation actions in PR4).
+
+### 23.6 ExecutionAction conversion
+
+| ResolvedAction kind | ExecutionAction |
+|--------------------|-----------------|
+| `PLACE_ENTRY` | `ActionType.PLACE`, `reduce_only=False`, reason=`grid_v2_PLACE_ENTRY` |
+| `PLACE_EXIT` | `ActionType.PLACE`, `reduce_only=True`, reason=`grid_v2_PLACE_EXIT` |
+| `CANCEL_ENTRY` | `ActionType.CANCEL`, `order_id=cid`, reason=`grid_v2_CANCEL_ENTRY` |
+| `CANCEL_EXIT` | `ActionType.CANCEL`, `order_id=cid`, reason=`grid_v2_CANCEL_EXIT` |
+
+### 23.7 Stable log reason codes
+
+| Code | Meaning |
+|------|---------|
+| `GRID_V2_RECONSTRUCTION_OK` | Startup reconstruction succeeded |
+| `GRID_V2_RECONSTRUCTION_FAILED` | Startup reconstruction failed (fail-closed) |
+| `GRID_V2_BRIDGE_STARTUP_OK` | Fresh startup completed |
+| `GRID_V2_FILL_PROCESSED` | Fill processed successfully |
+| `GRID_V2_FILL_REJECTED` | Fill rejected by state machine |
+| `GRID_V2_FILL_FOREIGN` | Fill CID not ours (ignored) |
+| `GRID_V2_DISPATCH_BLOCKED` | Operation blocked (reconstruction not done/failed) |
+
+### 23.8 Bridge data types
+
+```python
+@dataclass(frozen=True)
+class FillResult:
+    translated: TranslatedFill | None
+    transition: TransitionResult | None
+    resolved_actions: tuple[ResolvedAction, ...]
+    execution_actions: tuple[ExecutionAction, ...]
+    rejected: bool
+    reject_reason: str | None
+
+@dataclass(frozen=True)
+class CancelAckResult:
+    cid: str
+    kind: GridV2OrderKind
+    removed: bool
+```
+
+### 23.9 Runtime switch contract (engine integration)
+
+`LiveEngineV0` reads two env vars at `__init__`:
+
+- `GRINDER_GRID_V2_ENABLED` (bool, default `False`) — master switch
+- `GRINDER_GRID_V2_SYMBOL` (string, required when enabled) — symbol scope
+
+**Fail-closed**: `GRINDER_GRID_V2_ENABLED=True` + empty/missing symbol →
+`ValueError` at engine init. No silent degradation.
+
+**Config env vars** (read at init, used by `GridV2Config`):
+
+| Env var | Default | Maps to |
+|---------|---------|---------|
+| `GRINDER_GRID_V2_STEP_PCT` | `0.005` | `grid_step_pct` |
+| `GRINDER_GRID_V2_ENTRY_LEVELS` | `3` | `entry_levels_per_side` |
+| `GRINDER_GRID_V2_ORDER_SIZE` | `0.001` | `order_size` |
+| `GRINDER_GRID_V2_MAX_INV_LEVELS` | `3` | `max_inventory_levels` |
+| `GRINDER_GRID_V2_MAX_INV_NOTIONAL` | `1000` | `max_inventory_notional_usd` |
+
+**When disabled** (`GRINDER_GRID_V2_ENABLED=False`, default):
+- `_grid_v2_bridge` is `None`
+- All legacy code paths (planner, paper engine, cycle layer) unchanged
+- Zero behavioral impact
+
+**When enabled** (`GRINDER_GRID_V2_ENABLED=True`):
+1. Bridge constructed at engine init via `_create_grid_v2_bridge()`
+2. On first tick with account sync data, `_grid_v2_try_startup()` runs:
+   - Classifies exchange orders by strategy `g`
+   - If grid_v2 orders exist → `bridge.startup()` (reconstruct)
+   - If no grid_v2 orders + position non-flat → **fail-closed** (overexposure guard)
+   - If no grid_v2 orders + position flat → `bridge.startup_fresh()` (new grid)
+3. **Startup tick**: seed actions dispatched, fill/cancel-ack detection **skipped**
+   (seeded CIDs not yet on exchange → registry-vs-exchange diff would be false positives)
+4. On each subsequent tick where `_is_grid_v2_active(symbol)`:
+   - `_grid_v2_process_cancel_acks()` detects confirmed cancels via pending-cancel set
+   - `_grid_v2_process_fills()` detects fills via registry-vs-exchange diff
+   - Dispatched CANCEL actions tracked in `_grid_v2_pending_cancels`
+   - Fill actions replace legacy planner output for that symbol
+5. Legacy planner/paper engine skipped for the grid_v2 symbol (never falls through)
+6. **Post-step generators bypassed**: cycle layer (TP detection) and replenish path
+   are unconditionally skipped for the grid_v2 symbol — grid_v2 owns its own fill
+   detection and exit placement. This applies in both active and blocked states,
+   ensuring fail-closed cannot be circumvented by legacy action generators.
