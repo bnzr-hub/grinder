@@ -100,6 +100,7 @@ Claude (или другой агент) рассматривается как и
 - Мерж разрешается только после явного вердикта merge approved.
 - merge approved допустим только при P0=0 и P1=0.
 - Truth > marketing: README, pyproject.toml, workflows, docs должны соответствовать реальности.
+- Any drift between Proof Bundle/PR claims and SSOT docs (docs/STATE.md, docs/DECISIONS.md, relevant specs) on facts/counts (tests, classes, digests, status) is a blocking P0 until docs or proof are corrected.
 - Любые изменения поведения/контрактов/архитектуры требуют обновления docs/STATE.md и docs/DECISIONS.md, а также профильных specs при необходимости.
 - Контракты нельзя менять тихо: CLI, конфиги, JSON/fixtures, Prometheus-метрики, replay-форматы - только с тестами и доками.
 - Детерминизм обязателен для policy/risk/execution/replay/fixtures: запуск python -m scripts.verify_replay_determinism и совпадение digest.
@@ -118,6 +119,10 @@ Claude (или другой агент) рассматривается как и
 - Для packaging/CLI: pip install -e . и --help соответствующих CLI
 - Для Docker/compose/monitoring (если применимо): сборка/запуск + проверка /healthz и /metrics
 - Для CI/workflows: подтверждение, что workflow не ссылаются на несуществующие файлы/скрипты
+
+Additional proof requirements:
+- If review/PR lists specific test names, include verbatim pytest -v output with those exact names (class-level dot output is insufficient).
+- If external artifact paths are provided, do not claim "inline above"; explicitly label them as external artifact paths.
 
 Формат ревью-ответа:
 - Findings в порядке P0 -> P1 -> P2.
