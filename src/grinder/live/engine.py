@@ -203,6 +203,8 @@ class LiveAction:
     block_reason: BlockReason | None = None
     order_id: str | None = None
     error: str | None = None
+    pre_send: bool = False  # True if error occurred before HTTP request
+    exchange_code: int | None = None  # Binance error code if from exchange
     attempts: int = 1
     intent: RiskIntent | None = None
 
@@ -318,6 +320,29 @@ def classify_intent(
                 return RiskIntent.REDUCE_RISK
         # Default: conservative — all PLACE/REPLACE = INCREASE_RISK
         return RiskIntent.INCREASE_RISK
+
+
+# Binance error codes that indicate the order might actually exist on exchange
+# Only -2010 is genuinely ambiguous: "New order rejected" can mean
+# duplicate CID after network retry where the first attempt succeeded.
+# All other codes (-2019 margin, -1111 precision, etc) are definitive rejects.
+_AMBIGUOUS_EXCHANGE_CODES: frozenset[int] = frozenset(
+    {
+        -2010,  # "New order rejected" — can be duplicate CID after retry
+    }
+)
+
+
+def _grid_v2_is_exchange_code_ambiguous(exchange_code: int | None) -> bool:
+    """Return True if the exchange_code is ambiguous (order might exist).
+
+    None (no exchange response) is always ambiguous (network error / retry exhaustion).
+    Codes in _AMBIGUOUS_EXCHANGE_CODES are ambiguous (duplicate-like).
+    All other codes are definitive rejects (order was NOT placed).
+    """
+    if exchange_code is None:
+        return True
+    return exchange_code in _AMBIGUOUS_EXCHANGE_CODES
 
 
 class LiveEngineV0:
@@ -560,6 +585,8 @@ class LiveEngineV0:
         self._grid_v2_pending_cancels: dict[str, int] = {}  # cid → ts_ms
         self._grid_v2_awaiting_sync = False  # PR6: skip fill detection until seed CIDs visible
         self._grid_v2_pending_seed_cids: frozenset[str] = frozenset()  # PR6: CIDs to confirm
+        # cid → sync_gen at dispatch. Released after visibility OR 2 sync cycles grace.
+        self._grid_v2_pending_place_cids: dict[str, int] = {}
         if self._grid_v2_enabled:
             if not self._grid_v2_symbol:
                 raise ValueError(
@@ -714,6 +741,36 @@ class LiveEngineV0:
                 if bridge is not None and bridge.adapter.is_ours(a.order_id):
                     self._grid_v2_pending_cancels[a.order_id] = ts
 
+    def _grid_v2_clean_failed_place(self, cid: str) -> None:
+        """Remove a FAILED/BLOCKED/SKIPPED PLACE CID from registry and pending."""
+        self._grid_v2_pending_place_cids.pop(cid, None)
+        bridge = self._grid_v2_bridge
+        if bridge is None:
+            return
+        parsed_cid = bridge.adapter.parse_cid(cid)
+        if parsed_cid is None:
+            return
+        from grinder.grid_v2.adapter import GridV2OrderKind  # noqa: PLC0415
+
+        if parsed_cid.kind == GridV2OrderKind.ENTRY:
+            bridge.adapter.confirm_cancel_entry(cid)
+        else:
+            bridge.adapter.confirm_cancel_exit(cid)
+        logger.info(
+            "GRID_V2_FAILED_PLACE_CLEANED cid=%s kind=%s",
+            cid,
+            parsed_cid.kind.value,
+        )
+
+    def _grid_v2_register_pending_place(self, cid: str) -> None:
+        """Track an EXECUTED PLACE CID until visible on exchange.
+
+        Stores current account_sync_generation so the CID can be released
+        after a bounded grace period (2 sync cycles) even if never visible
+        (e.g. immediate fill before first snapshot).
+        """
+        self._grid_v2_pending_place_cids[cid] = self._account_sync_generation
+
     def _grid_v2_process_cancel_acks(self, symbol: str, _ts: int) -> None:
         """Detect confirmed cancels and route through bridge.on_cancel_ack().
 
@@ -768,8 +825,11 @@ class LiveEngineV0:
         )
         disappeared = registry_cids - current_cids
 
-        # Exclude pending cancels — those are cancel-acks, not fills
-        filled_cids = disappeared - set(self._grid_v2_pending_cancels)
+        # Exclude pending cancels — those are cancel-acks, not fills.
+        # Exclude pending places — those haven't appeared on exchange yet.
+        filled_cids = (
+            disappeared - set(self._grid_v2_pending_cancels) - set(self._grid_v2_pending_place_cids)
+        )
         if not filled_cids:
             return []
 
@@ -1460,6 +1520,49 @@ class LiveEngineV0:
             ):
                 self._cancel_failed_ids.add(action.order_id)
 
+            # Grid V2 PLACE lifecycle:
+            # - EXECUTED → pending (visibility gate until snapshot confirms)
+            # - BLOCKED/SKIPPED → never sent to exchange, safe to clean
+            # - FAILED + pre_send → local validation before HTTP, safe to clean
+            # - FAILED + !pre_send → ambiguous (post-HTTP error, order might exist)
+            #   Quarantine as pending; snapshot resolves via visibility or grace.
+            if (
+                action.action_type == ActionType.PLACE
+                and action.client_order_id is not None
+                and self._grid_v2_bridge is not None
+                and self._grid_v2_bridge.adapter.is_ours(action.client_order_id)
+            ):
+                if live_action.status == LiveActionStatus.EXECUTED:
+                    self._grid_v2_register_pending_place(action.client_order_id)
+                elif live_action.status in (
+                    LiveActionStatus.BLOCKED,
+                    LiveActionStatus.SKIPPED,
+                ):
+                    # Never sent to exchange — safe to clean immediately
+                    self._grid_v2_clean_failed_place(action.client_order_id)
+                elif live_action.status == LiveActionStatus.FAILED and live_action.pre_send:
+                    # Local validation error before HTTP (symbol, notional, order count).
+                    # Order was never sent — safe to clean immediately.
+                    self._grid_v2_clean_failed_place(action.client_order_id)
+                elif live_action.status == LiveActionStatus.FAILED:
+                    # Post-HTTP error: classify by exchange_code.
+                    if _grid_v2_is_exchange_code_ambiguous(live_action.exchange_code):
+                        # Ambiguous: no code (retry exhaustion / network), or
+                        # duplicate-like codes (-2010/-2019) where the order
+                        # might actually exist on exchange. Quarantine.
+                        self._grid_v2_register_pending_place(action.client_order_id)
+                        logger.warning(
+                            "GRID_V2_FAILED_PLACE_QUARANTINED cid=%s code=%s reason=%s",
+                            action.client_order_id,
+                            live_action.exchange_code,
+                            live_action.block_reason.value if live_action.block_reason else "?",
+                        )
+                    else:
+                        # Explicit exchange reject with definitive code
+                        # (e.g. -1111 precision, -4014 tick, -4164 notional).
+                        # Order was NOT placed — safe to clean.
+                        self._grid_v2_clean_failed_place(action.client_order_id)
+
             # ADR-090 follow-up: record dispatched CANCEL CID for per-sync-cycle dedup.
             if (
                 action.action_type == ActionType.CANCEL
@@ -1984,6 +2087,25 @@ class LiveEngineV0:
                         "GRID_V2_AWAITING_SYNC_PENDING missing=%d/%d",
                         len(missing),
                         len(self._grid_v2_pending_seed_cids),
+                    )
+            # Clear pending-place CIDs: visible on exchange OR grace expired.
+            # Grace = 2 sync cycles. After grace, CID released for fill detection
+            # (handles immediate-fill before first snapshot visibility).
+            if self._grid_v2_pending_place_cids:
+                visible_cids = {o.order_id for o in result.snapshot.open_orders}
+                gen = self._account_sync_generation + 1  # gen about to be set
+                expired: list[str] = []
+                for cid, dispatch_gen in list(self._grid_v2_pending_place_cids.items()):
+                    if cid in visible_cids or (gen - dispatch_gen) >= 2:
+                        expired.append(cid)
+                if expired:
+                    for cid in expired:
+                        del self._grid_v2_pending_place_cids[cid]
+                    logger.debug(
+                        "GRID_V2_PENDING_PLACES_CLEARED count=%d remaining=%d gen=%d",
+                        len(expired),
+                        len(self._grid_v2_pending_place_cids),
+                        gen,
                     )
             # PR-P0-RACE-1: monotonic generation counter for convergence guards
             self._account_sync_generation += 1
@@ -3154,10 +3276,12 @@ class LiveEngineV0:
             except ConnectorNonRetryableError as e:
                 # Non-retryable: fail immediately
                 error_msg = str(e)
+                _pre_send = getattr(e, "pre_send", False)
                 logger.error(
-                    "Non-retryable error on %s: %s",
+                    "Non-retryable error on %s: %s (pre_send=%s)",
                     action.action_type.value,
                     error_msg,
+                    _pre_send,
                 )
                 # Latch: order budget exhausted → suppress planner on future ticks
                 if "Order count limit reached" in error_msg and not self._order_budget_exhausted:
@@ -3172,6 +3296,8 @@ class LiveEngineV0:
                     error=error_msg,
                     attempts=attempt,
                     intent=intent,
+                    pre_send=_pre_send,
+                    exchange_code=getattr(e, "exchange_code", None),
                 )
             except ConnectorTransientError as e:
                 # Transient: retry with backoff
@@ -3188,7 +3314,7 @@ class LiveEngineV0:
                     )
                     time.sleep(delay_ms / 1000.0)
             except CircuitOpenError as e:
-                # Circuit breaker is OPEN: fail immediately (non-retryable)
+                # Circuit breaker is OPEN: request never sent
                 logger.warning(
                     "Circuit breaker OPEN for %s: %s",
                     action.action_type.value,
@@ -3201,6 +3327,7 @@ class LiveEngineV0:
                     error=str(e),
                     attempts=attempt,
                     intent=intent,
+                    pre_send=True,
                 )
             except ConnectorError as e:
                 # Other connector errors: check if retryable

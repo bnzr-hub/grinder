@@ -1325,3 +1325,1066 @@ class TestSideAwareQuantization:
         # Already on tick boundary
         result = b._quantize_price(Decimal("50000.01"), OrderSide.BUY)
         assert result == Decimal("50000.01")
+
+
+class TestPendingPlaceCidVisibility:
+    """Pending-place CID visibility gate + grace expiry + failure cleanup."""
+
+    def test_pending_place_not_treated_as_fill(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """CID in pending-place set → excluded from fill detection."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.grid_v2.adapter import EntryRegistration  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        port = MagicMock()
+        port.place_order.return_value = "ORDER_1"
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # Fresh startup + clear awaiting sync
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        # Add a CID to registry + pending (simulating post-fill PLACE dispatch)
+        new_cid = bridge.adapter.generate_entry_cid(_BASE_TS + 10000)
+        bridge.adapter.registry._entries[new_cid] = EntryRegistration(
+            cid=new_cid, side=OrderSide.BUY, price=Decimal("49500")
+        )
+        engine._grid_v2_pending_place_cids[new_cid] = engine._account_sync_generation
+
+        # Tick: snapshot does NOT have the new CID
+        seed_cids = [c for c in bridge.adapter.registry.all_entry_cids if c != new_cid]
+        open_orders = []
+        for cid in seed_cids:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            open_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 10000,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(open_orders),
+            ts=_BASE_TS + 10000,
+            source="test",
+        )
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output2 = engine.process_snapshot(snap2)
+
+        fill_actions = [
+            a for a in output2.live_actions if a.action.reason and "PLACE_EXIT" in a.action.reason
+        ]
+        assert len(fill_actions) == 0, "Pending-place CID must not trigger false fill"
+
+    def test_grace_expiry_releases_never_visible_cid(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """P0: After 2 sync cycles, pending CID released for fill detection."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.account.syncer import AccountSyncer, SyncResult  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.grid_v2.adapter import EntryRegistration  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        port = MagicMock()
+        port.place_order.return_value = "ORDER_1"
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # Fresh startup
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        # Add CID to registry + pending at current gen
+        new_cid = bridge.adapter.generate_entry_cid(_BASE_TS + 10000)
+        bridge.adapter.registry._entries[new_cid] = EntryRegistration(
+            cid=new_cid, side=OrderSide.BUY, price=Decimal("49500")
+        )
+        dispatch_gen = engine._account_sync_generation
+        engine._grid_v2_pending_place_cids[new_cid] = dispatch_gen
+
+        # Simulate 2 account syncs with CID never visible (empty open_orders)
+        mock_syncer = MagicMock(spec=AccountSyncer)
+        mock_syncer.compute_position_notional = AccountSyncer.compute_position_notional
+        engine._account_syncer = mock_syncer
+
+        for i in range(2):
+            empty_snap = AccountSnapshot(
+                positions=(), open_orders=(), ts=_BASE_TS + 20000 + i * 5000, source="test"
+            )
+            mock_syncer.sync.return_value = SyncResult(snapshot=empty_snap)
+            engine._tick_account_sync()
+
+        # After 2 sync cycles, CID should be released from pending
+        assert new_cid not in engine._grid_v2_pending_place_cids, (
+            "CID must be released after grace period"
+        )
+
+    def test_failed_place_cleaned_via_engine(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """P1/P2: FAILED PLACE goes through _grid_v2_clean_failed_place."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.grid_v2.adapter import EntryRegistration  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        port = MagicMock()
+        port.place_order.return_value = "ORDER_1"
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        initial_count = bridge.adapter.registry.entry_count
+
+        # Add CID to registry
+        new_cid = bridge.adapter.generate_entry_cid(_BASE_TS + 10000)
+        bridge.adapter.registry._entries[new_cid] = EntryRegistration(
+            cid=new_cid, side=OrderSide.BUY, price=Decimal("49500")
+        )
+        assert bridge.adapter.registry.entry_count == initial_count + 1
+
+        # Call production cleanup function
+        engine._grid_v2_clean_failed_place(new_cid)
+
+        # Registry should be cleaned
+        assert bridge.adapter.registry.entry_count == initial_count
+        assert new_cid not in engine._grid_v2_pending_place_cids
+
+
+class TestPendingPlaceIntegration:
+    """P2: Engine-level test through real fill → dispatch → pending lifecycle."""
+
+    def test_fill_generated_place_exit_goes_to_pending(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Real fill on entry → PLACE_EXIT dispatched → exit CID in pending."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        port = MagicMock()
+        port.place_order.return_value = "ORDER_1"
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # Tick 1: fresh startup → seeds placed
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap1 = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap1)
+
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+
+        # Simulate account sync showing seeds → clear awaiting + pending
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()  # seeds now visible
+
+        # Build snapshot with all seeds EXCEPT one (simulating fill)
+        remaining_orders = []
+        for cid in seed_cids[1:]:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            remaining_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 10000,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(remaining_orders),
+            ts=_BASE_TS + 10000,
+            source="test",
+        )
+
+        # Tick 2: fill detection → bridge.on_fill → PLACE_EXIT dispatched
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output2 = engine.process_snapshot(snap2)
+
+        # Should have generated actions from fill processing
+        executed = [a for a in output2.live_actions if a.status.value == "EXECUTED"]
+        exit_actions = [a for a in executed if a.action.reason and "PLACE_EXIT" in a.action.reason]
+        assert len(exit_actions) > 0, "Fill should generate PLACE_EXIT"
+
+        # The exit CID should now be in pending_place_cids (EXECUTED → pending)
+        exit_cid = exit_actions[0].action.client_order_id
+        assert exit_cid is not None
+        assert exit_cid in engine._grid_v2_pending_place_cids, (
+            "EXECUTED PLACE_EXIT CID must be in pending_place_cids"
+        )
+
+    def test_ambiguous_failed_place_stays_in_registry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """MAX_RETRIES_EXCEEDED PLACE → CID stays in registry + pending (not cleaned)."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.errors import ConnectorTransientError  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        port = MagicMock()
+        # First calls succeed (seeds), then fail with transient error
+        call_count = {"n": 0}
+
+        def flaky_place(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            if call_count["n"] > 6:  # seeds use 6 calls
+                raise ConnectorTransientError("timeout")
+            return f"ORDER_{call_count['n']}"
+
+        port.place_order.side_effect = flaky_place
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # Tick 1: fresh startup
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap1 = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap1)
+
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+
+        # Simulate fill: remove one seed from exchange
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()  # seeds now visible
+
+        remaining = []
+        for cid in seed_cids[1:]:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            remaining.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 10000,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(remaining),
+            ts=_BASE_TS + 10000,
+            source="test",
+        )
+
+        # Tick 2: fill detected → actions dispatched → some PLACEs fail with transient
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output2 = engine.process_snapshot(snap2)
+
+        # Find FAILED PLACEs that are ours
+        failed_place_actions = [
+            a
+            for a in output2.live_actions
+            if a.action.action_type == ActionType.PLACE
+            and a.status.value == "FAILED"
+            and a.action.client_order_id
+            and bridge.adapter.is_ours(a.action.client_order_id)
+        ]
+
+        # Mandatory: at least one FAILED PLACE must exist (otherwise test is vacuous)
+        assert len(failed_place_actions) > 0, (
+            "Test requires at least one FAILED grid_v2 PLACE to verify quarantine"
+        )
+
+        # All FAILED PLACEs should be quarantined in pending (not cleaned from registry)
+        for fa in failed_place_actions:
+            failed_cid = fa.action.client_order_id
+            assert failed_cid is not None
+            assert failed_cid in engine._grid_v2_pending_place_cids, (
+                f"FAILED CID {failed_cid} (reason={fa.block_reason}) must stay in pending"
+            )
+            # CID should still be in adapter registry (not cleaned)
+            assert (
+                bridge.adapter.registry.lookup_entry(failed_cid) is not None
+                or bridge.adapter.registry.lookup_exit(failed_cid) is not None
+            ), f"FAILED CID {failed_cid} must remain in adapter registry"
+
+
+class TestPreSendClassification:
+    """P0: pre_send FAILED → clean immediately, post-send FAILED → quarantine."""
+
+    def test_pre_send_failed_cleans_registry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Local validation error (pre_send=True) → CID cleaned from registry."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.errors import ConnectorNonRetryableError  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def place_then_presend_fail(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            if call_count["n"] > 6:  # seeds succeed, then pre-send fail
+                raise ConnectorNonRetryableError("notional too small", pre_send=True)
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = place_then_presend_fail
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # Fresh startup
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+
+        # Clear pending seeds
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        # Simulate fill: remove first seed
+        remaining = []
+        for cid in seed_cids[1:]:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            remaining.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 10000,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(remaining),
+            ts=_BASE_TS + 10000,
+            source="test",
+        )
+
+        # Tick 2: fill → PLACE actions → some fail with pre_send=True
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output2 = engine.process_snapshot(snap2)
+
+        # Find pre-send FAILED PLACEs
+        pre_send_failed = [
+            a
+            for a in output2.live_actions
+            if a.action.action_type == ActionType.PLACE
+            and a.status.value == "FAILED"
+            and a.pre_send
+            and a.action.client_order_id
+            and bridge.adapter.is_ours(a.action.client_order_id)
+        ]
+
+        # At least one pre-send failure should exist
+        assert len(pre_send_failed) > 0, "Need at least one pre-send FAILED PLACE"
+
+        # pre_send FAILED CIDs should be cleaned from registry (not quarantined)
+        for fa in pre_send_failed:
+            ps_cid = fa.action.client_order_id
+            assert ps_cid is not None
+            assert ps_cid not in engine._grid_v2_pending_place_cids, (
+                f"pre_send CID {ps_cid} must NOT be quarantined"
+            )
+            assert bridge.adapter.registry.lookup_entry(ps_cid) is None, (
+                f"pre_send CID {ps_cid} must be cleaned from registry"
+            )
+
+    def test_circuit_open_cleans_registry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """CircuitOpenError → pre_send=True → CID cleaned immediately."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.errors import CircuitOpenError  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def place_then_circuit(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            if call_count["n"] > 6:
+                raise CircuitOpenError("breaker open")
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = place_then_circuit
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+        remaining = []
+        for cid in seed_cids[1:]:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            remaining.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 10000,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(remaining),
+            ts=_BASE_TS + 10000,
+            source="test",
+        )
+
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output2 = engine.process_snapshot(snap2)
+
+        circuit_failed = [
+            a
+            for a in output2.live_actions
+            if a.action.action_type == ActionType.PLACE
+            and a.status.value == "FAILED"
+            and a.pre_send
+            and a.action.client_order_id
+            and bridge.adapter.is_ours(a.action.client_order_id)
+        ]
+        assert len(circuit_failed) > 0, "At least one CircuitOpen FAILED"
+        for fa in circuit_failed:
+            co_cid = fa.action.client_order_id
+            assert co_cid is not None
+            assert co_cid not in engine._grid_v2_pending_place_cids
+            assert bridge.adapter.registry.lookup_entry(co_cid) is None
+
+    def test_explicit_exchange_reject_cleans_registry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Post-HTTP exchange reject (with exchange_code) → CID cleaned."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.errors import ConnectorNonRetryableError  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def place_then_exchange_reject(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            if call_count["n"] > 6:
+                raise ConnectorNonRetryableError(
+                    "Binance error -4164: min notional", exchange_code=-4164
+                )
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = place_then_exchange_reject
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+        remaining = []
+        for cid in seed_cids[1:]:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            remaining.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 10000,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(remaining),
+            ts=_BASE_TS + 10000,
+            source="test",
+        )
+
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output2 = engine.process_snapshot(snap2)
+
+        exchange_rejected = [
+            a
+            for a in output2.live_actions
+            if a.action.action_type == ActionType.PLACE
+            and a.status.value == "FAILED"
+            and a.exchange_code is not None
+            and a.action.client_order_id
+            and bridge.adapter.is_ours(a.action.client_order_id)
+        ]
+        assert len(exchange_rejected) > 0, "At least one exchange-rejected FAILED"
+        for fa in exchange_rejected:
+            er_cid = fa.action.client_order_id
+            assert er_cid is not None
+            assert er_cid not in engine._grid_v2_pending_place_cids, (
+                f"Exchange-rejected CID {er_cid} must be cleaned, not quarantined"
+            )
+            assert bridge.adapter.registry.lookup_entry(er_cid) is None, (
+                f"Exchange-rejected CID {er_cid} must be cleaned from registry"
+            )
+
+    def test_duplicate_code_quarantines(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Post-HTTP -2010 (duplicate/ambiguous) → CID quarantined, NOT cleaned."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.errors import ConnectorNonRetryableError  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def place_then_duplicate(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            if call_count["n"] > 6:
+                raise ConnectorNonRetryableError(
+                    "Binance error -2010: New order rejected",
+                    exchange_code=-2010,
+                )
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = place_then_duplicate
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+        remaining = []
+        for cid in seed_cids[1:]:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            remaining.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 10000,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(remaining),
+            ts=_BASE_TS + 10000,
+            source="test",
+        )
+
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output2 = engine.process_snapshot(snap2)
+
+        # Find -2010 FAILED PLACEs
+        dup_failed = [
+            a
+            for a in output2.live_actions
+            if a.action.action_type == ActionType.PLACE
+            and a.status.value == "FAILED"
+            and a.exchange_code == -2010
+            and a.action.client_order_id
+            and bridge.adapter.is_ours(a.action.client_order_id)
+        ]
+        assert len(dup_failed) > 0, "At least one -2010 duplicate FAILED"
+
+        # -2010 CIDs must be QUARANTINED (not cleaned)
+        for fa in dup_failed:
+            dup_cid = fa.action.client_order_id
+            assert dup_cid is not None
+            assert dup_cid in engine._grid_v2_pending_place_cids, (
+                f"-2010 CID {dup_cid} must be quarantined, not cleaned"
+            )
+            assert (
+                bridge.adapter.registry.lookup_entry(dup_cid) is not None
+                or bridge.adapter.registry.lookup_exit(dup_cid) is not None
+            ), f"-2010 CID {dup_cid} must remain in registry"
+
+    def test_margin_insufficient_cleans_registry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """-2019 (margin insufficient) is definitive reject → CID cleaned."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.errors import ConnectorNonRetryableError  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def place_then_margin(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            if call_count["n"] > 6:
+                raise ConnectorNonRetryableError(
+                    "Binance error -2019: Margin is insufficient",
+                    exchange_code=-2019,
+                )
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = place_then_margin
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+        remaining = []
+        for cid in seed_cids[1:]:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            remaining.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 10000,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(remaining),
+            ts=_BASE_TS + 10000,
+            source="test",
+        )
+
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output2 = engine.process_snapshot(snap2)
+
+        margin_failed = [
+            a
+            for a in output2.live_actions
+            if a.action.action_type == ActionType.PLACE
+            and a.status.value == "FAILED"
+            and a.exchange_code == -2019
+            and a.action.client_order_id
+            and bridge.adapter.is_ours(a.action.client_order_id)
+        ]
+        assert len(margin_failed) > 0, "At least one -2019 FAILED"
+
+        for fa in margin_failed:
+            m_cid = fa.action.client_order_id
+            assert m_cid is not None
+            assert m_cid not in engine._grid_v2_pending_place_cids, (
+                f"-2019 CID {m_cid} must be cleaned, not quarantined"
+            )
+            assert bridge.adapter.registry.lookup_entry(m_cid) is None, (
+                f"-2019 CID {m_cid} must be cleaned from registry"
+            )

@@ -245,14 +245,16 @@ class BinanceFuturesPort:
         if self.config.mode != SafeMode.LIVE_TRADE:
             raise ConnectorNonRetryableError(
                 f"Cannot {op}: mode={self.config.mode.value}, requires LIVE_TRADE. "
-                "Set mode=SafeMode.LIVE_TRADE to enable trading."
+                "Set mode=SafeMode.LIVE_TRADE to enable trading.",
+                pre_send=True,
             )
 
     def _validate_symbol(self, symbol: str) -> None:
         """Validate symbol is in whitelist."""
         if self.config.symbol_whitelist and symbol not in self.config.symbol_whitelist:
             raise ConnectorNonRetryableError(
-                f"Symbol '{symbol}' not in whitelist: {self.config.symbol_whitelist}"
+                f"Symbol '{symbol}' not in whitelist: {self.config.symbol_whitelist}",
+                pre_send=True,
             )
 
     def _validate_notional(self, price: Decimal, quantity: Decimal) -> None:
@@ -263,7 +265,8 @@ class BinanceFuturesPort:
                 raise ConnectorNonRetryableError(
                     f"Order notional ${notional:.2f} exceeds max_notional_per_order "
                     f"${self.config.max_notional_per_order:.2f}. "
-                    "Reduce price or quantity."
+                    "Reduce price or quantity.",
+                    pre_send=True,
                 )
 
     def _validate_order_count(self) -> None:
@@ -271,7 +274,8 @@ class BinanceFuturesPort:
         if self.config._orders_this_run >= self.config.max_orders_per_run:
             raise ConnectorNonRetryableError(
                 f"Order count limit reached: {self.config.max_orders_per_run} orders per run. "
-                "Reset port or create new instance to place more orders."
+                "Reset port or create new instance to place more orders.",
+                pre_send=True,
             )
 
     def _sign_request(self, params: dict[str, Any]) -> dict[str, Any]:
