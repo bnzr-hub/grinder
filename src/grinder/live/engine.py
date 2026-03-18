@@ -1548,7 +1548,7 @@ class LiveEngineV0:
                     # Post-HTTP error: classify by exchange_code.
                     if _grid_v2_is_exchange_code_ambiguous(live_action.exchange_code):
                         # Ambiguous: no code (retry exhaustion / network), or
-                        # duplicate-like codes (-2010/-2019) where the order
+                        # duplicate-like code (-2010) where the order
                         # might actually exist on exchange. Quarantine.
                         self._grid_v2_register_pending_place(action.client_order_id)
                         logger.warning(
