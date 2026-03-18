@@ -1495,8 +1495,12 @@ class LiveEngineV0:
             ):
                 self._cancel_failed_ids.add(action.order_id)
 
-            # Grid V2 PLACE lifecycle: register pending on EXECUTED,
-            # clean registry on FAILED/BLOCKED/SKIPPED.
+            # Grid V2 PLACE lifecycle:
+            # - EXECUTED → register as pending (visibility gate)
+            # - BLOCKED/SKIPPED → never sent, safe to clean registry
+            # - FAILED with NON_RETRYABLE/CIRCUIT_BREAKER → exchange rejected, safe to clean
+            # - FAILED with MAX_RETRIES_EXCEEDED → ambiguous, keep in registry + pending
+            #   (snapshot will resolve: visible → clear pending; absent after grace → fill path)
             if (
                 action.action_type == ActionType.PLACE
                 and action.client_order_id is not None
@@ -1506,11 +1510,27 @@ class LiveEngineV0:
                 if live_action.status == LiveActionStatus.EXECUTED:
                     self._grid_v2_register_pending_place(action.client_order_id)
                 elif live_action.status in (
-                    LiveActionStatus.FAILED,
                     LiveActionStatus.BLOCKED,
                     LiveActionStatus.SKIPPED,
                 ):
+                    # Never sent to exchange — safe to clean immediately
                     self._grid_v2_clean_failed_place(action.client_order_id)
+                elif live_action.status == LiveActionStatus.FAILED and live_action.block_reason in (
+                    BlockReason.NON_RETRYABLE_ERROR,
+                    BlockReason.CIRCUIT_BREAKER_OPEN,
+                ):
+                    # Exchange explicitly rejected — safe to clean
+                    self._grid_v2_clean_failed_place(action.client_order_id)
+                elif live_action.status == LiveActionStatus.FAILED:
+                    # Ambiguous failure (e.g. MAX_RETRIES_EXCEEDED) — order might
+                    # be on exchange. Register as pending; snapshot will resolve.
+                    self._grid_v2_register_pending_place(action.client_order_id)
+                    logger.warning(
+                        "GRID_V2_AMBIGUOUS_PLACE_FAIL cid=%s reason=%s — "
+                        "keeping in registry until snapshot resolves",
+                        action.client_order_id,
+                        live_action.block_reason.value if live_action.block_reason else "?",
+                    )
 
             # ADR-090 follow-up: record dispatched CANCEL CID for per-sync-cycle dedup.
             if (
