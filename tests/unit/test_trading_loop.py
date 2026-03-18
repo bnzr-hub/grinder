@@ -25,6 +25,7 @@ import pytest
 import scripts.run_trading as run_trading_mod
 from scripts.run_trading import (
     _configure_logging,
+    _validate_futures_preflight_or_exit,
     build_connector,
     build_engine,
     build_exchange_port,
@@ -180,56 +181,39 @@ class TestBuildConnector:
 
 
 class TestFuturesPreflightValidation:
-    """P2: Preflight symbol-vs-venue validation fail-closed tests."""
+    """Preflight symbol-vs-venue validation via production function."""
 
-    def test_missing_constraints_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Futures mode + constraints unavailable → sys.exit(1)."""
+    def test_constraints_unavailable_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Futures + constraints=None → sys.exit(1)."""
         monkeypatch.setattr(run_trading_mod, "_load_symbol_constraints", lambda: None)
-        args = type(
-            "Args",
-            (),
-            {
-                "exchange_port": "futures",
-                "fixture": None,
-                "mainnet": True,
-                "armed": False,
-                "max_notional_per_order": 200,
-                "max_orders_per_run": 6,
-                "symbols": "BTCUSDT",
-                "metrics_port": 19090,
-                "paper_size_per_level": None,
-                "paper_spacing_bps": None,
-                "paper_levels": None,
-                "paper_cooldown_ms": None,
-                "log_level": "WARNING",
-            },
-        )()
-        # Simulate the preflight block from main()
         with pytest.raises(SystemExit):
-            # Inline the preflight logic
-            if args.exchange_port == "futures" and not args.fixture:
-                constraints = run_trading_mod._load_symbol_constraints()
-                if constraints is None:
-                    import sys  # noqa: PLC0415
-
-                    sys.exit(1)
+            _validate_futures_preflight_or_exit(["BTCUSDT"], "futures", None)
 
     def test_missing_symbol_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Futures mode + symbol not in constraints → sys.exit(1)."""
+        """Futures + symbol not in constraints → sys.exit(1)."""
         monkeypatch.setattr(
-            run_trading_mod,
-            "_load_symbol_constraints",
-            lambda: {"BTCUSDT": object()},
+            run_trading_mod, "_load_symbol_constraints", lambda: {"BTCUSDT": object()}
         )
-        symbols = ["FARTCOINUSDT"]
         with pytest.raises(SystemExit):
-            constraints = run_trading_mod._load_symbol_constraints()
-            assert constraints is not None
-            missing = [s for s in symbols if s not in constraints]
-            if missing:
-                import sys  # noqa: PLC0415
+            _validate_futures_preflight_or_exit(["FARTCOINUSDT"], "futures", None)
 
-                sys.exit(1)
+    def test_non_futures_no_exit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Non-futures port → no validation, no exit."""
+        monkeypatch.setattr(run_trading_mod, "_load_symbol_constraints", lambda: None)
+        # Should NOT raise even with broken constraints
+        _validate_futures_preflight_or_exit(["BTCUSDT"], "noop", None)
+
+    def test_futures_with_fixture_no_exit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Futures + fixture path → skip validation."""
+        monkeypatch.setattr(run_trading_mod, "_load_symbol_constraints", lambda: None)
+        _validate_futures_preflight_or_exit(["BTCUSDT"], "futures", "some/fixture.jsonl")
+
+    def test_valid_symbol_no_exit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Futures + symbol present in constraints → no exit."""
+        monkeypatch.setattr(
+            run_trading_mod, "_load_symbol_constraints", lambda: {"BTCUSDT": object()}
+        )
+        _validate_futures_preflight_or_exit(["BTCUSDT"], "futures", None)
 
 
 class TestBuildEngine:
