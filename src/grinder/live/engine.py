@@ -69,6 +69,9 @@ from grinder.execution.smart_order_router import (
 )
 from grinder.execution.sor_metrics import get_sor_metrics
 from grinder.execution.types import ActionType, ExecutionAction
+from grinder.grid_v2.adapter import GRID_V2_STRATEGY_ID
+from grinder.grid_v2.bridge import GridV2Bridge
+from grinder.grid_v2.state import GridV2Config, LotSide
 from grinder.live.grid_planner import GridPlanResult
 from grinder.live.live_metrics import get_live_engine_metrics
 from grinder.live.place_tracker import correlate_recent_places
@@ -547,6 +550,228 @@ class LiveEngineV0:
             "enabled" if self._rolling_grid_enabled else "disabled",
         )
 
+        # PR4 (doc-27): Grid V2 runtime switch (safe-by-default, off)
+        self._grid_v2_enabled = parse_bool("GRINDER_GRID_V2_ENABLED", default=False, strict=False)
+        self._grid_v2_symbol: str = os.environ.get("GRINDER_GRID_V2_SYMBOL", "")
+        self._grid_v2_bridge: GridV2Bridge | None = None
+        self._grid_v2_started = False
+        self._grid_v2_seed_actions: list[ExecutionAction] = []
+        self._grid_v2_pending_cancels: dict[str, int] = {}  # cid → ts_ms
+        if self._grid_v2_enabled:
+            if not self._grid_v2_symbol:
+                raise ValueError(
+                    "GRINDER_GRID_V2_ENABLED=True requires GRINDER_GRID_V2_SYMBOL to be set"
+                )
+            self._grid_v2_bridge = self._create_grid_v2_bridge()
+            logger.info(
+                "GRID_V2_ENABLED symbol=%s",
+                self._grid_v2_symbol,
+            )
+
+    # --- Grid V2 runtime methods (doc-27 section 23, PR4) ---
+
+    def _create_grid_v2_bridge(self) -> GridV2Bridge:
+        """Construct GridV2Bridge from env-var config. Fail-closed on bad config."""
+        config = GridV2Config(
+            grid_step_pct=Decimal(os.environ.get("GRINDER_GRID_V2_STEP_PCT", "0.005")),
+            entry_levels_per_side=int(os.environ.get("GRINDER_GRID_V2_ENTRY_LEVELS", "3")),
+            order_size=Decimal(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE", "0.001")),
+            max_inventory_levels=int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "3")),
+            max_inventory_notional_usd=Decimal(
+                os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL", "1000")
+            ),
+        )
+        return GridV2Bridge(config, self._grid_v2_symbol)
+
+    def _grid_v2_try_startup(self, snapshot: Snapshot) -> None:
+        """Attempt grid_v2 bridge startup on first tick with account data.
+
+        Fresh start only if no exchange orders AND position is flat.
+        Non-flat position with no g-orders = fail-closed (overexposure guard).
+        Failed reconstruct = fail-closed (bridge.reconstruction_ok stays False).
+        Called once — sets _grid_v2_started to prevent re-entry.
+        """
+        bridge = self._grid_v2_bridge
+        if bridge is None or self._grid_v2_started:
+            return
+
+        acct = self._last_account_snapshot
+        if acct is None:
+            logger.debug("GRID_V2_STARTUP_DEFERRED reason=no_account_snapshot")
+            return
+
+        # Classify exchange orders that belong to grid_v2 (strategy "g")
+        g_orders: list[tuple[str, OrderSide, Decimal, Decimal]] = []
+        for o in acct.open_orders:
+            if o.symbol != self._grid_v2_symbol:
+                continue
+            parsed = parse_client_order_id(o.order_id)
+            if parsed is not None and parsed.strategy_id == GRID_V2_STRATEGY_ID:
+                g_orders.append((o.order_id, OrderSide(o.side), o.price, o.qty))
+
+        pos_qty = self._get_position_qty(self._grid_v2_symbol) or Decimal(0)
+
+        if g_orders:
+            # Reconstruct from exchange state
+            ok = bridge.startup(g_orders, pos_qty, snapshot.mid_price, snapshot.ts)
+            if not ok:
+                logger.error(
+                    "GRID_V2_STARTUP_FAILED symbol=%s reason=%s",
+                    self._grid_v2_symbol,
+                    bridge.failed_reason,
+                )
+            self._grid_v2_started = True
+        elif pos_qty != 0:
+            # P0-2: Non-flat position with no grid_v2 orders = fail-closed.
+            # Cannot seed fresh grid when already exposed. Manual intervention required.
+            logger.error(
+                "GRID_V2_STARTUP_BLOCKED symbol=%s reason=non_flat_position_no_orders pos_qty=%s",
+                self._grid_v2_symbol,
+                pos_qty,
+            )
+            self._grid_v2_started = True  # prevent retry; stays blocked (reconstruction_ok=False)
+        else:
+            # Flat position, no orders: fresh start
+            seed = bridge.startup_fresh(snapshot.mid_price, snapshot.ts)
+            self._grid_v2_seed_actions = list(seed)
+            self._grid_v2_started = True
+
+    def _grid_v2_exchange_cids(self, symbol: str) -> set[str]:
+        """Get current grid_v2 CIDs on exchange from last account snapshot."""
+        acct = self._last_account_snapshot
+        if acct is None:
+            return set()
+        cids: set[str] = set()
+        for o in acct.open_orders:
+            if o.symbol != symbol:
+                continue
+            parsed = parse_client_order_id(o.order_id)
+            if parsed is not None and parsed.strategy_id == GRID_V2_STRATEGY_ID:
+                cids.add(o.order_id)
+        return cids
+
+    def _grid_v2_register_pending_cancels(
+        self,
+        actions: list[ExecutionAction],
+        ts: int,
+    ) -> None:
+        """Track CANCEL actions dispatched for grid_v2 orders."""
+        for a in actions:
+            if a.action_type == ActionType.CANCEL and a.order_id:
+                bridge = self._grid_v2_bridge
+                if bridge is not None and bridge.adapter.is_ours(a.order_id):
+                    self._grid_v2_pending_cancels[a.order_id] = ts
+
+    def _grid_v2_process_cancel_acks(self, symbol: str, _ts: int) -> None:
+        """Detect confirmed cancels and route through bridge.on_cancel_ack().
+
+        CIDs in pending-cancel set that are now absent from exchange =
+        cancel confirmed. Routes through bridge.on_cancel_ack() which
+        removes CID from registry. Cleans up pending-cancel set.
+        """
+        bridge = self._grid_v2_bridge
+        if bridge is None or not bridge.reconstruction_ok:
+            return
+        if symbol != self._grid_v2_symbol:
+            return
+        if not self._grid_v2_pending_cancels:
+            return
+
+        current_cids = self._grid_v2_exchange_cids(symbol)
+        confirmed: list[str] = []
+        for cid in list(self._grid_v2_pending_cancels):
+            if cid not in current_cids:
+                bridge.on_cancel_ack(cid)
+                confirmed.append(cid)
+            # If still on exchange: keep in pending-cancels regardless of age.
+            # Dropping on TTL would let a late disappearance route as fill.
+        for cid in confirmed:
+            del self._grid_v2_pending_cancels[cid]
+
+    def _grid_v2_process_fills(
+        self,
+        symbol: str,
+        ts: int,
+    ) -> list[ExecutionAction]:
+        """Detect fills for grid_v2 orders and route through bridge.
+
+        Uses registry vs exchange diff: CIDs in registry but absent from
+        exchange AND not in pending-cancel set = filled.
+        Iterates in sorted order for deterministic action sequence.
+        Returns ExecutionActions from bridge.on_fill() for dispatch.
+        """
+        bridge = self._grid_v2_bridge
+        if bridge is None or not bridge.reconstruction_ok:
+            return []
+        if symbol != self._grid_v2_symbol:
+            return []
+
+        current_cids = self._grid_v2_exchange_cids(symbol)
+        if not current_cids and self._last_account_snapshot is None:
+            return []
+
+        # Compare with registry: CIDs in registry but not on exchange = disappeared
+        registry_cids = set(bridge.adapter.registry.all_entry_cids) | set(
+            bridge.adapter.registry.all_exit_cids
+        )
+        disappeared = registry_cids - current_cids
+
+        # Exclude pending cancels — those are cancel-acks, not fills
+        filled_cids = disappeared - set(self._grid_v2_pending_cancels)
+        if not filled_cids:
+            return []
+
+        actions: list[ExecutionAction] = []
+        for cid in sorted(filled_cids):  # P1-2: deterministic order
+            entry_reg = bridge.adapter.registry.lookup_entry(cid)
+            if entry_reg is not None:
+                result = bridge.on_fill(
+                    cid,
+                    entry_reg.side,
+                    entry_reg.price,
+                    bridge._config.order_size,
+                    ts,
+                )
+                actions.extend(result.execution_actions)
+                continue
+
+            exit_reg = bridge.adapter.registry.lookup_exit(cid)
+            if exit_reg is None:
+                continue
+
+            # Infer exit side from lot ledger
+            side = self._grid_v2_infer_exit_side(bridge, exit_reg.exit_order_id)
+            result = bridge.on_fill(
+                cid,
+                side,
+                Decimal("0"),
+                bridge._config.order_size,
+                ts,
+            )
+            actions.extend(result.execution_actions)
+
+        return actions
+
+    @staticmethod
+    def _grid_v2_infer_exit_side(bridge: GridV2Bridge, exit_order_id: str) -> OrderSide:
+        """Infer OrderSide for an exit fill from the lot ledger."""
+        sm = bridge.state_machine
+        if sm is not None:
+            for lot in sm.snapshot.open_lots:
+                if lot.exit_order_id == exit_order_id:
+                    return OrderSide.SELL if lot.side == LotSide.LONG else OrderSide.BUY
+        return OrderSide.SELL  # default: LONG lots exit via SELL
+
+    def _is_grid_v2_active(self, symbol: str) -> bool:
+        """Check if grid_v2 is active for this symbol."""
+        return (
+            self._grid_v2_enabled
+            and self._grid_v2_bridge is not None
+            and self._grid_v2_started
+            and self._grid_v2_bridge.reconstruction_ok
+            and symbol == self._grid_v2_symbol
+        )
+
     def _resolve_auto_threshold(self) -> None:
         """Resolve threshold from eval report at startup (PR-C9).
 
@@ -812,11 +1037,42 @@ class LiveEngineV0:
                     self._anchor_reset_blocked_logged.discard(f"{snapshot.symbol}:PENDING_CANCELS")
                     self._anchor_reset_blocked_logged.discard(f"{snapshot.symbol}:POSITION_UNKNOWN")
 
-        # Step 1: Get actions -- either from LiveGridPlannerV1 or PaperEngine
-        if grid_frozen or budget_dead:
-            # Frozen/budget dead: no planner actions (TP reduce-only still allowed)
-            raw_actions: list[ExecutionAction] = []
+        # PR4 (doc-27): Grid V2 startup + fill processing + cancel-ack routing
+        if self._grid_v2_enabled and snapshot.symbol == self._grid_v2_symbol:
+            self._grid_v2_try_startup(snapshot)
+            # Skip fill/cancel-ack detection on startup tick: seed CIDs aren't on
+            # exchange yet, so registry-vs-exchange diff would be all false positives.
+            if not self._grid_v2_seed_actions:
+                self._grid_v2_process_cancel_acks(snapshot.symbol, snapshot.ts)
+                grid_v2_fill_actions = self._grid_v2_process_fills(
+                    snapshot.symbol,
+                    snapshot.ts,
+                )
+            else:
+                grid_v2_fill_actions = []
+        else:
+            grid_v2_fill_actions = []
+
+        # Step 1: Get actions -- either from GridV2Bridge, LiveGridPlannerV1, or PaperEngine
+        if self._grid_v2_enabled and snapshot.symbol == self._grid_v2_symbol:
+            # Grid V2 symbol: either active (dispatch actions) or blocked (no actions).
+            # Never falls through to legacy planner for this symbol.
+            if self._is_grid_v2_active(snapshot.symbol):
+                # Drain seed actions on first active tick, then fill-driven
+                raw_actions: list[ExecutionAction] = list(self._grid_v2_seed_actions) + list(
+                    grid_v2_fill_actions
+                )
+                self._grid_v2_seed_actions.clear()
+            else:
+                # Blocked: startup not done, failed, or non-flat/no-orders guard hit.
+                raw_actions = []
             paper_output: Any = _DeferredPaperOutput(
+                ts=snapshot.ts, symbol=snapshot.symbol, actions=raw_actions
+            )
+        elif grid_frozen or budget_dead:
+            # Frozen/budget dead: no planner actions (TP reduce-only still allowed)
+            raw_actions = []
+            paper_output = _DeferredPaperOutput(
                 ts=snapshot.ts, symbol=snapshot.symbol, actions=raw_actions
             )
         elif self._is_live_planner_enabled():
@@ -842,7 +1098,14 @@ class LiveEngineV0:
             paper_output = self._paper_engine.process_snapshot(snapshot)
 
         # PR-INV-3: Cycle layer — detect fills, generate TP actions
-        if self._is_cycle_layer_enabled() and self._last_account_snapshot is not None:
+        # PR4 (doc-27): grid_v2 symbol bypasses cycle layer entirely —
+        # grid_v2 owns its own fill detection and exit placement.
+        _grid_v2_owns_symbol = self._grid_v2_enabled and snapshot.symbol == self._grid_v2_symbol
+        if (
+            self._is_cycle_layer_enabled()
+            and self._last_account_snapshot is not None
+            and not _grid_v2_owns_symbol
+        ):
             symbol_orders = tuple(
                 o for o in self._last_account_snapshot.open_orders if o.symbol == snapshot.symbol
             )
@@ -877,12 +1140,18 @@ class LiveEngineV0:
         if rolling:
             self._register_rolling_cancels(raw_actions, snapshot.ts)
 
+        # PR4 (doc-27): register grid_v2 cancels for cancel-ack tracking
+        if self._is_grid_v2_active(snapshot.symbol):
+            self._grid_v2_register_pending_cancels(raw_actions, snapshot.ts)
+
         # Replenish-on-TP-fill: detect position decrease → add BUY below + SELL above
         # Bypassed in rolling mode — planner diff handles slot restoration.
+        # PR4 (doc-27): grid_v2 symbol bypasses replenish — grid_v2 owns exit placement.
         if (
             self._is_cycle_layer_enabled()
             and self._last_account_snapshot is not None
             and not rolling
+            and not _grid_v2_owns_symbol
         ):
             pos_qty_for_anchor = self._get_position_qty(snapshot.symbol)
             self._update_grid_anchors(snapshot.symbol, pos_qty_for_anchor)

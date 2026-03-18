@@ -12,6 +12,11 @@ from grinder.grid_v2.adapter import (
     ResolvedAction,
     TranslatedFill,
 )
+from grinder.grid_v2.bridge import (
+    CancelAckResult,
+    FillResult,
+    GridV2Bridge,
+)
 from grinder.grid_v2.state import (
     BranchMode,
     EmergencyStopTriggered,
@@ -29,10 +34,13 @@ from grinder.grid_v2.state import (
 
 __all__ = [
     "BranchMode",
+    "CancelAckResult",
     "EmergencyStopTriggered",
     "EntryFilled",
     "ExitFilled",
+    "FillResult",
     "GridV2Adapter",
+    "GridV2Bridge",
     "GridV2Config",
     "GridV2Event",
     "GridV2InvariantError",

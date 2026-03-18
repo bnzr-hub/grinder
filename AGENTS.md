@@ -159,4 +159,3 @@ Codex is not only a reviewer; Codex is also a strong PR writer.
 - Writes truth-first PR text: every claim must match code, tests, and SSOT.
 - Explicitly calls out risks, limits, and rollback implications.
 - Adds targeted proof and verification commands up front for controversial changes.
-
