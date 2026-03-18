@@ -2149,3 +2149,124 @@ class TestPreSendClassification:
             assert bridge.adapter.registry.lookup_entry(er_cid) is None, (
                 f"Exchange-rejected CID {er_cid} must be cleaned from registry"
             )
+
+    def test_duplicate_code_quarantines(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Post-HTTP -2010 (duplicate/ambiguous) → CID quarantined, NOT cleaned."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.errors import ConnectorNonRetryableError  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def place_then_duplicate(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            if call_count["n"] > 6:
+                raise ConnectorNonRetryableError(
+                    "Binance error -2010: New order rejected",
+                    exchange_code=-2010,
+                )
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = place_then_duplicate
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+        remaining = []
+        for cid in seed_cids[1:]:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            remaining.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 10000,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(remaining),
+            ts=_BASE_TS + 10000,
+            source="test",
+        )
+
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output2 = engine.process_snapshot(snap2)
+
+        # Find -2010 FAILED PLACEs
+        dup_failed = [
+            a
+            for a in output2.live_actions
+            if a.action.action_type == ActionType.PLACE
+            and a.status.value == "FAILED"
+            and a.exchange_code == -2010
+            and a.action.client_order_id
+            and bridge.adapter.is_ours(a.action.client_order_id)
+        ]
+        assert len(dup_failed) > 0, "At least one -2010 duplicate FAILED"
+
+        # -2010 CIDs must be QUARANTINED (not cleaned)
+        for fa in dup_failed:
+            dup_cid = fa.action.client_order_id
+            assert dup_cid is not None
+            assert dup_cid in engine._grid_v2_pending_place_cids, (
+                f"-2010 CID {dup_cid} must be quarantined, not cleaned"
+            )
+            assert (
+                bridge.adapter.registry.lookup_entry(dup_cid) is not None
+                or bridge.adapter.registry.lookup_exit(dup_cid) is not None
+            ), f"-2010 CID {dup_cid} must remain in registry"

@@ -322,6 +322,29 @@ def classify_intent(
         return RiskIntent.INCREASE_RISK
 
 
+# Binance error codes that indicate the order might actually exist on exchange
+# (duplicate CID after network retry, order already processing, etc).
+# These are NOT safe to clean from registry — must quarantine.
+_AMBIGUOUS_EXCHANGE_CODES: frozenset[int] = frozenset(
+    {
+        -2010,  # "New order rejected" — can be duplicate CID after retry
+        -2019,  # "Margin is insufficient" — can race with position change
+    }
+)
+
+
+def _grid_v2_is_exchange_code_ambiguous(exchange_code: int | None) -> bool:
+    """Return True if the exchange_code is ambiguous (order might exist).
+
+    None (no exchange response) is always ambiguous (network error / retry exhaustion).
+    Codes in _AMBIGUOUS_EXCHANGE_CODES are ambiguous (duplicate-like).
+    All other codes are definitive rejects (order was NOT placed).
+    """
+    if exchange_code is None:
+        return True
+    return exchange_code in _AMBIGUOUS_EXCHANGE_CODES
+
+
 class LiveEngineV0:
     """Live write-path engine wiring PaperEngine to real ExchangePort.
 
@@ -1523,21 +1546,22 @@ class LiveEngineV0:
                     self._grid_v2_clean_failed_place(action.client_order_id)
                 elif live_action.status == LiveActionStatus.FAILED:
                     # Post-HTTP error: classify by exchange_code.
-                    # Explicit rejects (exchange returned definitive error) → clean.
-                    # Ambiguous (no code, retry exhaustion) → quarantine.
-                    if live_action.exchange_code is not None:
-                        # Exchange responded with explicit error code → order NOT placed.
-                        # Safe to clean (covers -1111/-4014/-4164/-2010/-2022 etc).
-                        self._grid_v2_clean_failed_place(action.client_order_id)
-                    else:
-                        # No exchange code (MAX_RETRIES, network error after send).
-                        # Ambiguous — order might exist. Quarantine.
+                    if _grid_v2_is_exchange_code_ambiguous(live_action.exchange_code):
+                        # Ambiguous: no code (retry exhaustion / network), or
+                        # duplicate-like codes (-2010/-2019) where the order
+                        # might actually exist on exchange. Quarantine.
                         self._grid_v2_register_pending_place(action.client_order_id)
                         logger.warning(
-                            "GRID_V2_FAILED_PLACE_QUARANTINED cid=%s reason=%s",
+                            "GRID_V2_FAILED_PLACE_QUARANTINED cid=%s code=%s reason=%s",
                             action.client_order_id,
+                            live_action.exchange_code,
                             live_action.block_reason.value if live_action.block_reason else "?",
                         )
+                    else:
+                        # Explicit exchange reject with definitive code
+                        # (e.g. -1111 precision, -4014 tick, -4164 notional).
+                        # Order was NOT placed — safe to clean.
+                        self._grid_v2_clean_failed_place(action.client_order_id)
 
             # ADR-090 follow-up: record dispatched CANCEL CID for per-sync-cycle dedup.
             if (
