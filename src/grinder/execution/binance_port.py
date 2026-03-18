@@ -246,8 +246,8 @@ def map_binance_error(status_code: int, json_data: Any) -> None:
         if -1099 <= code <= -1000:
             raise ConnectorTransientError(f"Binance transient error {code}: {msg}")
 
-        # All other 4xx: non-retryable
-        raise ConnectorNonRetryableError(f"Binance error {code}: {msg}")
+        # All other 4xx: non-retryable (post-HTTP, exchange responded)
+        raise ConnectorNonRetryableError(f"Binance error {code}: {msg}", exchange_code=code)
 
 
 # --- Binance Exchange Port ---

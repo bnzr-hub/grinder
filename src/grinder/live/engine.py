@@ -204,6 +204,7 @@ class LiveAction:
     order_id: str | None = None
     error: str | None = None
     pre_send: bool = False  # True if error occurred before HTTP request
+    exchange_code: int | None = None  # Binance error code if from exchange
     attempts: int = 1
     intent: RiskIntent | None = None
 
@@ -1521,14 +1522,22 @@ class LiveEngineV0:
                     # Order was never sent — safe to clean immediately.
                     self._grid_v2_clean_failed_place(action.client_order_id)
                 elif live_action.status == LiveActionStatus.FAILED:
-                    # Post-HTTP error — ambiguous. Order might exist on exchange
-                    # (e.g. duplicate CID, network error after send). Quarantine.
-                    self._grid_v2_register_pending_place(action.client_order_id)
-                    logger.warning(
-                        "GRID_V2_FAILED_PLACE_QUARANTINED cid=%s reason=%s",
-                        action.client_order_id,
-                        live_action.block_reason.value if live_action.block_reason else "?",
-                    )
+                    # Post-HTTP error: classify by exchange_code.
+                    # Explicit rejects (exchange returned definitive error) → clean.
+                    # Ambiguous (no code, retry exhaustion) → quarantine.
+                    if live_action.exchange_code is not None:
+                        # Exchange responded with explicit error code → order NOT placed.
+                        # Safe to clean (covers -1111/-4014/-4164/-2010/-2022 etc).
+                        self._grid_v2_clean_failed_place(action.client_order_id)
+                    else:
+                        # No exchange code (MAX_RETRIES, network error after send).
+                        # Ambiguous — order might exist. Quarantine.
+                        self._grid_v2_register_pending_place(action.client_order_id)
+                        logger.warning(
+                            "GRID_V2_FAILED_PLACE_QUARANTINED cid=%s reason=%s",
+                            action.client_order_id,
+                            live_action.block_reason.value if live_action.block_reason else "?",
+                        )
 
             # ADR-090 follow-up: record dispatched CANCEL CID for per-sync-cycle dedup.
             if (
@@ -3264,6 +3273,7 @@ class LiveEngineV0:
                     attempts=attempt,
                     intent=intent,
                     pre_send=_pre_send,
+                    exchange_code=getattr(e, "exchange_code", None),
                 )
             except ConnectorTransientError as e:
                 # Transient: retry with backoff
@@ -3280,7 +3290,7 @@ class LiveEngineV0:
                     )
                     time.sleep(delay_ms / 1000.0)
             except CircuitOpenError as e:
-                # Circuit breaker is OPEN: fail immediately (non-retryable)
+                # Circuit breaker is OPEN: request never sent
                 logger.warning(
                     "Circuit breaker OPEN for %s: %s",
                     action.action_type.value,
@@ -3293,6 +3303,7 @@ class LiveEngineV0:
                     error=str(e),
                     attempts=attempt,
                     intent=intent,
+                    pre_send=True,
                 )
             except ConnectorError as e:
                 # Other connector errors: check if retryable
