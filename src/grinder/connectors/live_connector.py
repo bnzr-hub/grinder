@@ -112,7 +112,7 @@ class LiveConnectorConfig:
 
     mode: SafeMode = SafeMode.READ_ONLY
     symbols: list[str] = field(default_factory=list)
-    ws_url: str = "wss://testnet.binance.vision/ws"  # Testnet by default (safe)
+    ws_url: str | None = None  # Explicit WS URL override (None = derive from use_testnet)
     use_testnet: bool = True
     timeout_config: TimeoutConfig = field(default_factory=TimeoutConfig)
     retry_policy: RetryPolicy = field(default_factory=lambda: RetryPolicy(max_attempts=3))
@@ -219,10 +219,13 @@ class LiveConnectorV0(DataConnector):
         self._ws_connector: BinanceWsConnector | None = None
         self._ws_config: BinanceWsConfig | None = None
         if self._config.symbols:
+            # Pass ws_url as override so BinanceWsConfig uses the exact URL
+            # chosen by the caller (spot, futures, or testnet).
             self._ws_config = BinanceWsConfig(
                 symbols=list(self._config.symbols),
                 use_testnet=self._config.use_testnet,
                 timeout=self._config.timeout_config,
+                ws_url_override=self._config.ws_url if self._config.ws_url else None,
             )
             self._ws_connector = BinanceWsConnector(
                 config=self._ws_config,

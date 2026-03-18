@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 # Binance WebSocket endpoints
 BINANCE_WS_TESTNET = "wss://testnet.binance.vision/ws"
 BINANCE_WS_MAINNET = "wss://stream.binance.com:9443/ws"
+BINANCE_WS_FUTURES_MAINNET = "wss://fstream.binance.com/ws"
 
 
 class WsTransport(ABC):
@@ -224,10 +225,13 @@ class BinanceWsConfig:
     use_testnet: bool = True
     timeout: TimeoutConfig = field(default_factory=TimeoutConfig)
     retry: RetryConfig = field(default_factory=RetryConfig)
+    ws_url_override: str | None = None  # Explicit URL override (e.g. futures WS)
 
     @property
     def ws_url(self) -> str:
-        """Get WebSocket URL."""
+        """Get WebSocket URL. Override takes precedence over use_testnet logic."""
+        if self.ws_url_override is not None:
+            return self.ws_url_override
         return BINANCE_WS_TESTNET if self.use_testnet else BINANCE_WS_MAINNET
 
     def get_subscribe_message(self) -> str:

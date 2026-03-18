@@ -68,7 +68,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from grinder.connectors.binance_ws import BINANCE_WS_MAINNET, FakeWsTransport
+from grinder.connectors.binance_ws import (
+    BINANCE_WS_FUTURES_MAINNET,
+    FakeWsTransport,
+)
 from grinder.connectors.live_connector import (
     LiveConnectorConfig,
     LiveConnectorV0,
@@ -390,6 +393,7 @@ def build_connector(
     fixture_path: str | None,
     *,
     use_testnet: bool = True,
+    exchange_port: str = "noop",
 ) -> LiveConnectorV0:
     """Build LiveConnectorV0 with optional fixture transport.
 
@@ -398,6 +402,8 @@ def build_connector(
         mode: SafeMode for the connector.
         fixture_path: Optional path to JSONL fixture file.
         use_testnet: Use testnet WS endpoint (default True for safety).
+        exchange_port: Exchange port name ("noop" or "futures").
+            When "futures", uses fstream.binance.com for market data.
 
     Returns:
         Configured LiveConnectorV0 instance.
@@ -408,7 +414,15 @@ def build_connector(
             messages = [line.strip() for line in f if line.strip()]
         ws_transport = FakeWsTransport(messages=messages, delay_ms=100)
 
-    ws_url = BINANCE_WS_MAINNET if not use_testnet else "wss://testnet.binance.vision/ws"
+    # Explicit ws_url only for futures mainnet (fstream).
+    # Testnet and spot mainnet are handled by BinanceWsConfig via use_testnet flag.
+    ws_url: str | None = None
+    if not use_testnet and exchange_port == "futures":
+        ws_url = BINANCE_WS_FUTURES_MAINNET
+
+    net_label = "testnet" if use_testnet else ("futures" if exchange_port == "futures" else "spot")
+    effective = ws_url or ("testnet" if use_testnet else "spot-mainnet")
+    print(f"  Market data WS: {effective} ({net_label})")
 
     config = LiveConnectorConfig(
         mode=mode,
@@ -916,7 +930,7 @@ def _configure_logging() -> None:
     )
 
 
-def main() -> None:  # noqa: PLR0915
+def main() -> None:  # noqa: PLR0912, PLR0915
     global _ha_enabled  # noqa: PLW0603
 
     args = build_parser().parse_args()
@@ -997,7 +1011,34 @@ def main() -> None:  # noqa: PLR0915
     # Register readyz callback so /metrics emits grinder_readyz_ready gauge (PR-ALERTS-0)
     set_ready_fn(is_trading_ready)
 
-    connector = build_connector(symbols, mode, args.fixture, use_testnet=use_testnet)
+    # P1: Validate symbols are available on the chosen market-data venue.
+    # For futures, check against constraint provider (futures exchangeInfo).
+    # Fail-closed: unknown symbol on futures = immediate exit with actionable error.
+    if args.exchange_port == "futures" and not args.fixture:
+        constraints = _load_symbol_constraints()
+        if constraints is None:
+            print(
+                "ERROR: Cannot load futures exchangeInfo for symbol validation. "
+                "Futures mode requires symbol constraints to verify WS venue compatibility. "
+                "Check var/cache/exchange_info_futures.json or network access."
+            )
+            sys.exit(1)
+        missing = [s for s in symbols if s not in constraints]
+        if missing:
+            print(
+                f"ERROR: symbols {missing} not found in futures exchangeInfo. "
+                f"Cannot subscribe to futures WS for unknown symbols. "
+                f"Available: {len(constraints)} symbols."
+            )
+            sys.exit(1)
+
+    connector = build_connector(
+        symbols,
+        mode,
+        args.fixture,
+        use_testnet=use_testnet,
+        exchange_port=args.exchange_port,
+    )
 
     # Async loop with signal handling
     loop = asyncio.new_event_loop()

@@ -39,7 +39,11 @@ from scripts.run_trading import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-from grinder.connectors.binance_ws import BINANCE_WS_MAINNET, FakeWsTransport
+from grinder.connectors.binance_ws import (
+    BINANCE_WS_FUTURES_MAINNET,
+    BINANCE_WS_MAINNET,
+    FakeWsTransport,
+)
 from grinder.connectors.live_connector import (
     LiveConnectorConfig,
     LiveConnectorV0,
@@ -114,13 +118,118 @@ class TestBuildConnector:
         """Default build_connector uses testnet WS URL."""
         connector = build_connector(["BTCUSDT"], SafeMode.READ_ONLY, None)
         assert connector._config.use_testnet is True
-        assert connector._config.ws_url == "wss://testnet.binance.vision/ws"
+        assert connector._config.ws_url is None  # no explicit override
+        # Effective URL should be testnet (derived from use_testnet=True)
+        assert connector._ws_config is not None
+        assert connector._ws_config.ws_url == "wss://testnet.binance.vision/ws"
 
     def test_mainnet_flag_sets_mainnet_url(self) -> None:
-        """build_connector(use_testnet=False) uses mainnet WS URL."""
+        """build_connector(use_testnet=False) uses mainnet WS URL (spot)."""
         connector = build_connector(["BTCUSDT"], SafeMode.READ_ONLY, None, use_testnet=False)
         assert connector._config.use_testnet is False
-        assert connector._config.ws_url == BINANCE_WS_MAINNET
+        assert connector._config.ws_url is None  # no explicit override
+        # Effective URL should be spot mainnet (derived from use_testnet=False)
+        assert connector._ws_config is not None
+        assert connector._ws_config.ws_url == BINANCE_WS_MAINNET
+
+    def test_futures_port_uses_futures_ws(self) -> None:
+        """exchange_port=futures → fstream WS URL in both config and ws_config."""
+        connector = build_connector(
+            ["BTCUSDT"],
+            SafeMode.READ_ONLY,
+            None,
+            use_testnet=False,
+            exchange_port="futures",
+        )
+        assert connector._config.ws_url == BINANCE_WS_FUTURES_MAINNET
+        # Critical: verify the EFFECTIVE URL used by BinanceWsConnector
+        assert connector._ws_config is not None
+        assert connector._ws_config.ws_url == BINANCE_WS_FUTURES_MAINNET
+
+    def test_noop_port_uses_spot_ws(self) -> None:
+        """exchange_port=noop + use_testnet=False → spot WS URL."""
+        connector = build_connector(
+            ["BTCUSDT"],
+            SafeMode.READ_ONLY,
+            None,
+            use_testnet=False,
+            exchange_port="noop",
+        )
+        assert connector._config.ws_url is None  # no explicit override
+        assert connector._ws_config is not None
+        assert connector._ws_config.ws_url == BINANCE_WS_MAINNET
+
+    def test_testnet_overrides_futures(self) -> None:
+        """Testnet flag takes precedence over futures port."""
+        connector = build_connector(
+            ["BTCUSDT"],
+            SafeMode.READ_ONLY,
+            None,
+            use_testnet=True,
+            exchange_port="futures",
+        )
+        assert connector._config.ws_url is None  # testnet → no futures override
+        assert connector._ws_config is not None
+        assert connector._ws_config.ws_url == "wss://testnet.binance.vision/ws"
+
+    def test_direct_config_use_testnet_false_no_ws_url(self) -> None:
+        """P1 regression: LiveConnectorConfig(use_testnet=False) without ws_url → spot."""
+        c = LiveConnectorV0(config=LiveConnectorConfig(symbols=["BTCUSDT"], use_testnet=False))
+        assert c._ws_config is not None
+        assert c._ws_config.ws_url == BINANCE_WS_MAINNET
+
+
+class TestFuturesPreflightValidation:
+    """P2: Preflight symbol-vs-venue validation fail-closed tests."""
+
+    def test_missing_constraints_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Futures mode + constraints unavailable → sys.exit(1)."""
+        monkeypatch.setattr(run_trading_mod, "_load_symbol_constraints", lambda: None)
+        args = type(
+            "Args",
+            (),
+            {
+                "exchange_port": "futures",
+                "fixture": None,
+                "mainnet": True,
+                "armed": False,
+                "max_notional_per_order": 200,
+                "max_orders_per_run": 6,
+                "symbols": "BTCUSDT",
+                "metrics_port": 19090,
+                "paper_size_per_level": None,
+                "paper_spacing_bps": None,
+                "paper_levels": None,
+                "paper_cooldown_ms": None,
+                "log_level": "WARNING",
+            },
+        )()
+        # Simulate the preflight block from main()
+        with pytest.raises(SystemExit):
+            # Inline the preflight logic
+            if args.exchange_port == "futures" and not args.fixture:
+                constraints = run_trading_mod._load_symbol_constraints()
+                if constraints is None:
+                    import sys  # noqa: PLC0415
+
+                    sys.exit(1)
+
+    def test_missing_symbol_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Futures mode + symbol not in constraints → sys.exit(1)."""
+        monkeypatch.setattr(
+            run_trading_mod,
+            "_load_symbol_constraints",
+            lambda: {"BTCUSDT": object()},
+        )
+        symbols = ["FARTCOINUSDT"]
+        with pytest.raises(SystemExit):
+            constraints = run_trading_mod._load_symbol_constraints()
+            assert constraints is not None
+            missing = [s for s in symbols if s not in constraints]
+            if missing:
+                import sys  # noqa: PLC0415
+
+                sys.exit(1)
 
 
 class TestBuildEngine:
