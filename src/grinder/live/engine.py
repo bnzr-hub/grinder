@@ -834,7 +834,18 @@ class LiveEngineV0:
             return []
 
         actions: list[ExecutionAction] = []
-        for cid in sorted(filled_cids):  # P1-2: deterministic order
+
+        # Deterministic order with EXIT before ENTRY.
+        # This lets same-tick "exit + opposite entry" sequences flatten first,
+        # reducing branch-incompatible rejects in one-sided inventory mode.
+        def _fill_priority(fill_cid: str) -> tuple[int, str]:
+            if bridge.adapter.registry.lookup_exit(fill_cid) is not None:
+                return (0, fill_cid)
+            if bridge.adapter.registry.lookup_entry(fill_cid) is not None:
+                return (1, fill_cid)
+            return (2, fill_cid)
+
+        for cid in sorted(filled_cids, key=_fill_priority):
             entry_reg = bridge.adapter.registry.lookup_entry(cid)
             if entry_reg is not None:
                 result = bridge.on_fill(
@@ -844,6 +855,14 @@ class LiveEngineV0:
                     bridge._config.order_size,
                     ts,
                 )
+                if result.rejected:
+                    bridge.adapter.confirm_cancel_entry(cid)
+                    logger.warning(
+                        "GRID_V2_REJECTED_FILL_CLEANED cid=%s kind=entry reason=%s",
+                        cid,
+                        result.reject_reason or "?",
+                    )
+                    continue
                 actions.extend(result.execution_actions)
                 continue
 
@@ -860,6 +879,14 @@ class LiveEngineV0:
                 bridge._config.order_size,
                 ts,
             )
+            if result.rejected:
+                bridge.adapter.confirm_cancel_exit(cid)
+                logger.warning(
+                    "GRID_V2_REJECTED_FILL_CLEANED cid=%s kind=exit reason=%s",
+                    cid,
+                    result.reject_reason or "?",
+                )
+                continue
             actions.extend(result.execution_actions)
 
         return actions

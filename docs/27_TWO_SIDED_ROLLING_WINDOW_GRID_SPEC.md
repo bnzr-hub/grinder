@@ -284,16 +284,16 @@ SSOT for order ownership.
 * at least one open long lot
 * no short lots allowed
 * each long lot has paired sell exit
-* **opposite-side sell-entry orders suppressed** (strict one-sided branch)
-* only buy-entries below + sell-exits above
+* entry window stays two-sided but rolls with each accepted buy fill
+* opposite-side sell-entry fills are rejected while mode remains `LONG_BRANCH` (`BRANCH_INCOMPATIBLE`)
 
 ### 8.3 SHORT_BRANCH
 
 * at least one open short lot
 * no long lots allowed
 * each short lot has paired buy exit
-* **opposite-side buy-entry orders suppressed** (strict one-sided branch)
-* only sell-entries above + buy-exits below
+* entry window stays two-sided but rolls with each accepted sell fill
+* opposite-side buy-entry fills are rejected while mode remains `SHORT_BRANCH` (`BRANCH_INCOMPATIBLE`)
 
 ---
 
@@ -338,10 +338,10 @@ Actions:
 2. Create paired `SELL exit` at `entry_price + 1 step`
 3. Remove filled buy-entry from window
 4. Add new farthest buy-entry one step lower than current lowest
-5. **Remove ALL sell-entry orders** (strict one-sided branch per D1)
+5. Remove one farthest sell-entry level (opposite-edge trim)
 6. mode -> `LONG_BRANCH`
 
-Post-condition: entry window contains only buy-entries. No sell-entries exist.
+Post-condition: entry window remains bounded and two-sided; opposite side is trimmed by one level.
 
 ### 11.2 FLAT + EntryFilled(SELL)
 
@@ -352,10 +352,10 @@ Actions:
 2. Create paired `BUY exit` at `entry_price - 1 step`
 3. Remove filled sell-entry from window
 4. Add new farthest sell-entry one step higher than current highest
-5. **Remove ALL buy-entry orders** (strict one-sided branch per D1)
+5. Remove one farthest buy-entry level (opposite-edge trim)
 6. mode -> `SHORT_BRANCH`
 
-Post-condition: entry window contains only sell-entries. No buy-entries exist.
+Post-condition: entry window remains bounded and two-sided; opposite side is trimmed by one level.
 
 ### 11.3 LONG_BRANCH + EntryFilled(BUY)
 
@@ -366,13 +366,14 @@ Actions:
 2. Create paired `SELL exit` one step above its entry
 3. Remove filled buy-entry from window
 4. Add new farthest buy-entry one step lower than current lowest
-5. mode remains `LONG_BRANCH`
+5. Remove one farthest sell-entry level (opposite-edge trim)
+6. mode remains `LONG_BRANCH`
 
-Note: no opposite-side removal needed -- sell-entries were already fully removed on branch entry (11.1).
+Note: rolling trim applies on every accepted branch-compatible entry fill.
 
 ### 11.4 SHORT_BRANCH + EntryFilled(SELL)
 
-Symmetric to 11.3. No opposite-side removal needed -- buy-entries were already fully removed on branch entry (11.2).
+Symmetric to 11.3, including one-level opposite-edge trim per accepted fill.
 
 ### 11.5 LONG_BRANCH + ExitFilled(SELL)
 
@@ -382,7 +383,7 @@ Actions:
 1. Mark corresponding long lot `CLOSED`
 2. Remove/close corresponding exit order
 3. If open long lots remain: mode remains `LONG_BRANCH`
-4. If no open lots remain: mode -> `FLAT`, trigger flat normalization
+4. If no open lots remain: mode -> `FLAT`, keep rolled window (optional explicit recenter)
 
 ### 11.6 SHORT_BRANCH + ExitFilled(BUY)
 
@@ -394,16 +395,17 @@ Symmetric to 11.5.
 
 These are binding for v1 implementation.
 
-### D1. Active branch mode: strict one-sided branch
+### D1. Active branch mode: one-sided inventory, two-sided rolling entries
 
 **Choice: YES.**
-When branch is active, only branch-compatible entries remain.
-Opposite-side entry orders that would open forbidden inventory are **suppressed**.
+When branch is active, inventory remains one-sided, but entry window remains two-sided and bounded.
+Each accepted branch-compatible fill rolls the window and trims one farthest level on the opposite side.
+Opposite-side entry fills are rejected by branch gate while branch mode is active.
 
-In `LONG_BRANCH`: only buy-entries below + sell-exits above.
-In `SHORT_BRANCH`: only sell-entries above + buy-exits below.
+In `LONG_BRANCH`: accepted fills are `BUY` only.
+In `SHORT_BRANCH`: accepted fills are `SELL` only.
 
-**Rationale:** simplest to reason about, safest, eliminates mixed-inventory edge cases entirely.
+**Rationale:** preserves rolling two-sided market coverage while keeping mixed inventory forbidden.
 
 ### D2. Full recenter: flat only
 
@@ -424,7 +426,8 @@ Rolling/recenter logic never touches exits.
 ### D5. Flat normalization: soft recenter in flat (Option B)
 
 **Choice: Option B -- soft recenter.**
-When branch fully unwinds to FLAT, rebuild entry window symmetrically around current mid/reference.
+When branch fully unwinds to FLAT, keep the current rolled entry window.
+Optional explicit `RecenterRequested` may rebuild it symmetrically around a new reference.
 
 **Rationale:** avoids drift accumulation from asymmetric unwind sequences.
 Cleaner operationally than keep-as-is (Option A).
@@ -456,14 +459,16 @@ Recenter forbidden if ANY condition true:
 ### During LONG_BRANCH
 
 * maintain buy-entry chain below (up to `N_buy` levels)
+* maintain sell-entry chain above (opposite side, trimmed by rolling)
 * sell-exit orders above for open long lots
-* **no sell-entry orders** (would open short inventory)
+* opposite-side fill attempts are rejected by branch gate (`BRANCH_INCOMPATIBLE`)
 
 ### During SHORT_BRANCH
 
 * maintain sell-entry chain above (up to `N_sell` levels)
+* maintain buy-entry chain below (opposite side, trimmed by rolling)
 * buy-exit orders below for open short lots
-* **no buy-entry orders** (would open long inventory)
+* opposite-side fill attempts are rejected by branch gate (`BRANCH_INCOMPATIBLE`)
 
 ---
 
@@ -676,20 +681,14 @@ They are normative for the pure state machine implementation.
 ### 21.1 Flat normalization contract
 
 When the last open lot is closed (rules 11.5/11.6), the state machine transitions to
-`mode = FLAT` and **clears the entry window** (buy/sell price tuples become empty,
-`reference_price` preserved for audit).
+`mode = FLAT` and preserves the current rolled entry window.
 
-The state machine does not hold market data and cannot determine a new reference price.
-The caller (execution/reconciliation layer, PR3+) must send an explicit
-`RecenterRequested(new_reference_price, ts)` to rebuild the entry window.
-
-**State-level inactivity guarantee:** After full unwind, the entry window is empty.
-Any `EntryFilled` event is rejected by 21.6 (price not in active window) because
-there are no active entries. No separate "inactive" flag needed — empty window = inactive.
+The state machine does not hold market data and does not auto-recenter.
+The caller (execution/reconciliation layer, PR3+) may send explicit
+`RecenterRequested(new_reference_price, ts)` to normalize around a new reference.
 
 This is the PR2 interpretation of D5 ("soft recenter"). The "soft" refers to
-rebuilding the window symmetrically around a new reference, not to automatic
-triggering. Triggering is the caller's responsibility.
+explicit optional normalization around a new reference, not to automatic triggering.
 
 ### 21.2 OperatorCleanup semantics
 
@@ -794,7 +793,7 @@ of the entry window:
 4. Emit one `PLACE_ENTRY` per new level in the rebuilt window.
 
 **Action sequence:** `[CANCEL_ENTRY for old entries, ..., PLACE_ENTRY for new entries, ...]`
-If old window was empty (normal post-unwind case per 21.1): only `PLACE_ENTRY` emitted.
+If old window is empty: only `PLACE_ENTRY` emitted.
 
 The entry window after recenter is identical to `create_initial()` output
 for the same reference price.
@@ -827,7 +826,7 @@ Closed set of `reason` strings for `ActionIntent`:
 | `PLACE_EXIT` | `"PAIRED_EXIT_FOR_LOT"` | exit order for new lot (11.1-11.4) |
 | `PLACE_ENTRY` | `"FILL_REPLACEMENT"` | new farthest entry replacing filled level |
 | `PLACE_ENTRY` | `"RECENTER"` | entry from recenter rebuild |
-| `CANCEL_ENTRY` | `"BRANCH_SUPPRESS"` | opposite-side suppression on branch entry (D1) |
+| `CANCEL_ENTRY` | `"ROLLING_TRIM"` | opposite-side far-edge trim on accepted entry fill |
 | `CANCEL_ENTRY` | `"EMERGENCY_STOP"` | entry canceled by emergency stop |
 | `CANCEL_ENTRY` | `"OPERATOR_CLEANUP"` | entry canceled by cleanup |
 | `CANCEL_ENTRY` | `"RECENTER_REPLACE"` | old entry removed before recenter rebuild |
@@ -1210,6 +1209,9 @@ adapter, and returns `ExecutionAction` tuples for initial PLACE_ENTRY orders.
 | Exit CID, SM accepts | Confirm fill, resolve actions (window shifts), return ExecutionActions |
 | Any CID, SM rejects | `FillResult(rejected=True, reject_reason=...)` — no confirm, no actions |
 
+Bridge contract is intentionally local: on reject, bridge does not mutate registry.
+Engine-level disappeared-fill handling may apply additional cleanup policy (23.9).
+
 ### 23.4 Cancel ack lifecycle
 
 `on_cancel_ack(cid)` → `CancelAckResult`:
@@ -1300,6 +1302,9 @@ class CancelAckResult:
 4. On each subsequent tick where `_is_grid_v2_active(symbol)`:
    - `_grid_v2_process_cancel_acks()` detects confirmed cancels via pending-cancel set
    - `_grid_v2_process_fills()` detects fills via registry-vs-exchange diff
+   - fill processing order is deterministic: EXIT CIDs first, then ENTRY CIDs
+   - if a disappeared CID maps to a rejected fill, engine removes that CID from
+     registry (`confirm_cancel_*`) and logs `GRID_V2_REJECTED_FILL_CLEANED`
    - Dispatched CANCEL actions tracked in `_grid_v2_pending_cancels`
    - Fill actions replace legacy planner output for that symbol
 5. Legacy planner/paper engine skipped for the grid_v2 symbol (never falls through)

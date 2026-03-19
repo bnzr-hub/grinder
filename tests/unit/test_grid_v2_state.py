@@ -146,8 +146,9 @@ class TestInitialPlacement:
 
 class TestFirstEntryFill:
     def test_buy_creates_long_branch(self) -> None:
-        """T2: BUY fill -> LONG_BRANCH + SELL exit + opposite entries removed."""
+        """T2: BUY fill -> LONG_BRANCH + SELL exit + opposite side trimmed by 1."""
         sm = _sm()
+        initial_sells = sm.snapshot.entry_window.sell_entry_prices
         buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
         result = sm.apply(EntryFilled("E1", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1))
 
@@ -159,12 +160,13 @@ class TestFirstEntryFill:
         assert snap.open_lots[0].entry_price == buy_price
         assert len(snap.exit_orders) == 1
         assert snap.exit_orders[0].side == OrderSide.SELL
-        # All sell entries removed (D1 branch suppress)
-        assert snap.entry_window.sell_entry_prices == ()
+        # Opposite side keeps nearest levels, far edge is trimmed.
+        assert snap.entry_window.sell_entry_prices == initial_sells[:-1]
 
     def test_sell_creates_short_branch(self) -> None:
-        """T3: SELL fill -> SHORT_BRANCH + BUY exit + opposite entries removed."""
+        """T3: SELL fill -> SHORT_BRANCH + BUY exit + opposite side trimmed by 1."""
         sm = _sm()
+        initial_buys = sm.snapshot.entry_window.buy_entry_prices
         sell_price = sm.snapshot.entry_window.sell_entry_prices[0]
         result = sm.apply(EntryFilled("E1", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 1))
 
@@ -175,8 +177,8 @@ class TestFirstEntryFill:
         assert snap.open_lots[0].side == LotSide.SHORT
         assert len(snap.exit_orders) == 1
         assert snap.exit_orders[0].side == OrderSide.BUY
-        # All buy entries removed
-        assert snap.entry_window.buy_entry_prices == ()
+        # Opposite side keeps nearest levels, far edge is trimmed.
+        assert snap.entry_window.buy_entry_prices == initial_buys[:-1]
 
     def test_action_order_correct(self) -> None:
         """Actions: PLACE_EXIT -> CANCEL_ENTRY(s) -> PLACE_ENTRY."""
@@ -199,19 +201,24 @@ class TestFirstEntryFill:
 
 class TestBranchContinuation:
     def test_long_continuation(self) -> None:
-        """T4: Second BUY in LONG_BRANCH continues, no opposite cancel."""
+        """T4: Second BUY in LONG_BRANCH continues and trims opposite far edge."""
         sm = _sm()
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
+        sells_before = sm.snapshot.entry_window.sell_entry_prices
         buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
         result = sm.apply(EntryFilled("E2", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 2))
 
         assert not result.rejected
         assert result.snapshot.mode == BranchMode.LONG_BRANCH
         assert len(result.snapshot.open_lots) == 2
-        # No CANCEL_ENTRY for sells (already suppressed on first entry)
+        # One opposite far-edge trim per fill.
         cancel_entries = [a for a in result.actions if a.kind == ActionIntentKind.CANCEL_ENTRY]
-        assert len(cancel_entries) == 0
+        assert len(cancel_entries) == 1
+        assert cancel_entries[0].side == OrderSide.SELL
+        assert cancel_entries[0].reason == "ROLLING_TRIM"
+        assert cancel_entries[0].price == sells_before[-1]
+        assert result.snapshot.entry_window.sell_entry_prices == sells_before[:-1]
 
     def test_short_continuation(self) -> None:
         """T5: Second SELL in SHORT_BRANCH continues."""
@@ -345,10 +352,11 @@ class TestExitPairIntegrity:
 
 class TestFullUnwind:
     def test_last_exit_goes_flat(self) -> None:
-        """T8: Last exit -> FLAT, window cleared."""
+        """T8: Last exit -> FLAT, entry window preserved."""
         sm = _sm()
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
+        window_before_exit = sm.snapshot.entry_window
 
         lot = sm.snapshot.open_lots[0]
         exit_eo = sm.snapshot.exit_orders[0]
@@ -361,14 +369,14 @@ class TestFullUnwind:
         assert snap.mode == BranchMode.FLAT
         assert snap.open_lots == ()
         assert len(snap.closed_lots) == 1
-        # Window cleared (empty tuples)
-        assert snap.entry_window.buy_entry_prices == ()
-        assert snap.entry_window.sell_entry_prices == ()
+        # Rolling entry window is preserved; recenter remains optional.
+        assert snap.entry_window.buy_entry_prices == window_before_exit.buy_entry_prices
+        assert snap.entry_window.sell_entry_prices == window_before_exit.sell_entry_prices
         # Reference preserved
         assert snap.entry_window.reference_price == _REF_PRICE
 
     def test_entry_before_recenter_rejected(self) -> None:
-        """EntryFilled on empty window rejected (21.6)."""
+        """Filled price that left the active window is rejected (21.6)."""
         sm = _sm()
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
@@ -378,7 +386,7 @@ class TestFullUnwind:
             ExitFilled(exit_eo.exit_order_id, lot.lot_id, lot.exit_price, _ORDER_SIZE, _BASE_TS + 2)
         )
 
-        # Now FLAT with empty window — any entry should be rejected
+        # Filled level is consumed and no longer active.
         result = sm.apply(EntryFilled("E2", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 3))
         assert result.rejected
         assert result.reject_reason == "PRICE_NOT_IN_ACTIVE_WINDOW"
@@ -410,7 +418,7 @@ class TestFullUnwind:
         assert not r2.rejected
         assert r2.snapshot.mode == BranchMode.FLAT
         assert r2.snapshot.open_lots == ()
-        assert r2.snapshot.entry_window.buy_entry_prices == ()
+        assert len(r2.snapshot.entry_window.buy_entry_prices) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -514,8 +522,7 @@ class TestMixedInventoryForbidden:
         )
         result = sm.apply(EntryFilled("E2", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 2))
         assert result.rejected
-        # Either BRANCH_INCOMPATIBLE or PRICE_NOT_IN_ACTIVE_WINDOW (buys suppressed)
-        assert result.reject_reason in ("BRANCH_INCOMPATIBLE", "PRICE_NOT_IN_ACTIVE_WINDOW")
+        assert result.reject_reason == "BRANCH_INCOMPATIBLE"
 
     def test_sell_in_long_rejected(self) -> None:
         sm = _sm()
@@ -528,7 +535,7 @@ class TestMixedInventoryForbidden:
         )
         result = sm.apply(EntryFilled("E2", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 2))
         assert result.rejected
-        assert result.reject_reason in ("BRANCH_INCOMPATIBLE", "PRICE_NOT_IN_ACTIVE_WINDOW")
+        assert result.reject_reason == "BRANCH_INCOMPATIBLE"
 
 
 # ---------------------------------------------------------------------------
@@ -580,8 +587,8 @@ class TestActiveEntryValidation:
         assert result.rejected
         assert result.reject_reason == "PRICE_NOT_IN_ACTIVE_WINDOW"
 
-    def test_fill_on_empty_window_rejected(self) -> None:
-        """Post-unwind empty window rejects any entry."""
+    def test_stale_filled_level_rejected(self) -> None:
+        """Post-unwind, consumed price outside active window is rejected."""
         sm = _sm()
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
@@ -1049,12 +1056,12 @@ class TestActionReasons:
         pe = next(a for a in result.actions if a.kind == ActionIntentKind.PLACE_ENTRY)
         assert pe.reason == "FILL_REPLACEMENT"
 
-    def test_cancel_entry_branch_suppress(self) -> None:
+    def test_cancel_entry_rolling_trim(self) -> None:
         sm = _sm()
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         result = sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
         ce = [a for a in result.actions if a.kind == ActionIntentKind.CANCEL_ENTRY]
-        assert all(a.reason == "BRANCH_SUPPRESS" for a in ce)
+        assert all(a.reason == "ROLLING_TRIM" for a in ce)
 
     def test_recenter_reasons(self) -> None:
         sm = _sm()
