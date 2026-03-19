@@ -407,7 +407,6 @@ class GridV2StateMachine:
         """Execute a validated entry fill."""
         snap = self._snapshot
         cfg = self._config
-        was_flat = snap.mode == BranchMode.FLAT
 
         if event.side == OrderSide.BUY:
             lot_side, exit_side = LotSide.LONG, OrderSide.SELL
@@ -447,11 +446,8 @@ class GridV2StateMachine:
             ),
         ]
 
-        if was_flat:
-            actions.extend(self._branch_suppress_actions(event.side))
-
-        new_window, place_action = self._update_window_after_fill(event, was_flat)
-        actions.append(place_action)
+        new_window, rolling_actions = self._update_window_after_fill(event)
+        actions.extend(rolling_actions)
 
         new_mode = BranchMode.LONG_BRANCH if lot_side == LotSide.LONG else BranchMode.SHORT_BRANCH
         new_snapshot = GridV2Snapshot(
@@ -465,61 +461,74 @@ class GridV2StateMachine:
         )
         return self._commit(new_snapshot, tuple(actions))
 
-    def _branch_suppress_actions(self, fill_side: OrderSide) -> list[ActionIntent]:
-        """Generate CANCEL_ENTRY actions for opposite-side entries (D1)."""
-        window = self._snapshot.entry_window
-        if fill_side == OrderSide.BUY:
-            return [
-                ActionIntent(
-                    kind=ActionIntentKind.CANCEL_ENTRY,
-                    side=OrderSide.SELL,
-                    price=p,
-                    reason="BRANCH_SUPPRESS",
-                )
-                for p in window.sell_entry_prices
-            ]
-        return [
-            ActionIntent(
-                kind=ActionIntentKind.CANCEL_ENTRY,
-                side=OrderSide.BUY,
-                price=p,
-                reason="BRANCH_SUPPRESS",
-            )
-            for p in window.buy_entry_prices
-        ]
-
     def _update_window_after_fill(
-        self, event: EntryFilled, was_flat: bool
-    ) -> tuple[EntryWindow, ActionIntent]:
-        """Remove filled price, add new farthest, return (new_window, place_action)."""
+        self, event: EntryFilled
+    ) -> tuple[EntryWindow, tuple[ActionIntent, ...]]:
+        """Apply rolling-window update for an accepted entry fill.
+
+        Rolling rule:
+        - extend entries on the fill side with one new farthest level
+        - trim one farthest level from the opposite side
+        - opposite trim emits one CANCEL_ENTRY action
+        - replacement PLACE_ENTRY emits only when replacement gate allows it
+        """
         window = self._snapshot.entry_window
         cfg = self._config
+        actions: list[ActionIntent] = []
 
         if event.side == OrderSide.BUY:
             remaining = tuple(p for p in window.buy_entry_prices if p != event.price)
             farthest = remaining[-1] if remaining else event.price
             new_farthest = farthest * (Decimal(1) - cfg.grid_step_pct)
+            if window.sell_entry_prices:
+                trimmed = window.sell_entry_prices[-1]
+                new_sells = window.sell_entry_prices[:-1]
+                actions.append(
+                    ActionIntent(
+                        kind=ActionIntentKind.CANCEL_ENTRY,
+                        side=OrderSide.SELL,
+                        price=trimmed,
+                        reason="ROLLING_TRIM",
+                    )
+                )
+            else:
+                new_sells = ()
             new_buys = (*remaining, new_farthest)[: cfg.entry_levels_per_side]
-            new_sells = () if was_flat else window.sell_entry_prices
-            action = ActionIntent(
-                kind=ActionIntentKind.PLACE_ENTRY,
-                side=OrderSide.BUY,
-                price=new_farthest,
-                qty=cfg.order_size,
-                reason="FILL_REPLACEMENT",
+            actions.append(
+                ActionIntent(
+                    kind=ActionIntentKind.PLACE_ENTRY,
+                    side=OrderSide.BUY,
+                    price=new_farthest,
+                    qty=cfg.order_size,
+                    reason="FILL_REPLACEMENT",
+                )
             )
         else:
             remaining = tuple(p for p in window.sell_entry_prices if p != event.price)
             farthest = remaining[-1] if remaining else event.price
             new_farthest = farthest * (Decimal(1) + cfg.grid_step_pct)
+            if window.buy_entry_prices:
+                trimmed = window.buy_entry_prices[-1]
+                new_buys = window.buy_entry_prices[:-1]
+                actions.append(
+                    ActionIntent(
+                        kind=ActionIntentKind.CANCEL_ENTRY,
+                        side=OrderSide.BUY,
+                        price=trimmed,
+                        reason="ROLLING_TRIM",
+                    )
+                )
+            else:
+                new_buys = ()
             new_sells = (*remaining, new_farthest)[: cfg.entry_levels_per_side]
-            new_buys = () if was_flat else window.buy_entry_prices
-            action = ActionIntent(
-                kind=ActionIntentKind.PLACE_ENTRY,
-                side=OrderSide.SELL,
-                price=new_farthest,
-                qty=cfg.order_size,
-                reason="FILL_REPLACEMENT",
+            actions.append(
+                ActionIntent(
+                    kind=ActionIntentKind.PLACE_ENTRY,
+                    side=OrderSide.SELL,
+                    price=new_farthest,
+                    qty=cfg.order_size,
+                    reason="FILL_REPLACEMENT",
+                )
             )
 
         new_window = EntryWindow(
@@ -529,7 +538,7 @@ class GridV2StateMachine:
             levels_per_side=window.levels_per_side,
             step_pct=window.step_pct,
         )
-        return new_window, action
+        return new_window, tuple(actions)
 
     def _apply_exit_filled(self, event: ExitFilled) -> TransitionResult:
         snap = self._snapshot
@@ -579,7 +588,7 @@ class GridV2StateMachine:
 
         if not new_open:
             new_mode = BranchMode.FLAT
-            new_window = _empty_entry_window(snap.entry_window)
+            new_window = snap.entry_window
         else:
             new_mode = snap.mode
             new_window = snap.entry_window

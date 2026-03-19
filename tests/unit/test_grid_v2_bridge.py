@@ -909,7 +909,7 @@ class TestActionConversion:
     def test_cancel_action_conversion(self) -> None:
         """CANCEL actions use CID as order_id."""
         b, seed = _fresh_bridge()
-        # Force a fill to get cancel actions (branch suppression)
+        # Force a fill to get cancel actions (rolling opposite-edge trim)
         buy_seed = [s for s in seed if s.side == OrderSide.BUY]
         buy_cid = buy_seed[0].client_order_id
         buy_price = buy_seed[0].price
@@ -920,6 +920,141 @@ class TestActionConversion:
         for c in cancels:
             assert c.order_id is not None
             assert c.reason.startswith("grid_v2_CANCEL_")
+
+
+class TestEngineFillOrdering:
+    """Engine fill ordering for same-tick disappeared CIDs."""
+
+    def test_exit_is_processed_before_entry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Exit-first processing allows branch transition before opposite entry fill."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # Startup fresh bridge
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        # Enable fill detection and remove startup visibility gates.
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        # Create LONG branch via one BUY entry fill.
+        buy_cid = next(
+            cid
+            for cid in sorted(bridge.adapter.registry.all_entry_cids)
+            if (reg := bridge.adapter.registry.lookup_entry(cid)) is not None
+            and reg.side == OrderSide.BUY
+        )
+        buy_reg = bridge.adapter.registry.lookup_entry(buy_cid)
+        assert buy_reg is not None
+        first_fill = bridge.on_fill(
+            buy_cid,
+            buy_reg.side,
+            buy_reg.price,
+            _ORDER_SIZE,
+            _BASE_TS + 1_000,
+        )
+        assert not first_fill.rejected
+        sm_before = bridge.state_machine
+        assert sm_before is not None
+        assert sm_before.mode == BranchMode.LONG_BRANCH
+
+        # Pick one exit CID and one SELL-entry CID to disappear in the same tick.
+        exit_cid = next(iter(bridge.adapter.registry.all_exit_cids))
+        sell_entry_cid = next(
+            cid
+            for cid in sorted(bridge.adapter.registry.all_entry_cids)
+            if (reg := bridge.adapter.registry.lookup_entry(cid)) is not None
+            and reg.side == OrderSide.SELL
+        )
+
+        # Exchange snapshot: both selected CIDs disappeared.
+        surviving_orders: list[OpenOrderSnap] = []
+        for cid in sorted(
+            set(bridge.adapter.registry.all_entry_cids) | set(bridge.adapter.registry.all_exit_cids)
+        ):
+            if cid in {exit_cid, sell_entry_cid}:
+                continue
+            entry_reg = bridge.adapter.registry.lookup_entry(cid)
+            if entry_reg is not None:
+                surviving_orders.append(
+                    OpenOrderSnap(
+                        order_id=cid,
+                        symbol="BTCUSDT",
+                        side=entry_reg.side.value,
+                        order_type="LIMIT",
+                        price=entry_reg.price,
+                        qty=_ORDER_SIZE,
+                        filled_qty=Decimal(0),
+                        reduce_only=False,
+                        status="NEW",
+                        ts=_BASE_TS + 2_000,
+                    )
+                )
+                continue
+            exit_reg = bridge.adapter.registry.lookup_exit(cid)
+            if exit_reg is not None:
+                surviving_orders.append(
+                    OpenOrderSnap(
+                        order_id=cid,
+                        symbol="BTCUSDT",
+                        side=OrderSide.SELL.value,
+                        order_type="LIMIT",
+                        price=Decimal("1"),
+                        qty=_ORDER_SIZE,
+                        filled_qty=Decimal(0),
+                        reduce_only=True,
+                        status="NEW",
+                        ts=_BASE_TS + 2_000,
+                    )
+                )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(surviving_orders),
+            ts=_BASE_TS + 2_000,
+            source="test",
+        )
+
+        actions = engine._grid_v2_process_fills("BTCUSDT", _BASE_TS + 2_000)
+
+        sm_after = bridge.state_machine
+        assert sm_after is not None
+        assert sm_after.mode == BranchMode.SHORT_BRANCH
+        assert any(a.reason == "grid_v2_PLACE_EXIT" for a in actions)
 
 
 class TestFullLifecycle:
