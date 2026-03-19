@@ -412,7 +412,7 @@ class TestExitPairIntegrity:
 
 class TestFullUnwind:
     def test_last_exit_goes_flat(self) -> None:
-        """T8: Last exit -> FLAT, entry window preserved."""
+        """T8: Last exit -> FLAT, entry window reseeds symmetrically."""
         sm = _sm()
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
@@ -429,14 +429,46 @@ class TestFullUnwind:
         assert snap.mode == BranchMode.FLAT
         assert snap.open_lots == ()
         assert len(snap.closed_lots) == 1
-        # Rolling entry window is preserved; recenter remains optional.
-        assert snap.entry_window.buy_entry_prices == window_before_exit.buy_entry_prices
-        assert snap.entry_window.sell_entry_prices == window_before_exit.sell_entry_prices
-        # Reference preserved
-        assert snap.entry_window.reference_price == _REF_PRICE
+        assert any(a.kind == ActionIntentKind.CANCEL_ENTRY for a in result.actions)
+        assert any(a.kind == ActionIntentKind.PLACE_ENTRY for a in result.actions)
 
-    def test_entry_before_recenter_rejected(self) -> None:
-        """Filled price that left the active window is rejected (21.6)."""
+        fresh = GridV2StateMachine.create_initial(
+            _config(), window_before_exit.reference_price, _BASE_TS + 2
+        )
+        assert snap.entry_window.buy_entry_prices == fresh.snapshot.entry_window.buy_entry_prices
+        assert snap.entry_window.sell_entry_prices == fresh.snapshot.entry_window.sell_entry_prices
+        assert snap.entry_window.reference_price == window_before_exit.reference_price
+
+    def test_short_last_exit_goes_flat(self) -> None:
+        """T8: Short unwind to FLAT reseeds the symmetric entry window."""
+        sm = _sm()
+        sell1 = sm.snapshot.entry_window.sell_entry_prices[0]
+        sm.apply(EntryFilled("E1", OrderSide.SELL, sell1, _ORDER_SIZE, _BASE_TS + 1))
+        window_before_exit = sm.snapshot.entry_window
+
+        lot = sm.snapshot.open_lots[0]
+        exit_eo = sm.snapshot.exit_orders[0]
+        result = sm.apply(
+            ExitFilled(exit_eo.exit_order_id, lot.lot_id, lot.exit_price, _ORDER_SIZE, _BASE_TS + 2)
+        )
+
+        assert not result.rejected
+        snap = result.snapshot
+        assert snap.mode == BranchMode.FLAT
+        assert snap.open_lots == ()
+        assert len(snap.closed_lots) == 1
+        assert any(a.kind == ActionIntentKind.CANCEL_ENTRY for a in result.actions)
+        assert any(a.kind == ActionIntentKind.PLACE_ENTRY for a in result.actions)
+
+        fresh = GridV2StateMachine.create_initial(
+            _config(), window_before_exit.reference_price, _BASE_TS + 2
+        )
+        assert snap.entry_window.buy_entry_prices == fresh.snapshot.entry_window.buy_entry_prices
+        assert snap.entry_window.sell_entry_prices == fresh.snapshot.entry_window.sell_entry_prices
+        assert snap.entry_window.reference_price == window_before_exit.reference_price
+
+    def test_entry_after_flat_reseed_reactivates_consumed_price(self) -> None:
+        """After full unwind, the consumed price becomes active again."""
         sm = _sm()
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
@@ -446,10 +478,10 @@ class TestFullUnwind:
             ExitFilled(exit_eo.exit_order_id, lot.lot_id, lot.exit_price, _ORDER_SIZE, _BASE_TS + 2)
         )
 
-        # Filled level is consumed and no longer active.
         result = sm.apply(EntryFilled("E2", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 3))
-        assert result.rejected
-        assert result.reject_reason == "PRICE_NOT_IN_ACTIVE_WINDOW"
+        assert not result.rejected
+        assert result.snapshot.mode == BranchMode.LONG_BRANCH
+        assert len(result.snapshot.open_lots) == 1
 
     def test_multi_lot_unwind(self) -> None:
         """Multiple lots unwound one by one."""
@@ -478,7 +510,10 @@ class TestFullUnwind:
         assert not r2.rejected
         assert r2.snapshot.mode == BranchMode.FLAT
         assert r2.snapshot.open_lots == ()
-        assert len(r2.snapshot.entry_window.buy_entry_prices) > 0
+        assert any(a.kind == ActionIntentKind.CANCEL_ENTRY for a in r2.actions)
+        assert any(a.kind == ActionIntentKind.PLACE_ENTRY for a in r2.actions)
+        assert len(r2.snapshot.entry_window.buy_entry_prices) == _config().entry_levels_per_side
+        assert len(r2.snapshot.entry_window.sell_entry_prices) == _config().entry_levels_per_side
 
 
 # ---------------------------------------------------------------------------
@@ -647,19 +682,20 @@ class TestActiveEntryValidation:
         assert result.rejected
         assert result.reject_reason == "PRICE_NOT_IN_ACTIVE_WINDOW"
 
-    def test_stale_filled_level_rejected(self) -> None:
-        """Post-unwind, consumed price outside active window is rejected."""
+    def test_sell_after_flat_reseed_reactivates_consumed_price(self) -> None:
+        """After full unwind, the consumed SELL price becomes active again."""
         sm = _sm()
-        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
-        sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
+        sell1 = sm.snapshot.entry_window.sell_entry_prices[0]
+        sm.apply(EntryFilled("E1", OrderSide.SELL, sell1, _ORDER_SIZE, _BASE_TS + 1))
         lot = sm.snapshot.open_lots[0]
         exit_eo = sm.snapshot.exit_orders[0]
         sm.apply(
             ExitFilled(exit_eo.exit_order_id, lot.lot_id, lot.exit_price, _ORDER_SIZE, _BASE_TS + 2)
         )
-        result = sm.apply(EntryFilled("E2", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 3))
-        assert result.rejected
-        assert result.reject_reason == "PRICE_NOT_IN_ACTIVE_WINDOW"
+        result = sm.apply(EntryFilled("E2", OrderSide.SELL, sell1, _ORDER_SIZE, _BASE_TS + 3))
+        assert not result.rejected
+        assert result.snapshot.mode == BranchMode.SHORT_BRANCH
+        assert len(result.snapshot.open_lots) == 1
 
 
 # ---------------------------------------------------------------------------

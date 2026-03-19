@@ -588,6 +588,8 @@ class GridV2StateMachine:
 
         actions: list[ActionIntent] = []
         new_window = snap.entry_window
+        new_mode = BranchMode.FLAT if not new_open else snap.mode
+        new_last_recenter_ts = snap.last_recenter_ts
         if new_open:
             step_delta = snap.entry_window.reference_price * self._config.grid_step_pct
             if snap.mode == BranchMode.LONG_BRANCH:
@@ -640,8 +642,51 @@ class GridV2StateMachine:
                     levels_per_side=snap.entry_window.levels_per_side,
                     step_pct=snap.entry_window.step_pct,
                 )
-
-        new_mode = BranchMode.FLAT if not new_open else snap.mode
+        else:
+            new_window = _build_entry_window(
+                snap.entry_window.reference_price,
+                self._config.entry_levels_per_side,
+                self._config.grid_step_pct,
+            )
+            actions.extend(
+                ActionIntent(
+                    kind=ActionIntentKind.CANCEL_ENTRY,
+                    side=OrderSide.BUY,
+                    price=p,
+                    reason="RECENTER_REPLACE",
+                )
+                for p in snap.entry_window.buy_entry_prices
+            )
+            actions.extend(
+                ActionIntent(
+                    kind=ActionIntentKind.CANCEL_ENTRY,
+                    side=OrderSide.SELL,
+                    price=p,
+                    reason="RECENTER_REPLACE",
+                )
+                for p in snap.entry_window.sell_entry_prices
+            )
+            actions.extend(
+                ActionIntent(
+                    kind=ActionIntentKind.PLACE_ENTRY,
+                    side=OrderSide.BUY,
+                    price=p,
+                    qty=self._config.order_size,
+                    reason="RECENTER",
+                )
+                for p in new_window.buy_entry_prices
+            )
+            actions.extend(
+                ActionIntent(
+                    kind=ActionIntentKind.PLACE_ENTRY,
+                    side=OrderSide.SELL,
+                    price=p,
+                    qty=self._config.order_size,
+                    reason="RECENTER",
+                )
+                for p in new_window.sell_entry_prices
+            )
+            new_last_recenter_ts = event.ts
 
         new_snapshot = GridV2Snapshot(
             mode=new_mode,
@@ -650,7 +695,7 @@ class GridV2StateMachine:
             closed_lots=new_closed,
             exit_orders=new_exits,
             emergency_stopped=snap.emergency_stopped,
-            last_recenter_ts=snap.last_recenter_ts,
+            last_recenter_ts=new_last_recenter_ts,
         )
         return self._commit(new_snapshot, tuple(actions))
 

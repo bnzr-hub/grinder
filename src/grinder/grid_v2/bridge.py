@@ -32,6 +32,8 @@ from grinder.grid_v2.adapter import (
 )
 from grinder.grid_v2.state import (
     ActionIntentKind,
+    EntryFilled,
+    ExitFilled,
     GridV2Config,
     GridV2StateMachine,
     TransitionResult,
@@ -197,6 +199,7 @@ class GridV2Bridge:
         price: Decimal,
         qty: Decimal,
         ts: int,
+        allow_stale: bool = False,
     ) -> FillResult:
         """Process an exchange fill through the binding runtime contract.
 
@@ -213,7 +216,46 @@ class GridV2Bridge:
         assert self._sm is not None  # guaranteed by _assert_dispatch_ok
 
         # Step 1: translate
-        translated = self._adapter.translate_fill(client_order_id, side, price, qty, ts)
+        try:
+            translated = self._adapter.translate_fill(client_order_id, side, price, qty, ts)
+        except ValueError:
+            if not allow_stale:
+                raise
+            parsed = self._adapter.parse_cid(client_order_id)
+            if parsed is None:
+                raise
+            if parsed.kind == GridV2OrderKind.ENTRY:
+                translated = TranslatedFill(
+                    event=EntryFilled(
+                        order_id=client_order_id,
+                        side=side,
+                        price=price,
+                        qty=qty,
+                        ts=ts,
+                    ),
+                    source_cid=client_order_id,
+                )
+            else:
+                lot_id = None
+                assert self._sm is not None
+                for lot in self._sm.snapshot.open_lots:
+                    if lot.exit_order_id == client_order_id:
+                        lot_id = lot.lot_id
+                        break
+                if lot_id is None:
+                    raise ValueError(
+                        f"Exit CID not in open lot ledger: {client_order_id}"
+                    ) from None
+                translated = TranslatedFill(
+                    event=ExitFilled(
+                        exit_order_id=client_order_id,
+                        lot_id=lot_id,
+                        price=price,
+                        qty=qty,
+                        ts=ts,
+                    ),
+                    source_cid=client_order_id,
+                )
         if translated is None:
             logger.debug(
                 "%s symbol=%s cid=%s",

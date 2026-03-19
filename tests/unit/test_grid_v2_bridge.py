@@ -249,6 +249,40 @@ class TestFillLifecycleExit:
         assert b.state_machine is not None
         assert b.state_machine.mode == BranchMode.FLAT
 
+    def test_exit_fill_to_flat_reseeds_window(self) -> None:
+        """Entry fill → exit fill → back to FLAT with a fresh seeded window."""
+        b, seed = _fresh_bridge()
+        buy_seed = [s for s in seed if s.side == OrderSide.BUY]
+        buy_cid = buy_seed[0].client_order_id
+        buy_price = buy_seed[0].price
+        assert buy_cid is not None and buy_price is not None
+
+        entry_result = b.on_fill(buy_cid, OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1000)
+        assert not entry_result.rejected
+
+        exit_actions = [
+            ea for ea in entry_result.execution_actions if ea.reason == "grid_v2_PLACE_EXIT"
+        ]
+        assert len(exit_actions) == 1
+        exit_cid = exit_actions[0].client_order_id
+        exit_price = exit_actions[0].price
+        assert exit_cid is not None and exit_price is not None
+
+        exit_result = b.on_fill(exit_cid, OrderSide.SELL, exit_price, _ORDER_SIZE, _BASE_TS + 2000)
+        assert not exit_result.rejected
+        assert b.state_machine is not None
+        assert b.state_machine.mode == BranchMode.FLAT
+
+        cancel_actions = [
+            ea for ea in exit_result.execution_actions if ea.action_type == ActionType.CANCEL
+        ]
+        place_actions = [
+            ea for ea in exit_result.execution_actions if ea.action_type == ActionType.PLACE
+        ]
+        assert len(cancel_actions) == 5
+        assert len(place_actions) == 6
+        assert all(ea.reason == "grid_v2_PLACE_ENTRY" for ea in place_actions)
+
 
 class TestFillRejected:
     """REQ-002 supplement: rejected transitions produce no dispatch."""

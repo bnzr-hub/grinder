@@ -383,7 +383,7 @@ Actions:
 1. Mark corresponding long lot `CLOSED`
 2. Remove/close corresponding exit order
 3. If open long lots remain: mode remains `LONG_BRANCH` and emit one `PLACE_ENTRY(SELL)` to restore the trimmed far edge
-4. If no open lots remain: mode -> `FLAT`, keep rolled window (optional explicit recenter)
+4. If no open lots remain: mode -> `FLAT`, immediately reseed the entry window symmetrically around the preserved reference price
 
 ### 11.6 SHORT_BRANCH + ExitFilled(BUY)
 
@@ -426,11 +426,12 @@ Rolling/recenter logic never touches exits.
 ### D5. Flat normalization: soft recenter in flat (Option B)
 
 **Choice: Option B -- soft recenter.**
-When branch fully unwinds to FLAT, keep the current rolled entry window.
-Optional explicit `RecenterRequested` may rebuild it symmetrically around a new reference.
+When branch fully unwinds to FLAT, immediately reseed the entry window to the
+standard symmetric shape around the preserved reference price.
+Optional explicit `RecenterRequested` may still rebuild it symmetrically around a new reference.
 
 **Rationale:** avoids drift accumulation from asymmetric unwind sequences.
-Cleaner operationally than keep-as-is (Option A).
+Cleaner operationally than keep-as-is (Option A), while preserving flat-state coverage.
 
 ---
 
@@ -681,14 +682,17 @@ They are normative for the pure state machine implementation.
 ### 21.1 Flat normalization contract
 
 When the last open lot is closed (rules 11.5/11.6), the state machine transitions to
-`mode = FLAT` and preserves the current rolled entry window.
+`mode = FLAT` and reseeds the entry window to the standard symmetric create_initial
+shape around the preserved reference price.
 
-The state machine does not hold market data and does not auto-recenter.
+The state machine does not hold market data and does not need a separate
+recenter request to restore symmetric coverage after full unwind.
 The caller (execution/reconciliation layer, PR3+) may send explicit
 `RecenterRequested(new_reference_price, ts)` to normalize around a new reference.
 
-This is the PR2 interpretation of D5 ("soft recenter"). The "soft" refers to
-explicit optional normalization around a new reference, not to automatic triggering.
+This is the PR2 interpretation of D5 ("soft recenter"), with the important
+runtime detail that flat unwind now auto-reseeds the original symmetric window.
+The optional explicit recenter still refers to a caller-chosen new reference.
 
 ### 21.2 OperatorCleanup semantics
 

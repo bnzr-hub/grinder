@@ -833,20 +833,22 @@ class LiveEngineV0:
         if not filled_cids:
             return []
 
+        entry_regs = {cid: bridge.adapter.registry.lookup_entry(cid) for cid in filled_cids}
+        exit_regs = {cid: bridge.adapter.registry.lookup_exit(cid) for cid in filled_cids}
         actions: list[ExecutionAction] = []
 
         # Deterministic order with EXIT before ENTRY.
         # This lets same-tick "exit + opposite entry" sequences flatten first,
         # reducing branch-incompatible rejects in one-sided inventory mode.
         def _fill_priority(fill_cid: str) -> tuple[int, str]:
-            if bridge.adapter.registry.lookup_exit(fill_cid) is not None:
+            if exit_regs.get(fill_cid) is not None:
                 return (0, fill_cid)
-            if bridge.adapter.registry.lookup_entry(fill_cid) is not None:
+            if entry_regs.get(fill_cid) is not None:
                 return (1, fill_cid)
             return (2, fill_cid)
 
         for cid in sorted(filled_cids, key=_fill_priority):
-            entry_reg = bridge.adapter.registry.lookup_entry(cid)
+            entry_reg = entry_regs.get(cid)
             if entry_reg is not None:
                 result = bridge.on_fill(
                     cid,
@@ -854,6 +856,7 @@ class LiveEngineV0:
                     entry_reg.price,
                     bridge._config.order_size,
                     ts,
+                    allow_stale=True,
                 )
                 if result.rejected:
                     bridge.adapter.confirm_cancel_entry(cid)
@@ -866,7 +869,7 @@ class LiveEngineV0:
                 actions.extend(result.execution_actions)
                 continue
 
-            exit_reg = bridge.adapter.registry.lookup_exit(cid)
+            exit_reg = exit_regs.get(cid)
             if exit_reg is None:
                 continue
 
@@ -878,6 +881,7 @@ class LiveEngineV0:
                 Decimal("0"),
                 bridge._config.order_size,
                 ts,
+                allow_stale=True,
             )
             if result.rejected:
                 bridge.adapter.confirm_cancel_exit(cid)
