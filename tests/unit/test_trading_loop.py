@@ -183,6 +183,22 @@ class TestBuildConnector:
 class TestFuturesPreflightValidation:
     """Preflight symbol-vs-venue validation via production function."""
 
+    def test_wrapper_constraints_unavailable_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Wrapper: futures + constraints=None → sys.exit(1)."""
+        monkeypatch.setattr(run_trading_mod, "_load_symbol_constraints", lambda: None)
+        with pytest.raises(SystemExit) as exc_info:
+            run_trading_mod._validate_futures_preflight_or_exit(["BTCUSDT"], "futures", None)
+        assert exc_info.value.code == 1
+
+    def test_wrapper_missing_symbol_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Wrapper: futures + symbol not in constraints → sys.exit(1)."""
+        monkeypatch.setattr(
+            run_trading_mod, "_load_symbol_constraints", lambda: {"BTCUSDT": object()}
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            run_trading_mod._validate_futures_preflight_or_exit(["FARTCOINUSDT"], "futures", None)
+        assert exc_info.value.code == 1
+
     def test_constraints_unavailable_exits(self) -> None:
         """Futures + constraints=None → fail-closed."""
         result = evaluate_futures_preflight(["BTCUSDT"], "futures", None, None)
