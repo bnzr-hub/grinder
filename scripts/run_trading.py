@@ -928,6 +928,7 @@ async def trading_loop(
         duration_s: Max duration (0 = infinite).
     """
     global _loop_ready  # noqa: PLW0603
+
     async def _user_data_loop(user_conn: FuturesUserDataWsConnector) -> None:
         try:
             await user_conn.connect()
