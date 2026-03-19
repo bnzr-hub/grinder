@@ -2,7 +2,8 @@
 """Place a single test order for Stage D testing.
 
 This script places one limit order far from market to test reconcile cancel.
-The order uses grinder_d_... clientOrderId format.
+The order prefers grinder_d_... clientOrderId format and falls back to g_d_...
+if the symbol would exceed Binance's 36-char clientOrderId limit.
 
 Usage:
     source .env.stage_d
@@ -38,7 +39,7 @@ from grinder.execution.binance_futures_port import (
     BinanceFuturesPortConfig,
 )
 from grinder.execution.binance_port import HttpResponse
-from grinder.reconcile.identity import OrderIdentityConfig
+from grinder.reconcile.identity import OrderIdentityConfig, generate_client_order_id
 
 
 @dataclass
@@ -76,6 +77,27 @@ class RequestsHttpClient:
             raise ConnectorNonRetryableError(f"Request error: {e}") from e
 
 
+def _select_identity_config(
+    symbol: str, strategy_id: str, level_id: int
+) -> tuple[OrderIdentityConfig, str]:
+    """Pick CID prefix that fits Binance 36-char clientOrderId limit.
+
+    Prefers legacy-compatible "grinder_" prefix for existing Stage D flows.
+    Falls back to short "g_" prefix when symbol length would overflow.
+    """
+    ts_ms = int(time.time() * 1000)
+    for prefix in ("grinder_", "g_"):
+        config = OrderIdentityConfig(prefix=prefix, strategy_id=strategy_id)
+        try:
+            sample_cid = generate_client_order_id(config, symbol, level_id, ts_ms, 1)
+            return config, sample_cid
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Cannot build valid clientOrderId for symbol={symbol}, strategy_id={strategy_id}, level_id={level_id}"
+    )
+
+
 def main() -> int:
     # Check env
     api_key = os.environ.get("BINANCE_API_KEY", "")
@@ -105,16 +127,13 @@ def main() -> int:
     print(f"  Quantity: {quantity}")
     print(f"  Notional: ${price * quantity}")
     print()
-    print("  ClientOrderId format: grinder_d_BTCUSDT_...")
+    # Create port with identity config.
+    # Keep legacy "grinder_" when it fits; fallback to short "g_" for long symbols.
+    identity_config, sample_cid = _select_identity_config(symbol, strategy_id="d", level_id=0)
+    print(f"  ClientOrderId example: {sample_cid}")
+    if identity_config.prefix == "g_":
+        print("  ClientOrderId prefix fallback: g_ (grinder_ would exceed 36-char Binance limit)")
     print("=" * 60)
-
-    # Create port with identity config
-    # Use short strategy_id "d" to keep clientOrderId < 36 chars
-    # Format: grinder_d_BTCUSDT_0_<ts_sec>_1 = ~31 chars
-    identity_config = OrderIdentityConfig(
-        prefix="grinder_",
-        strategy_id="d",  # Short ID to meet Binance 36 char limit
-    )
 
     http_client = RequestsHttpClient()
     config = BinanceFuturesPortConfig(
