@@ -123,6 +123,34 @@ class TestTrueDryRunMode:
         assert "grinder_d_BTCUSDT_1_1000" in order_id
         assert len(noop_client.calls) == 0
 
+    def test_place_order_dry_run_long_symbol_uses_short_prefix_fallback(
+        self, noop_client: NoopHttpClient
+    ) -> None:
+        """Long symbols fallback from grinder_ to g_ to stay within Binance CID limit."""
+        config = BinanceFuturesPortConfig(
+            mode=SafeMode.LIVE_TRADE,
+            base_url=BINANCE_FUTURES_TESTNET_URL,
+            api_key="test_key",
+            api_secret="test_secret",
+            symbol_whitelist=["FARTCOINUSDT"],
+            dry_run=True,
+            max_orders_per_run=100,
+        )
+        port = BinanceFuturesPort(http_client=noop_client, config=config)
+
+        order_id = port.place_order(
+            symbol="FARTCOINUSDT",
+            side=OrderSide.BUY,
+            price=Decimal("1.0"),
+            quantity=Decimal("1"),
+            level_id=1,
+            ts=1700000000000,
+        )
+
+        assert order_id.startswith("g_d_FARTCOINUSDT_1_")
+        assert len(order_id) <= 36
+        assert len(noop_client.calls) == 0
+
     def test_cancel_order_dry_run_zero_http_calls(
         self, noop_client: NoopHttpClient, dry_run_config: BinanceFuturesPortConfig
     ) -> None:
@@ -594,6 +622,32 @@ class TestMarketOrders:
         assert order_id is not None
         # Level_id is "c" (short for cleanup) to fit Binance 36-char limit
         assert "_c_" in order_id
+        assert len(noop_client.calls) == 0
+
+    def test_place_market_order_dry_run_long_symbol_uses_short_prefix_fallback(
+        self, noop_client: NoopHttpClient
+    ) -> None:
+        """Cleanup market order uses short prefix for long symbol CID overflow."""
+        config = BinanceFuturesPortConfig(
+            mode=SafeMode.LIVE_TRADE,
+            base_url=BINANCE_FUTURES_TESTNET_URL,
+            api_key="test_key",
+            api_secret="test_secret",
+            symbol_whitelist=["FARTCOINUSDT"],
+            dry_run=True,
+            max_orders_per_run=100,
+        )
+        port = BinanceFuturesPort(http_client=noop_client, config=config)
+
+        order_id = port.place_market_order(
+            symbol="FARTCOINUSDT",
+            side=OrderSide.SELL,
+            quantity=Decimal("1"),
+            reduce_only=True,
+        )
+
+        assert order_id.startswith("g_d_FARTCOINUSDT_c_")
+        assert len(order_id) <= 36
         assert len(noop_client.calls) == 0
 
 

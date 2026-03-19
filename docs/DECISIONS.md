@@ -2024,6 +2024,11 @@
     - `BinancePort.place_order()`: Uses `generate_client_order_id()`
     - `ReconcileEngine._check_unexpected_orders()`: Uses `is_ours()`
     - `RemediationExecutor.can_execute()` Gate 8: Uses `is_ours()`
+  - **Post-acceptance update (2026-03-19):**
+    - `BinanceFuturesPort` applies overflow-safe CID generation for long symbols:
+      first attempt uses configured prefix (default `grinder_`), then retries with `g_`
+      only if CID exceeds Binance 36-char limit.
+    - Short symbols (e.g. `BTCUSDT`) keep existing `grinder_` behavior.
   - **Strategy allowlist semantics:**
     - If `allowed_strategies` empty at init → defaults to `{strategy_id}`
     - Legacy orders (`__legacy__`) allowed only if `allow_legacy_format=True`

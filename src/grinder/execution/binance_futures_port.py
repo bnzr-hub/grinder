@@ -98,6 +98,54 @@ def _parse_reduce_only(val: Any) -> bool:
     return bool(val)
 
 
+def _generate_client_order_id_with_fallback(
+    identity: OrderIdentityConfig,
+    symbol: str,
+    level_id: str | int,
+    ts: int,
+    seq: int,
+) -> str:
+    """Generate CID and fallback to short prefix for long-symbol overflow.
+
+    Keeps existing behavior for standard symbols (`grinder_` prefix).
+    For overlong IDs, retries once with `g_` prefix when base prefix is `grinder_`.
+    """
+    try:
+        return generate_client_order_id(
+            config=identity,
+            symbol=symbol,
+            level_id=level_id,
+            ts=ts,
+            seq=seq,
+        )
+    except ValueError:
+        if identity.prefix != "grinder_":
+            raise
+
+    fallback_identity = OrderIdentityConfig(
+        prefix="g_",
+        strategy_id=identity.strategy_id,
+        allowed_strategies=set(identity.allowed_strategies),
+        require_strategy_allowlist=identity.require_strategy_allowlist,
+        allow_legacy_format=identity.allow_legacy_format,
+        identity_format_version=identity.identity_format_version,
+    )
+    logger.info(
+        "CID_PREFIX_FALLBACK symbol=%s strategy_id=%s old_prefix=%s new_prefix=%s",
+        symbol,
+        identity.strategy_id,
+        identity.prefix,
+        fallback_identity.prefix,
+    )
+    return generate_client_order_id(
+        config=fallback_identity,
+        symbol=symbol,
+        level_id=level_id,
+        ts=ts,
+        seq=seq,
+    )
+
+
 @dataclass
 class BinanceFuturesPortConfig:
     """Configuration for BinanceFuturesPort (USDT-M).
@@ -663,8 +711,8 @@ class BinanceFuturesPort:
         self._order_counter += 1
         if client_order_id is None:
             identity = self.config.identity_config or get_default_identity_config()
-            client_order_id = generate_client_order_id(
-                config=identity,
+            client_order_id = _generate_client_order_id_with_fallback(
+                identity=identity,
                 symbol=symbol,
                 level_id=level_id,
                 ts=ts,
@@ -738,8 +786,8 @@ class BinanceFuturesPort:
         self._order_counter += 1
         ts = int(time.time() * 1000)
         identity = self.config.identity_config or get_default_identity_config()
-        client_order_id = generate_client_order_id(
-            config=identity,
+        client_order_id = _generate_client_order_id_with_fallback(
+            identity=identity,
             symbol=symbol,
             level_id="c",  # Short for "cleanup" to fit 36-char Binance limit
             ts=ts,
