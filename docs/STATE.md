@@ -494,11 +494,15 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
     - `cancel_order_by_binance_id()`: Cancel by numeric order ID
     - `cancel_all_orders()`: DELETE /fapi/v1/allOpenOrders
     - `fetch_open_orders()`: GET /fapi/v1/openOrders
+  - **CID overflow guard (2026-03-19):**
+    - `place_order()` and `place_market_order()` generate CID with configured prefix first (default `grinder_`)
+    - If Binance 36-char limit would be exceeded, port retries once with short prefix `g_`
+    - No behavior change for symbols that already fit with `grinder_`
   - **How to verify:**
     ```bash
     PYTHONPATH=src pytest tests/unit/test_binance_futures_port.py -v
     ```
-  - **Unit tests:** `tests/unit/test_binance_futures_port.py` (30 tests)
+  - **Unit tests:** `tests/unit/test_binance_futures_port.py` (45 tests)
     - Dry-run tests prove 0 HTTP calls
     - SafeMode tests prove READ_ONLY blocks writes
     - Mainnet guard tests prove all guards enforced
