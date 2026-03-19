@@ -63,10 +63,11 @@ import sys
 import threading
 import time
 import urllib.request
+from dataclasses import dataclass
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from grinder.connectors.binance_ws import (
     BINANCE_WS_FUTURES_MAINNET,
@@ -463,6 +464,45 @@ def _load_symbol_constraints() -> dict[str, SymbolConstraints] | None:
     return None
 
 
+FuturesPreflightStatus = Literal[
+    "skipped",
+    "passed",
+    "constraints_unavailable",
+    "symbol_missing",
+]
+
+
+@dataclass(frozen=True)
+class FuturesPreflightResult:
+    """Result of futures preflight validation."""
+
+    status: FuturesPreflightStatus
+    missing_symbols: tuple[str, ...] = ()
+
+
+def evaluate_futures_preflight(
+    symbols: list[str],
+    exchange_port: str,
+    fixture_path: str | None,
+    constraints: dict[str, SymbolConstraints] | None,
+) -> FuturesPreflightResult:
+    """Pure futures preflight validation.
+
+    Returns a structured result so callers can decide whether to exit, log, or skip.
+    """
+    if exchange_port != "futures" or fixture_path is not None:
+        return FuturesPreflightResult(status="skipped")
+
+    if constraints is None:
+        return FuturesPreflightResult(status="constraints_unavailable")
+
+    missing = tuple(s for s in symbols if s not in constraints)
+    if missing:
+        return FuturesPreflightResult(status="symbol_missing", missing_symbols=missing)
+
+    return FuturesPreflightResult(status="passed")
+
+
 def _validate_futures_preflight_or_exit(
     symbols: list[str],
     exchange_port: str,
@@ -473,23 +513,29 @@ def _validate_futures_preflight_or_exit(
     No-op unless exchange_port=="futures" and fixture_path is None.
     Exits with code 1 if constraints unavailable or symbols missing.
     """
-    if exchange_port != "futures" or fixture_path is not None:
+    constraints = None
+    if exchange_port == "futures" and fixture_path is None:
+        constraints = _load_symbol_constraints()
+    result = evaluate_futures_preflight(
+        symbols,
+        exchange_port,
+        fixture_path,
+        constraints,
+    )
+    if result.status in {"skipped", "passed"}:
         return
-
-    constraints = _load_symbol_constraints()
-    if constraints is None:
+    if result.status == "constraints_unavailable":
         print(
             "ERROR: Cannot load futures exchangeInfo for symbol validation. "
             "Futures mode requires symbol constraints to verify WS venue compatibility. "
             "Check var/cache/exchange_info_futures.json or network access."
         )
         sys.exit(1)
-    missing = [s for s in symbols if s not in constraints]
-    if missing:
+    if result.status == "symbol_missing":
         print(
-            f"ERROR: symbols {missing} not found in futures exchangeInfo. "
+            f"ERROR: symbols {list(result.missing_symbols)} not found in futures exchangeInfo. "
             f"Cannot subscribe to futures WS for unknown symbols. "
-            f"Available: {len(constraints)} symbols."
+            f"Available: {len(constraints or {})} symbols."
         )
         sys.exit(1)
 
