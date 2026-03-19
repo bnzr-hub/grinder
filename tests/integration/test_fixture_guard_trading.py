@@ -2,13 +2,34 @@
 
 from __future__ import annotations
 
+import socket
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "trading_loop" / "bookticker_5tick.jsonl"
 RUN_TRADING = REPO_ROOT / "scripts" / "run_trading.py"
+
+
+def _can_open_local_inet_socket() -> bool:
+    """Return False when environment forbids AF_INET socket creation/bind."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+    except PermissionError:
+        return False
+    return True
+
+
+_SOCKETS_AVAILABLE = _can_open_local_inet_socket()
+
+pytestmark = pytest.mark.skipif(
+    not _SOCKETS_AVAILABLE,
+    reason="AF_INET sockets are blocked in this environment; skipping fixture subprocess integration test",
+)
 
 
 def test_fixture_mode_activates_network_guard() -> None:
