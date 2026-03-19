@@ -266,8 +266,8 @@ class TestExitFill:
         assert len(result.snapshot.closed_lots) == 1
         assert result.snapshot.closed_lots[0].lot_id == lot.lot_id
 
-    def test_long_exit_restores_trimmed_sell_level(self) -> None:
-        """T6: Exit fill restores one SELL entry while LONG branch remains open."""
+    def test_long_exit_restores_both_sides(self) -> None:
+        """T6: Exit fill in LONG branch restores SELL far edge + BUY near edge."""
         sm = _sm()
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
@@ -282,18 +282,41 @@ class TestExitFill:
         )
 
         assert not result.rejected
-        assert len(result.actions) == 1
-        action = result.actions[0]
-        assert action.kind == ActionIntentKind.PLACE_ENTRY
-        assert action.side == OrderSide.SELL
-        assert action.reason == "EXIT_RESTORE"
+        assert len(result.actions) == 3
+        sell_action = next(
+            a
+            for a in result.actions
+            if a.kind == ActionIntentKind.PLACE_ENTRY and a.side == OrderSide.SELL
+        )
+        buy_action = next(
+            a
+            for a in result.actions
+            if a.kind == ActionIntentKind.PLACE_ENTRY and a.side == OrderSide.BUY
+        )
+        buy_cancel = next(
+            a
+            for a in result.actions
+            if a.kind == ActionIntentKind.CANCEL_ENTRY and a.side == OrderSide.BUY
+        )
+        assert sell_action.kind == ActionIntentKind.PLACE_ENTRY
+        assert buy_action.kind == ActionIntentKind.PLACE_ENTRY
+        assert sell_action.reason == "EXIT_RESTORE"
+        assert buy_action.reason == "EXIT_RESTORE"
         expected_sells = (
             *pre_exit_window.sell_entry_prices,
             pre_exit_window.sell_entry_prices[-1] + pre_exit_window.reference_price * _STEP,
         )
+        expected_buys = (
+            pre_exit_window.buy_entry_prices[0] + pre_exit_window.reference_price * _STEP,
+            *pre_exit_window.buy_entry_prices[:-1],
+        )
         assert result.snapshot.mode == BranchMode.LONG_BRANCH
         assert result.snapshot.entry_window.sell_entry_prices == expected_sells
-        assert action.price == expected_sells[-1]
+        assert result.snapshot.entry_window.buy_entry_prices == expected_buys
+        assert sell_action.price == expected_sells[-1]
+        assert buy_action.price == expected_buys[0]
+        assert buy_cancel.price == pre_exit_window.buy_entry_prices[-1]
+        assert buy_cancel.reason == "EXIT_RESTORE_SHIFT"
         assert len(result.snapshot.open_lots) == 1
 
     def test_short_exit_closes_lot(self) -> None:
@@ -314,8 +337,8 @@ class TestExitFill:
         assert len(result.snapshot.open_lots) == 1
         assert len(result.snapshot.closed_lots) == 1
 
-    def test_short_exit_restores_trimmed_buy_level(self) -> None:
-        """T7: Exit fill restores one BUY entry while SHORT branch remains open."""
+    def test_short_exit_restores_both_sides(self) -> None:
+        """T7: Exit fill in SHORT branch restores BUY far edge + SELL near edge."""
         sm = _sm()
         sell1 = sm.snapshot.entry_window.sell_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.SELL, sell1, _ORDER_SIZE, _BASE_TS + 1))
@@ -330,18 +353,41 @@ class TestExitFill:
         )
 
         assert not result.rejected
-        assert len(result.actions) == 1
-        action = result.actions[0]
-        assert action.kind == ActionIntentKind.PLACE_ENTRY
-        assert action.side == OrderSide.BUY
-        assert action.reason == "EXIT_RESTORE"
+        assert len(result.actions) == 3
+        buy_action = next(
+            a
+            for a in result.actions
+            if a.kind == ActionIntentKind.PLACE_ENTRY and a.side == OrderSide.BUY
+        )
+        sell_action = next(
+            a
+            for a in result.actions
+            if a.kind == ActionIntentKind.PLACE_ENTRY and a.side == OrderSide.SELL
+        )
+        sell_cancel = next(
+            a
+            for a in result.actions
+            if a.kind == ActionIntentKind.CANCEL_ENTRY and a.side == OrderSide.SELL
+        )
+        assert buy_action.kind == ActionIntentKind.PLACE_ENTRY
+        assert sell_action.kind == ActionIntentKind.PLACE_ENTRY
+        assert buy_action.reason == "EXIT_RESTORE"
+        assert sell_action.reason == "EXIT_RESTORE"
         expected_buys = (
             *pre_exit_window.buy_entry_prices,
             pre_exit_window.buy_entry_prices[-1] - pre_exit_window.reference_price * _STEP,
         )
+        expected_sells = (
+            pre_exit_window.sell_entry_prices[0] - pre_exit_window.reference_price * _STEP,
+            *pre_exit_window.sell_entry_prices[:-1],
+        )
         assert result.snapshot.mode == BranchMode.SHORT_BRANCH
         assert result.snapshot.entry_window.buy_entry_prices == expected_buys
-        assert action.price == expected_buys[-1]
+        assert result.snapshot.entry_window.sell_entry_prices == expected_sells
+        assert buy_action.price == expected_buys[-1]
+        assert sell_action.price == expected_sells[0]
+        assert sell_cancel.price == pre_exit_window.sell_entry_prices[-1]
+        assert sell_cancel.reason == "EXIT_RESTORE_SHIFT"
         assert len(result.snapshot.open_lots) == 1
 
 
