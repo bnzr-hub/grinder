@@ -38,8 +38,28 @@ if TYPE_CHECKING:
 # Type alias for subprocess with bytes streams
 PopenBytes = subprocess.Popen[bytes]
 
-# Mark all tests in this module as integration tests
-pytestmark = pytest.mark.integration
+
+def _can_open_local_inet_socket() -> bool:
+    """Return False when environment forbids AF_INET socket creation/bind."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+    except PermissionError:
+        return False
+    return True
+
+
+_SOCKETS_AVAILABLE = _can_open_local_inet_socket()
+
+# Mark all tests in this module as integration tests.
+# Skip via marker (instead of module-level pytest.skip) so file-level runs exit 0.
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not _SOCKETS_AVAILABLE,
+        reason="AF_INET sockets are blocked in this environment; skipping live HTTP integration tests",
+    ),
+]
 
 
 def find_free_port() -> int:
