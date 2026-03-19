@@ -49,7 +49,7 @@ from grinder.connectors.errors import (
 )
 from grinder.connectors.live_connector import SafeMode
 from grinder.connectors.retries import RetryPolicy, is_retryable
-from grinder.core import OrderSide, SystemState
+from grinder.core import OrderSide, OrderState, SystemState
 from grinder.env_parse import parse_bool, parse_csv, parse_enum, parse_int
 from grinder.execution.fill_prob_evidence import maybe_emit_fill_prob_evidence
 from grinder.execution.fill_prob_gate import (
@@ -97,6 +97,7 @@ from grinder.risk.emergency_exit_metrics import get_emergency_exit_metrics
 if TYPE_CHECKING:
     from grinder.account.contracts import AccountSnapshot, OpenOrderSnap
     from grinder.contracts import Snapshot
+    from grinder.execution.futures_events import UserDataEvent
     from grinder.execution.port import ExchangePort
     from grinder.features.engine import FeatureEngine
     from grinder.features.types import FeatureSnapshot
@@ -587,6 +588,7 @@ class LiveEngineV0:
         self._grid_v2_pending_seed_cids: frozenset[str] = frozenset()  # PR6: CIDs to confirm
         # cid → sync_gen at dispatch. Released after visibility OR 2 sync cycles grace.
         self._grid_v2_pending_place_cids: dict[str, int] = {}
+        self._grid_v2_user_fill_seen: set[str] = set()
         if self._grid_v2_enabled:
             if not self._grid_v2_symbol:
                 raise ValueError(
@@ -906,6 +908,105 @@ class LiveEngineV0:
             actions.extend(result.execution_actions)
 
         return actions
+
+    def _grid_v2_dispatch_immediate_actions(
+        self,
+        actions: list[ExecutionAction],
+        ts: int,
+    ) -> None:
+        """Dispatch grid_v2 actions emitted by immediate user-data fill handling."""
+        for action in actions:
+            live_action = self._process_action(action, ts)
+            if (
+                action.action_type == ActionType.PLACE
+                and action.client_order_id is not None
+                and self._grid_v2_bridge is not None
+                and self._grid_v2_bridge.adapter.is_ours(action.client_order_id)
+            ):
+                if live_action.status == LiveActionStatus.EXECUTED:
+                    self._grid_v2_register_pending_place(action.client_order_id)
+                elif live_action.status in (
+                    LiveActionStatus.BLOCKED,
+                    LiveActionStatus.SKIPPED,
+                ) or (live_action.status == LiveActionStatus.FAILED and live_action.pre_send):
+                    self._grid_v2_clean_failed_place(action.client_order_id)
+                elif live_action.status == LiveActionStatus.FAILED:
+                    if _grid_v2_is_exchange_code_ambiguous(live_action.exchange_code):
+                        self._grid_v2_register_pending_place(action.client_order_id)
+                        logger.warning(
+                            "GRID_V2_FAILED_PLACE_QUARANTINED cid=%s code=%s reason=%s",
+                            action.client_order_id,
+                            live_action.exchange_code,
+                            live_action.block_reason.value if live_action.block_reason else "?",
+                        )
+                    else:
+                        self._grid_v2_clean_failed_place(action.client_order_id)
+
+            if (
+                action.action_type == ActionType.CANCEL
+                and action.order_id is not None
+                and live_action.status in (LiveActionStatus.EXECUTED, LiveActionStatus.FAILED)
+            ):
+                self._cancel_dispatched_pending_sync.add(action.order_id)
+
+    def process_user_data_event(self, event: UserDataEvent) -> None:  # noqa: PLR0911, PLR0912
+        """Process immediate user-data order events for grid_v2.
+
+        This path is a low-latency supplement to account-sync polling:
+        terminal ORDER_TRADE_UPDATE events are applied immediately.
+        """
+        if not self._is_grid_v2_active(self._grid_v2_symbol):
+            return
+        if event.order_event is None:
+            return
+        oe = event.order_event
+        if oe.symbol != self._grid_v2_symbol:
+            return
+
+        bridge = self._grid_v2_bridge
+        if bridge is None or not bridge.reconstruction_ok:
+            return
+        if not bridge.adapter.is_ours(oe.client_order_id):
+            return
+
+        if oe.status == OrderState.FILLED:
+            if oe.client_order_id in self._grid_v2_user_fill_seen:
+                return
+            qty = oe.executed_qty if oe.executed_qty > 0 else bridge._config.order_size
+            price = oe.avg_price if oe.avg_price > 0 else oe.price
+            result = bridge.on_fill(
+                oe.client_order_id,
+                oe.side,
+                price,
+                qty,
+                oe.ts,
+                allow_stale=True,
+            )
+            if result.rejected:
+                parsed = bridge.adapter.parse_cid(oe.client_order_id)
+                if parsed is not None:
+                    from grinder.grid_v2.adapter import GridV2OrderKind  # noqa: PLC0415
+
+                    if parsed.kind == GridV2OrderKind.ENTRY:
+                        bridge.adapter.confirm_cancel_entry(oe.client_order_id)
+                    else:
+                        bridge.adapter.confirm_cancel_exit(oe.client_order_id)
+                logger.warning(
+                    "GRID_V2_REJECTED_FILL_CLEANED cid=%s source=user_data reason=%s",
+                    oe.client_order_id,
+                    result.reject_reason or "?",
+                )
+                self._grid_v2_user_fill_seen.add(oe.client_order_id)
+                return
+
+            self._grid_v2_user_fill_seen.add(oe.client_order_id)
+            if result.execution_actions:
+                self._grid_v2_dispatch_immediate_actions(list(result.execution_actions), oe.ts)
+            return
+
+        if oe.status in (OrderState.CANCELLED, OrderState.EXPIRED, OrderState.REJECTED):
+            bridge.on_cancel_ack(oe.client_order_id)
+            self._grid_v2_pending_cancels.pop(oe.client_order_id, None)
 
     @staticmethod
     def _grid_v2_infer_exit_side(bridge: GridV2Bridge, exit_order_id: str) -> OrderSide:

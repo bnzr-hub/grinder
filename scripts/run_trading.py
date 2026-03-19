@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -69,6 +70,18 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from grinder.connectors.binance_user_data_ws import (
+    BINANCE_FUTURES_MAINNET_URL as USER_DATA_MAINNET_URL,
+)
+from grinder.connectors.binance_user_data_ws import (
+    BINANCE_FUTURES_TESTNET_URL as USER_DATA_TESTNET_URL,
+)
+from grinder.connectors.binance_user_data_ws import (
+    FuturesUserDataWsConnector,
+    ListenKeyConfig,
+    ListenKeyManager,
+    UserDataWsConfig,
+)
 from grinder.connectors.binance_ws import (
     BINANCE_WS_FUTURES_MAINNET,
     FakeWsTransport,
@@ -433,6 +446,48 @@ def build_connector(
         use_testnet=use_testnet,
     )
     return LiveConnectorV0(config=config)
+
+
+def _build_user_data_connector_or_none(
+    *,
+    symbols: list[str],
+    mode: SafeMode,
+    exchange_port: str,
+    fixture_path: str | None,
+    use_testnet: bool,
+) -> FuturesUserDataWsConnector | None:
+    """Build optional user-data connector for immediate fill/cancel events.
+
+    Enabled only in live futures mode (non-fixture) and can be toggled via
+    GRINDER_USER_DATA_IMMEDIATE_ENABLED (default: true).
+    """
+    enabled = parse_bool("GRINDER_USER_DATA_IMMEDIATE_ENABLED", default=True, strict=False)
+    if not enabled:
+        print("  User-data immediate path: disabled (GRINDER_USER_DATA_IMMEDIATE_ENABLED=false)")
+        return None
+    if mode != SafeMode.LIVE_TRADE or exchange_port != "futures" or fixture_path is not None:
+        return None
+
+    api_key = os.environ.get("BINANCE_API_KEY", "").strip()
+    if not api_key:
+        print("  User-data immediate path: disabled (missing BINANCE_API_KEY)")
+        return None
+
+    base_url = USER_DATA_TESTNET_URL if use_testnet else USER_DATA_MAINNET_URL
+    symbol_filter = symbols[0] if len(symbols) == 1 else None
+    ws_cfg = UserDataWsConfig(
+        base_url=base_url,
+        api_key=api_key,
+        use_testnet=use_testnet,
+        symbol_filter=symbol_filter,
+    )
+    lk_cfg = ListenKeyConfig(base_url=base_url, api_key=api_key)
+    lk_mgr = ListenKeyManager(RequestsHttpClient(port_name="user_data"), lk_cfg)
+    print(
+        f"  User-data immediate path: enabled "
+        f"(symbol_filter={symbol_filter or 'none'}, net={'testnet' if use_testnet else 'mainnet'})"
+    )
+    return FuturesUserDataWsConnector(config=ws_cfg, listen_key_manager=lk_mgr)
 
 
 def _load_symbol_constraints() -> dict[str, SymbolConstraints] | None:
@@ -857,6 +912,7 @@ async def trading_loop(
     engine: LiveEngineV0,
     shutdown: asyncio.Event,
     duration_s: int,
+    user_data_connector: FuturesUserDataWsConnector | None = None,
 ) -> None:
     """Run the trading loop: connector -> engine.process_snapshot().
 
@@ -872,7 +928,24 @@ async def trading_loop(
         duration_s: Max duration (0 = infinite).
     """
     global _loop_ready  # noqa: PLW0603
+
+    async def _user_data_loop(user_conn: FuturesUserDataWsConnector) -> None:
+        try:
+            await user_conn.connect()
+            async for event in user_conn.iter_events():
+                if shutdown.is_set():
+                    break
+                engine.process_user_data_event(event)
+        except Exception as e:
+            print(f"  User-data loop warning: {e}")
+        finally:
+            with contextlib.suppress(Exception):
+                await user_conn.close()
+
+    user_data_task: asyncio.Task[None] | None = None
     await connector.connect()
+    if user_data_connector is not None:
+        user_data_task = asyncio.create_task(_user_data_loop(user_data_connector))
     _loop_ready = True
     print("  /readyz now returning 200 (if HA permits)")
     start = time.time()
@@ -897,6 +970,10 @@ async def trading_loop(
                 print(f"  Processed {tick_count} ticks ({snapshot.symbol})")
     finally:
         _loop_ready = False
+        if user_data_task is not None and not user_data_task.done():
+            user_data_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await user_data_task
         await connector.close()
         print(f"  Trading loop stopped. Total ticks: {tick_count}, HA skips: {ha_skip_count}")
 
@@ -1098,6 +1175,13 @@ def main() -> None:  # noqa: PLR0915
         use_testnet=use_testnet,
         exchange_port=args.exchange_port,
     )
+    user_data_connector = _build_user_data_connector_or_none(
+        symbols=symbols,
+        mode=mode,
+        exchange_port=args.exchange_port,
+        fixture_path=args.fixture,
+        use_testnet=use_testnet,
+    )
 
     # Async loop with signal handling
     loop = asyncio.new_event_loop()
@@ -1112,7 +1196,15 @@ def main() -> None:  # noqa: PLR0915
     print("\nGRINDER TRADING LOOP running. Press Ctrl+C to stop.")
     exit_code = 0
     try:
-        loop.run_until_complete(trading_loop(connector, engine, shutdown, args.duration_s))
+        loop.run_until_complete(
+            trading_loop(
+                connector,
+                engine,
+                shutdown,
+                args.duration_s,
+                user_data_connector=user_data_connector,
+            )
+        )
     except Exception as exc:
         print(f"GRINDER TRADING LOOP FATAL: {exc}")
         exit_code = 2

@@ -540,7 +540,7 @@ class GridV2StateMachine:
         )
         return new_window, tuple(actions)
 
-    def _apply_exit_filled(self, event: ExitFilled) -> TransitionResult:
+    def _apply_exit_filled(self, event: ExitFilled) -> TransitionResult:  # noqa: PLR0912, PLR0915
         snap = self._snapshot
 
         if event.qty <= 0:
@@ -593,6 +593,7 @@ class GridV2StateMachine:
         if new_open:
             step_delta = snap.entry_window.reference_price * self._config.grid_step_pct
             if snap.mode == BranchMode.LONG_BRANCH:
+                buy_prices = list(snap.entry_window.buy_entry_prices)
                 sell_prices = list(snap.entry_window.sell_entry_prices)
                 if len(sell_prices) < self._config.entry_levels_per_side:
                     next_price = (
@@ -610,15 +611,60 @@ class GridV2StateMachine:
                             reason="EXIT_RESTORE",
                         )
                     )
+                if len(buy_prices) < self._config.entry_levels_per_side:
+                    next_price = (
+                        buy_prices[0] + step_delta
+                        if buy_prices
+                        else snap.entry_window.reference_price - step_delta
+                    )
+                    buy_prices.append(next_price)
+                    buy_prices.sort(reverse=True)
+                    actions.append(
+                        ActionIntent(
+                            kind=ActionIntentKind.PLACE_ENTRY,
+                            side=OrderSide.BUY,
+                            price=next_price,
+                            qty=self._config.order_size,
+                            reason="EXIT_RESTORE",
+                        )
+                    )
+                elif buy_prices:
+                    next_price = buy_prices[0] + step_delta
+                    if (
+                        next_price < snap.entry_window.reference_price
+                        and next_price not in buy_prices
+                    ):
+                        far_price = buy_prices[-1]
+                        buy_prices = buy_prices[:-1]
+                        buy_prices.append(next_price)
+                        buy_prices.sort(reverse=True)
+                        actions.append(
+                            ActionIntent(
+                                kind=ActionIntentKind.CANCEL_ENTRY,
+                                side=OrderSide.BUY,
+                                price=far_price,
+                                reason="EXIT_RESTORE_SHIFT",
+                            )
+                        )
+                        actions.append(
+                            ActionIntent(
+                                kind=ActionIntentKind.PLACE_ENTRY,
+                                side=OrderSide.BUY,
+                                price=next_price,
+                                qty=self._config.order_size,
+                                reason="EXIT_RESTORE",
+                            )
+                        )
                 new_window = EntryWindow(
                     reference_price=snap.entry_window.reference_price,
-                    buy_entry_prices=snap.entry_window.buy_entry_prices,
+                    buy_entry_prices=tuple(buy_prices),
                     sell_entry_prices=tuple(sell_prices),
                     levels_per_side=snap.entry_window.levels_per_side,
                     step_pct=snap.entry_window.step_pct,
                 )
             elif snap.mode == BranchMode.SHORT_BRANCH:
                 buy_prices = list(snap.entry_window.buy_entry_prices)
+                sell_prices = list(snap.entry_window.sell_entry_prices)
                 if len(buy_prices) < self._config.entry_levels_per_side:
                     next_price = (
                         buy_prices[-1] - step_delta
@@ -635,10 +681,54 @@ class GridV2StateMachine:
                             reason="EXIT_RESTORE",
                         )
                     )
+                if len(sell_prices) < self._config.entry_levels_per_side:
+                    next_price = (
+                        sell_prices[0] - step_delta
+                        if sell_prices
+                        else snap.entry_window.reference_price + step_delta
+                    )
+                    sell_prices.append(next_price)
+                    sell_prices.sort()
+                    actions.append(
+                        ActionIntent(
+                            kind=ActionIntentKind.PLACE_ENTRY,
+                            side=OrderSide.SELL,
+                            price=next_price,
+                            qty=self._config.order_size,
+                            reason="EXIT_RESTORE",
+                        )
+                    )
+                elif sell_prices:
+                    next_price = sell_prices[0] - step_delta
+                    if (
+                        next_price > snap.entry_window.reference_price
+                        and next_price not in sell_prices
+                    ):
+                        far_price = sell_prices[-1]
+                        sell_prices = sell_prices[:-1]
+                        sell_prices.append(next_price)
+                        sell_prices.sort()
+                        actions.append(
+                            ActionIntent(
+                                kind=ActionIntentKind.CANCEL_ENTRY,
+                                side=OrderSide.SELL,
+                                price=far_price,
+                                reason="EXIT_RESTORE_SHIFT",
+                            )
+                        )
+                        actions.append(
+                            ActionIntent(
+                                kind=ActionIntentKind.PLACE_ENTRY,
+                                side=OrderSide.SELL,
+                                price=next_price,
+                                qty=self._config.order_size,
+                                reason="EXIT_RESTORE",
+                            )
+                        )
                 new_window = EntryWindow(
                     reference_price=snap.entry_window.reference_price,
                     buy_entry_prices=tuple(buy_prices),
-                    sell_entry_prices=snap.entry_window.sell_entry_prices,
+                    sell_entry_prices=tuple(sell_prices),
                     levels_per_side=snap.entry_window.levels_per_side,
                     step_pct=snap.entry_window.step_pct,
                 )
