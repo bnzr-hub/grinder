@@ -13,7 +13,7 @@ jobs:
     permissions:
       pull-requests: read
       contents: read
-      checks: read
+      checks: write
     if: |
       github.event_name == 'pull_request' ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
@@ -104,7 +104,7 @@ jobs:
           WORKFLOW_RUN_PR_NUMBER: ${{ steps.get_pr.outputs.pr_number }}
         run: |
           python - << 'PY'
-          import json, os, re, sys, urllib.request
+          import json, os, re, sys, urllib.error, urllib.request
 
           with open(os.environ["GITHUB_EVENT_PATH"], "r", encoding="utf-8") as f:
             event = json.load(f)
@@ -120,6 +120,10 @@ jobs:
             number = int(workflow_run_pr)
             print(f"INFO: Using PR number from workflow_run event: {number}")
 
+          is_workflow_run = event.get("workflow_run") is not None
+          if is_workflow_run:
+            head_sha = (event.get("workflow_run") or {}).get("head_sha", head_sha)
+
           def gh_get(url: str):
             req = urllib.request.Request(url)
             req.add_header("Accept", "application/vnd.github+json")
@@ -127,6 +131,40 @@ jobs:
               req.add_header("Authorization", f"Bearer {token}")
             with urllib.request.urlopen(req) as r:
               return json.loads(r.read().decode("utf-8"))
+
+          def publish_check_run(conclusion: str, summary: str):
+            if not (is_workflow_run and number and repo and head_sha and token):
+              return
+
+            payload = {
+              "name": "proof-guard",
+              "head_sha": head_sha,
+              "status": "completed",
+              "conclusion": conclusion,
+              "output": {
+                "title": "Proof Guard",
+                "summary": summary,
+              },
+            }
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/check-runs",
+              data=data,
+              method="POST",
+            )
+            req.add_header("Accept", "application/vnd.github+json")
+            req.add_header("Authorization", f"Bearer {token}")
+            req.add_header("Content-Type", "application/json")
+            try:
+              with urllib.request.urlopen(req) as r:
+                _ = json.loads(r.read().decode("utf-8"))
+              print(
+                f"INFO: Published proof-guard check-run for {head_sha[:8]} "
+                f"(conclusion={conclusion})"
+              )
+            except urllib.error.HTTPError as e:
+              print(f"ERROR: Failed to publish proof-guard check-run: {e}")
+              sys.exit(1)
 
           if number and repo:
             try:
@@ -155,6 +193,7 @@ jobs:
 
           if not body:
             print("ERROR: PR description is empty. Proof bundle is REQUIRED.")
+            publish_check_run("failure", "PR description is empty. Proof bundle is REQUIRED.")
             sys.exit(1)
 
           # Check for PENDING marker
@@ -162,6 +201,7 @@ jobs:
           if re.search(pending_pattern, body, re.MULTILINE):
             print("ERROR: PR body still has PENDING marker - no proof yet.")
             print("Wait for Acceptance Packet workflow to complete.")
+            publish_check_run("failure", "PR body still has PENDING marker - no proof yet.")
             sys.exit(1)
 
           # CI ARTIFACT mode
@@ -181,6 +221,7 @@ jobs:
             missing_fields = [f for f in required_ci_fields if f not in ci_artifact_fields]
             if missing_fields:
               print(f"ERROR: CI ARTIFACT mode missing required fields: {missing_fields}")
+              publish_check_run("failure", f"CI ARTIFACT mode missing required fields: {missing_fields}")
               sys.exit(1)
 
             artifact_head_sha = ci_artifact_fields["HEAD_SHA"]
@@ -199,11 +240,16 @@ jobs:
 
               if not matching_check:
                 print(f"ERROR: No check-run named '{check_name}' found for commit {artifact_head_sha}")
+                publish_check_run("failure", f"No check-run named '{check_name}' found for commit {artifact_head_sha}")
                 sys.exit(1)
 
               conclusion = matching_check.get("conclusion")
               if conclusion != "success":
                 print(f"ERROR: Check-run '{check_name}' has conclusion '{conclusion}', expected 'success'")
+                publish_check_run(
+                  "failure",
+                  f"Check-run '{check_name}' has conclusion '{conclusion}', expected 'success'",
+                )
                 sys.exit(1)
 
               print(f"OK: CI ARTIFACT mode validated. Check-run '{check_name}' passed for {artifact_head_sha[:8]}")
@@ -224,6 +270,7 @@ jobs:
 
             if "== ACCEPTANCE PACKET:" not in body:
               print("ERROR: PR body must include verbatim acceptance packet output.")
+              publish_check_run("failure", "PR body must include verbatim acceptance packet output.")
               sys.exit(1)
 
             missing = [m for m in acceptance_packet_markers if m not in body]
@@ -231,14 +278,17 @@ jobs:
               print(f"ERROR: Missing required markers in PR body:")
               for m in missing:
                 print(f" - {m}")
+              publish_check_run("failure", f"Missing required markers in PR body: {missing}")
               sys.exit(1)
 
             if "diff --git" not in body:
               print("ERROR: Acceptance packet must include full PR diff.")
+              publish_check_run("failure", "Acceptance packet must include full PR diff.")
               sys.exit(1)
 
             print(f"OK: FULL VERBATIM mode validated.")
 
           mode_desc = "CI ARTIFACT" if is_ci_artifact_mode else "FULL VERBATIM"
+          publish_check_run("success", f"Proof bundle requirements satisfied (mode: {mode_desc}).")
           print(f"OK: Proof bundle requirements satisfied (mode: {mode_desc}).")
           PY

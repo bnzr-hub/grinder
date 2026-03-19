@@ -360,7 +360,7 @@ class TestActionResolution:
         assert reg.lot_id == "lot-entry1"
 
     def test_cancel_entry_returns_cid_no_removal(self) -> None:
-        """CANCEL_ENTRY looks up CID but does NOT remove (22.3)."""
+        """CANCEL_ENTRY looks up CID and releases the registry slot."""
         a = _adapter()
         cid = a.generate_entry_cid(_BASE_TS)
         a.registry.register_entry(cid, OrderSide.BUY, Decimal("49750"))
@@ -375,8 +375,7 @@ class TestActionResolution:
         resolved = a.resolve_actions(actions, _BASE_TS)
         assert len(resolved) == 1
         assert resolved[0].cid == cid
-        # Registry NOT mutated
-        assert a.registry.lookup_entry(cid) is not None
+        assert a.registry.lookup_entry(cid) is None
 
     def test_cancel_exit_returns_cid_no_removal(self) -> None:
         a = _adapter()
@@ -392,7 +391,7 @@ class TestActionResolution:
         resolved = a.resolve_actions(actions, _BASE_TS)
         assert len(resolved) == 1
         assert resolved[0].cid == cid
-        assert a.registry.lookup_exit(cid) is not None
+        assert a.registry.lookup_exit(cid) is None
 
     def test_cancel_unregistered_entry_raises(self) -> None:
         a = _adapter()

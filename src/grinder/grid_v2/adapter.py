@@ -433,6 +433,8 @@ class GridV2Adapter:
 
         PLACE_ENTRY/PLACE_EXIT: generates new CID, registers in registry.
         CANCEL_ENTRY/CANCEL_EXIT: looks up CID (no removal per 22.3).
+        CANCEL actions also release the registry slot immediately so a
+        same-batch replacement PLACE_* can re-register at the same price.
         Raises ValueError for cancel of unregistered entry/exit.
         """
         resolved: list[ResolvedAction] = []
@@ -484,6 +486,7 @@ class GridV2Adapter:
                         f"No registered entry CID for CANCEL_ENTRY: "
                         f"side={action.side.value}, price={action.price}"
                     )
+                self._registry.remove_entry(found_cid)
                 resolved.append(
                     ResolvedAction(
                         cid=found_cid,
@@ -501,6 +504,7 @@ class GridV2Adapter:
                     raise ValueError(
                         f"No registered exit CID for CANCEL_EXIT: exit_order_id={action.order_id}"
                     )
+                self._registry.remove_exit(found_cid)
                 resolved.append(
                     ResolvedAction(
                         cid=found_cid,
