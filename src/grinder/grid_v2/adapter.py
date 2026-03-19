@@ -48,8 +48,8 @@ GRID_V2_STRATEGY_ID = "g"
 _ENTRY_PREFIX = "e"
 _EXIT_PREFIX = "x"
 
-# Fixed CID overhead: grinder_ (8) + g (1) + 4 separators (4) + ts_sec (10) + seq (1)
-_CID_FIXED_OVERHEAD = 24
+# Fixed CID overhead: g_ (2) + g (1) + 4 separators (4) + ts_sec (10) + seq (1)
+_CID_FIXED_OVERHEAD = 18
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +287,9 @@ class GridV2Adapter:
         self._config = config
         self._symbol = symbol
         self._strategy_id = strategy_id
-        self._identity_config = OrderIdentityConfig(strategy_id=strategy_id)
+        # Short prefix "g" instead of "grinder_" to fit longer symbols
+        # within Binance 36-char CID limit. Format: g_g_{symbol}_{level}_{ts}_{seq}
+        self._identity_config = OrderIdentityConfig(strategy_id=strategy_id, prefix="g_")
         self._registry = GridV2OrderRegistry()
         self._entry_seq = 0
         self._exit_seq = 0
