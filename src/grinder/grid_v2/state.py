@@ -586,12 +586,62 @@ class GridV2StateMachine:
             for eo in snap.exit_orders
         )
 
-        if not new_open:
-            new_mode = BranchMode.FLAT
-            new_window = snap.entry_window
-        else:
-            new_mode = snap.mode
-            new_window = snap.entry_window
+        actions: list[ActionIntent] = []
+        new_window = snap.entry_window
+        if new_open:
+            step_delta = snap.entry_window.reference_price * self._config.grid_step_pct
+            if snap.mode == BranchMode.LONG_BRANCH:
+                sell_prices = list(snap.entry_window.sell_entry_prices)
+                if len(sell_prices) < self._config.entry_levels_per_side:
+                    next_price = (
+                        sell_prices[-1] + step_delta
+                        if sell_prices
+                        else snap.entry_window.reference_price + step_delta
+                    )
+                    sell_prices.append(next_price)
+                    actions.append(
+                        ActionIntent(
+                            kind=ActionIntentKind.PLACE_ENTRY,
+                            side=OrderSide.SELL,
+                            price=next_price,
+                            qty=self._config.order_size,
+                            reason="EXIT_RESTORE",
+                        )
+                    )
+                new_window = EntryWindow(
+                    reference_price=snap.entry_window.reference_price,
+                    buy_entry_prices=snap.entry_window.buy_entry_prices,
+                    sell_entry_prices=tuple(sell_prices),
+                    levels_per_side=snap.entry_window.levels_per_side,
+                    step_pct=snap.entry_window.step_pct,
+                )
+            elif snap.mode == BranchMode.SHORT_BRANCH:
+                buy_prices = list(snap.entry_window.buy_entry_prices)
+                if len(buy_prices) < self._config.entry_levels_per_side:
+                    next_price = (
+                        buy_prices[-1] - step_delta
+                        if buy_prices
+                        else snap.entry_window.reference_price - step_delta
+                    )
+                    buy_prices.append(next_price)
+                    actions.append(
+                        ActionIntent(
+                            kind=ActionIntentKind.PLACE_ENTRY,
+                            side=OrderSide.BUY,
+                            price=next_price,
+                            qty=self._config.order_size,
+                            reason="EXIT_RESTORE",
+                        )
+                    )
+                new_window = EntryWindow(
+                    reference_price=snap.entry_window.reference_price,
+                    buy_entry_prices=tuple(buy_prices),
+                    sell_entry_prices=snap.entry_window.sell_entry_prices,
+                    levels_per_side=snap.entry_window.levels_per_side,
+                    step_pct=snap.entry_window.step_pct,
+                )
+
+        new_mode = BranchMode.FLAT if not new_open else snap.mode
 
         new_snapshot = GridV2Snapshot(
             mode=new_mode,
@@ -602,7 +652,7 @@ class GridV2StateMachine:
             emergency_stopped=snap.emergency_stopped,
             last_recenter_ts=snap.last_recenter_ts,
         )
-        return self._commit(new_snapshot, ())
+        return self._commit(new_snapshot, tuple(actions))
 
     def _find_open_lot(self, lot_id: str) -> tuple[InventoryLot | None, TransitionResult | None]:
         """Find open lot by ID. Returns (lot, None) or (None, rejection)."""

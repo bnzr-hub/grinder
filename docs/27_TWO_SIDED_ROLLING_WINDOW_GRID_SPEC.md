@@ -382,12 +382,12 @@ Preconditions: exit belongs to an open long lot.
 Actions:
 1. Mark corresponding long lot `CLOSED`
 2. Remove/close corresponding exit order
-3. If open long lots remain: mode remains `LONG_BRANCH`
+3. If open long lots remain: mode remains `LONG_BRANCH` and emit one `PLACE_ENTRY(SELL)` to restore the trimmed far edge
 4. If no open lots remain: mode -> `FLAT`, keep rolled window (optional explicit recenter)
 
 ### 11.6 SHORT_BRANCH + ExitFilled(BUY)
 
-Symmetric to 11.5.
+Symmetric to 11.5, restoring one `PLACE_ENTRY(BUY)` while short lots remain open.
 
 ---
 
@@ -825,6 +825,7 @@ Closed set of `reason` strings for `ActionIntent`:
 |------|--------|------|
 | `PLACE_EXIT` | `"PAIRED_EXIT_FOR_LOT"` | exit order for new lot (11.1-11.4) |
 | `PLACE_ENTRY` | `"FILL_REPLACEMENT"` | new farthest entry replacing filled level |
+| `PLACE_ENTRY` | `"EXIT_RESTORE"` | restore trimmed far-edge entry after exit fill |
 | `PLACE_ENTRY` | `"RECENTER"` | entry from recenter rebuild |
 | `CANCEL_ENTRY` | `"ROLLING_TRIM"` | opposite-side far-edge trim on accepted entry fill |
 | `CANCEL_ENTRY` | `"EMERGENCY_STOP"` | entry canceled by emergency stop |
