@@ -692,6 +692,18 @@ class LiveEngineV0:
                     self._grid_v2_symbol,
                     bridge.failed_reason,
                 )
+            elif pos_qty == 0 and bridge.state_machine is not None:
+                # If we're flat and restarting on existing grid orders, recenter once
+                # so entry distance from mid reflects current step/levels config.
+                reseed = bridge.recenter_flat(snapshot.mid_price, snapshot.ts)
+                if reseed:
+                    self._grid_v2_seed_actions = list(reseed)
+                    self._grid_v2_awaiting_sync = True
+                    self._grid_v2_pending_seed_cids = frozenset(
+                        ea.client_order_id
+                        for ea in reseed
+                        if ea.action_type == ActionType.PLACE and ea.client_order_id is not None
+                    )
             self._grid_v2_started = True
         elif pos_qty != 0:
             # P0-2: Non-flat position with no grid_v2 orders = fail-closed.

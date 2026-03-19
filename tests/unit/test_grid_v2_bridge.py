@@ -595,6 +595,91 @@ class TestEngineFreshStartupDispatch:
             assert ea.action.reason == "grid_v2_PLACE_ENTRY"
 
 
+class TestEngineStartupRecenterOnFlat:
+    """Flat restart with existing g-orders should reseed around current mid."""
+
+    def test_reconstruct_flat_reseeds_window_with_current_step(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("GRINDER_GRID_V2_STEP_PCT", "0.0025")
+
+        # Build pre-existing exchange orders using older spacing (0.5%),
+        # simulating a restart after config change.
+        old_bridge, _ = _fresh_bridge(config=_config(step=Decimal("0.005")))
+        existing_orders: list[OpenOrderSnap] = []
+        for cid in old_bridge.adapter.registry.all_entry_cids:
+            reg = old_bridge.adapter.registry.lookup_entry(cid)
+            assert reg is not None
+            existing_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS,
+                )
+            )
+
+        port = MagicMock()
+        port.place_order.return_value = "ORDER_1"
+        port.cancel_order.return_value = True
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(existing_orders),
+            ts=_BASE_TS,
+            source="test",
+        )
+
+        snapshot = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output = engine.process_snapshot(snapshot)
+
+        executed = [a.action for a in output.live_actions if a.status.value == "EXECUTED"]
+        assert any(a.action_type == ActionType.CANCEL for a in executed)
+        placed_entries = [
+            a
+            for a in executed
+            if a.action_type == ActionType.PLACE and a.reason == "grid_v2_PLACE_ENTRY"
+        ]
+        assert len(placed_entries) >= 6
+        assert any(
+            a.side == OrderSide.BUY and a.price == Decimal("49875.00") for a in placed_entries
+        )
+        assert any(
+            a.side == OrderSide.SELL and a.price == Decimal("50125.00") for a in placed_entries
+        )
+
+
 class TestEngineNonFlatFailClosed:
     """P0-2: Non-flat position + no g-orders must fail-closed."""
 

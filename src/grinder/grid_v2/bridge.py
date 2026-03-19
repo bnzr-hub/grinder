@@ -36,6 +36,7 @@ from grinder.grid_v2.state import (
     ExitFilled,
     GridV2Config,
     GridV2StateMachine,
+    RecenterRequested,
     TransitionResult,
 )
 
@@ -189,6 +190,24 @@ class GridV2Bridge:
             len(seed_resolved),
         )
         return self._to_execution_actions(seed_resolved)
+
+    def recenter_flat(self, reference_price: Decimal, ts: int) -> tuple[ExecutionAction, ...]:
+        """Rebuild FLAT entry window around reference_price and emit actions."""
+        self._assert_dispatch_ok()
+        assert self._sm is not None
+
+        result = self._sm.apply(RecenterRequested(new_reference_price=reference_price, ts=ts))
+        if result.rejected:
+            logger.warning(
+                "GRID_V2_RECENTER_SKIPPED symbol=%s reason=%s",
+                self._symbol,
+                result.reject_reason,
+            )
+            return ()
+
+        resolved = self._adapter.resolve_actions(result.actions, ts)
+        logger.info("GRID_V2_RECENTER_OK symbol=%s actions=%d", self._symbol, len(resolved))
+        return self._to_execution_actions(resolved)
 
     # --- Fill lifecycle (23.2) ---
 
