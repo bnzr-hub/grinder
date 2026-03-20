@@ -178,6 +178,11 @@ Validates PR body has required proof markers before merge:
 - Enforces replay determinism if touching fixture/replay files
 ```
 
+**Operational rule:** when refreshing proof/acceptance checks for a PR, run the
+workflow against the PR ref/head SHA, not against `main`. A successful
+`workflow_dispatch` on `main` does not replace stale PR-head check runs and will
+leave `gh pr checks` and merge protection blocked.
+
 ### Failure Modes
 
 | Error | Cause | Fix |
