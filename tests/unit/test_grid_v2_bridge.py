@@ -989,7 +989,9 @@ class TestEngineImmediateUserDataPath:
         )
         engine.process_user_data_event(event)
 
-        snap = bridge.state_machine.snapshot
+        sm = bridge.state_machine
+        assert sm is not None
+        snap = sm.snapshot
         assert len(snap.open_lots) == 1
         assert snap.open_lots[0].entry_price == reg.price
 
