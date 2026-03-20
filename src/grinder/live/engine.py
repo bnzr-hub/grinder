@@ -72,7 +72,7 @@ from grinder.execution.types import ActionType, ExecutionAction
 from grinder.grid_v2.adapter import GRID_V2_STRATEGY_ID
 from grinder.grid_v2.bridge import GridV2Bridge
 from grinder.grid_v2.shadow import GridV2ShadowRunner
-from grinder.grid_v2.state import BranchMode, GridV2Config, LotSide
+from grinder.grid_v2.state import ActionIntent, ActionIntentKind, BranchMode, GridV2Config, LotSide
 from grinder.live.grid_planner import GridPlanResult
 from grinder.live.live_metrics import get_live_engine_metrics
 from grinder.live.place_tracker import correlate_recent_places
@@ -914,10 +914,10 @@ class LiveEngineV0:
 
         return actions
 
-    def _grid_v2_integrity_repair(  # noqa: PLR0911
+    def _grid_v2_integrity_repair(  # noqa: PLR0911, PLR0912, PLR0915
         self, snapshot: Snapshot
     ) -> list[ExecutionAction]:
-        """Continuously validate grid integrity and auto-repair FLAT window drift."""
+        """Continuously validate grid integrity and auto-repair drift."""
         if not self._is_grid_v2_active(snapshot.symbol):
             self._grid_v2_integrity_mismatch_streak = 0
             return []
@@ -937,16 +937,29 @@ class LiveEngineV0:
             return []
 
         sm = bridge.state_machine
-        if sm.mode != BranchMode.FLAT:
-            self._grid_v2_integrity_mismatch_streak = 0
-            return []
 
         if snapshot.ts < self._grid_v2_integrity_repair_cooldown_until_ts:
             return []
 
         current_cids = self._grid_v2_exchange_cids(snapshot.symbol)
+        acct = self._last_account_snapshot
         current_entries = 0
         current_exits = 0
+        current_entry_by_key: dict[tuple[OrderSide, Decimal], str] = {}
+        if acct is not None:
+            for o in acct.open_orders:
+                if o.symbol != snapshot.symbol:
+                    continue
+                parsed = bridge.adapter.parse_cid(o.order_id)
+                if parsed is None:
+                    continue
+                if parsed.kind.value != "ENTRY":
+                    continue
+                try:
+                    side = OrderSide(o.side)
+                except ValueError:
+                    continue
+                current_entry_by_key[(side, o.price)] = o.order_id
         for cid in current_cids:
             parsed = bridge.adapter.parse_cid(cid)
             if parsed is None:
@@ -956,10 +969,17 @@ class LiveEngineV0:
             else:
                 current_exits += 1
 
-        expected_entries = len(sm.snapshot.entry_window.buy_entry_prices) + len(
-            sm.snapshot.entry_window.sell_entry_prices
-        )
-        mismatch = current_entries != expected_entries or current_exits != 0
+        expected_entry_keys: set[tuple[OrderSide, Decimal]] = set()
+        for p in sm.snapshot.entry_window.buy_entry_prices:
+            expected_entry_keys.add((OrderSide.BUY, bridge._quantize_price(p, OrderSide.BUY)))
+        for p in sm.snapshot.entry_window.sell_entry_prices:
+            expected_entry_keys.add((OrderSide.SELL, bridge._quantize_price(p, OrderSide.SELL)))
+        expected_entries = len(expected_entry_keys)
+
+        if sm.mode == BranchMode.FLAT:
+            mismatch = current_entries != expected_entries or current_exits != 0
+        else:
+            mismatch = set(current_entry_by_key.keys()) != expected_entry_keys
         if not mismatch:
             self._grid_v2_integrity_mismatch_streak = 0
             return []
@@ -982,18 +1002,82 @@ class LiveEngineV0:
         self._grid_v2_integrity_repair_cooldown_until_ts = (
             snapshot.ts + _GRID_V2_INTEGRITY_REPAIR_COOLDOWN_MS
         )
-        logger.warning(
-            "GRID_V2_INTEGRITY_REPAIR_TRIGGER symbol=%s entries=%d expected=%d exits=%d",
-            snapshot.symbol,
-            current_entries,
-            expected_entries,
-            current_exits,
-        )
-        repair_actions = bridge.recenter_flat(snapshot.mid_price, snapshot.ts)
+        repair_actions: list[ExecutionAction] = []
+        if sm.mode == BranchMode.FLAT:
+            logger.warning(
+                "GRID_V2_INTEGRITY_REPAIR_TRIGGER symbol=%s mode=%s entries=%d expected=%d exits=%d",
+                snapshot.symbol,
+                sm.mode.value,
+                current_entries,
+                expected_entries,
+                current_exits,
+            )
+            repair_actions = list(bridge.recenter_flat(snapshot.mid_price, snapshot.ts))
+        else:
+            current_keys = set(current_entry_by_key.keys())
+            missing = expected_entry_keys - current_keys
+            extra = current_keys - expected_entry_keys
+            logger.warning(
+                "GRID_V2_INTEGRITY_REPAIR_TRIGGER symbol=%s mode=%s entries=%d expected=%d "
+                "missing=%d extra=%d",
+                snapshot.symbol,
+                sm.mode.value,
+                len(current_keys),
+                len(expected_entry_keys),
+                len(missing),
+                len(extra),
+            )
+
+            # Cancel entry orders that exist on exchange but are outside expected window.
+            for side, price in sorted(extra, key=lambda item: (item[0].value, item[1])):
+                cid = current_entry_by_key[(side, price)]
+                repair_actions.append(
+                    ExecutionAction(
+                        action_type=ActionType.CANCEL,
+                        order_id=cid,
+                        symbol=snapshot.symbol,
+                        reason="grid_v2_INTEGRITY_CANCEL_ENTRY",
+                    )
+                )
+
+            # Place missing entries; drop stale registry slots first if they disappeared on exchange.
+            intents: list[ActionIntent] = []
+            for side, price in sorted(missing, key=lambda item: (item[0].value, item[1])):
+                stale_cid = bridge.adapter.registry.cid_for_entry(side, price)
+                if stale_cid is not None and stale_cid not in current_cids:
+                    bridge.adapter.confirm_cancel_entry(stale_cid)
+                    logger.warning(
+                        "GRID_V2_INTEGRITY_STALE_ENTRY_DROPPED symbol=%s cid=%s side=%s price=%s",
+                        snapshot.symbol,
+                        stale_cid,
+                        side.value,
+                        price,
+                    )
+                intents.append(
+                    ActionIntent(
+                        kind=ActionIntentKind.PLACE_ENTRY,
+                        side=side,
+                        price=price,
+                        qty=bridge._config.order_size,
+                        reason="INTEGRITY_REPAIR",
+                    )
+                )
+            if intents:
+                try:
+                    resolved = bridge.adapter.resolve_actions(tuple(intents), snapshot.ts)
+                except ValueError as exc:
+                    logger.warning(
+                        "GRID_V2_INTEGRITY_REPAIR_RESOLVE_FAILED symbol=%s reason=%s",
+                        snapshot.symbol,
+                        exc,
+                    )
+                else:
+                    repair_actions.extend(bridge._to_execution_actions(resolved))
         if repair_actions:
             logger.info(
-                "GRID_V2_INTEGRITY_REPAIR_DISPATCH symbol=%s actions=%d",
+                "GRID_V2_INTEGRITY_REPAIR_DISPATCH symbol=%s mode=%s actions=%d",
                 snapshot.symbol,
+                sm.mode.value,
                 len(repair_actions),
             )
         return list(repair_actions)
