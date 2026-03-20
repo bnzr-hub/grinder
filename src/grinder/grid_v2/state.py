@@ -396,10 +396,13 @@ class GridV2StateMachine:
         is_grid_v2_cid = parsed is not None and parsed.strategy_id == "g"
         if event.price not in active_prices and not is_grid_v2_cid:
             return "PRICE_NOT_IN_ACTIVE_WINDOW"
-        if len(snap.open_lots) >= cfg.max_inventory_levels:
+        if len(snap.open_lots) >= cfg.max_inventory_levels and not is_grid_v2_cid:
             return "MAX_INVENTORY_LEVELS"
         current_notional = sum(lot.qty * lot.entry_price for lot in snap.open_lots)
-        if current_notional + event.qty * event.price > cfg.max_inventory_notional_usd:
+        if (
+            current_notional + event.qty * event.price > cfg.max_inventory_notional_usd
+            and not is_grid_v2_cid
+        ):
             return "MAX_INVENTORY_NOTIONAL_USD"
         if (snap.mode == BranchMode.SHORT_BRANCH and event.side == OrderSide.BUY) or (
             snap.mode == BranchMode.LONG_BRANCH and event.side == OrderSide.SELL
