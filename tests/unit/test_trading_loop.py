@@ -268,6 +268,7 @@ class TestGridV2AccountSyncPreflight:
             run_trading_mod._validate_grid_v2_account_sync_or_exit("futures", None)
         assert exc_info.value.code == 1
 
+
 class TestBuildEngine:
     """Test build_engine() rehearsal knobs (PR-P2-LOOP-2)."""
 

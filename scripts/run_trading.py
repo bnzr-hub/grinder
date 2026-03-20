@@ -636,7 +636,9 @@ def _validate_grid_v2_account_sync_or_exit(
         exchange_port=exchange_port,
         fixture_path=fixture_path,
         grid_v2_enabled=parse_bool("GRINDER_GRID_V2_ENABLED", default=False, strict=False),
-        account_sync_enabled=parse_bool("GRINDER_ACCOUNT_SYNC_ENABLED", default=False, strict=False),
+        account_sync_enabled=parse_bool(
+            "GRINDER_ACCOUNT_SYNC_ENABLED", default=False, strict=False
+        ),
     )
     if result.status in {"skipped", "passed"}:
         return
