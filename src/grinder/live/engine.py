@@ -979,9 +979,10 @@ class LiveEngineV0:
             and len(sm.snapshot.open_lots) >= bridge._config.max_inventory_levels
         )
         target_entry_keys = set(expected_entry_keys)
-        # Branch-aware integrity target:
-        # state machine rejects LONG+SELL and SHORT+BUY entry fills as
-        # BRANCH_INCOMPATIBLE, so repair must not place those sides.
+        # Branch-mode enforcement: only same-side entries are valid.
+        # SM rejects opposite-side fills as BRANCH_INCOMPATIBLE (state.py:428-431),
+        # so opposite-side entries must not remain on exchange — they would create
+        # REJECTED_FILL_CLEANED desync risk if filled.
         if sm.mode == BranchMode.LONG_BRANCH:
             target_entry_keys = {
                 (side, price) for side, price in target_entry_keys if side == OrderSide.BUY
@@ -999,6 +1000,8 @@ class LiveEngineV0:
         if sm.mode == BranchMode.FLAT:
             mismatch = current_entries != expected_entries or current_exits != 0
         else:
+            # Full comparison: same-side entries must match target,
+            # and any opposite-side entries on exchange are extra (must cancel).
             mismatch = set(current_entry_by_key.keys()) != target_entry_keys
         if not mismatch:
             self._grid_v2_integrity_mismatch_streak = 0
@@ -1034,6 +1037,8 @@ class LiveEngineV0:
             )
             repair_actions = list(bridge.recenter_flat(snapshot.mid_price, snapshot.ts))
         else:
+            # Full current set: opposite-side entries appear as extra (canceled).
+            # target_entry_keys is already same-side only, so missing = same-side gaps.
             current_keys = set(current_entry_by_key.keys())
             missing = target_entry_keys - current_keys
             extra = current_keys - target_entry_keys
@@ -1043,7 +1048,7 @@ class LiveEngineV0:
                 snapshot.symbol,
                 sm.mode.value,
                 len(current_keys),
-                len(expected_entry_keys),
+                len(target_entry_keys),
                 len(missing),
                 len(extra),
             )
@@ -1063,20 +1068,6 @@ class LiveEngineV0:
             # Place missing entries; drop stale registry slots first if they disappeared on exchange.
             intents: list[ActionIntent] = []
             for side, price in sorted(missing, key=lambda item: (item[0].value, item[1])):
-                # Defense-in-depth: even if target calculation regresses,
-                # do not generate branch-incompatible entry intents.
-                if (sm.mode == BranchMode.LONG_BRANCH and side == OrderSide.SELL) or (
-                    sm.mode == BranchMode.SHORT_BRANCH and side == OrderSide.BUY
-                ):
-                    logger.warning(
-                        "GRID_V2_INTEGRITY_REPAIR_SKIPPED_INCOMPATIBLE symbol=%s mode=%s side=%s "
-                        "price=%s",
-                        snapshot.symbol,
-                        sm.mode.value,
-                        side.value,
-                        price,
-                    )
-                    continue
                 stale_cid = bridge.adapter.registry.cid_for_entry(side, price)
                 if stale_cid is not None and stale_cid not in current_cids:
                     bridge.adapter.confirm_cancel_entry(stale_cid)
