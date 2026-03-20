@@ -72,7 +72,7 @@ from grinder.execution.types import ActionType, ExecutionAction
 from grinder.grid_v2.adapter import GRID_V2_STRATEGY_ID
 from grinder.grid_v2.bridge import GridV2Bridge
 from grinder.grid_v2.shadow import GridV2ShadowRunner
-from grinder.grid_v2.state import GridV2Config, LotSide
+from grinder.grid_v2.state import BranchMode, GridV2Config, LotSide
 from grinder.live.grid_planner import GridPlanResult
 from grinder.live.live_metrics import get_live_engine_metrics
 from grinder.live.place_tracker import correlate_recent_places
@@ -124,6 +124,8 @@ _TP_CLOSE_RETRY_COOLDOWN_MS = 10_000  # 10s between retry attempts
 
 # PR-P0-RACE-1: Convergence guard constants
 _CONVERGENCE_TIMEOUT_MS = 30_000  # 30s safety valve for inflight latch
+_GRID_V2_INTEGRITY_MISMATCH_STREAK = 2
+_GRID_V2_INTEGRITY_REPAIR_COOLDOWN_MS = 5_000
 
 
 @dataclass
@@ -589,6 +591,8 @@ class LiveEngineV0:
         # cid → sync_gen at dispatch. Released after visibility OR 2 sync cycles grace.
         self._grid_v2_pending_place_cids: dict[str, int] = {}
         self._grid_v2_user_fill_seen: set[str] = set()
+        self._grid_v2_integrity_mismatch_streak = 0
+        self._grid_v2_integrity_repair_cooldown_until_ts = 0
         if self._grid_v2_enabled:
             if not self._grid_v2_symbol:
                 raise ValueError(
@@ -909,6 +913,90 @@ class LiveEngineV0:
             actions.extend(result.execution_actions)
 
         return actions
+
+    def _grid_v2_integrity_repair(  # noqa: PLR0911
+        self, snapshot: Snapshot
+    ) -> list[ExecutionAction]:
+        """Continuously validate grid integrity and auto-repair FLAT window drift."""
+        if not self._is_grid_v2_active(snapshot.symbol):
+            self._grid_v2_integrity_mismatch_streak = 0
+            return []
+
+        bridge = self._grid_v2_bridge
+        if bridge is None or bridge.state_machine is None:
+            self._grid_v2_integrity_mismatch_streak = 0
+            return []
+
+        # Don't attempt repair while orders are still converging.
+        if (
+            self._grid_v2_awaiting_sync
+            or self._grid_v2_pending_cancels
+            or self._grid_v2_pending_place_cids
+        ):
+            self._grid_v2_integrity_mismatch_streak = 0
+            return []
+
+        sm = bridge.state_machine
+        if sm.mode != BranchMode.FLAT:
+            self._grid_v2_integrity_mismatch_streak = 0
+            return []
+
+        if snapshot.ts < self._grid_v2_integrity_repair_cooldown_until_ts:
+            return []
+
+        current_cids = self._grid_v2_exchange_cids(snapshot.symbol)
+        current_entries = 0
+        current_exits = 0
+        for cid in current_cids:
+            parsed = bridge.adapter.parse_cid(cid)
+            if parsed is None:
+                continue
+            if parsed.kind.value == "ENTRY":
+                current_entries += 1
+            else:
+                current_exits += 1
+
+        expected_entries = len(sm.snapshot.entry_window.buy_entry_prices) + len(
+            sm.snapshot.entry_window.sell_entry_prices
+        )
+        mismatch = current_entries != expected_entries or current_exits != 0
+        if not mismatch:
+            self._grid_v2_integrity_mismatch_streak = 0
+            return []
+
+        self._grid_v2_integrity_mismatch_streak += 1
+        if self._grid_v2_integrity_mismatch_streak < _GRID_V2_INTEGRITY_MISMATCH_STREAK:
+            logger.warning(
+                "GRID_V2_INTEGRITY_MISMATCH_PENDING symbol=%s entries=%d expected=%d exits=%d "
+                "streak=%d/%d",
+                snapshot.symbol,
+                current_entries,
+                expected_entries,
+                current_exits,
+                self._grid_v2_integrity_mismatch_streak,
+                _GRID_V2_INTEGRITY_MISMATCH_STREAK,
+            )
+            return []
+
+        self._grid_v2_integrity_mismatch_streak = 0
+        self._grid_v2_integrity_repair_cooldown_until_ts = (
+            snapshot.ts + _GRID_V2_INTEGRITY_REPAIR_COOLDOWN_MS
+        )
+        logger.warning(
+            "GRID_V2_INTEGRITY_REPAIR_TRIGGER symbol=%s entries=%d expected=%d exits=%d",
+            snapshot.symbol,
+            current_entries,
+            expected_entries,
+            current_exits,
+        )
+        repair_actions = bridge.recenter_flat(snapshot.mid_price, snapshot.ts)
+        if repair_actions:
+            logger.info(
+                "GRID_V2_INTEGRITY_REPAIR_DISPATCH symbol=%s actions=%d",
+                snapshot.symbol,
+                len(repair_actions),
+            )
+        return list(repair_actions)
 
     def _grid_v2_dispatch_immediate_actions(
         self,
@@ -1349,10 +1437,13 @@ class LiveEngineV0:
                     snapshot.symbol,
                     snapshot.ts,
                 )
+                grid_v2_integrity_actions = self._grid_v2_integrity_repair(snapshot)
             else:
                 grid_v2_fill_actions = []
+                grid_v2_integrity_actions = []
         else:
             grid_v2_fill_actions = []
+            grid_v2_integrity_actions = []
 
         # Step 1: Get actions -- either from GridV2Bridge, LiveGridPlannerV1, or PaperEngine
         if self._grid_v2_enabled and snapshot.symbol == self._grid_v2_symbol:
@@ -1360,8 +1451,10 @@ class LiveEngineV0:
             # Never falls through to legacy planner for this symbol.
             if self._is_grid_v2_active(snapshot.symbol):
                 # Drain seed actions on first active tick, then fill-driven
-                raw_actions: list[ExecutionAction] = list(self._grid_v2_seed_actions) + list(
-                    grid_v2_fill_actions
+                raw_actions: list[ExecutionAction] = (
+                    list(self._grid_v2_seed_actions)
+                    + list(grid_v2_fill_actions)
+                    + list(grid_v2_integrity_actions)
                 )
                 self._grid_v2_seed_actions.clear()
             else:
