@@ -29,6 +29,7 @@ from scripts.run_trading import (
     build_engine,
     build_exchange_port,
     evaluate_futures_preflight,
+    evaluate_grid_v2_account_sync_preflight,
     is_trading_ready,
     reset_trading_state,
     trading_loop,
@@ -226,6 +227,46 @@ class TestFuturesPreflightValidation:
         constraints: dict[str, Any] = {"BTCUSDT": object()}
         result = evaluate_futures_preflight(["BTCUSDT"], "futures", None, constraints)
         assert result.status == "passed"
+
+
+class TestGridV2AccountSyncPreflight:
+    """Grid_v2 preflight: fail-closed when account sync is disabled."""
+
+    def test_grid_v2_disabled_skips(self) -> None:
+        result = evaluate_grid_v2_account_sync_preflight(
+            exchange_port="futures",
+            fixture_path=None,
+            grid_v2_enabled=False,
+            account_sync_enabled=False,
+        )
+        assert result.status == "skipped"
+
+    def test_grid_v2_enabled_requires_account_sync(self) -> None:
+        result = evaluate_grid_v2_account_sync_preflight(
+            exchange_port="futures",
+            fixture_path=None,
+            grid_v2_enabled=True,
+            account_sync_enabled=False,
+        )
+        assert result.status == "account_sync_disabled"
+
+    def test_grid_v2_enabled_with_account_sync_passes(self) -> None:
+        result = evaluate_grid_v2_account_sync_preflight(
+            exchange_port="futures",
+            fixture_path=None,
+            grid_v2_enabled=True,
+            account_sync_enabled=True,
+        )
+        assert result.status == "passed"
+
+    def test_grid_v2_wrapper_exits_when_account_sync_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_ACCOUNT_SYNC_ENABLED", "0")
+        with pytest.raises(SystemExit) as exc_info:
+            run_trading_mod._validate_grid_v2_account_sync_or_exit("futures", None)
+        assert exc_info.value.code == 1
 
 
 class TestBuildEngine:
