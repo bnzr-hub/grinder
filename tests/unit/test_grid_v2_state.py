@@ -1049,12 +1049,16 @@ class TestRiskGuards:
         sm = GridV2StateMachine.create_initial(cfg, _REF_PRICE, _BASE_TS)
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(
-            EntryFilled("g_g_PIPPINUSDT_e1_1773952851_0", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1)
+            EntryFilled(
+                "g_g_PIPPINUSDT_e1_1773952851_0", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1
+            )
         )
 
         buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
         result = sm.apply(
-            EntryFilled("g_g_PIPPINUSDT_e2_1773952852_0", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 2)
+            EntryFilled(
+                "g_g_PIPPINUSDT_e2_1773952852_0", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 2
+            )
         )
         assert not result.rejected
         assert len(result.snapshot.open_lots) == 2
@@ -1064,12 +1068,16 @@ class TestRiskGuards:
         sm = GridV2StateMachine.create_initial(cfg, _REF_PRICE, _BASE_TS)
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(
-            EntryFilled("g_g_PIPPINUSDT_e1_1773952851_0", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1)
+            EntryFilled(
+                "g_g_PIPPINUSDT_e1_1773952851_0", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1
+            )
         )
 
         buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
         result = sm.apply(
-            EntryFilled("g_g_PIPPINUSDT_e2_1773952852_0", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 2)
+            EntryFilled(
+                "g_g_PIPPINUSDT_e2_1773952852_0", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 2
+            )
         )
         assert not result.rejected
 
