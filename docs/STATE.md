@@ -1423,7 +1423,7 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
   - **Spec:** `docs/27_TWO_SIDED_ROLLING_WINDOW_GRID_SPEC.md` (sections 1-25, including PR2 21.1-21.16, PR3 22.1-22.11, PR4 23.1-23.9, PR5 24.1-24.5, PR6 25.1-25.3).
   - **Supersedes conceptually:** doc-26 (Rolling Infinite Grid, ADR-085) as target grid architecture.
   - **Key differences from doc-26:** explicit entry/exit separation, inventory lot ledger, one-sided inventory mode with two-sided rolling entry window, bounded entry window, flat-only recenter, deterministic state machine.
-  - **Architectural choices (v1):** one-sided inventory with opposite-edge rolling trim, flat-only recenter, forbidden mixed inventory, exits outside rolling window, explicit/optional recenter after full unwind.
+  - **Architectural choices (v1):** one-sided inventory with opposite-edge rolling trim, flat-only recenter, forbidden mixed inventory, exits outside rolling window, explicit/optional recenter after full unwind. Integrity repair enforces one-sided entries in branch mode: opposite-side entries are canceled (SM rejects their fills as BRANCH_INCOMPATIBLE).
   - **Implementation plan:** PR1 (spec) -> **PR2 (state machine) [DONE]** -> **PR3 (reconciliation adapter) [DONE]** -> **PR4 (runtime bridge) [DONE]** -> **PR5 (shadow verification) [DONE]** -> **PR6 (live ceremony) [DONE]**.
   - **PR2 scope:** Pure deterministic state machine only. No exchange interaction, no live execution, no reconciliation adapter. Zero changes to existing code.
   - **PR3 scope:** Reconciliation adapter (CID scheme, order registry, fill translation, action resolution, reconciliation detection, snapshot reconstruction). No exchange I/O. No dispatch. Detection only. Strategy `g` reserved for grid_v2.

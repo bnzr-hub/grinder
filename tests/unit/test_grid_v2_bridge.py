@@ -1708,7 +1708,9 @@ class TestEngineIntegrityWatchdog:
         # Must NOT place any SELL entries.
         place_actions = [a for a in second if a.reason == "grid_v2_PLACE_ENTRY"]
         for pa in place_actions:
-            assert pa.side != OrderSide.SELL, "Must not place opposite-side SELL entry in LONG_BRANCH"
+            assert pa.side != OrderSide.SELL, (
+                "Must not place opposite-side SELL entry in LONG_BRANCH"
+            )
 
     def test_branch_integrity_short_branch_cancels_buy_entries(
         self,
@@ -1865,7 +1867,9 @@ class TestEngineIntegrityWatchdog:
         # Must NOT place any BUY entries.
         place_actions = [a for a in second if a.reason == "grid_v2_PLACE_ENTRY"]
         for pa in place_actions:
-            assert pa.side != OrderSide.BUY, "Must not place opposite-side BUY entry in SHORT_BRANCH"
+            assert pa.side != OrderSide.BUY, (
+                "Must not place opposite-side BUY entry in SHORT_BRANCH"
+            )
 
     def test_branch_integrity_at_max_inventory_does_not_place_entries(
         self,
