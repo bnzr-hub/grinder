@@ -847,22 +847,23 @@ class LiveEngineV0:
         if not filled_cids:
             return []
 
-        entry_regs = {cid: bridge.adapter.registry.lookup_entry(cid) for cid in filled_cids}
-        exit_regs = {cid: bridge.adapter.registry.lookup_exit(cid) for cid in filled_cids}
         actions: list[ExecutionAction] = []
 
         # Deterministic order with EXIT before ENTRY.
         # This lets same-tick "exit + opposite entry" sequences flatten first,
         # reducing branch-incompatible rejects in one-sided inventory mode.
         def _fill_priority(fill_cid: str) -> tuple[int, str]:
-            if exit_regs.get(fill_cid) is not None:
+            parsed = bridge.adapter.parse_cid(fill_cid)
+            if parsed is not None and parsed.kind.value == "EXIT":
                 return (0, fill_cid)
-            if entry_regs.get(fill_cid) is not None:
+            if parsed is not None and parsed.kind.value == "ENTRY":
                 return (1, fill_cid)
             return (2, fill_cid)
 
         for cid in sorted(filled_cids, key=_fill_priority):
-            entry_reg = entry_regs.get(cid)
+            # Re-read registry per CID: prior fills in this batch may have
+            # changed registration state via resolve_actions/confirm_*.
+            entry_reg = bridge.adapter.registry.lookup_entry(cid)
             if entry_reg is not None:
                 result = bridge.on_fill(
                     cid,
@@ -883,7 +884,7 @@ class LiveEngineV0:
                 actions.extend(result.execution_actions)
                 continue
 
-            exit_reg = exit_regs.get(cid)
+            exit_reg = bridge.adapter.registry.lookup_exit(cid)
             if exit_reg is None:
                 continue
 
@@ -973,7 +974,10 @@ class LiveEngineV0:
             if oe.client_order_id in self._grid_v2_user_fill_seen:
                 return
             qty = oe.executed_qty if oe.executed_qty > 0 else bridge._config.order_size
-            price = oe.avg_price if oe.avg_price > 0 else oe.price
+            # Use order price for grid_v2 state transitions when available.
+            # avg_price can carry noisy fractional values and break
+            # price-keyed registry/state alignment for LIMIT grid orders.
+            price = oe.price if oe.price > 0 else oe.avg_price
             result = bridge.on_fill(
                 oe.client_order_id,
                 oe.side,

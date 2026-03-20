@@ -933,6 +933,66 @@ class TestEngineImmediateUserDataPath:
         assert bridge.adapter.registry.exit_count == 1
         assert port.place_order.call_count >= 1
 
+    def test_user_data_fill_uses_order_price_not_avg_price(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        port = MagicMock()
+        port.place_order.return_value = "ORDER_1"
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=(),
+            ts=_BASE_TS,
+            source="test",
+        )
+        assert engine._grid_v2_bridge is not None
+        engine._grid_v2_bridge.startup_fresh(_REF_PRICE, _BASE_TS)
+        engine._grid_v2_started = True
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+
+        bridge = engine._grid_v2_bridge
+        entry_cid = sorted(bridge.adapter.registry.all_entry_cids)[0]
+        reg = bridge.adapter.registry.lookup_entry(entry_cid)
+        assert reg is not None
+        noisy_avg = reg.price + Decimal("0.00000123")
+        event = UserDataEvent(
+            event_type=UserDataEventType.ORDER_TRADE_UPDATE,
+            order_event=FuturesOrderEvent(
+                ts=_BASE_TS + 1,
+                symbol="BTCUSDT",
+                order_id=1,
+                client_order_id=entry_cid,
+                side=reg.side,
+                status=OrderState.FILLED,
+                price=reg.price,
+                qty=_ORDER_SIZE,
+                executed_qty=_ORDER_SIZE,
+                avg_price=noisy_avg,
+            ),
+        )
+        engine.process_user_data_event(event)
+
+        snap = bridge.state_machine.snapshot
+        assert len(snap.open_lots) == 1
+        assert snap.open_lots[0].entry_price == reg.price
+
     def test_late_cancel_ack_after_aging_not_treated_as_fill(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1113,7 +1173,7 @@ class TestEngineFillOrdering:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Exit-first processing allows branch transition before opposite entry fill."""
+        """Exit-first processing prevents stale same-tick entry replay after recenter."""
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
@@ -1237,8 +1297,8 @@ class TestEngineFillOrdering:
 
         sm_after = bridge.state_machine
         assert sm_after is not None
-        assert sm_after.mode == BranchMode.SHORT_BRANCH
-        assert any(a.reason == "grid_v2_PLACE_EXIT" for a in actions)
+        assert sm_after.mode == BranchMode.FLAT
+        assert any(a.reason == "grid_v2_CANCEL_ENTRY" for a in actions)
 
 
 class TestFullLifecycle:
