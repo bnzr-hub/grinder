@@ -1546,6 +1546,160 @@ class TestEngineIntegrityWatchdog:
         assert second
         assert any(a.reason == "grid_v2_PLACE_ENTRY" for a in second)
 
+    def test_branch_integrity_at_max_inventory_does_not_place_entries(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from dataclasses import replace  # noqa: PLC0415
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=(),
+            ts=_BASE_TS,
+            source="test",
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        # Enter SHORT_BRANCH with one SELL fill.
+        sell_cid = sorted(bridge.adapter.registry.all_entry_cids)[-1]
+        sell_reg = bridge.adapter.registry.lookup_entry(sell_cid)
+        assert sell_reg is not None
+        fill_result = bridge.on_fill(
+            sell_cid,
+            OrderSide.SELL,
+            sell_reg.price,
+            _ORDER_SIZE,
+            _BASE_TS + 1_000,
+            allow_stale=True,
+        )
+        assert not fill_result.rejected
+        assert bridge.state_machine is not None
+        assert bridge.state_machine.mode == BranchMode.SHORT_BRANCH
+
+        # Force state to max inventory for safety gating.
+        lot = bridge.state_machine.snapshot.open_lots[0]
+        max_levels = bridge._config.max_inventory_levels
+        open_lots = tuple(
+            replace(
+                lot,
+                lot_id=f"{lot.lot_id}_{i}",
+                source_entry_order_id=f"{lot.source_entry_order_id}_{i}",
+                exit_order_id=f"{lot.exit_order_id}_{i}",
+            )
+            for i in range(max_levels)
+        )
+        bridge.state_machine._snapshot = replace(  # pyright: ignore[reportPrivateUsage]
+            bridge.state_machine.snapshot,
+            open_lots=open_lots,
+        )
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+        engine._grid_v2_pending_cancels.clear()
+
+        # Simulate exchange still carrying branch entries.
+        open_orders: list[OpenOrderSnap] = []
+        for cid in sorted(bridge.adapter.registry.all_entry_cids):
+            entry_reg = bridge.adapter.registry.lookup_entry(cid)
+            assert entry_reg is not None
+            open_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=entry_reg.side.value,
+                    order_type="LIMIT",
+                    price=entry_reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 2_000,
+                )
+            )
+        for cid in sorted(bridge.adapter.registry.all_exit_cids):
+            exit_reg = bridge.adapter.registry.lookup_exit(cid)
+            assert exit_reg is not None
+            open_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=OrderSide.BUY.value,
+                    order_type="LIMIT",
+                    price=Decimal("1"),
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=True,
+                    status="NEW",
+                    ts=_BASE_TS + 2_000,
+                )
+            )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(open_orders),
+            ts=_BASE_TS + 2_000,
+            source="test",
+        )
+
+        first = engine._grid_v2_integrity_repair(
+            Snapshot(
+                ts=_BASE_TS + 2_000,
+                symbol="BTCUSDT",
+                bid_price=Decimal("49999"),
+                ask_price=Decimal("50001"),
+                bid_qty=Decimal("1"),
+                ask_qty=Decimal("1"),
+                last_price=Decimal("50000"),
+                last_qty=Decimal("1"),
+            )
+        )
+        second = engine._grid_v2_integrity_repair(
+            Snapshot(
+                ts=_BASE_TS + 2_001,
+                symbol="BTCUSDT",
+                bid_price=Decimal("49999"),
+                ask_price=Decimal("50001"),
+                bid_qty=Decimal("1"),
+                ask_qty=Decimal("1"),
+                last_price=Decimal("50000"),
+                last_qty=Decimal("1"),
+            )
+        )
+
+        assert first == []
+        assert second
+        assert all(a.reason != "grid_v2_PLACE_ENTRY" for a in second)
+        assert any(a.reason == "grid_v2_INTEGRITY_CANCEL_ENTRY" for a in second)
+
 
 class TestFullLifecycle:
     """Integration: full entry → exit → flat lifecycle through bridge."""

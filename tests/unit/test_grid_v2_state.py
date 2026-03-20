@@ -1044,6 +1044,43 @@ class TestRiskGuards:
         assert result.rejected
         assert result.reject_reason == "MAX_INVENTORY_NOTIONAL_USD"
 
+    def test_grid_cid_bypasses_max_levels_rejection(self) -> None:
+        cfg = _config(max_levels=1, max_notional=Decimal("100000"))
+        sm = GridV2StateMachine.create_initial(cfg, _REF_PRICE, _BASE_TS)
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(
+            EntryFilled(
+                "g_g_PIPPINUSDT_e1_1773952851_0", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1
+            )
+        )
+
+        buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
+        result = sm.apply(
+            EntryFilled(
+                "g_g_PIPPINUSDT_e2_1773952852_0", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 2
+            )
+        )
+        assert not result.rejected
+        assert len(result.snapshot.open_lots) == 2
+
+    def test_grid_cid_bypasses_max_notional_rejection(self) -> None:
+        cfg = _config(max_notional=Decimal("100"), max_levels=10)
+        sm = GridV2StateMachine.create_initial(cfg, _REF_PRICE, _BASE_TS)
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(
+            EntryFilled(
+                "g_g_PIPPINUSDT_e1_1773952851_0", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1
+            )
+        )
+
+        buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
+        result = sm.apply(
+            EntryFilled(
+                "g_g_PIPPINUSDT_e2_1773952852_0", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 2
+            )
+        )
+        assert not result.rejected
+
 
 # ---------------------------------------------------------------------------
 # T19/T20: Emergency stop (section 16, 21.2, 21.7, 21.16)

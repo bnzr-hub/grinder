@@ -974,12 +974,21 @@ class LiveEngineV0:
             expected_entry_keys.add((OrderSide.BUY, bridge._quantize_price(p, OrderSide.BUY)))
         for p in sm.snapshot.entry_window.sell_entry_prices:
             expected_entry_keys.add((OrderSide.SELL, bridge._quantize_price(p, OrderSide.SELL)))
-        expected_entries = len(expected_entry_keys)
+        inventory_full = (
+            sm.mode != BranchMode.FLAT
+            and len(sm.snapshot.open_lots) >= bridge._config.max_inventory_levels
+        )
+        target_entry_keys = set(expected_entry_keys)
+        if inventory_full:
+            # Safety: when inventory cap is reached, do not replenish/maintain
+            # branch entries from integrity repair. Let exits reduce exposure first.
+            target_entry_keys = set()
+        expected_entries = len(target_entry_keys)
 
         if sm.mode == BranchMode.FLAT:
             mismatch = current_entries != expected_entries or current_exits != 0
         else:
-            mismatch = set(current_entry_by_key.keys()) != expected_entry_keys
+            mismatch = set(current_entry_by_key.keys()) != target_entry_keys
         if not mismatch:
             self._grid_v2_integrity_mismatch_streak = 0
             return []
@@ -1015,8 +1024,8 @@ class LiveEngineV0:
             repair_actions = list(bridge.recenter_flat(snapshot.mid_price, snapshot.ts))
         else:
             current_keys = set(current_entry_by_key.keys())
-            missing = expected_entry_keys - current_keys
-            extra = current_keys - expected_entry_keys
+            missing = target_entry_keys - current_keys
+            extra = current_keys - target_entry_keys
             logger.warning(
                 "GRID_V2_INTEGRITY_REPAIR_TRIGGER symbol=%s mode=%s entries=%d expected=%d "
                 "missing=%d extra=%d",
