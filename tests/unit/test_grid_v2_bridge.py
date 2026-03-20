@@ -1470,8 +1470,15 @@ class TestEngineIntegrityWatchdog:
         engine._grid_v2_pending_place_cids.clear()
         engine._grid_v2_pending_cancels.clear()
 
-        # Simulate missing one expected entry on exchange while in branch mode.
-        missing_entry_cid = sorted(bridge.adapter.registry.all_entry_cids)[0]
+        # Simulate missing one same-side (SELL) entry on exchange while in SHORT_BRANCH.
+        # Opposite-side (BUY) entries are neutral and ignored by integrity repair.
+        missing_entry_cid = ""
+        for cid in sorted(bridge.adapter.registry.all_entry_cids):
+            entry_reg = bridge.adapter.registry.lookup_entry(cid)
+            if entry_reg is not None and entry_reg.side == OrderSide.SELL:
+                missing_entry_cid = cid
+                break
+        assert missing_entry_cid
         open_orders: list[OpenOrderSnap] = []
         for cid in sorted(bridge.adapter.registry.all_entry_cids):
             if cid == missing_entry_cid:
@@ -1546,11 +1553,11 @@ class TestEngineIntegrityWatchdog:
         assert second
         assert any(a.reason == "grid_v2_PLACE_ENTRY" for a in second)
 
-    def test_branch_integrity_long_branch_repairs_missing_sell_entries(
+    def test_branch_integrity_long_branch_does_not_place_or_cancel_sell_entries(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """LONG_BRANCH with missing SELL entries: repair MUST place them (symmetric ladder)."""
+        """LONG_BRANCH: opposite-side (SELL) entries are neutral — not placed, not canceled."""
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
@@ -1614,7 +1621,8 @@ class TestEngineIntegrityWatchdog:
         engine._grid_v2_pending_place_cids.clear()
         engine._grid_v2_pending_cancels.clear()
 
-        # Exchange has only BUY entries (all SELL entries missing).
+        # Exchange has only BUY entries + exits (all SELL entries missing from exchange).
+        # Repair must NOT try to place SELL entries and must NOT cancel remaining SELLs.
         open_orders: list[OpenOrderSnap] = []
         for cid in sorted(bridge.adapter.registry.all_entry_cids):
             entry_reg = bridge.adapter.registry.lookup_entry(cid)
@@ -1660,7 +1668,6 @@ class TestEngineIntegrityWatchdog:
             source="test",
         )
 
-        # Streak tick 1: mismatch detected, no action yet.
         first = engine._grid_v2_integrity_repair(
             Snapshot(
                 ts=_BASE_TS + 2_000,
@@ -1673,7 +1680,6 @@ class TestEngineIntegrityWatchdog:
                 last_qty=Decimal("1"),
             )
         )
-        # Streak tick 2: repair fires.
         second = engine._grid_v2_integrity_repair(
             Snapshot(
                 ts=_BASE_TS + 2_001,
@@ -1687,16 +1693,15 @@ class TestEngineIntegrityWatchdog:
             )
         )
 
+        # No mismatch: opposite-side entries are neutral, same-side BUY entries present.
         assert first == []
-        # Repair MUST place the missing SELL entries (not ignore them).
-        assert second
-        assert any(a.reason == "grid_v2_PLACE_ENTRY" for a in second)
+        assert second == []
 
-    def test_branch_integrity_short_branch_repairs_missing_buy_entries(
+    def test_branch_integrity_short_branch_does_not_place_or_cancel_buy_entries(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """SHORT_BRANCH with missing BUY entries: repair MUST place them (symmetric ladder)."""
+        """SHORT_BRANCH: opposite-side (BUY) entries are neutral — not placed, not canceled."""
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
@@ -1760,7 +1765,8 @@ class TestEngineIntegrityWatchdog:
         engine._grid_v2_pending_place_cids.clear()
         engine._grid_v2_pending_cancels.clear()
 
-        # Exchange has only SELL entries (all BUY entries missing).
+        # Exchange has only SELL entries + exits (all BUY entries missing from exchange).
+        # Repair must NOT try to place BUY entries and must NOT cancel remaining BUYs.
         open_orders: list[OpenOrderSnap] = []
         for cid in sorted(bridge.adapter.registry.all_entry_cids):
             entry_reg = bridge.adapter.registry.lookup_entry(cid)
@@ -1806,7 +1812,6 @@ class TestEngineIntegrityWatchdog:
             source="test",
         )
 
-        # Streak tick 1: mismatch detected, no action yet.
         first = engine._grid_v2_integrity_repair(
             Snapshot(
                 ts=_BASE_TS + 2_000,
@@ -1819,7 +1824,6 @@ class TestEngineIntegrityWatchdog:
                 last_qty=Decimal("1"),
             )
         )
-        # Streak tick 2: repair fires.
         second = engine._grid_v2_integrity_repair(
             Snapshot(
                 ts=_BASE_TS + 2_001,
@@ -1833,10 +1837,9 @@ class TestEngineIntegrityWatchdog:
             )
         )
 
+        # No mismatch: opposite-side entries are neutral, same-side SELL entries present.
         assert first == []
-        # Repair MUST place the missing BUY entries (not ignore them).
-        assert second
-        assert any(a.reason == "grid_v2_PLACE_ENTRY" for a in second)
+        assert second == []
 
     def test_branch_integrity_at_max_inventory_does_not_place_entries(
         self,

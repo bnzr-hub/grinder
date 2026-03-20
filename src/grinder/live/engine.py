@@ -979,6 +979,19 @@ class LiveEngineV0:
             and len(sm.snapshot.open_lots) >= bridge._config.max_inventory_levels
         )
         target_entry_keys = set(expected_entry_keys)
+        # Branch-mode scoping: only manage same-side entries.
+        # Opposite-side entries from FLAT seed are left as-is on exchange
+        # (not placed, not canceled) to preserve the symmetric ladder.
+        # SM rejects opposite-side fills (BRANCH_INCOMPATIBLE), so placing
+        # new ones would create desync risk without lifecycle support.
+        if sm.mode == BranchMode.LONG_BRANCH:
+            target_entry_keys = {
+                (side, price) for side, price in target_entry_keys if side == OrderSide.BUY
+            }
+        elif sm.mode == BranchMode.SHORT_BRANCH:
+            target_entry_keys = {
+                (side, price) for side, price in target_entry_keys if side == OrderSide.SELL
+            }
         if inventory_full:
             # Safety: when inventory cap is reached, do not replenish/maintain
             # branch entries from integrity repair. Let exits reduce exposure first.
@@ -988,7 +1001,14 @@ class LiveEngineV0:
         if sm.mode == BranchMode.FLAT:
             mismatch = current_entries != expected_entries or current_exits != 0
         else:
-            mismatch = set(current_entry_by_key.keys()) != target_entry_keys
+            # Compare only managed (same-side) entries; opposite-side is neutral.
+            current_managed = {
+                (s, p)
+                for s, p in current_entry_by_key
+                if (sm.mode == BranchMode.LONG_BRANCH and s == OrderSide.BUY)
+                or (sm.mode == BranchMode.SHORT_BRANCH and s == OrderSide.SELL)
+            }
+            mismatch = current_managed != target_entry_keys
         if not mismatch:
             self._grid_v2_integrity_mismatch_streak = 0
             return []
@@ -1023,16 +1043,24 @@ class LiveEngineV0:
             )
             repair_actions = list(bridge.recenter_flat(snapshot.mid_price, snapshot.ts))
         else:
-            current_keys = set(current_entry_by_key.keys())
-            missing = target_entry_keys - current_keys
-            extra = current_keys - target_entry_keys
+            # Only compute missing/extra for managed (same-side) entries.
+            # Opposite-side entries on exchange are left untouched.
+            managed_current: set[tuple[OrderSide, Decimal]] = set()
+            if sm.mode == BranchMode.LONG_BRANCH:
+                managed_current = {(s, p) for s, p in current_entry_by_key if s == OrderSide.BUY}
+            elif sm.mode == BranchMode.SHORT_BRANCH:
+                managed_current = {(s, p) for s, p in current_entry_by_key if s == OrderSide.SELL}
+            else:
+                managed_current = set(current_entry_by_key.keys())
+            missing = target_entry_keys - managed_current
+            extra = managed_current - target_entry_keys
             logger.warning(
                 "GRID_V2_INTEGRITY_REPAIR_TRIGGER symbol=%s mode=%s entries=%d expected=%d "
                 "missing=%d extra=%d",
                 snapshot.symbol,
                 sm.mode.value,
-                len(current_keys),
-                len(expected_entry_keys),
+                len(managed_current),
+                len(target_entry_keys),
                 len(missing),
                 len(extra),
             )
