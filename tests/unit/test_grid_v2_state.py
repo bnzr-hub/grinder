@@ -48,6 +48,7 @@ def _config(
     order_size: Decimal = _ORDER_SIZE,
     max_levels: int = 5,
     max_notional: Decimal = Decimal("10000"),
+    tick_size: Decimal = Decimal("0.01"),
 ) -> GridV2Config:
     return GridV2Config(
         grid_step_pct=step,
@@ -55,6 +56,7 @@ def _config(
         order_size=order_size,
         max_inventory_levels=max_levels,
         max_inventory_notional_usd=max_notional,
+        price_tick_size=tick_size,
     )
 
 
@@ -137,6 +139,17 @@ class TestInitialPlacement:
         assert buys[1] == _REF_PRICE * (Decimal(1) - _STEP * 2)
         # Sell level 1 = ref * (1 + 0.01*1) = 101
         assert sells[0] == _REF_PRICE * (Decimal(1) + _STEP)
+
+    def test_strict_tick_step_intervals_match(self) -> None:
+        cfg = _config(step=Decimal("0.0025"), levels=5, tick_size=Decimal("0.0001"))
+        sm = _sm(ref=Decimal("0.09583"), cfg=cfg)
+        buys = sm.snapshot.entry_window.buy_entry_prices
+        sells = sm.snapshot.entry_window.sell_entry_prices
+        buy_deltas = [buys[i] - buys[i + 1] for i in range(len(buys) - 1)]
+        sell_deltas = [sells[i + 1] - sells[i] for i in range(len(sells) - 1)]
+        assert len(set(buy_deltas)) == 1
+        assert len(set(sell_deltas)) == 1
+        assert buy_deltas[0] == sell_deltas[0] == Decimal("0.0003")
 
 
 # ---------------------------------------------------------------------------

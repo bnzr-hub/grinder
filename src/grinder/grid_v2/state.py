@@ -12,7 +12,7 @@ Design constraints:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 from enum import Enum
 
 from grinder.core import OrderSide
@@ -215,14 +215,13 @@ def _build_entry_window(
     reference_price: Decimal,
     levels_per_side: int,
     step_pct: Decimal,
+    tick_size: Decimal,
 ) -> EntryWindow:
     """Build symmetric entry window around reference price (section 9)."""
-    buy_prices = tuple(
-        reference_price * (Decimal(1) - step_pct * i) for i in range(1, levels_per_side + 1)
-    )
-    sell_prices = tuple(
-        reference_price * (Decimal(1) + step_pct * i) for i in range(1, levels_per_side + 1)
-    )
+    step_price = _grid_step_price(reference_price, step_pct, tick_size)
+    anchor = _round_to_tick(reference_price, tick_size, rounding=ROUND_HALF_UP)
+    buy_prices = tuple(anchor - step_price * i for i in range(1, levels_per_side + 1))
+    sell_prices = tuple(anchor + step_price * i for i in range(1, levels_per_side + 1))
     return EntryWindow(
         reference_price=reference_price,
         buy_entry_prices=buy_prices,
@@ -230,6 +229,25 @@ def _build_entry_window(
         levels_per_side=levels_per_side,
         step_pct=step_pct,
     )
+
+
+def _round_to_tick(
+    price: Decimal,
+    tick_size: Decimal,
+    *,
+    rounding: str = ROUND_HALF_UP,
+) -> Decimal:
+    """Quantize a price to tick_size."""
+    return (price / tick_size).quantize(Decimal("1"), rounding=rounding) * tick_size
+
+
+def _grid_step_price(reference_price: Decimal, step_pct: Decimal, tick_size: Decimal) -> Decimal:
+    """Convert pct step to a stable integer number of ticks (min 1 tick)."""
+    raw_step = reference_price * step_pct
+    step_ticks = (raw_step / tick_size).quantize(Decimal("1"), rounding=ROUND_CEILING)
+    if step_ticks < 1:
+        step_ticks = Decimal("1")
+    return step_ticks * tick_size
 
 
 def _empty_entry_window(window: EntryWindow) -> EntryWindow:
@@ -313,7 +331,10 @@ class GridV2StateMachine:
         Goes through __init__ for single validation path (21.15).
         """
         window = _build_entry_window(
-            reference_price, config.entry_levels_per_side, config.grid_step_pct
+            reference_price,
+            config.entry_levels_per_side,
+            config.grid_step_pct,
+            config.price_tick_size,
         )
         snapshot = GridV2Snapshot(
             mode=BranchMode.FLAT,
@@ -486,7 +507,10 @@ class GridV2StateMachine:
         if event.side == OrderSide.BUY:
             remaining = tuple(p for p in window.buy_entry_prices if p != event.price)
             farthest = remaining[-1] if remaining else event.price
-            new_farthest = farthest * (Decimal(1) - cfg.grid_step_pct)
+            step_price = _grid_step_price(
+                window.reference_price, cfg.grid_step_pct, cfg.price_tick_size
+            )
+            new_farthest = farthest - step_price
             if window.sell_entry_prices:
                 trimmed = window.sell_entry_prices[-1]
                 new_sells = window.sell_entry_prices[:-1]
@@ -513,7 +537,10 @@ class GridV2StateMachine:
         else:
             remaining = tuple(p for p in window.sell_entry_prices if p != event.price)
             farthest = remaining[-1] if remaining else event.price
-            new_farthest = farthest * (Decimal(1) + cfg.grid_step_pct)
+            step_price = _grid_step_price(
+                window.reference_price, cfg.grid_step_pct, cfg.price_tick_size
+            )
+            new_farthest = farthest + step_price
             if window.buy_entry_prices:
                 trimmed = window.buy_entry_prices[-1]
                 new_buys = window.buy_entry_prices[:-1]
@@ -598,7 +625,11 @@ class GridV2StateMachine:
         new_mode = BranchMode.FLAT if not new_open else snap.mode
         new_last_recenter_ts = snap.last_recenter_ts
         if new_open:
-            step_delta = snap.entry_window.reference_price * self._config.grid_step_pct
+            step_delta = _grid_step_price(
+                snap.entry_window.reference_price,
+                self._config.grid_step_pct,
+                self._config.price_tick_size,
+            )
             if snap.mode == BranchMode.LONG_BRANCH:
                 buy_prices = list(snap.entry_window.buy_entry_prices)
                 sell_prices = list(snap.entry_window.sell_entry_prices)
@@ -744,6 +775,7 @@ class GridV2StateMachine:
                 snap.entry_window.reference_price,
                 self._config.entry_levels_per_side,
                 self._config.grid_step_pct,
+                self._config.price_tick_size,
             )
             actions.extend(
                 ActionIntent(
@@ -860,6 +892,7 @@ class GridV2StateMachine:
             event.new_reference_price,
             self._config.entry_levels_per_side,
             self._config.grid_step_pct,
+            self._config.price_tick_size,
         )
 
         for p in new_window.buy_entry_prices:
