@@ -1451,10 +1451,10 @@ class LiveEngineV0:
             # Never falls through to legacy planner for this symbol.
             if self._is_grid_v2_active(snapshot.symbol):
                 # Drain seed actions on first active tick, then fill-driven
-                raw_actions: list[ExecutionAction] = list(self._grid_v2_seed_actions) + list(
-                    grid_v2_fill_actions
-                ) + list(
-                    grid_v2_integrity_actions
+                raw_actions: list[ExecutionAction] = (
+                    list(self._grid_v2_seed_actions)
+                    + list(grid_v2_fill_actions)
+                    + list(grid_v2_integrity_actions)
                 )
                 self._grid_v2_seed_actions.clear()
             else:
