@@ -227,11 +227,15 @@ class TestOrderRegistry:
         r = GridV2OrderRegistry()
         r.register_entry("e1", OrderSide.BUY, Decimal("100"))
         r.register_exit("x1", "exit-x", "lot-x")
+        r.mark_entry_cancel_pending("e1")
+        r.mark_exit_cancel_pending("x1")
         r.clear()
         assert r.entry_count == 0
         assert r.exit_count == 0
         assert r.lookup_entry("e1") is None
+        assert r.lookup_stale_entry("e1") is None
         assert r.lookup_exit("x1") is None
+        assert r.lookup_stale_exit("x1") is None
 
 
 class TestFillTranslation:
@@ -284,7 +288,7 @@ class TestFillTranslation:
         with pytest.raises(ValueError, match="not in registry"):
             a.translate_fill(cid, OrderSide.SELL, Decimal("100"), _ORDER_SIZE, _BASE_TS)
 
-    def test_preserves_price_qty_ts(self) -> None:
+    def test_entry_fill_uses_registered_price_and_preserves_qty_ts(self) -> None:
         a = _adapter()
         cid = a.generate_entry_cid(_BASE_TS)
         a.registry.register_entry(cid, OrderSide.SELL, Decimal("50250"))
@@ -296,9 +300,60 @@ class TestFillTranslation:
             _BASE_TS + 1000,
         )
         assert result is not None
-        assert result.event.price == Decimal("50250.50")
+        assert result.event.price == Decimal("50250")
         assert result.event.qty == Decimal("0.002")
         assert result.event.ts == _BASE_TS + 1000
+
+    def test_late_entry_fill_after_cancel_uses_stale_registration(self) -> None:
+        a = _adapter()
+        cid = a.generate_entry_cid(_BASE_TS)
+        a.registry.register_entry(cid, OrderSide.SELL, Decimal("50250"))
+        actions = (
+            ActionIntent(
+                kind=ActionIntentKind.CANCEL_ENTRY,
+                side=OrderSide.SELL,
+                price=Decimal("50250"),
+                reason="ROLLING_TRIM",
+            ),
+        )
+        a.resolve_actions(actions, _BASE_TS + 1)
+
+        result = a.translate_fill(
+            cid,
+            OrderSide.SELL,
+            Decimal("50250.50"),
+            Decimal("0.002"),
+            _BASE_TS + 1000,
+        )
+        assert result is not None
+        assert result.event.price == Decimal("50250")
+        assert result.event.qty == Decimal("0.002")
+        assert result.event.ts == _BASE_TS + 1000
+
+    def test_late_exit_fill_after_cancel_uses_stale_registration(self) -> None:
+        a = _adapter()
+        cid = a.generate_exit_cid(_BASE_TS)
+        a.registry.register_exit(cid, "exit-E1", "lot-E1")
+        actions = (
+            ActionIntent(
+                kind=ActionIntentKind.CANCEL_EXIT,
+                order_id="exit-E1",
+                reason="OPERATOR_CLEANUP",
+            ),
+        )
+        a.resolve_actions(actions, _BASE_TS + 1)
+
+        result = a.translate_fill(
+            cid,
+            OrderSide.SELL,
+            Decimal("50250.50"),
+            Decimal("0.002"),
+            _BASE_TS + 1000,
+        )
+        assert result is not None
+        assert isinstance(result.event, ExitFilled)
+        assert result.event.exit_order_id == "exit-E1"
+        assert result.event.lot_id == "lot-E1"
 
     def test_duplicate_entry_fill_same_event(self) -> None:
         """Adapter is stateless: same CID -> same event (22.4)."""
@@ -360,7 +415,7 @@ class TestActionResolution:
         assert reg.lot_id == "lot-entry1"
 
     def test_cancel_entry_returns_cid_no_removal(self) -> None:
-        """CANCEL_ENTRY looks up CID and releases the registry slot."""
+        """CANCEL_ENTRY releases active slot but keeps stale CID for late fills."""
         a = _adapter()
         cid = a.generate_entry_cid(_BASE_TS)
         a.registry.register_entry(cid, OrderSide.BUY, Decimal("49750"))
@@ -376,6 +431,7 @@ class TestActionResolution:
         assert len(resolved) == 1
         assert resolved[0].cid == cid
         assert a.registry.lookup_entry(cid) is None
+        assert a.registry.lookup_stale_entry(cid) is not None
 
     def test_cancel_exit_returns_cid_no_removal(self) -> None:
         a = _adapter()
@@ -392,6 +448,7 @@ class TestActionResolution:
         assert len(resolved) == 1
         assert resolved[0].cid == cid
         assert a.registry.lookup_exit(cid) is None
+        assert a.registry.lookup_stale_exit(cid) is not None
 
     def test_cancel_unregistered_entry_raises(self) -> None:
         a = _adapter()

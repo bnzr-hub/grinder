@@ -167,6 +167,8 @@ class GridV2OrderRegistry:
         self._exits: dict[str, ExitRegistration] = {}
         self._entry_by_side_price: dict[tuple[OrderSide, Decimal], str] = {}
         self._exit_by_exit_id: dict[str, str] = {}
+        self._stale_entries: dict[str, EntryRegistration] = {}
+        self._stale_exits: dict[str, ExitRegistration] = {}
 
     def register_entry(self, cid: str, side: OrderSide, price: Decimal) -> None:
         """Register a new entry order.
@@ -203,6 +205,10 @@ class GridV2OrderRegistry:
     def lookup_entry(self, cid: str) -> EntryRegistration | None:
         return self._entries.get(cid)
 
+    def lookup_stale_entry(self, cid: str) -> EntryRegistration | None:
+        """Lookup a recently-canceled entry CID for late fill translation."""
+        return self._stale_entries.get(cid)
+
     def lookup_exit(self, cid: str) -> ExitRegistration | None:
         return self._exits.get(cid)
 
@@ -219,6 +225,17 @@ class GridV2OrderRegistry:
         reg = self._entries.pop(cid, None)
         if reg is not None:
             self._entry_by_side_price.pop((reg.side, reg.price), None)
+            self._stale_entries.pop(cid, None)
+            return reg
+        return self._stale_entries.pop(cid, None)
+
+    def mark_entry_cancel_pending(self, cid: str) -> EntryRegistration | None:
+        """Move active entry to stale cache so late fills can still translate."""
+        reg = self._entries.pop(cid, None)
+        if reg is None:
+            return None
+        self._entry_by_side_price.pop((reg.side, reg.price), None)
+        self._stale_entries[cid] = reg
         return reg
 
     def remove_exit(self, cid: str) -> ExitRegistration | None:
@@ -226,6 +243,21 @@ class GridV2OrderRegistry:
         reg = self._exits.pop(cid, None)
         if reg is not None:
             self._exit_by_exit_id.pop(reg.exit_order_id, None)
+            self._stale_exits.pop(cid, None)
+            return reg
+        return self._stale_exits.pop(cid, None)
+
+    def lookup_stale_exit(self, cid: str) -> ExitRegistration | None:
+        """Lookup a recently-canceled exit CID for late fill translation."""
+        return self._stale_exits.get(cid)
+
+    def mark_exit_cancel_pending(self, cid: str) -> ExitRegistration | None:
+        """Move active exit to stale cache so late fills can still translate."""
+        reg = self._exits.pop(cid, None)
+        if reg is None:
+            return None
+        self._exit_by_exit_id.pop(reg.exit_order_id, None)
+        self._stale_exits[cid] = reg
         return reg
 
     def clear(self) -> None:
@@ -234,6 +266,8 @@ class GridV2OrderRegistry:
         self._exits.clear()
         self._entry_by_side_price.clear()
         self._exit_by_exit_id.clear()
+        self._stale_entries.clear()
+        self._stale_exits.clear()
 
     @property
     def entry_count(self) -> int:
@@ -399,11 +433,13 @@ class GridV2Adapter:
         if parsed.kind == GridV2OrderKind.ENTRY:
             entry_reg = self._registry.lookup_entry(client_order_id)
             if entry_reg is None:
+                entry_reg = self._registry.lookup_stale_entry(client_order_id)
+            if entry_reg is None:
                 raise ValueError(f"Entry CID not in registry (stale?): {client_order_id}")
             event = EntryFilled(
                 order_id=client_order_id,
                 side=side,
-                price=price,
+                price=entry_reg.price,
                 qty=qty,
                 ts=ts,
             )
@@ -411,6 +447,8 @@ class GridV2Adapter:
 
         # EXIT
         exit_reg = self._registry.lookup_exit(client_order_id)
+        if exit_reg is None:
+            exit_reg = self._registry.lookup_stale_exit(client_order_id)
         if exit_reg is None:
             raise ValueError(f"Exit CID not in registry (stale?): {client_order_id}")
         exit_event = ExitFilled(
@@ -486,7 +524,7 @@ class GridV2Adapter:
                         f"No registered entry CID for CANCEL_ENTRY: "
                         f"side={action.side.value}, price={action.price}"
                     )
-                self._registry.remove_entry(found_cid)
+                self._registry.mark_entry_cancel_pending(found_cid)
                 resolved.append(
                     ResolvedAction(
                         cid=found_cid,
@@ -504,7 +542,7 @@ class GridV2Adapter:
                     raise ValueError(
                         f"No registered exit CID for CANCEL_EXIT: exit_order_id={action.order_id}"
                     )
-                self._registry.remove_exit(found_cid)
+                self._registry.mark_exit_cancel_pending(found_cid)
                 resolved.append(
                     ResolvedAction(
                         cid=found_cid,

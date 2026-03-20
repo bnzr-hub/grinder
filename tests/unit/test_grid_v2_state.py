@@ -728,6 +728,22 @@ class TestActiveEntryValidation:
         assert result.rejected
         assert result.reject_reason == "PRICE_NOT_IN_ACTIVE_WINDOW"
 
+    def test_grid_cid_entry_fill_outside_window_is_accepted(self) -> None:
+        """Late fill on grid CID remains processable after window shift."""
+        sm = _sm()
+        result = sm.apply(
+            EntryFilled(
+                "g_g_PIPPINUSDT_e5_1773952851_0",
+                OrderSide.SELL,
+                Decimal("200"),
+                _ORDER_SIZE,
+                _BASE_TS + 1,
+            )
+        )
+        assert not result.rejected
+        assert result.snapshot.mode == BranchMode.SHORT_BRANCH
+        assert len(result.snapshot.open_lots) == 1
+
     def test_sell_after_flat_reseed_reactivates_consumed_price(self) -> None:
         """After full unwind, the consumed SELL price becomes active again."""
         sm = _sm()
