@@ -16,6 +16,7 @@ from decimal import Decimal
 from enum import Enum
 
 from grinder.core import OrderSide
+from grinder.reconcile.identity import parse_client_order_id
 
 
 class BranchMode(Enum):
@@ -380,23 +381,26 @@ class GridV2StateMachine:
         snap = self._snapshot
         cfg = self._config
 
+        if any(
+            lot.source_entry_order_id == event.order_id
+            for lot in (*snap.open_lots, *snap.closed_lots)
+        ):
+            return "DUPLICATE_ENTRY_FILL"
+
         active_prices = (
             snap.entry_window.buy_entry_prices
             if event.side == OrderSide.BUY
             else snap.entry_window.sell_entry_prices
         )
-        if event.price not in active_prices:
+        parsed = parse_client_order_id(event.order_id)
+        is_grid_v2_cid = parsed is not None and parsed.strategy_id == "g"
+        if event.price not in active_prices and not is_grid_v2_cid:
             return "PRICE_NOT_IN_ACTIVE_WINDOW"
         if len(snap.open_lots) >= cfg.max_inventory_levels:
             return "MAX_INVENTORY_LEVELS"
         current_notional = sum(lot.qty * lot.entry_price for lot in snap.open_lots)
         if current_notional + event.qty * event.price > cfg.max_inventory_notional_usd:
             return "MAX_INVENTORY_NOTIONAL_USD"
-        if any(
-            lot.source_entry_order_id == event.order_id
-            for lot in (*snap.open_lots, *snap.closed_lots)
-        ):
-            return "DUPLICATE_ENTRY_FILL"
         if (snap.mode == BranchMode.SHORT_BRANCH and event.side == OrderSide.BUY) or (
             snap.mode == BranchMode.LONG_BRANCH and event.side == OrderSide.SELL
         ):
