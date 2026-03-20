@@ -535,6 +535,20 @@ class FuturesPreflightResult:
     missing_symbols: tuple[str, ...] = ()
 
 
+GridV2PreflightStatus = Literal[
+    "skipped",
+    "passed",
+    "account_sync_disabled",
+]
+
+
+@dataclass(frozen=True)
+class GridV2PreflightResult:
+    """Result of grid_v2 runtime preflight validation."""
+
+    status: GridV2PreflightStatus
+
+
 def evaluate_futures_preflight(
     symbols: list[str],
     exchange_port: str,
@@ -556,6 +570,24 @@ def evaluate_futures_preflight(
         return FuturesPreflightResult(status="symbol_missing", missing_symbols=missing)
 
     return FuturesPreflightResult(status="passed")
+
+
+def evaluate_grid_v2_account_sync_preflight(
+    exchange_port: str,
+    fixture_path: str | None,
+    grid_v2_enabled: bool,
+    account_sync_enabled: bool,
+) -> GridV2PreflightResult:
+    """Pure grid_v2 preflight validation.
+
+    grid_v2 runtime requires account-sync truth to recover from missed user-data
+    events and keep fill/cancel reconciliation deterministic in futures live mode.
+    """
+    if not grid_v2_enabled or exchange_port != "futures" or fixture_path is not None:
+        return GridV2PreflightResult(status="skipped")
+    if not account_sync_enabled:
+        return GridV2PreflightResult(status="account_sync_disabled")
+    return GridV2PreflightResult(status="passed")
 
 
 def _validate_futures_preflight_or_exit(
@@ -593,6 +625,27 @@ def _validate_futures_preflight_or_exit(
             f"Available: {len(constraints or {})} symbols."
         )
         sys.exit(1)
+
+
+def _validate_grid_v2_account_sync_or_exit(
+    exchange_port: str,
+    fixture_path: str | None,
+) -> None:
+    """Fail-closed: primary grid_v2 in futures mode requires AccountSync."""
+    result = evaluate_grid_v2_account_sync_preflight(
+        exchange_port=exchange_port,
+        fixture_path=fixture_path,
+        grid_v2_enabled=parse_bool("GRINDER_GRID_V2_ENABLED", default=False, strict=False),
+        account_sync_enabled=parse_bool("GRINDER_ACCOUNT_SYNC_ENABLED", default=False, strict=False),
+    )
+    if result.status in {"skipped", "passed"}:
+        return
+    print(
+        "ERROR: GRINDER_GRID_V2_ENABLED=true with --exchange-port futures requires "
+        "GRINDER_ACCOUNT_SYNC_ENABLED=1. Without account-sync, grid_v2 may miss "
+        "fill/cancel reconciliation and stop updating order placement."
+    )
+    sys.exit(1)
 
 
 def _build_grid_planners(
@@ -1167,6 +1220,7 @@ def main() -> None:  # noqa: PLR0915
 
     # Futures preflight: validate symbols exist on futures venue (fail-closed).
     _validate_futures_preflight_or_exit(symbols, args.exchange_port, args.fixture)
+    _validate_grid_v2_account_sync_or_exit(args.exchange_port, args.fixture)
 
     connector = build_connector(
         symbols,
