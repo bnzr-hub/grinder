@@ -55,6 +55,7 @@ BRIDGE_STARTUP_OK = "GRID_V2_BRIDGE_STARTUP_OK"
 BRIDGE_FILL_PROCESSED = "GRID_V2_FILL_PROCESSED"
 BRIDGE_FILL_REJECTED = "GRID_V2_FILL_REJECTED"
 BRIDGE_FILL_FOREIGN = "GRID_V2_FILL_FOREIGN"
+BRIDGE_EXIT_FILL_ORPHAN = "GRID_V2_EXIT_FILL_ORPHAN"
 BRIDGE_DISPATCH_BLOCKED = "GRID_V2_DISPATCH_BLOCKED"
 
 
@@ -262,9 +263,20 @@ class GridV2Bridge:
                         lot_id = lot.lot_id
                         break
                 if lot_id is None:
-                    raise ValueError(
-                        f"Exit CID not in open lot ledger: {client_order_id}"
-                    ) from None
+                    logger.warning(
+                        "%s symbol=%s cid=%s",
+                        BRIDGE_EXIT_FILL_ORPHAN,
+                        self._symbol,
+                        client_order_id,
+                    )
+                    return FillResult(
+                        translated=None,
+                        transition=None,
+                        resolved_actions=(),
+                        execution_actions=(),
+                        rejected=True,
+                        reject_reason="EXIT_LOT_NOT_FOUND",
+                    )
                 translated = TranslatedFill(
                     event=ExitFilled(
                         exit_order_id=client_order_id,
