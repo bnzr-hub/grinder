@@ -650,6 +650,7 @@ class LiveEngineV0:
                 os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL", "1000")
             ),
             price_tick_size=self._resolve_grid_v2_tick_size(),
+            reseed_on_flat=parse_bool("GRINDER_GRID_V2_RESEED_ON_FLAT", default=True, strict=False),
         )
         return GridV2Bridge(config, self._grid_v2_symbol)
 
@@ -700,7 +701,9 @@ class LiveEngineV0:
                     self._grid_v2_symbol,
                     bridge.failed_reason,
                 )
-            elif pos_qty == 0 and bridge.state_machine is not None:
+            elif (
+                pos_qty == 0 and bridge.state_machine is not None and bridge._config.reseed_on_flat
+            ):
                 # If we're flat and restarting on existing grid orders, recenter once
                 # so entry distance from mid reflects current step/levels config.
                 reseed = bridge.recenter_flat(snapshot.mid_price, snapshot.ts)
@@ -1060,15 +1063,54 @@ class LiveEngineV0:
         )
         repair_actions: list[ExecutionAction] = []
         if sm.mode == BranchMode.FLAT:
-            logger.warning(
-                "GRID_V2_INTEGRITY_REPAIR_TRIGGER symbol=%s mode=%s entries=%d expected=%d exits=%d",
-                snapshot.symbol,
-                sm.mode.value,
-                current_entries,
-                expected_entries,
-                current_exits,
-            )
-            repair_actions = list(bridge.recenter_flat(snapshot.mid_price, snapshot.ts))
+            if bridge._config.reseed_on_flat:
+                logger.warning(
+                    "GRID_V2_INTEGRITY_REPAIR_TRIGGER symbol=%s mode=%s entries=%d expected=%d "
+                    "exits=%d",
+                    snapshot.symbol,
+                    sm.mode.value,
+                    current_entries,
+                    expected_entries,
+                    current_exits,
+                )
+                repair_actions = list(bridge.recenter_flat(snapshot.mid_price, snapshot.ts))
+            else:
+                current_keys = set(current_entry_by_key.keys())
+                extra = current_keys - target_entry_keys
+                # Preserve mode: never reseed/rebuild in FLAT.
+                # Only perform cleanup for exchange-visible drift.
+                for side, price in sorted(extra, key=lambda item: (item[0].value, item[1])):
+                    cid = current_entry_by_key[(side, price)]
+                    repair_actions.append(
+                        ExecutionAction(
+                            action_type=ActionType.CANCEL,
+                            order_id=cid,
+                            symbol=snapshot.symbol,
+                            reason="grid_v2_INTEGRITY_CANCEL_ENTRY",
+                        )
+                    )
+                for cid in sorted(current_cids):
+                    parsed = bridge.adapter.parse_cid(cid)
+                    if parsed is None or parsed.kind.value == "ENTRY":
+                        continue
+                    repair_actions.append(
+                        ExecutionAction(
+                            action_type=ActionType.CANCEL,
+                            order_id=cid,
+                            symbol=snapshot.symbol,
+                            reason="grid_v2_INTEGRITY_CANCEL_EXIT",
+                        )
+                    )
+                logger.warning(
+                    "GRID_V2_INTEGRITY_FLAT_PRESERVE symbol=%s entries=%d expected=%d exits=%d "
+                    "extra=%d cleanup_actions=%d reason=reseed_on_flat_disabled",
+                    snapshot.symbol,
+                    current_entries,
+                    expected_entries,
+                    current_exits,
+                    len(extra),
+                    len(repair_actions),
+                )
         else:
             current_keys = set(current_entry_by_key.keys())
             missing = target_entry_keys - current_keys
