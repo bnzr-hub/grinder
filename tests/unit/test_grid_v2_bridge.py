@@ -1470,8 +1470,8 @@ class TestEngineIntegrityWatchdog:
         engine._grid_v2_pending_place_cids.clear()
         engine._grid_v2_pending_cancels.clear()
 
-        # Simulate missing one same-side (SELL) entry on exchange while in SHORT_BRANCH.
-        # Opposite-side (BUY) entries are neutral and ignored by integrity repair.
+        # Simulate missing one branch-compatible entry on exchange while in branch mode.
+        # SHORT_BRANCH should maintain SELL entries; missing SELL must trigger replacement.
         missing_entry_cid = ""
         for cid in sorted(bridge.adapter.registry.all_entry_cids):
             entry_reg = bridge.adapter.registry.lookup_entry(cid)
@@ -1553,17 +1553,15 @@ class TestEngineIntegrityWatchdog:
         assert second
         assert any(a.reason == "grid_v2_PLACE_ENTRY" for a in second)
 
-    def test_branch_integrity_long_branch_cancels_sell_entries(
+    def test_branch_integrity_long_branch_ignores_missing_sell_entries(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """LONG_BRANCH: opposite-side (SELL) entries on exchange must be canceled."""
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
         from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
         from grinder.contracts import Snapshot  # noqa: PLC0415
-        from grinder.execution.types import ActionType  # noqa: PLC0415
         from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
         from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
 
@@ -1622,15 +1620,12 @@ class TestEngineIntegrityWatchdog:
         engine._grid_v2_pending_place_cids.clear()
         engine._grid_v2_pending_cancels.clear()
 
-        # Exchange has BUY entries + SELL entries (opposite-side leftover from FLAT seed) + exits.
-        # Repair must cancel SELL entries and must NOT place new SELL entries.
-        sell_entry_cids: list[str] = []
         open_orders: list[OpenOrderSnap] = []
         for cid in sorted(bridge.adapter.registry.all_entry_cids):
             entry_reg = bridge.adapter.registry.lookup_entry(cid)
             assert entry_reg is not None
-            if entry_reg.side == OrderSide.SELL:
-                sell_entry_cids.append(cid)
+            if entry_reg.side != OrderSide.BUY:
+                continue
             open_orders.append(
                 OpenOrderSnap(
                     order_id=cid,
@@ -1662,7 +1657,6 @@ class TestEngineIntegrityWatchdog:
                     ts=_BASE_TS + 2_000,
                 )
             )
-        assert sell_entry_cids  # must have opposite-side entries to cancel
 
         engine._last_account_snapshot = AccountSnapshot(
             positions=(),
@@ -1671,7 +1665,6 @@ class TestEngineIntegrityWatchdog:
             source="test",
         )
 
-        # Streak tick 1: mismatch pending.
         first = engine._grid_v2_integrity_repair(
             Snapshot(
                 ts=_BASE_TS + 2_000,
@@ -1684,7 +1677,6 @@ class TestEngineIntegrityWatchdog:
                 last_qty=Decimal("1"),
             )
         )
-        # Streak tick 2: repair fires.
         second = engine._grid_v2_integrity_repair(
             Snapshot(
                 ts=_BASE_TS + 2_001,
@@ -1699,30 +1691,17 @@ class TestEngineIntegrityWatchdog:
         )
 
         assert first == []
-        assert second
-        # Must cancel opposite-side SELL entries.
-        cancel_actions = [a for a in second if a.action_type == ActionType.CANCEL]
-        canceled_cids = {a.order_id for a in cancel_actions}
-        for sell_cid in sell_entry_cids:
-            assert sell_cid in canceled_cids, f"SELL entry {sell_cid} not canceled"
-        # Must NOT place any SELL entries.
-        place_actions = [a for a in second if a.reason == "grid_v2_PLACE_ENTRY"]
-        for pa in place_actions:
-            assert pa.side != OrderSide.SELL, (
-                "Must not place opposite-side SELL entry in LONG_BRANCH"
-            )
+        assert second == []
 
-    def test_branch_integrity_short_branch_cancels_buy_entries(
+    def test_branch_integrity_short_branch_ignores_missing_buy_entries(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """SHORT_BRANCH: opposite-side (BUY) entries on exchange must be canceled."""
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
         from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
         from grinder.contracts import Snapshot  # noqa: PLC0415
-        from grinder.execution.types import ActionType  # noqa: PLC0415
         from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
         from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
 
@@ -1781,15 +1760,12 @@ class TestEngineIntegrityWatchdog:
         engine._grid_v2_pending_place_cids.clear()
         engine._grid_v2_pending_cancels.clear()
 
-        # Exchange has SELL entries + BUY entries (opposite-side leftover from FLAT seed) + exits.
-        # Repair must cancel BUY entries and must NOT place new BUY entries.
-        buy_entry_cids: list[str] = []
         open_orders: list[OpenOrderSnap] = []
         for cid in sorted(bridge.adapter.registry.all_entry_cids):
             entry_reg = bridge.adapter.registry.lookup_entry(cid)
             assert entry_reg is not None
-            if entry_reg.side == OrderSide.BUY:
-                buy_entry_cids.append(cid)
+            if entry_reg.side != OrderSide.SELL:
+                continue
             open_orders.append(
                 OpenOrderSnap(
                     order_id=cid,
@@ -1821,7 +1797,6 @@ class TestEngineIntegrityWatchdog:
                     ts=_BASE_TS + 2_000,
                 )
             )
-        assert buy_entry_cids  # must have opposite-side entries to cancel
 
         engine._last_account_snapshot = AccountSnapshot(
             positions=(),
@@ -1830,7 +1805,6 @@ class TestEngineIntegrityWatchdog:
             source="test",
         )
 
-        # Streak tick 1: mismatch pending.
         first = engine._grid_v2_integrity_repair(
             Snapshot(
                 ts=_BASE_TS + 2_000,
@@ -1843,7 +1817,6 @@ class TestEngineIntegrityWatchdog:
                 last_qty=Decimal("1"),
             )
         )
-        # Streak tick 2: repair fires.
         second = engine._grid_v2_integrity_repair(
             Snapshot(
                 ts=_BASE_TS + 2_001,
@@ -1858,18 +1831,7 @@ class TestEngineIntegrityWatchdog:
         )
 
         assert first == []
-        assert second
-        # Must cancel opposite-side BUY entries.
-        cancel_actions = [a for a in second if a.action_type == ActionType.CANCEL]
-        canceled_cids = {a.order_id for a in cancel_actions}
-        for buy_cid in buy_entry_cids:
-            assert buy_cid in canceled_cids, f"BUY entry {buy_cid} not canceled"
-        # Must NOT place any BUY entries.
-        place_actions = [a for a in second if a.reason == "grid_v2_PLACE_ENTRY"]
-        for pa in place_actions:
-            assert pa.side != OrderSide.BUY, (
-                "Must not place opposite-side BUY entry in SHORT_BRANCH"
-            )
+        assert second == []
 
     def test_branch_integrity_at_max_inventory_does_not_place_entries(
         self,

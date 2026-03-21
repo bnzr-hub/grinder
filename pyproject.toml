@@ -161,11 +161,6 @@ known-first-party = ["grinder"]
     "ARG001",  # Unused function argument (fixtures)
     "PLR2004", # Magic values in tests OK
 ]
-"tests/unit/test_grid_v2_bridge.py" = [
-    "ARG001",
-    "PLR2004",
-    "PLR0915", # too many statements - complex engine integration tests
-]
 "src/grinder/paper/engine.py" = [
     "PLR0912", # too many branches - complex pipeline logic
     "PLR0915", # too many statements - complex pipeline logic
