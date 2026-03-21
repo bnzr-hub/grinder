@@ -460,14 +460,14 @@ Recenter forbidden if ANY condition true:
 ### During LONG_BRANCH
 
 * maintain buy-entry chain below (up to `N_buy` levels)
-* opposite-side (sell) entries are canceled by integrity repair — SM rejects opposite-side fills as `BRANCH_INCOMPATIBLE`, so retaining them creates fill desync risk
+* maintain sell-entry chain above (opposite side, trimmed by rolling)
 * sell-exit orders above for open long lots
 * opposite-side fill attempts are rejected by branch gate (`BRANCH_INCOMPATIBLE`)
 
 ### During SHORT_BRANCH
 
 * maintain sell-entry chain above (up to `N_sell` levels)
-* opposite-side (buy) entries are canceled by integrity repair — SM rejects opposite-side fills as `BRANCH_INCOMPATIBLE`, so retaining them creates fill desync risk
+* maintain buy-entry chain below (opposite side, trimmed by rolling)
 * buy-exit orders below for open short lots
 * opposite-side fill attempts are rejected by branch gate (`BRANCH_INCOMPATIBLE`)
 
