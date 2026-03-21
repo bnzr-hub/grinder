@@ -60,6 +60,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -968,7 +969,7 @@ async def trading_loop(
     shutdown: asyncio.Event,
     duration_s: int,
     user_data_connector: FuturesUserDataWsConnector | None = None,
-) -> None:
+) -> str:
     """Run the trading loop: connector -> engine.process_snapshot().
 
     Sets module-level _loop_ready flag after connector.connect() succeeds.
@@ -1006,12 +1007,15 @@ async def trading_loop(
     start = time.time()
     tick_count = 0
     ha_skip_count = 0
+    stop_reason = "stream_ended"
     try:
         async for snapshot in connector.iter_snapshots():
             if shutdown.is_set():
+                stop_reason = "shutdown_requested"
                 break
             if duration_s > 0 and (time.time() - start) >= duration_s:
                 print(f"\nDuration ({duration_s}s) reached after {tick_count} ticks.")
+                stop_reason = "duration_reached"
                 break
             # HA gating: skip processing when not ACTIVE
             if _ha_enabled and get_ha_state().role != HARole.ACTIVE:
@@ -1031,6 +1035,7 @@ async def trading_loop(
                 await user_data_task
         await connector.close()
         print(f"  Trading loop stopped. Total ticks: {tick_count}, HA skips: {ha_skip_count}")
+    return stop_reason
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1103,6 +1108,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override PaperEngine per-symbol cooldown in milliseconds (default 100).",
     )
+    parser.add_argument(
+        "--cleanup-on-exit",
+        action="store_true",
+        default=False,
+        help=(
+            "After trading loop stops, auto-run exchange cleanup for each symbol "
+            "(futures + live_trade + --armed + --mainnet only)."
+        ),
+    )
     return parser
 
 
@@ -1139,7 +1153,76 @@ def _configure_logging() -> None:
     )
 
 
-def main() -> None:  # noqa: PLR0915
+def evaluate_cleanup_on_exit_policy(
+    *,
+    cleanup_on_exit: bool,
+    mode: SafeMode,
+    exchange_port: str,
+    armed: bool,
+    mainnet: bool,
+    fixture_path: str | None,
+    stop_reason: str,
+) -> tuple[bool, str]:
+    """Decide whether post-run cleanup should execute."""
+    enabled = False
+    reason = "disabled"
+    if cleanup_on_exit:
+        enabled = True
+        reason = "enabled"
+        if mode != SafeMode.LIVE_TRADE:
+            enabled = False
+            reason = "not_live_trade"
+        elif exchange_port != "futures":
+            enabled = False
+            reason = "not_futures_port"
+        elif not armed:
+            enabled = False
+            reason = "not_armed"
+        elif not mainnet:
+            enabled = False
+            reason = "not_mainnet"
+        elif fixture_path:
+            enabled = False
+            reason = "fixture_mode"
+        elif stop_reason != "duration_reached":
+            enabled = False
+            reason = "not_duration_timeout"
+    return (enabled, reason)
+
+
+def _run_cleanup_on_exit(
+    symbols: list[str],
+    *,
+    run_cmd: Any = subprocess.run,
+    executable: str = sys.executable,
+) -> int:
+    """Run exchange_state cleanup for each symbol. Returns failed symbol count."""
+    repo_root = Path(__file__).resolve().parents[1]
+    failures = 0
+    for symbol in symbols:
+        print(f"  Cleanup-on-exit: cleaning {symbol} ...")
+        env = os.environ.copy()
+        env["ALLOW_MAINNET_TRADE"] = "1"
+        env.setdefault("PYTHONPATH", ".")
+        result = run_cmd(
+            [executable, "-m", "scripts.exchange_state", "cleanup", symbol],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.stdout:
+            print(result.stdout.strip())
+        if result.returncode != 0:
+            failures += 1
+            print(f"  Cleanup-on-exit FAILED symbol={symbol} rc={result.returncode}")
+            if result.stderr:
+                print(result.stderr.strip())
+    return failures
+
+
+def main() -> None:  # noqa: PLR0912, PLR0915
     global _ha_enabled  # noqa: PLW0603
 
     args = build_parser().parse_args()
@@ -1251,8 +1334,9 @@ def main() -> None:  # noqa: PLR0915
 
     print("\nGRINDER TRADING LOOP running. Press Ctrl+C to stop.")
     exit_code = 0
+    loop_stop_reason = "not_started"
     try:
-        loop.run_until_complete(
+        loop_stop_reason = loop.run_until_complete(
             trading_loop(
                 connector,
                 engine,
@@ -1268,6 +1352,25 @@ def main() -> None:  # noqa: PLR0915
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.run_until_complete(_drain_pending_tasks())
         loop.close()
+        should_cleanup, cleanup_reason = evaluate_cleanup_on_exit_policy(
+            cleanup_on_exit=args.cleanup_on_exit,
+            mode=mode,
+            exchange_port=args.exchange_port,
+            armed=args.armed,
+            mainnet=args.mainnet,
+            fixture_path=args.fixture,
+            stop_reason=loop_stop_reason,
+        )
+        if should_cleanup:
+            failures = _run_cleanup_on_exit(symbols)
+            if failures > 0:
+                print(f"  Cleanup-on-exit completed with failures={failures}")
+                if exit_code == 0:
+                    exit_code = 3
+            else:
+                print("  Cleanup-on-exit completed successfully.")
+        elif args.cleanup_on_exit:
+            print(f"  Cleanup-on-exit skipped: {cleanup_reason}")
         if elector is not None:
             print("  Stopping LeaderElector...")
             elector.stop()
