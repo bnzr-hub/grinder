@@ -48,11 +48,23 @@ METRIC_WS_CONNECTED = "grinder_ws_connected"
 METRIC_WS_RECONNECT_TOTAL = "grinder_ws_reconnect_total"
 METRIC_TICKS_RECEIVED_TOTAL = "grinder_ticks_received_total"
 METRIC_LAST_TICK_TS = "grinder_last_tick_ts"
+METRIC_USER_DATA_UNKNOWN_EVENTS_TOTAL = "grinder_user_data_unknown_events_total"
 
 # Label keys
 LABEL_OP = "op"
 LABEL_REASON = "reason"
 LABEL_STATE = "state"
+LABEL_EVENT_TYPE = "event_type"
+
+# Keep label cardinality bounded for unknown user-data events.
+_KNOWN_USER_DATA_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        "ACCOUNT_CONFIG_UPDATE",
+        "STRATEGY_UPDATE",
+        "MARGIN_CALL",
+        "CONDITIONAL_ORDER_TRIGGER_REJECT",
+    }
+)
 
 
 @dataclass
@@ -85,6 +97,7 @@ class ConnectorMetrics:
     ws_reconnect_total: dict[tuple[str, str], int] = field(default_factory=dict)
     ticks_received: dict[str, int] = field(default_factory=dict)
     last_tick_ts: dict[str, int] = field(default_factory=dict)
+    user_data_unknown_events: dict[str, int] = field(default_factory=dict)
 
     # --- H2 Retries ---
 
@@ -169,6 +182,13 @@ class ConnectorMetrics:
             ts: Timestamp in milliseconds
         """
         self.last_tick_ts[connector] = ts
+
+    def record_user_data_unknown_event(self, event_type: str) -> None:
+        """Record unknown user-data event by bounded event-type label."""
+        normalized = event_type if event_type in _KNOWN_USER_DATA_EVENT_TYPES else "other"
+        self.user_data_unknown_events[normalized] = (
+            self.user_data_unknown_events.get(normalized, 0) + 1
+        )
 
     # --- Prometheus Export ---
 
@@ -338,6 +358,21 @@ class ConnectorMetrics:
                 lines.append(f'{METRIC_LAST_TICK_TS}{{connector="{connector}"}} {ts}')
         else:
             lines.append(f'{METRIC_LAST_TICK_TS}{{connector="none"}} 0')
+
+        # Unknown user-data events by event type (bounded cardinality).
+        lines.extend(
+            [
+                f"# HELP {METRIC_USER_DATA_UNKNOWN_EVENTS_TOTAL} Unknown user-data events by type",
+                f"# TYPE {METRIC_USER_DATA_UNKNOWN_EVENTS_TOTAL} counter",
+            ]
+        )
+        if self.user_data_unknown_events:
+            for event_type, count in sorted(self.user_data_unknown_events.items()):
+                lines.append(
+                    f'{METRIC_USER_DATA_UNKNOWN_EVENTS_TOTAL}{{{LABEL_EVENT_TYPE}="{event_type}"}} {count}'
+                )
+        else:
+            lines.append(f'{METRIC_USER_DATA_UNKNOWN_EVENTS_TOTAL}{{{LABEL_EVENT_TYPE}="none"}} 0')
 
         return lines
 

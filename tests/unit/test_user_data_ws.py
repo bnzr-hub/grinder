@@ -12,6 +12,7 @@ from grinder.connectors.binance_user_data_ws import (
 from grinder.connectors.binance_ws import FakeWsTransport
 from grinder.connectors.data_connector import ConnectorState
 from grinder.connectors.errors import ConnectorClosedError, ConnectorTransientError
+from grinder.connectors.metrics import get_connector_metrics, reset_connector_metrics
 from grinder.core import OrderState
 from grinder.execution.futures_events import UserDataEventType
 
@@ -80,6 +81,12 @@ def make_account_update_msg(
             },
         }
     )
+
+
+@pytest.fixture(autouse=True)
+def reset_metrics() -> None:
+    """Reset connector metrics between tests."""
+    reset_connector_metrics()
 
 
 class TestFuturesUserDataWsConnector:
@@ -332,6 +339,9 @@ class TestIterEvents(TestFuturesUserDataWsConnector):
         assert events[0].event_type == UserDataEventType.UNKNOWN
         assert events[0].raw_data is not None
         assert events[1].event_type == UserDataEventType.ORDER_TRADE_UPDATE
+        assert connector.stats.unknown_event_types == {"MARGIN_CALL": 1}
+        metrics = get_connector_metrics()
+        assert metrics.user_data_unknown_events["MARGIN_CALL"] == 1
 
     def test_listen_key_expired_triggers_transient_reconnect_signal(
         self, config: UserDataWsConfig, fake_manager: FakeListenKeyManager
