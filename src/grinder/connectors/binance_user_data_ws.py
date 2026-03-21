@@ -24,6 +24,7 @@ from grinder.connectors.errors import (
     ConnectorNonRetryableError,
     ConnectorTransientError,
 )
+from grinder.connectors.metrics import get_connector_metrics
 from grinder.execution.futures_events import UserDataEvent
 
 if TYPE_CHECKING:
@@ -230,6 +231,7 @@ class UserDataWsStats:
     order_events: int = 0
     position_events: int = 0
     unknown_events: int = 0
+    unknown_event_types: dict[str, int] = field(default_factory=dict)
     reconnects: int = 0
     keepalive_count: int = 0
     errors: int = 0
@@ -242,6 +244,7 @@ class UserDataWsStats:
             "order_events": self.order_events,
             "position_events": self.position_events,
             "unknown_events": self.unknown_events,
+            "unknown_event_types": dict(self.unknown_event_types),
             "reconnects": self.reconnects,
             "keepalive_count": self.keepalive_count,
             "errors": self.errors,
@@ -498,6 +501,11 @@ class FuturesUserDataWsConnector:
                 self._stats.position_events += 1
             else:
                 self._stats.unknown_events += 1
+                event_type = str(data.get("e", ""))
+                self._stats.unknown_event_types[event_type] = (
+                    self._stats.unknown_event_types.get(event_type, 0) + 1
+                )
+                get_connector_metrics().record_user_data_unknown_event(event_type)
 
             return event
 

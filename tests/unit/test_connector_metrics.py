@@ -18,6 +18,7 @@ from grinder.connectors.metrics import (
     METRIC_IDEMPOTENCY_HITS,
     METRIC_IDEMPOTENCY_MISSES,
     METRIC_RETRIES_TOTAL,
+    METRIC_USER_DATA_UNKNOWN_EVENTS_TOTAL,
     CircuitMetricState,
     ConnectorMetrics,
     get_connector_metrics,
@@ -91,6 +92,15 @@ class TestConnectorMetrics:
 
         assert metrics.circuit_trips[("place", "threshold")] == 1
 
+    def test_record_user_data_unknown_event_bounded_labels(self) -> None:
+        """Unknown user-data labels must stay bounded (known + other)."""
+        metrics = ConnectorMetrics()
+        metrics.record_user_data_unknown_event("ACCOUNT_CONFIG_UPDATE")
+        metrics.record_user_data_unknown_event("FOO_BAR_CUSTOM")
+
+        assert metrics.user_data_unknown_events["ACCOUNT_CONFIG_UPDATE"] == 1
+        assert metrics.user_data_unknown_events["other"] == 1
+
 
 class TestPrometheusOutput:
     """Tests for Prometheus text format output."""
@@ -116,6 +126,8 @@ class TestPrometheusOutput:
         assert f"# TYPE {METRIC_CIRCUIT_REJECTED}" in output
         assert f"# HELP {METRIC_CIRCUIT_TRIPS}" in output
         assert f"# TYPE {METRIC_CIRCUIT_TRIPS}" in output
+        assert f"# HELP {METRIC_USER_DATA_UNKNOWN_EVENTS_TOTAL}" in output
+        assert f"# TYPE {METRIC_USER_DATA_UNKNOWN_EVENTS_TOTAL}" in output
 
         # Should have placeholder values
         assert '{op="none"' in output
@@ -130,6 +142,8 @@ class TestPrometheusOutput:
         metrics.set_circuit_state("place", CircuitMetricState.OPEN)
         metrics.record_circuit_rejected("place")
         metrics.record_circuit_trip("place", "threshold")
+        metrics.record_user_data_unknown_event("ACCOUNT_CONFIG_UPDATE")
+        metrics.record_user_data_unknown_event("WHATEVER_NEW_EVENT")
 
         lines = metrics.to_prometheus_lines()
         output = "\n".join(lines)
@@ -143,6 +157,11 @@ class TestPrometheusOutput:
         assert f'{METRIC_CIRCUIT_STATE}{{op="place",state="closed"}} 0' in output
         assert f'{METRIC_CIRCUIT_REJECTED}{{op="place"}} 1' in output
         assert f'{METRIC_CIRCUIT_TRIPS}{{op="place",reason="threshold"}} 1' in output
+        assert (
+            f'{METRIC_USER_DATA_UNKNOWN_EVENTS_TOTAL}{{event_type="ACCOUNT_CONFIG_UPDATE"}} 1'
+            in output
+        )
+        assert f'{METRIC_USER_DATA_UNKNOWN_EVENTS_TOTAL}{{event_type="other"}} 1' in output
 
 
 class TestGlobalSingleton:
