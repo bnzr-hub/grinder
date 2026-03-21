@@ -17,17 +17,21 @@ import asyncio
 import hashlib
 import json
 import logging
+import sys
 import time as time_module
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
 import scripts.run_trading as run_trading_mod
 from scripts.run_trading import (
     _configure_logging,
+    _run_cleanup_on_exit,
     build_connector,
     build_engine,
     build_exchange_port,
+    evaluate_cleanup_on_exit_policy,
     evaluate_futures_preflight,
     evaluate_grid_v2_account_sync_preflight,
     is_trading_ready,
@@ -111,6 +115,107 @@ class TestValidateEnv:
         monkeypatch.delenv("GRINDER_TRADING_LOOP_ACK", raising=False)
         mode = validate_env()
         assert mode == SafeMode.READ_ONLY
+
+
+class TestCleanupOnExitPolicy:
+    def test_cleanup_policy_disabled(self) -> None:
+        enabled, reason = evaluate_cleanup_on_exit_policy(
+            cleanup_on_exit=False,
+            mode=SafeMode.LIVE_TRADE,
+            exchange_port="futures",
+            armed=True,
+            mainnet=True,
+            fixture_path=None,
+            stop_reason="duration_reached",
+        )
+        assert enabled is False
+        assert reason == "disabled"
+
+    def test_cleanup_policy_enabled_live_futures_mainnet(self) -> None:
+        enabled, reason = evaluate_cleanup_on_exit_policy(
+            cleanup_on_exit=True,
+            mode=SafeMode.LIVE_TRADE,
+            exchange_port="futures",
+            armed=True,
+            mainnet=True,
+            fixture_path=None,
+            stop_reason="duration_reached",
+        )
+        assert enabled is True
+        assert reason == "enabled"
+
+    def test_cleanup_policy_skips_when_not_armed(self) -> None:
+        enabled, reason = evaluate_cleanup_on_exit_policy(
+            cleanup_on_exit=True,
+            mode=SafeMode.LIVE_TRADE,
+            exchange_port="futures",
+            armed=False,
+            mainnet=True,
+            fixture_path=None,
+            stop_reason="duration_reached",
+        )
+        assert enabled is False
+        assert reason == "not_armed"
+
+    def test_cleanup_policy_skips_fixture_mode(self) -> None:
+        enabled, reason = evaluate_cleanup_on_exit_policy(
+            cleanup_on_exit=True,
+            mode=SafeMode.LIVE_TRADE,
+            exchange_port="futures",
+            armed=True,
+            mainnet=True,
+            fixture_path="fixture.jsonl",
+            stop_reason="duration_reached",
+        )
+        assert enabled is False
+        assert reason == "fixture_mode"
+
+    def test_cleanup_policy_skips_when_not_duration_timeout(self) -> None:
+        enabled, reason = evaluate_cleanup_on_exit_policy(
+            cleanup_on_exit=True,
+            mode=SafeMode.LIVE_TRADE,
+            exchange_port="futures",
+            armed=True,
+            mainnet=True,
+            fixture_path=None,
+            stop_reason="shutdown_requested",
+        )
+        assert enabled is False
+        assert reason == "not_duration_timeout"
+
+
+class TestRunCleanupOnExit:
+    def test_run_cleanup_on_exit_invokes_exchange_state_per_symbol(self) -> None:
+        calls: list[list[str]] = []
+
+        def _fake_run(
+            cmd: list[str],
+            *,
+            cwd: Any,
+            env: dict[str, str],
+            capture_output: bool,
+            text: bool,
+            check: bool,
+        ) -> Any:
+            calls.append(cmd)
+            assert env["ALLOW_MAINNET_TRADE"] == "1"
+            assert capture_output is True
+            assert text is True
+            assert check is False
+            _ = cwd
+            return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        failures = _run_cleanup_on_exit(
+            ["BTCUSDT", "ETHUSDT"],
+            run_cmd=_fake_run,
+            executable=sys.executable,
+        )
+
+        assert failures == 0
+        assert calls == [
+            [sys.executable, "-m", "scripts.exchange_state", "cleanup", "BTCUSDT"],
+            [sys.executable, "-m", "scripts.exchange_state", "cleanup", "ETHUSDT"],
+        ]
 
 
 class TestBuildConnector:
