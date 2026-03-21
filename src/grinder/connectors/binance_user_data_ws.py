@@ -483,10 +483,10 @@ class FuturesUserDataWsConnector:
             if "result" in data or "id" in data:
                 return None
 
-            # Skip listenKey expiry warnings (handled by keepalive)
+            # Trigger immediate reconnect on listenKey expiry signal.
             if data.get("e") == "listenKeyExpired":
                 logger.warning("listenKey_expired")
-                return None
+                raise ConnectorTransientError("listenKeyExpired")
 
             # Parse event
             event = UserDataEvent.from_binance(data, self._config.symbol_filter)

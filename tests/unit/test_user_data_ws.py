@@ -333,6 +333,20 @@ class TestIterEvents(TestFuturesUserDataWsConnector):
         assert events[0].raw_data is not None
         assert events[1].event_type == UserDataEventType.ORDER_TRADE_UPDATE
 
+    def test_listen_key_expired_triggers_transient_reconnect_signal(
+        self, config: UserDataWsConfig, fake_manager: FakeListenKeyManager
+    ) -> None:
+        """listenKeyExpired should force reconnect path via ConnectorTransientError."""
+        transport = FakeWsTransport(messages=[])
+        connector = FuturesUserDataWsConnector(
+            config=config,
+            listen_key_manager=fake_manager,
+            transport=transport,
+        )
+
+        with pytest.raises(ConnectorTransientError, match="listenKeyExpired"):
+            connector._parse_event(json.dumps({"e": "listenKeyExpired", "E": 1234}))
+
     @pytest.mark.asyncio
     async def test_skips_subscription_responses(
         self, config: UserDataWsConfig, fake_manager: FakeListenKeyManager

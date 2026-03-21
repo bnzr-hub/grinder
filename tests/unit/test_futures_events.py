@@ -1,6 +1,7 @@
 """Tests for futures user-data stream event types."""
 
 import json
+import logging
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -508,6 +509,37 @@ class TestUserDataEvent:
         assert event.raw_data["e"] == "MARGIN_CALL"
         assert event.order_event is None
         assert event.position_event is None
+
+    def test_from_binance_non_actionable_unknown_logs_debug(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG)
+        binance_msg = {"e": "ACCOUNT_CONFIG_UPDATE", "E": 1000000}
+
+        event = UserDataEvent.from_binance(binance_msg)
+
+        assert event.event_type == UserDataEventType.UNKNOWN
+        warnings = [
+            r
+            for r in caplog.records
+            if r.message == "unknown_event_type" and r.levelno >= logging.WARNING
+        ]
+        assert warnings == []
+
+    def test_from_binance_risky_unknown_keeps_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG)
+        binance_msg = {"e": "MARGIN_CALL", "E": 1000000}
+
+        _ = UserDataEvent.from_binance(binance_msg)
+
+        warnings = [
+            r
+            for r in caplog.records
+            if r.message == "unknown_event_type" and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
 
     def test_to_json_is_deterministic(self, order_event: FuturesOrderEvent) -> None:
         wrapper = UserDataEvent(

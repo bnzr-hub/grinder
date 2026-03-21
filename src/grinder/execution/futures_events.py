@@ -22,6 +22,15 @@ from grinder.core import OrderSide, OrderState
 
 logger = logging.getLogger(__name__)
 
+# Event types we intentionally ignore for trading decisions.
+# These are operational/config notifications that should not flood WARNING.
+_NON_ACTIONABLE_USER_DATA_EVENTS: frozenset[str] = frozenset(
+    {
+        "ACCOUNT_CONFIG_UPDATE",
+        "STRATEGY_UPDATE",
+    }
+)
+
 
 # Binance status -> OrderState mapping
 BINANCE_STATUS_MAP: dict[str, OrderState] = {
@@ -377,8 +386,11 @@ class UserDataEvent:
                 position_event=position_event,
             )
 
-        # Unknown event type - log but don't crash
-        logger.warning(
+        # Unknown event type - keep parser fail-open but classify log severity.
+        log_fn = (
+            logger.debug if event_type_str in _NON_ACTIONABLE_USER_DATA_EVENTS else logger.warning
+        )
+        log_fn(
             "unknown_event_type",
             extra={"event_type": event_type_str, "raw_data_preview": str(data)[:200]},
         )
