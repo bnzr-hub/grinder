@@ -68,6 +68,7 @@ class GridV2Config:
     max_inventory_levels: int
     max_inventory_notional_usd: Decimal
     price_tick_size: Decimal = Decimal("0.01")  # PR6: exchange tick size for price quantization
+    reseed_on_flat: bool = True  # PRx: when False, preserve current window on full unwind to FLAT
 
     def __post_init__(self) -> None:
         if self.grid_step_pct <= 0:
@@ -770,7 +771,7 @@ class GridV2StateMachine:
                     levels_per_side=snap.entry_window.levels_per_side,
                     step_pct=snap.entry_window.step_pct,
                 )
-        else:
+        elif self._config.reseed_on_flat:
             new_window = _build_entry_window(
                 snap.entry_window.reference_price,
                 self._config.entry_levels_per_side,
@@ -816,6 +817,8 @@ class GridV2StateMachine:
                 for p in new_window.sell_entry_prices
             )
             new_last_recenter_ts = event.ts
+        else:
+            new_window = snap.entry_window
 
         new_snapshot = GridV2Snapshot(
             mode=new_mode,

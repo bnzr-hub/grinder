@@ -650,6 +650,7 @@ class LiveEngineV0:
                 os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL", "1000")
             ),
             price_tick_size=self._resolve_grid_v2_tick_size(),
+            reseed_on_flat=parse_bool("GRINDER_GRID_V2_RESEED_ON_FLAT", default=True, strict=False),
         )
         return GridV2Bridge(config, self._grid_v2_symbol)
 
@@ -700,7 +701,9 @@ class LiveEngineV0:
                     self._grid_v2_symbol,
                     bridge.failed_reason,
                 )
-            elif pos_qty == 0 and bridge.state_machine is not None:
+            elif (
+                pos_qty == 0 and bridge.state_machine is not None and bridge._config.reseed_on_flat
+            ):
                 # If we're flat and restarting on existing grid orders, recenter once
                 # so entry distance from mid reflects current step/levels config.
                 reseed = bridge.recenter_flat(snapshot.mid_price, snapshot.ts)
@@ -1060,15 +1063,27 @@ class LiveEngineV0:
         )
         repair_actions: list[ExecutionAction] = []
         if sm.mode == BranchMode.FLAT:
-            logger.warning(
-                "GRID_V2_INTEGRITY_REPAIR_TRIGGER symbol=%s mode=%s entries=%d expected=%d exits=%d",
-                snapshot.symbol,
-                sm.mode.value,
-                current_entries,
-                expected_entries,
-                current_exits,
-            )
-            repair_actions = list(bridge.recenter_flat(snapshot.mid_price, snapshot.ts))
+            if bridge._config.reseed_on_flat:
+                logger.warning(
+                    "GRID_V2_INTEGRITY_REPAIR_TRIGGER symbol=%s mode=%s entries=%d expected=%d "
+                    "exits=%d",
+                    snapshot.symbol,
+                    sm.mode.value,
+                    current_entries,
+                    expected_entries,
+                    current_exits,
+                )
+                repair_actions = list(bridge.recenter_flat(snapshot.mid_price, snapshot.ts))
+            else:
+                logger.warning(
+                    "GRID_V2_INTEGRITY_FLAT_PRESERVE symbol=%s entries=%d expected=%d exits=%d "
+                    "reason=reseed_on_flat_disabled",
+                    snapshot.symbol,
+                    current_entries,
+                    expected_entries,
+                    current_exits,
+                )
+                repair_actions = []
         else:
             current_keys = set(current_entry_by_key.keys())
             missing = target_entry_keys - current_keys

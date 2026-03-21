@@ -717,6 +717,72 @@ class TestEngineStartupRecenterOnFlat:
             a.side == OrderSide.SELL and a.price == Decimal("50125.00") for a in placed_entries
         )
 
+    def test_reconstruct_flat_no_reseed_when_disabled(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT", "0")
+        monkeypatch.setenv("GRINDER_GRID_V2_STEP_PCT", "0.0025")
+
+        old_bridge, _ = _fresh_bridge(config=_config(step=Decimal("0.005")))
+        existing_orders: list[OpenOrderSnap] = []
+        for cid in old_bridge.adapter.registry.all_entry_cids:
+            reg = old_bridge.adapter.registry.lookup_entry(cid)
+            assert reg is not None
+            existing_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS,
+                )
+            )
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(existing_orders),
+            ts=_BASE_TS,
+            source="test",
+        )
+
+        snapshot = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output = engine.process_snapshot(snapshot)
+
+        executed = [a.action for a in output.live_actions if a.status.value == "EXECUTED"]
+        assert all(a.reason != "grid_v2_CANCEL_ENTRY" for a in executed)
+        assert all(a.reason != "grid_v2_PLACE_ENTRY" for a in executed)
+
 
 class TestEngineNonFlatFailClosed:
     """P0-2: Non-flat position + no g-orders must fail-closed."""
@@ -1444,6 +1510,109 @@ class TestEngineIntegrityWatchdog:
         assert second
         assert any(a.reason == "grid_v2_CANCEL_ENTRY" for a in second)
         assert any(a.reason == "grid_v2_PLACE_ENTRY" for a in second)
+
+    def test_flat_integrity_mismatch_preserved_when_reseed_disabled(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT", "0")
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=(),
+            ts=_BASE_TS,
+            source="test",
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+        engine._grid_v2_pending_cancels.clear()
+
+        missing = sorted(bridge.adapter.registry.all_entry_cids)[0]
+        surviving_orders: list[OpenOrderSnap] = []
+        for cid in sorted(bridge.adapter.registry.all_entry_cids):
+            if cid == missing:
+                continue
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            assert reg is not None
+            surviving_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 2_000,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(surviving_orders),
+            ts=_BASE_TS + 2_000,
+            source="test",
+        )
+
+        first = engine._grid_v2_integrity_repair(
+            Snapshot(
+                ts=_BASE_TS + 2_000,
+                symbol="BTCUSDT",
+                bid_price=Decimal("49999"),
+                ask_price=Decimal("50001"),
+                bid_qty=Decimal("1"),
+                ask_qty=Decimal("1"),
+                last_price=Decimal("50000"),
+                last_qty=Decimal("1"),
+            )
+        )
+        second = engine._grid_v2_integrity_repair(
+            Snapshot(
+                ts=_BASE_TS + 2_001,
+                symbol="BTCUSDT",
+                bid_price=Decimal("49999"),
+                ask_price=Decimal("50001"),
+                bid_qty=Decimal("1"),
+                ask_qty=Decimal("1"),
+                last_price=Decimal("50000"),
+                last_qty=Decimal("1"),
+            )
+        )
+
+        assert first == []
+        assert second == []
 
     def test_branch_integrity_mismatch_replaces_missing_entry_after_debounce(
         self,
