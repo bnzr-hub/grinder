@@ -303,6 +303,43 @@ class TestFillRejected:
         with pytest.raises(ValueError, match="not in registry"):
             b.on_fill(buy_cid, OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 2000)
 
+    def test_orphan_exit_fill_allow_stale_is_rejected_not_raised(self) -> None:
+        """Late/duplicate exit fill should not crash the tick when allow_stale=True."""
+        b, seed = _fresh_bridge()
+        buy_seed = [s for s in seed if s.side == OrderSide.BUY]
+        buy_cid = buy_seed[0].client_order_id
+        buy_price = buy_seed[0].price
+        assert buy_cid is not None and buy_price is not None
+
+        # Open one lot and create an exit CID.
+        entry_result = b.on_fill(buy_cid, OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1000)
+        exit_actions = [
+            ea for ea in entry_result.execution_actions if ea.reason == "grid_v2_PLACE_EXIT"
+        ]
+        assert len(exit_actions) == 1
+        exit_cid = exit_actions[0].client_order_id
+        exit_price = exit_actions[0].price
+        assert exit_cid is not None and exit_price is not None
+
+        # Close lot normally.
+        closed = b.on_fill(exit_cid, OrderSide.SELL, exit_price, _ORDER_SIZE, _BASE_TS + 2000)
+        assert not closed.rejected
+        assert b.state_machine is not None
+        assert len(b.state_machine.snapshot.open_lots) == 0
+
+        # Duplicate/late exit event with stale CID should be graceful reject.
+        late = b.on_fill(
+            exit_cid,
+            OrderSide.SELL,
+            exit_price,
+            _ORDER_SIZE,
+            _BASE_TS + 3000,
+            allow_stale=True,
+        )
+        assert late.rejected is True
+        assert late.reject_reason == "EXIT_LOT_NOT_FOUND"
+        assert late.execution_actions == ()
+
 
 class TestCancelLifecycleEntry:
     """REQ-003: Cancel lifecycle — entry path."""
