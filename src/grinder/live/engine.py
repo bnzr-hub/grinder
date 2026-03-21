@@ -1075,15 +1075,42 @@ class LiveEngineV0:
                 )
                 repair_actions = list(bridge.recenter_flat(snapshot.mid_price, snapshot.ts))
             else:
+                current_keys = set(current_entry_by_key.keys())
+                extra = current_keys - target_entry_keys
+                # Preserve mode: never reseed/rebuild in FLAT.
+                # Only perform cleanup for exchange-visible drift.
+                for side, price in sorted(extra, key=lambda item: (item[0].value, item[1])):
+                    cid = current_entry_by_key[(side, price)]
+                    repair_actions.append(
+                        ExecutionAction(
+                            action_type=ActionType.CANCEL,
+                            order_id=cid,
+                            symbol=snapshot.symbol,
+                            reason="grid_v2_INTEGRITY_CANCEL_ENTRY",
+                        )
+                    )
+                for cid in sorted(current_cids):
+                    parsed = bridge.adapter.parse_cid(cid)
+                    if parsed is None or parsed.kind.value == "ENTRY":
+                        continue
+                    repair_actions.append(
+                        ExecutionAction(
+                            action_type=ActionType.CANCEL,
+                            order_id=cid,
+                            symbol=snapshot.symbol,
+                            reason="grid_v2_INTEGRITY_CANCEL_EXIT",
+                        )
+                    )
                 logger.warning(
                     "GRID_V2_INTEGRITY_FLAT_PRESERVE symbol=%s entries=%d expected=%d exits=%d "
-                    "reason=reseed_on_flat_disabled",
+                    "extra=%d cleanup_actions=%d reason=reseed_on_flat_disabled",
                     snapshot.symbol,
                     current_entries,
                     expected_entries,
                     current_exits,
+                    len(extra),
+                    len(repair_actions),
                 )
-                repair_actions = []
         else:
             current_keys = set(current_entry_by_key.keys())
             missing = target_entry_keys - current_keys
