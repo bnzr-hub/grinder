@@ -529,10 +529,10 @@ class TestFullUnwind:
         assert snap.entry_window.reference_price == window_before_exit.reference_price
 
     def test_last_exit_goes_flat_without_reseed_when_disabled(self) -> None:
-        sm = _sm(cfg=_config(reseed_on_flat=False))
+        cfg = _config(reseed_on_flat=False)
+        sm = _sm(cfg=cfg)
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
-        window_before_exit = sm.snapshot.entry_window
 
         lot = sm.snapshot.open_lots[0]
         exit_eo = sm.snapshot.exit_orders[0]
@@ -544,7 +544,9 @@ class TestFullUnwind:
         snap = result.snapshot
         assert snap.mode == BranchMode.FLAT
         assert snap.open_lots == ()
-        assert snap.entry_window == window_before_exit
+        assert len(snap.entry_window.buy_entry_prices) == cfg.entry_levels_per_side
+        assert len(snap.entry_window.sell_entry_prices) == cfg.entry_levels_per_side
+        assert any(a.reason == "EXIT_RESTORE" for a in result.actions)
         assert all(a.reason not in {"RECENTER", "RECENTER_REPLACE"} for a in result.actions)
 
     def test_entry_after_flat_reseed_reactivates_consumed_price(self) -> None:

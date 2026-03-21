@@ -430,7 +430,7 @@ Rolling/recenter logic never touches exits.
 **Choice: Option B -- soft recenter.**
 When branch fully unwinds to FLAT, the default behavior is to reseed the entry
 window to the standard symmetric shape around the preserved reference price.
-Optional preserve mode keeps the current window unchanged on unwind.
+Optional preserve mode skips full recenter on unwind and keeps rolling continuity.
 Optional explicit `RecenterRequested` may still rebuild it symmetrically around a new reference.
 
 **Rationale:** reseed remains safe default against drift; preserve mode is an
@@ -688,8 +688,9 @@ When the last open lot is closed (rules 11.5/11.6), the state machine transition
 `mode = FLAT` and, by default, reseeds the entry window to the standard symmetric
 create_initial shape around the preserved reference price.
 
-If `reseed_on_flat=False`, unwind to FLAT preserves the current entry window and
-emits no `RECENTER`/`RECENTER_REPLACE` actions.
+If `reseed_on_flat=False`, unwind to FLAT emits no `RECENTER`/`RECENTER_REPLACE`
+actions. Rolling restore semantics still apply, so missing side levels may be
+replenished via `EXIT_RESTORE` to keep the ladder symmetric without recentering.
 
 The state machine does not hold market data and does not need a separate
 recenter request to restore symmetric coverage after full unwind.

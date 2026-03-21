@@ -625,7 +625,12 @@ class GridV2StateMachine:
         new_window = snap.entry_window
         new_mode = BranchMode.FLAT if not new_open else snap.mode
         new_last_recenter_ts = snap.last_recenter_ts
-        if new_open:
+        restore_without_reseed = (
+            not self._config.reseed_on_flat
+            and not new_open
+            and snap.mode in {BranchMode.LONG_BRANCH, BranchMode.SHORT_BRANCH}
+        )
+        if new_open or restore_without_reseed:
             step_delta = _grid_step_price(
                 snap.entry_window.reference_price,
                 self._config.grid_step_pct,
