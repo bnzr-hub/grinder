@@ -126,6 +126,7 @@ _TP_CLOSE_RETRY_COOLDOWN_MS = 10_000  # 10s between retry attempts
 _CONVERGENCE_TIMEOUT_MS = 30_000  # 30s safety valve for inflight latch
 _GRID_V2_INTEGRITY_MISMATCH_STREAK = 2
 _GRID_V2_INTEGRITY_REPAIR_COOLDOWN_MS = 5_000
+_GRID_V2_INTEGRITY_MISMATCH_WINDOW_MS = 30_000
 
 
 @dataclass
@@ -592,6 +593,7 @@ class LiveEngineV0:
         self._grid_v2_pending_place_cids: dict[str, int] = {}
         self._grid_v2_user_fill_seen: set[str] = set()
         self._grid_v2_integrity_mismatch_streak = 0
+        self._grid_v2_integrity_mismatch_last_ts = 0
         self._grid_v2_integrity_repair_cooldown_until_ts = 0
         if self._grid_v2_enabled:
             if not self._grid_v2_symbol:
@@ -780,6 +782,33 @@ class LiveEngineV0:
             parsed_cid.kind.value,
         )
 
+    def _grid_v2_handle_failed_cancel(self, cid: str, exchange_code: int | None) -> bool:
+        """Handle definitive CANCEL failures for grid_v2 and return True if handled.
+
+        For exchange code -2011 ("Unknown order"), treat as confirmed cancel-ack:
+        the order is already gone on exchange, so registry/pending state should
+        be converged immediately.
+        """
+        if exchange_code != -2011:
+            return False
+
+        bridge = self._grid_v2_bridge
+        if bridge is None or not bridge.reconstruction_ok:
+            return False
+        if not bridge.adapter.is_ours(cid):
+            return False
+
+        result = bridge.on_cancel_ack(cid)
+        self._grid_v2_pending_cancels.pop(cid, None)
+        self._cancel_failed_ids.discard(cid)
+        logger.warning(
+            "GRID_V2_CANCEL_UNKNOWN_TREATED_AS_ACK cid=%s removed=%s kind=%s",
+            cid,
+            result.removed,
+            result.kind.value,
+        )
+        return True
+
     def _grid_v2_register_pending_place(self, cid: str) -> None:
         """Track an EXECUTED PLACE CID until visible on exchange.
 
@@ -933,7 +962,15 @@ class LiveEngineV0:
             or self._grid_v2_pending_cancels
             or self._grid_v2_pending_place_cids
         ):
-            self._grid_v2_integrity_mismatch_streak = 0
+            # Keep mismatch streak across short convergence windows so repeated
+            # mismatch cannot be permanently stuck at 1/2 under volatile fills.
+            if (
+                self._grid_v2_integrity_mismatch_last_ts > 0
+                and snapshot.ts - self._grid_v2_integrity_mismatch_last_ts
+                > _GRID_V2_INTEGRITY_MISMATCH_WINDOW_MS
+            ):
+                self._grid_v2_integrity_mismatch_streak = 0
+                self._grid_v2_integrity_mismatch_last_ts = 0
             return []
 
         sm = bridge.state_machine
@@ -991,9 +1028,18 @@ class LiveEngineV0:
             mismatch = set(current_entry_by_key.keys()) != target_entry_keys
         if not mismatch:
             self._grid_v2_integrity_mismatch_streak = 0
+            self._grid_v2_integrity_mismatch_last_ts = 0
             return []
 
-        self._grid_v2_integrity_mismatch_streak += 1
+        if (
+            self._grid_v2_integrity_mismatch_last_ts == 0
+            or snapshot.ts - self._grid_v2_integrity_mismatch_last_ts
+            > _GRID_V2_INTEGRITY_MISMATCH_WINDOW_MS
+        ):
+            self._grid_v2_integrity_mismatch_streak = 1
+        else:
+            self._grid_v2_integrity_mismatch_streak += 1
+        self._grid_v2_integrity_mismatch_last_ts = snapshot.ts
         if self._grid_v2_integrity_mismatch_streak < _GRID_V2_INTEGRITY_MISMATCH_STREAK:
             logger.warning(
                 "GRID_V2_INTEGRITY_MISMATCH_PENDING symbol=%s entries=%d expected=%d exits=%d "
@@ -1008,6 +1054,7 @@ class LiveEngineV0:
             return []
 
         self._grid_v2_integrity_mismatch_streak = 0
+        self._grid_v2_integrity_mismatch_last_ts = 0
         self._grid_v2_integrity_repair_cooldown_until_ts = (
             snapshot.ts + _GRID_V2_INTEGRITY_REPAIR_COOLDOWN_MS
         )
@@ -1851,6 +1898,9 @@ class LiveEngineV0:
                 action.action_type == ActionType.CANCEL
                 and action.order_id is not None
                 and live_action.status == LiveActionStatus.FAILED
+                and not self._grid_v2_handle_failed_cancel(
+                    action.order_id, live_action.exchange_code
+                )
             ):
                 self._cancel_failed_ids.add(action.order_id)
 
@@ -1898,6 +1948,16 @@ class LiveEngineV0:
                         self._grid_v2_clean_failed_place(action.client_order_id)
 
             # ADR-090 follow-up: record dispatched CANCEL CID for per-sync-cycle dedup.
+            if (
+                action.action_type == ActionType.CANCEL
+                and action.order_id is not None
+                and live_action.status == LiveActionStatus.FAILED
+                and not self._grid_v2_handle_failed_cancel(
+                    action.order_id, live_action.exchange_code
+                )
+            ):
+                self._cancel_failed_ids.add(action.order_id)
+
             if (
                 action.action_type == ActionType.CANCEL
                 and action.order_id is not None
