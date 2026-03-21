@@ -1700,6 +1700,184 @@ class TestEngineIntegrityWatchdog:
         assert all(a.reason != "grid_v2_PLACE_ENTRY" for a in second)
         assert any(a.reason == "grid_v2_INTEGRITY_CANCEL_ENTRY" for a in second)
 
+    def test_integrity_mismatch_not_reset_by_pending_convergence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Mismatch streak should survive brief pending windows and trigger repair."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=(),
+            ts=_BASE_TS,
+            source="test",
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+        engine._grid_v2_pending_cancels.clear()
+
+        # Prepare mismatch: one expected entry missing on exchange.
+        missing = sorted(bridge.adapter.registry.all_entry_cids)[0]
+        surviving_orders: list[OpenOrderSnap] = []
+        for cid in sorted(bridge.adapter.registry.all_entry_cids):
+            if cid == missing:
+                continue
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            assert reg is not None
+            surviving_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 2_000,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(surviving_orders),
+            ts=_BASE_TS + 2_000,
+            source="test",
+        )
+
+        first = engine._grid_v2_integrity_repair(
+            Snapshot(
+                ts=_BASE_TS + 2_000,
+                symbol="BTCUSDT",
+                bid_price=Decimal("49999"),
+                ask_price=Decimal("50001"),
+                bid_qty=Decimal("1"),
+                ask_qty=Decimal("1"),
+                last_price=Decimal("50000"),
+                last_qty=Decimal("1"),
+            )
+        )
+        assert first == []
+
+        # Convergence gate active on next tick: should not reset mismatch streak.
+        engine._grid_v2_pending_place_cids["dummy"] = engine._account_sync_generation
+        gated = engine._grid_v2_integrity_repair(
+            Snapshot(
+                ts=_BASE_TS + 2_001,
+                symbol="BTCUSDT",
+                bid_price=Decimal("49999"),
+                ask_price=Decimal("50001"),
+                bid_qty=Decimal("1"),
+                ask_qty=Decimal("1"),
+                last_price=Decimal("50000"),
+                last_qty=Decimal("1"),
+            )
+        )
+        assert gated == []
+
+        # Pending cleared: second mismatch should trigger repair.
+        engine._grid_v2_pending_place_cids.clear()
+        second = engine._grid_v2_integrity_repair(
+            Snapshot(
+                ts=_BASE_TS + 2_002,
+                symbol="BTCUSDT",
+                bid_price=Decimal("49999"),
+                ask_price=Decimal("50001"),
+                bid_qty=Decimal("1"),
+                ask_qty=Decimal("1"),
+                last_price=Decimal("50000"),
+                last_qty=Decimal("1"),
+            )
+        )
+        assert second
+        assert any(a.reason == "grid_v2_PLACE_ENTRY" for a in second)
+
+
+class TestEngineCancelUnknownClassification:
+    def test_cancel_2011_treated_as_ack_for_grid_v2_cid(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=(),
+            ts=_BASE_TS,
+            source="test",
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        cid = sorted(bridge.adapter.registry.all_entry_cids)[0]
+        assert bridge.adapter.registry.lookup_entry(cid) is not None
+        engine._grid_v2_pending_cancels[cid] = _BASE_TS + 100
+        engine._cancel_failed_ids.add(cid)
+
+        handled = engine._grid_v2_handle_failed_cancel(cid, -2011)
+
+        assert handled
+        assert bridge.adapter.registry.lookup_entry(cid) is None
+        assert cid not in engine._grid_v2_pending_cancels
+        assert cid not in engine._cancel_failed_ids
+
 
 class TestFullLifecycle:
     """Integration: full entry → exit → flat lifecycle through bridge."""
