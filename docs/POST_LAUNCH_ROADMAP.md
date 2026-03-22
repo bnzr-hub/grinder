@@ -1,13 +1,16 @@
 # Post-Launch Roadmap v1 (P1 Hardening Pack + P2 Target State)
 
 > Status: ACTIVE (post Launch-12)
-> Last updated: 2026-03-22 (main @ `a051ff7`)
+> Last updated: 2026-03-22
 > Scope: single-venue stabilization (Binance USDT-M Futures) + target-state backlog shaping
 
 ## 0a) Current Phase (2026-03-22)
 
 - `doc-27` chain is complete: PR1 (spec) → PR2 (state machine) → PR3 (adapter) → PR4 (bridge) → PR5 (shadow) → PR6 (live ceremony).
-- Post-PR6 hardening is active and ongoing (startup/visibility guards, fill/cancel lifecycle robustness, flat normalization modes).
+- Post-PR6 hardening is active and ongoing (startup/visibility guards, fill/cancel lifecycle robustness, flat normalization modes):
+  - full recenter: `GRINDER_GRID_V2_RESEED_ON_FLAT=true`
+  - preserve: `GRINDER_GRID_V2_RESEED_ON_FLAT=false` + `GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW=false`
+  - skew-only recenter: `GRINDER_GRID_V2_RESEED_ON_FLAT=false` + `GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW=true`
 - Documentation governance is now explicit:
   - operational SSOT: `STATE.md`, `DECISIONS.md`, this roadmap
   - historical context preserved in `ROADMAP.md` and `GAPS.md` (non-binding)
