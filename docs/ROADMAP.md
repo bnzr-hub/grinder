@@ -1,5 +1,13 @@
 # ROADMAP — Grinder
 
+> **Status:** HISTORICAL SNAPSHOT (reference, non-binding for current execution decisions)
+>
+> This document preserves milestone history and context.
+> For current implementation truth and active priorities, use:
+> - `docs/STATE.md` (implemented reality)
+> - `docs/DECISIONS.md` (binding decisions/ADRs)
+> - `docs/POST_LAUNCH_ROADMAP.md` (active roadmap/backlog)
+
 This file tracks **plan + progress**.
 
 - **Source of truth for current implementation:** `docs/STATE.md`

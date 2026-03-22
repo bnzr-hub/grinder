@@ -4,7 +4,28 @@ Where to find information:
 
 - **Implementation truth:** `docs/STATE.md`
 - **Decisions:** `docs/DECISIONS.md`
-- **Plan + progress:** `docs/ROADMAP.md`
+- **Plan + progress (active):** `docs/POST_LAUNCH_ROADMAP.md`
+
+---
+
+## Documentation Taxonomy (SSOT-first)
+
+Use this classification before relying on any doc in reviews/implementation:
+
+- **ACTIVE (operational SSOT):**
+  - `docs/STATE.md`
+  - `docs/DECISIONS.md`
+  - `docs/POST_LAUNCH_ROADMAP.md`
+  - `docs/27_TWO_SIDED_ROLLING_WINDOW_GRID_SPEC.md` (grid_v2 contract line)
+- **CANDIDATE (valuable ideas, not binding contracts yet):**
+  - Feature/spec docs that describe future work unless explicitly marked implemented in `STATE.md`
+- **HISTORICAL (context preserved, not current contract):**
+  - `docs/ROADMAP.md` (historical milestone snapshot)
+  - `docs/GAPS.md` (historical gap snapshot)
+  - legacy branches/spec lines superseded in `STATE.md`/`DECISIONS.md`
+
+If documents conflict, trust order is:
+`STATE.md` -> `DECISIONS.md` -> active roadmap/spec.
 
 ---
 
@@ -12,7 +33,8 @@ Where to find information:
 - `docs/00_PRODUCT.md` — goals, scope, milestone checklists (target spec)
 - `docs/STATE.md` — what is implemented *right now*
 - `docs/DECISIONS.md` — why key choices were made
-- `docs/ROADMAP.md` — progress tracker + traceability + M1 DoD
+- `docs/POST_LAUNCH_ROADMAP.md` — current post-launch priorities and backlog
+- `docs/ROADMAP.md` — historical milestone tracker (reference only)
 
 ---
 

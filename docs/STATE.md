@@ -2,8 +2,8 @@
 
 Goal: document **what actually works now** (not what we wish worked). Update in every PR if something changed.
 
-Next steps and progress tracker: `docs/ROADMAP.md`.
-Post-launch roadmap (P1 hardening + P2 backlog): `docs/POST_LAUNCH_ROADMAP.md`.
+Next steps and progress tracker (active): `docs/POST_LAUNCH_ROADMAP.md`.
+Historical roadmap snapshot: `docs/ROADMAP.md` (reference only).
 **Launch readiness SSOT:** `docs/LAUNCH_PLAN.md` — definition of done, release gates, remaining work.
 
 ## Launch readiness
