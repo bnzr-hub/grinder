@@ -543,6 +543,84 @@ GridV2PreflightStatus = Literal[
 ]
 
 
+# ---------------------------------------------------------------------------
+# Launch Guard v2: preflight → (optional cleanup) → verify → start
+# ---------------------------------------------------------------------------
+
+LaunchGuardStatus = Literal[
+    "skipped",
+    "verify_clean",
+    "verify_dirty_no_cleanup",
+    "cleanup_then_clean",
+    "cleanup_then_still_dirty",
+    "verify_error",
+]
+
+
+@dataclass(frozen=True)
+class LaunchGuardResult:
+    """Result of the launch-guard sequence."""
+
+    status: LaunchGuardStatus
+    reason: str
+    orders: int = 0
+    position: str = "FLAT"
+
+
+def evaluate_launch_guard(
+    *,
+    exchange_port: str,
+    mainnet: bool,
+    armed: bool,
+    fixture_path: str | None,
+    pre_cleanup: bool,
+    symbols: list[str],
+) -> LaunchGuardResult:
+    """Pure launch-guard evaluation (calls exchange_state helpers).
+
+    Sequence: check → (optional cleanup) → verify.
+    Only active for futures + mainnet + armed + no-fixture (live mainnet path).
+    """
+    if exchange_port != "futures" or not mainnet or not armed or fixture_path is not None:
+        return LaunchGuardResult(status="skipped", reason="not_live_mainnet_futures")
+
+    from scripts.exchange_state import cmd_verify_programmatic  # noqa: PLC0415
+
+    for symbol in symbols:
+        ok, orders, position = cmd_verify_programmatic(symbol)
+        if ok:
+            continue
+
+        # Dirty state detected
+        if not pre_cleanup:
+            return LaunchGuardResult(
+                status="verify_dirty_no_cleanup",
+                reason=f"symbol={symbol} not clean, --pre-cleanup not enabled",
+                orders=orders,
+                position=position,
+            )
+
+        # Cleanup requested
+        from scripts.exchange_state import cmd_cleanup  # noqa: PLC0415
+
+        cmd_cleanup(symbol)
+
+        # Re-verify after cleanup
+        ok2, orders2, position2 = cmd_verify_programmatic(symbol)
+        if not ok2:
+            return LaunchGuardResult(
+                status="cleanup_then_still_dirty",
+                reason=f"symbol={symbol} still dirty after cleanup",
+                orders=orders2,
+                position=position2,
+            )
+
+    return LaunchGuardResult(
+        status="cleanup_then_clean" if pre_cleanup else "verify_clean",
+        reason="all symbols clean",
+    )
+
+
 @dataclass(frozen=True)
 class GridV2PreflightResult:
     """Result of grid_v2 runtime preflight validation."""
@@ -1117,6 +1195,25 @@ def build_parser() -> argparse.ArgumentParser:
             "(futures + live_trade + --armed + --mainnet only)."
         ),
     )
+    parser.add_argument(
+        "--pre-cleanup",
+        action="store_true",
+        default=False,
+        help=(
+            "Before start, if exchange state is DIRTY, run cleanup first. "
+            "Without this flag, dirty state = fail-closed (no start). "
+            "Only applies to futures + mainnet + armed."
+        ),
+    )
+    parser.add_argument(
+        "--skip-launch-guard",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the launch guard verify step. NOT recommended for mainnet. "
+            "Use only for testnet/paper/debugging."
+        ),
+    )
     return parser
 
 
@@ -1306,6 +1403,30 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # Futures preflight: validate symbols exist on futures venue (fail-closed).
     _validate_futures_preflight_or_exit(symbols, args.exchange_port, args.fixture)
     _validate_grid_v2_account_sync_or_exit(args.exchange_port, args.fixture)
+
+    # Launch guard v2: verify exchange state clean before start (fail-closed).
+    if not args.skip_launch_guard:
+        guard_result = evaluate_launch_guard(
+            exchange_port=args.exchange_port,
+            mainnet=args.mainnet,
+            armed=args.armed,
+            fixture_path=args.fixture,
+            pre_cleanup=args.pre_cleanup,
+            symbols=symbols,
+        )
+        print(f"  LAUNCH_GUARD status={guard_result.status} reason={guard_result.reason}")
+        if guard_result.status in ("verify_dirty_no_cleanup", "cleanup_then_still_dirty"):
+            print(
+                f"ERROR: Launch guard FAILED — exchange state not clean. "
+                f"orders={guard_result.orders} position={guard_result.position}. "
+                f"Run 'python3 -m scripts.exchange_state cleanup <SYMBOL>' or use --pre-cleanup."
+            )
+            sys.exit(1)
+        if guard_result.status == "verify_error":
+            print(f"ERROR: Launch guard verify error — {guard_result.reason}. Cannot start safely.")
+            sys.exit(1)
+    else:
+        print("  LAUNCH_GUARD status=skipped reason=--skip-launch-guard")
 
     connector = build_connector(
         symbols,

@@ -34,6 +34,7 @@ from scripts.run_trading import (
     evaluate_cleanup_on_exit_policy,
     evaluate_futures_preflight,
     evaluate_grid_v2_account_sync_preflight,
+    evaluate_launch_guard,
     is_trading_ready,
     reset_trading_state,
     trading_loop,
@@ -817,3 +818,160 @@ class TestConfigureLogging:
         monkeypatch.setenv("GRINDER_LOG_LEVEL", "debug")
         _configure_logging()
         assert logging.getLogger().level == logging.DEBUG
+
+
+class TestLaunchGuard:
+    """Launch guard v2: preflight → (optional cleanup) → verify → start."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_exchange_state(self) -> None:
+        """Import exchange_state module once for monkeypatching."""
+        import scripts.exchange_state as es_mod  # noqa: PLC0415
+
+        self._es_mod = es_mod
+
+    def test_skipped_for_noop_port(self) -> None:
+        """Non-futures port → guard skipped."""
+        result = evaluate_launch_guard(
+            exchange_port="noop",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=False,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "skipped"
+
+    def test_skipped_for_testnet(self) -> None:
+        """Testnet → guard skipped."""
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=False,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=False,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "skipped"
+
+    def test_skipped_for_fixture(self) -> None:
+        """Fixture mode → guard skipped."""
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path="some/fixture.jsonl",
+            pre_cleanup=False,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "skipped"
+
+    def test_skipped_when_not_armed(self) -> None:
+        """Not armed → guard skipped."""
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=False,
+            fixture_path=None,
+            pre_cleanup=False,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "skipped"
+
+    def test_verify_clean_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """All symbols verify CLEAN → guard passes."""
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (True, 0, "FLAT"))
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=False,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "verify_clean"
+
+    def test_verify_dirty_no_cleanup_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Dirty state + no --pre-cleanup → fail-closed."""
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (False, 3, "0.002"))
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=False,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "verify_dirty_no_cleanup"
+        assert result.orders == 3
+        assert result.position == "0.002"
+
+    def test_cleanup_then_clean(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Dirty → cleanup → clean → guard passes."""
+        call_count = 0
+
+        def mock_verify(symbol: str) -> tuple[bool, int, str]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (False, 5, "0.001")  # first call: dirty
+            return (True, 0, "FLAT")  # after cleanup: clean
+
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", mock_verify)
+        monkeypatch.setattr(self._es_mod, "cmd_cleanup", lambda _s: None)
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=True,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "cleanup_then_clean"
+
+    def test_cleanup_then_still_dirty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Dirty → cleanup → still dirty → fail-closed."""
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (False, 2, "0.005"))
+        monkeypatch.setattr(self._es_mod, "cmd_cleanup", lambda _s: None)
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=True,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "cleanup_then_still_dirty"
+        assert result.orders == 2
+
+    def test_multi_symbol_first_dirty_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Multiple symbols, first is dirty → fail-closed on first."""
+
+        def mock_verify(symbol: str) -> tuple[bool, int, str]:
+            if symbol == "BTCUSDT":
+                return (False, 1, "0.001")
+            return (True, 0, "FLAT")
+
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", mock_verify)
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=False,
+            symbols=["BTCUSDT", "ETHUSDT"],
+        )
+        assert result.status == "verify_dirty_no_cleanup"
+
+    def test_multi_symbol_all_clean(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Multiple symbols, all clean → passes."""
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (True, 0, "FLAT"))
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=False,
+            symbols=["BTCUSDT", "ETHUSDT", "PIPPINUSDT"],
+        )
+        assert result.status == "verify_clean"
