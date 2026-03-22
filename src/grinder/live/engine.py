@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     from grinder.live.grid_planner import LiveGridPlannerV1
     from grinder.ml.fill_model_v0 import FillModelV0
     from grinder.paper.engine import PaperEngine
+    from grinder.selection.shadow_selector import ShadowSelector
 
 logger = logging.getLogger(__name__)
 
@@ -383,6 +384,8 @@ class LiveEngineV0:
         feature_engine: FeatureEngine | None = None,
         grid_planners: dict[str, LiveGridPlannerV1] | None = None,
         cycle_layer: LiveCycleLayerV1 | None = None,
+        shadow_selector: ShadowSelector | None = None,
+        operator_symbols: list[str] | None = None,
     ) -> None:
         """Initialize LiveEngineV0.
 
@@ -400,6 +403,8 @@ class LiveEngineV0:
             feature_engine: Optional FeatureEngine for NATR/volatility features (PR-L0)
             grid_planners: Per-symbol grid planners for live mode (PR-L2). None = disabled.
             cycle_layer: Optional LiveCycleLayerV1 for TP generation (PR-INV-3). None = disabled.
+            shadow_selector: Optional ShadowSelector for Phase 1 observability (doc-36). None = disabled.
+            operator_symbols: Operator-configured symbol universe for shadow selector.
         """
         self._paper_engine = paper_engine
         self._exchange_port = exchange_port
@@ -417,6 +422,9 @@ class LiveEngineV0:
         self._grid_planners = grid_planners
         self._cycle_layer = cycle_layer
         self._last_account_snapshot: AccountSnapshot | None = None
+        # Doc-36 Phase 1: shadow selector (observability only, no dispatch mutation)
+        self._shadow_selector = shadow_selector
+        self._operator_symbols = operator_symbols or []
         # Read GRINDER_LIVE_PLANNER_ENABLED once at init (PR-L2)
         self._live_planner_env_override = parse_bool(
             "GRINDER_LIVE_PLANNER_ENABLED", default=False, strict=False
@@ -2083,6 +2091,14 @@ class LiveEngineV0:
                 tp_renew_place_ok[action.symbol or ""] = (
                     live_action.status == LiveActionStatus.EXECUTED
                 )
+
+        # Doc-36 Phase 1: shadow selector tick (post-dispatch, no side effects)
+        if self._shadow_selector is not None and self._last_feature_snapshot is not None:
+            self._shadow_selector.update_features(self._last_feature_snapshot)
+            try:
+                self._shadow_selector.maybe_run(snapshot.ts, self._operator_symbols)
+            except Exception:
+                logger.exception("SELECTOR_SHADOW_ERROR — fail-open, continuing")
 
         # Step 3: Build output
         return LiveEngineOutput(

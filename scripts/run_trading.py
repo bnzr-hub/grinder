@@ -92,7 +92,7 @@ from grinder.connectors.live_connector import (
     LiveConnectorV0,
     SafeMode,
 )
-from grinder.env_parse import parse_bool
+from grinder.env_parse import parse_bool, parse_int
 from grinder.execution.binance_futures_port import (
     BINANCE_FUTURES_MAINNET_URL,
     BinanceFuturesPort,
@@ -1046,6 +1046,47 @@ def build_engine(  # noqa: PLR0915
     # Live cycle layer (opt-in via GRINDER_LIVE_CYCLE_ENABLED, PR-INV-3)
     cycle_layer = _build_cycle_layer(symbols or [], symbol_constraints, paper_kwargs)
 
+    # Doc-36 Phase 1: shadow selector (observability only, no dispatch mutation)
+    shadow_selector = None
+    if parse_bool("GRINDER_SYMBOL_SELECTOR_SHADOW", default=False, strict=False):
+        from grinder.selection.shadow_selector import (  # noqa: PLC0415
+            ShadowSelector,
+            ShadowSelectorConfig,
+        )
+
+        def _parse_weight(env_var: str, default: float) -> float:
+            raw = os.environ.get(env_var, "").strip()
+            if not raw:
+                return default
+            try:
+                return float(raw)
+            except ValueError:
+                print(f"  WARNING: invalid {env_var}={raw!r}, using default {default}")
+                return default
+
+        selector_config = ShadowSelectorConfig(
+            enabled=True,
+            k=parse_int("GRINDER_SYMBOL_SELECTOR_K", default=3, strict=False) or 3,
+            cycle_s=parse_int("GRINDER_SYMBOL_SELECTOR_CYCLE_S", default=60, strict=False) or 60,
+            min_natr_bps=parse_int(
+                "GRINDER_SYMBOL_SELECTOR_MIN_NATR_BPS", default=100, strict=False
+            )
+            or 100,
+            trend_hard_gate_bps=parse_int(
+                "GRINDER_SYMBOL_SELECTOR_TREND_HARD_GATE_BPS", default=0, strict=False
+            )
+            or 0,
+            range_weight_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_RANGE_WEIGHT_W", 1.0),
+            liquidity_weight_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_LIQUIDITY_WEIGHT_W", 1.0),
+            toxicity_penalty_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_TOXICITY_PENALTY_W", 1.0),
+            trend_penalty_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_TREND_PENALTY_W", 1.0),
+        )
+        shadow_selector = ShadowSelector(selector_config)
+        print(
+            f"  Shadow selector enabled: k={selector_config.k} "
+            f"cycle_s={selector_config.cycle_s} min_natr={selector_config.min_natr_bps}bps"
+        )
+
     return LiveEngineV0(
         paper_engine=paper_engine,
         exchange_port=port,
@@ -1058,6 +1099,8 @@ def build_engine(  # noqa: PLR0915
         feature_engine=feature_engine,
         grid_planners=grid_planners,
         cycle_layer=cycle_layer,
+        shadow_selector=shadow_selector,
+        operator_symbols=symbols,
     )
 
 
