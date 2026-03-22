@@ -179,6 +179,7 @@ class BlockReason(Enum):
     TP_RENEW_PLACE_FAILED = "TP_RENEW_PLACE_FAILED"
     TP_CLOSE_PLACE_FAILED = "TP_CLOSE_PLACE_FAILED"
     CANCEL_ALREADY_FAILED = "CANCEL_ALREADY_FAILED"
+    SELECTOR_BLOCKED = "SELECTOR_BLOCKED"
 
 
 class LiveActionStatus(Enum):
@@ -3355,7 +3356,7 @@ class LiveEngineV0:
         self._grid_anchor_mid[symbol] = mid_price
         return actions
 
-    def _process_action(self, action: ExecutionAction, ts: int) -> LiveAction:  # noqa: PLR0911
+    def _process_action(self, action: ExecutionAction, ts: int) -> LiveAction:  # noqa: PLR0911, PLR0912
         """Process single action through safety gates and execute.
 
         Args:
@@ -3488,6 +3489,25 @@ class LiveEngineV0:
             fill_result = self._check_fill_prob(action, intent)
             if fill_result is not None:
                 return fill_result
+
+        # Gate 9: Selector gate (doc-36 Phase 2) — blocks INCREASE_RISK for symbols
+        # not in active set or in graceful_exit_only. Cancel/reduce allowed.
+        if (
+            intent == RiskIntent.INCREASE_RISK
+            and action.symbol
+            and not self.is_selector_dispatch_allowed(action.symbol)
+        ):
+            logger.info(
+                "Action blocked: SELECTOR_BLOCKED symbol=%s action=%s",
+                action.symbol,
+                action.action_type.value,
+            )
+            return LiveAction(
+                action=action,
+                status=LiveActionStatus.BLOCKED,
+                block_reason=BlockReason.SELECTOR_BLOCKED,
+                intent=intent,
+            )
 
         # SOR routing (Launch-14 PR2): after all safety gates, before execution
         if self._is_sor_enabled() and action.action_type in (

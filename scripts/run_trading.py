@@ -1046,6 +1046,17 @@ def build_engine(  # noqa: PLR0912, PLR0915
     # Live cycle layer (opt-in via GRINDER_LIVE_CYCLE_ENABLED, PR-INV-3)
     cycle_layer = _build_cycle_layer(symbols or [], symbol_constraints, paper_kwargs)
 
+    # Doc-36: shared weight parser for Phase 1 (shadow) and Phase 2 (active) selectors
+    def _parse_weight(env_var: str, default: float) -> float:
+        raw = os.environ.get(env_var, "").strip()
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            print(f"  WARNING: invalid {env_var}={raw!r}, using default {default}")
+            return default
+
     # Doc-36 Phase 1: shadow selector (observability only, no dispatch mutation)
     shadow_selector = None
     if parse_bool("GRINDER_SYMBOL_SELECTOR_SHADOW", default=False, strict=False):
@@ -1053,16 +1064,6 @@ def build_engine(  # noqa: PLR0912, PLR0915
             ShadowSelector,
             ShadowSelectorConfig,
         )
-
-        def _parse_weight(env_var: str, default: float) -> float:
-            raw = os.environ.get(env_var, "").strip()
-            if not raw:
-                return default
-            try:
-                return float(raw)
-            except ValueError:
-                print(f"  WARNING: invalid {env_var}={raw!r}, using default {default}")
-                return default
 
         selector_config = ShadowSelectorConfig(
             enabled=True,

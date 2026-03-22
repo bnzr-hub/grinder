@@ -15,9 +15,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from unittest.mock import MagicMock
 
 import pytest
 
+from grinder.connectors.live_connector import SafeMode
+from grinder.execution.port import NoOpExchangePort
+from grinder.execution.types import ActionType, ExecutionAction
+from grinder.live import LiveEngineConfig, LiveEngineV0
+from grinder.live.engine import BlockReason
 from grinder.selection.active_selector import (
     ActiveSelector,
     ActiveSelectorConfig,
@@ -299,3 +305,86 @@ class TestMetricsContract:
         lines = metrics.to_prometheus_lines()
         assert any("grinder_selector_active_set_size" in line for line in lines)
         assert any("grinder_selector_transition_total" in line for line in lines)
+
+
+# ---------------------------------------------------------------
+# I) Engine dispatch gating
+# ---------------------------------------------------------------
+
+
+class TestEngineDispatchGating:
+    def test_selector_blocks_increase_risk_for_excluded_symbol(self) -> None:
+        """Symbol not in active set → INCREASE_RISK blocked at engine gate."""
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+
+        active_config = _base_config(k=1, max_changes_per_cycle=10)
+        # Active set = only AAA
+        selector = ActiveSelector(active_config, initial_active={"AAA"})
+
+        engine = LiveEngineV0(
+            paper_engine=paper,
+            exchange_port=NoOpExchangePort(),
+            config=config,
+            active_selector=selector,
+            operator_symbols=["AAA", "BBB"],
+        )
+
+        # Try to place an entry for BBB (not in active set)
+        action = ExecutionAction(
+            action_type=ActionType.PLACE,
+            symbol="BBB",
+        )
+        result = engine._process_action(action, 1000)
+        assert result.block_reason == BlockReason.SELECTOR_BLOCKED
+
+    def test_selector_allows_cancel_for_excluded_symbol(self) -> None:
+        """CANCEL is allowed even for symbols not in active set."""
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+
+        active_config = _base_config(k=1, max_changes_per_cycle=10)
+        selector = ActiveSelector(active_config, initial_active={"AAA"})
+
+        engine = LiveEngineV0(
+            paper_engine=paper,
+            exchange_port=NoOpExchangePort(),
+            config=config,
+            active_selector=selector,
+            operator_symbols=["AAA", "BBB"],
+        )
+
+        # CANCEL for BBB should NOT be blocked by selector
+        action = ExecutionAction(
+            action_type=ActionType.CANCEL,
+            symbol="BBB",
+            order_id="test-cancel-1",
+        )
+        result = engine._process_action(action, 1000)
+        # Should not be SELECTOR_BLOCKED (cancel is reduce/cancel intent)
+        assert result.block_reason != BlockReason.SELECTOR_BLOCKED
+
+
+# ---------------------------------------------------------------
+# J) build_engine with SHADOW=0 + ENABLED=1
+# ---------------------------------------------------------------
+
+
+class TestBuildEnginePhase2Only:
+    def test_enabled_without_shadow_no_crash(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """ENABLED=1 + SHADOW=0 must not crash with UnboundLocalError."""
+        monkeypatch.setenv("GRINDER_SYMBOL_SELECTOR_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_SYMBOL_SELECTOR_SHADOW", "0")
+        monkeypatch.setenv("GRINDER_TRADING_MODE", "read_only")
+
+        from scripts.run_trading import build_engine  # noqa: PLC0415
+
+        engine = build_engine(
+            SafeMode.READ_ONLY,
+            armed=False,
+            symbols=["BTCUSDT"],
+        )
+        assert engine._active_selector is not None
+        assert engine._shadow_selector is None

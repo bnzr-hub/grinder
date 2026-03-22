@@ -98,7 +98,7 @@ This track must not bypass current operational hardening priorities.
 - Bounded transitions: `MAX_CHANGES_PER_CYCLE` (default 1).
 - Grid-v2 safety: `graceful_exit_only` for non-flat symbols (no forced unwind, exits preserved).
 - Fail-safe: on runtime error, retains previous stable active set for that cycle.
-- Metrics: `grinder_selector_active_set_size` (gauge), `grinder_selector_transition_total{kind,result}` (counter), `grinder_selector_graceful_exit_only_gauge{symbol}` (gauge).
+- Metrics: `grinder_selector_active_set_size` (gauge), `grinder_selector_transition_total{kind,result}` (counter), `grinder_selector_graceful_exit_only_gauge` (gauge, count of symbols in graceful-exit mode).
 - Flagged by `GRINDER_SYMBOL_SELECTOR_ENABLED=1`.
 
 ### Phase 3 — ML-assisted scoring (shadow then active)
