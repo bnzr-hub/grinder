@@ -22,8 +22,11 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from decimal import Decimal
+from typing import Any
 
+from grinder.connectors.errors import ConnectorTransientError
 from grinder.connectors.live_connector import SafeMode
 from grinder.execution.binance_futures_port import (
     BINANCE_FUTURES_MAINNET_URL,
@@ -31,6 +34,31 @@ from grinder.execution.binance_futures_port import (
     BinanceFuturesPortConfig,
 )
 from scripts.http_measured_client import RequestsHttpClient, build_measured_client
+
+_READ_RETRY_ATTEMPTS = 3
+_READ_RETRY_SLEEP_S = 2.0
+
+
+def _is_binance_timestamp_ahead_error(exc: ConnectorTransientError) -> bool:
+    """Return True only for Binance -1021 clock-skew transient."""
+    message = str(exc)
+    return "-1021" in message and "Timestamp for this request was" in message
+
+
+def _read_with_timestamp_retry(fn: Any, *, op_name: str, symbol: str) -> Any:
+    """Retry read op on Binance -1021 timestamp-ahead transient."""
+    for attempt in range(1, _READ_RETRY_ATTEMPTS + 1):
+        try:
+            return fn()
+        except ConnectorTransientError as exc:
+            if not _is_binance_timestamp_ahead_error(exc) or attempt >= _READ_RETRY_ATTEMPTS:
+                raise
+            print(
+                "WARN: exchange_state transient -1021, retrying "
+                f"op={op_name} symbol={symbol} attempt={attempt}/{_READ_RETRY_ATTEMPTS - 1}"
+            )
+            time.sleep(_READ_RETRY_SLEEP_S)
+    raise RuntimeError("unreachable")
 
 
 def _build_port(symbol: str, *, write: bool = False) -> BinanceFuturesPort:
@@ -68,8 +96,16 @@ def cmd_check(symbol: str) -> None:
     """Pre-flight check: show open orders and position for symbol."""
     port = _build_port(symbol, write=False)
 
-    orders = port.fetch_open_orders_raw(symbol)
-    positions = port.fetch_positions_raw(symbol)
+    orders = _read_with_timestamp_retry(
+        lambda: port.fetch_open_orders_raw(symbol),
+        op_name="fetch_open_orders_raw",
+        symbol=symbol,
+    )
+    positions = _read_with_timestamp_retry(
+        lambda: port.fetch_positions_raw(symbol),
+        op_name="fetch_positions_raw",
+        symbol=symbol,
+    )
 
     print(f"EXCHANGE_STATE_CHECK symbol={symbol}")
     print(f"  open_orders={len(orders)}")
@@ -153,8 +189,16 @@ def cmd_verify_programmatic(symbol: str) -> tuple[bool, int, str]:
     """
     port = _build_port(symbol, write=False)
 
-    orders = port.fetch_open_orders_raw(symbol)
-    positions = port.fetch_positions_raw(symbol)
+    orders = _read_with_timestamp_retry(
+        lambda: port.fetch_open_orders_raw(symbol),
+        op_name="fetch_open_orders_raw",
+        symbol=symbol,
+    )
+    positions = _read_with_timestamp_retry(
+        lambda: port.fetch_positions_raw(symbol),
+        op_name="fetch_positions_raw",
+        symbol=symbol,
+    )
 
     pos_qty = Decimal("0")
     for p in positions:
