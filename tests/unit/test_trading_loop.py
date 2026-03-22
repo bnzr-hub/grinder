@@ -975,3 +975,57 @@ class TestLaunchGuard:
             symbols=["BTCUSDT", "ETHUSDT", "PIPPINUSDT"],
         )
         assert result.status == "verify_clean"
+
+    def test_verify_error_on_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Verify throws exception → verify_error with reason."""
+
+        def _boom(_s: str) -> tuple[bool, int, str]:
+            msg = "connection refused"
+            raise ConnectionError(msg)
+
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", _boom)
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=False,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "verify_error"
+        assert "connection refused" in result.reason
+
+    def test_cleanup_error_on_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Cleanup throws exception → verify_error."""
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (False, 1, "0.001"))
+
+        def _boom(_s: str) -> None:
+            msg = "API rate limit"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(self._es_mod, "cmd_cleanup", _boom)
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=True,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "verify_error"
+        assert "cleanup failed" in result.reason
+
+    def test_pre_cleanup_already_clean_returns_verify_clean(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--pre-cleanup + already clean → verify_clean (not cleanup_then_clean)."""
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (True, 0, "FLAT"))
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=True,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "verify_clean"

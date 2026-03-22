@@ -567,7 +567,7 @@ class LaunchGuardResult:
     position: str = "FLAT"
 
 
-def evaluate_launch_guard(
+def evaluate_launch_guard(  # noqa: PLR0911
     *,
     exchange_port: str,
     mainnet: bool,
@@ -586,8 +586,15 @@ def evaluate_launch_guard(
 
     from scripts.exchange_state import cmd_verify_programmatic  # noqa: PLC0415
 
+    cleanup_performed = False
     for symbol in symbols:
-        ok, orders, position = cmd_verify_programmatic(symbol)
+        try:
+            ok, orders, position = cmd_verify_programmatic(symbol)
+        except Exception as exc:
+            return LaunchGuardResult(
+                status="verify_error",
+                reason=f"symbol={symbol} verify failed: {exc}",
+            )
         if ok:
             continue
 
@@ -603,10 +610,23 @@ def evaluate_launch_guard(
         # Cleanup requested
         from scripts.exchange_state import cmd_cleanup  # noqa: PLC0415
 
-        cmd_cleanup(symbol)
+        try:
+            cmd_cleanup(symbol)
+        except Exception as exc:
+            return LaunchGuardResult(
+                status="verify_error",
+                reason=f"symbol={symbol} cleanup failed: {exc}",
+            )
+        cleanup_performed = True
 
         # Re-verify after cleanup
-        ok2, orders2, position2 = cmd_verify_programmatic(symbol)
+        try:
+            ok2, orders2, position2 = cmd_verify_programmatic(symbol)
+        except Exception as exc:
+            return LaunchGuardResult(
+                status="verify_error",
+                reason=f"symbol={symbol} post-cleanup verify failed: {exc}",
+            )
         if not ok2:
             return LaunchGuardResult(
                 status="cleanup_then_still_dirty",
@@ -616,7 +636,7 @@ def evaluate_launch_guard(
             )
 
     return LaunchGuardResult(
-        status="cleanup_then_clean" if pre_cleanup else "verify_clean",
+        status="cleanup_then_clean" if cleanup_performed else "verify_clean",
         reason="all symbols clean",
     )
 
