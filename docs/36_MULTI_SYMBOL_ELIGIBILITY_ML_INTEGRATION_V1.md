@@ -91,10 +91,15 @@ This track must not bypass current operational hardening priorities.
 - Fail-open: selector exceptions logged, engine continues unaffected.
 - Flagged by `GRINDER_SYMBOL_SELECTOR_SHADOW=1`.
 
-### Phase 2 — Controlled activation
-- Feature-flagged activation for a bounded subset.
-- Hysteresis and max symbol-change-per-cycle guard enabled.
-- Flagged by `GRINDER_SYMBOL_SELECTOR_ENABLED=1` (proposal).
+### Phase 2 — Controlled activation **[DELIVERED]**
+- `ActiveSelector` in `src/grinder/selection/active_selector.py`, wraps Phase 1 scoring.
+- Operator-universe only (no auto-scan / universe discovery).
+- Hysteresis: `MIN_HOLD_CYCLES` (default 5), `ENTER/EXIT_THRESHOLD_BPS` (default 0).
+- Bounded transitions: `MAX_CHANGES_PER_CYCLE` (default 1).
+- Grid-v2 safety: `graceful_exit_only` for non-flat symbols (no forced unwind, exits preserved).
+- Fail-safe: on runtime error, retains previous stable active set for that cycle.
+- Metrics: `grinder_selector_active_set_size` (gauge), `grinder_selector_transition_total{kind,result}` (counter), `grinder_selector_graceful_exit_only_gauge` (gauge, count of symbols in graceful-exit mode).
+- Flagged by `GRINDER_SYMBOL_SELECTOR_ENABLED=1`.
 
 ### Phase 3 — ML-assisted scoring (shadow then active)
 - Add bounded ML adjustment term after baseline Top-K v1 score.

@@ -279,8 +279,8 @@ class TestCardinalityCap:
         sel.maybe_run(1000, [f"SYM{i:02d}USDT" for i in range(10)])
         metrics = get_selector_metrics()
         # Should have at most (k + 2) * 5 components = 4 * 5 = 20 entries
-        symbols_in_score = {sym for sym, _ in metrics.score_bps}
-        assert len(symbols_in_score) <= 2 + 2  # k + _SCORE_EMIT_EXTRA
+        ranks_in_score = {rank for rank, _ in metrics.score_bps}
+        assert len(ranks_in_score) <= 2 + 2  # k + _SCORE_EMIT_EXTRA
 
 
 class TestWarmupIncomplete:
