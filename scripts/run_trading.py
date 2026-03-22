@@ -1054,6 +1054,16 @@ def build_engine(  # noqa: PLR0915
             ShadowSelectorConfig,
         )
 
+        def _parse_weight(env_var: str, default: float) -> float:
+            raw = os.environ.get(env_var, "").strip()
+            if not raw:
+                return default
+            try:
+                return float(raw)
+            except ValueError:
+                print(f"  WARNING: invalid {env_var}={raw!r}, using default {default}")
+                return default
+
         selector_config = ShadowSelectorConfig(
             enabled=True,
             k=parse_int("GRINDER_SYMBOL_SELECTOR_K", default=3, strict=False) or 3,
@@ -1066,6 +1076,10 @@ def build_engine(  # noqa: PLR0915
                 "GRINDER_SYMBOL_SELECTOR_TREND_HARD_GATE_BPS", default=0, strict=False
             )
             or 0,
+            range_weight_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_RANGE_WEIGHT_W", 1.0),
+            liquidity_weight_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_LIQUIDITY_WEIGHT_W", 1.0),
+            toxicity_penalty_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_TOXICITY_PENALTY_W", 1.0),
+            trend_penalty_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_TREND_PENALTY_W", 1.0),
         )
         shadow_selector = ShadowSelector(selector_config)
         print(

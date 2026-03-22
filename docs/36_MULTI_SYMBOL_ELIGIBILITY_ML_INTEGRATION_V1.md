@@ -85,7 +85,7 @@ This track must not bypass current operational hardening priorities.
 - `ShadowSelector` in `src/grinder/selection/shadow_selector.py`, wired post-dispatch in `LiveEngineV0`.
 - Reuses `select_topk_v1` scoring with timestamp-based cooldown (`GRINDER_SYMBOL_SELECTOR_CYCLE_S`).
 - Hard gates: `NATR_BELOW_MIN`, `TREND_TOO_STRONG` (when threshold > 0), plus topk_v1 gates.
-- Metrics: 5 families (`grinder_selector_{cycle,candidate_count,excluded,churn,score_bps}_total`).
+- Metrics: 5 families — counters: `grinder_selector_cycle_total`, `grinder_selector_excluded_total`, `grinder_selector_churn_total`; gauges: `grinder_selector_candidate_count`, `grinder_selector_score_bps`.
 - Score cardinality capped to top-K + 2 near-cutoff symbols.
 - Hypothetical churn only (would_add/would_remove). **No dispatch-universe mutation.**
 - Fail-open: selector exceptions logged, engine continues unaffected.

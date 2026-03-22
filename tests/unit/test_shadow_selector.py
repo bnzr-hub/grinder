@@ -18,9 +18,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from unittest.mock import MagicMock
 
 import pytest
 
+from grinder.connectors.live_connector import SafeMode
+from grinder.contracts import Snapshot
+from grinder.execution.port import NoOpExchangePort
+from grinder.features.engine import FeatureEngine, FeatureEngineConfig
+from grinder.live import LiveEngineConfig, LiveEngineV0
 from grinder.selection.shadow_selector import (
     ShadowSelector,
     ShadowSelectorConfig,
@@ -303,3 +309,58 @@ class TestPrometheusOutput:
         lines = metrics.to_prometheus_lines()
         assert any("grinder_selector_cycle_total" in line for line in lines)
         assert any("grinder_selector_candidate_count" in line for line in lines)
+
+
+class TestEngineLevelShadowSafety:
+    """P0 invariant: shadow ON does not change dispatch output."""
+
+    def test_shadow_on_vs_off_identical_output(self) -> None:
+        """LiveEngineV0 produces identical output with shadow ON vs OFF."""
+        snap = Snapshot(
+            ts=100_000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("100"),
+            ask_price=Decimal("100.02"),
+            bid_qty=Decimal("10"),
+            ask_qty=Decimal("10"),
+            last_price=Decimal("100.01"),
+            last_qty=Decimal("1"),
+        )
+        config = LiveEngineConfig(armed=False, mode=SafeMode.READ_ONLY)
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+        feat_engine = FeatureEngine(FeatureEngineConfig(bar_interval_ms=60_000))
+
+        # Run 1: shadow OFF
+        reset_selector_metrics()
+        engine_off = LiveEngineV0(
+            paper_engine=paper,
+            exchange_port=NoOpExchangePort(),
+            config=config,
+            feature_engine=feat_engine,
+        )
+        out_off = engine_off.process_snapshot(snap)
+
+        # Run 2: shadow ON (fresh feature engine to match state)
+        reset_selector_metrics()
+        feat_engine2 = FeatureEngine(FeatureEngineConfig(bar_interval_ms=60_000))
+        shadow_config = ShadowSelectorConfig(enabled=True, k=1, cycle_s=0)
+        selector = ShadowSelector(shadow_config)
+        engine_on = LiveEngineV0(
+            paper_engine=paper,
+            exchange_port=NoOpExchangePort(),
+            config=config,
+            feature_engine=feat_engine2,
+            shadow_selector=selector,
+            operator_symbols=["BTCUSDT"],
+        )
+        out_on = engine_on.process_snapshot(snap)
+
+        # P0 invariant: live_actions identical
+        assert out_off.live_actions == out_on.live_actions
+        assert out_off.armed == out_on.armed
+        assert out_off.mode == out_on.mode
+
+        # Shadow selector ran and emitted metrics
+        metrics = get_selector_metrics()
+        assert metrics.cycle_total.get(("shadow", "ok"), 0) >= 1
