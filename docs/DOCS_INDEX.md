@@ -72,6 +72,7 @@ If documents conflict, trust order is:
 - `docs/23_NATR_CONTRACT.md` — NATR(14) computation contract
 - `docs/24_NATR_SPACING_HOOK.md` — NATR-to-spacing hook (TRD-3b)
 - `docs/25_LIVE_GRID_PLANNER_SPEC.md` — LiveGridPlanner (exchange-truth reconciliation)
+- `docs/36_MULTI_SYMBOL_ELIGIBILITY_ML_INTEGRATION_V1.md` — candidate design for live multi-symbol eligibility orchestration
 
 ---
 
