@@ -20,6 +20,7 @@
 1. Operational launch guard for live runs (`preflight -> [optional cleanup] -> verify -> start`) to prevent dirty-start fail-closed loops.
 2. Stable live validation windows with strict proof bundles (clean start, symmetry checks, stop reason, end-state verify).
 3. Targeted watchdog hardening only for observed failure modes (no broad speculative framework changes).
+4. Stage candidate design for multi-symbol eligibility + ML-assisted selection, gated behind items 1-3 (`docs/36_MULTI_SYMBOL_ELIGIBILITY_ML_INTEGRATION_V1.md`).
 
 ## 0) What changed after Launch-12
 
