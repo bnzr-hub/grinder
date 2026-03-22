@@ -35,6 +35,7 @@ from grinder.observability.fill_metrics import get_fill_metrics
 from grinder.observability.latency_metrics import get_http_metrics
 from grinder.reconcile.metrics import get_reconcile_metrics
 from grinder.risk.emergency_exit_metrics import get_emergency_exit_metrics
+from grinder.selection.shadow_selector import get_selector_metrics
 
 
 @dataclass
@@ -181,6 +182,9 @@ class MetricsBuilder:
 
         # Live engine metrics (PR-ROLL-1)
         lines.extend(self._build_live_engine_metrics())
+
+        # Shadow selector metrics (doc-36 Phase 1)
+        lines.extend(self._build_selector_metrics())
 
         return "\n".join(lines)
 
@@ -377,6 +381,10 @@ class MetricsBuilder:
     def _build_live_engine_metrics(self) -> list[str]:
         """Build live engine metrics (PR-ROLL-1)."""
         return get_live_engine_metrics().format_metrics()
+
+    def _build_selector_metrics(self) -> list[str]:
+        """Build shadow selector metrics (doc-36 Phase 1)."""
+        return get_selector_metrics().to_prometheus_lines()
 
 
 class _BuilderHolder:
