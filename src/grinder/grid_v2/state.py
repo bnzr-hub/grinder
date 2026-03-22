@@ -69,6 +69,9 @@ class GridV2Config:
     max_inventory_notional_usd: Decimal
     price_tick_size: Decimal = Decimal("0.01")  # PR6: exchange tick size for price quantization
     reseed_on_flat: bool = True  # PRx: when False, preserve current window on full unwind to FLAT
+    reseed_on_flat_only_on_skew: bool = (
+        False  # PRx: on FLAT, reseed only when BUY/SELL ladder is skewed
+    )
 
     def __post_init__(self) -> None:
         if self.grid_step_pct <= 0:

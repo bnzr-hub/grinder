@@ -651,6 +651,11 @@ class LiveEngineV0:
             ),
             price_tick_size=self._resolve_grid_v2_tick_size(),
             reseed_on_flat=parse_bool("GRINDER_GRID_V2_RESEED_ON_FLAT", default=True, strict=False),
+            reseed_on_flat_only_on_skew=parse_bool(
+                "GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW",
+                default=False,
+                strict=False,
+            ),
         )
         return GridV2Bridge(config, self._grid_v2_symbol)
 
@@ -702,7 +707,15 @@ class LiveEngineV0:
                     bridge.failed_reason,
                 )
             elif (
-                pos_qty == 0 and bridge.state_machine is not None and bridge._config.reseed_on_flat
+                pos_qty == 0
+                and bridge.state_machine is not None
+                and (
+                    bridge._config.reseed_on_flat
+                    or (
+                        bridge._config.reseed_on_flat_only_on_skew
+                        and self._grid_v2_flat_registry_is_skewed(bridge)
+                    )
+                )
             ):
                 # If we're flat and restarting on existing grid orders, recenter once
                 # so entry distance from mid reflects current step/levels config.
@@ -1063,15 +1076,23 @@ class LiveEngineV0:
         )
         repair_actions: list[ExecutionAction] = []
         if sm.mode == BranchMode.FLAT:
-            if bridge._config.reseed_on_flat:
+            flat_skew = self._grid_v2_flat_entry_is_skewed(
+                current_entry_by_key=current_entry_by_key,
+                expected_entry_keys=target_entry_keys,
+            )
+            if bridge._config.reseed_on_flat or (
+                bridge._config.reseed_on_flat_only_on_skew and flat_skew
+            ):
                 logger.warning(
                     "GRID_V2_INTEGRITY_REPAIR_TRIGGER symbol=%s mode=%s entries=%d expected=%d "
-                    "exits=%d",
+                    "exits=%d reseed_mode=%s skew=%s",
                     snapshot.symbol,
                     sm.mode.value,
                     current_entries,
                     expected_entries,
                     current_exits,
+                    "always" if bridge._config.reseed_on_flat else "only_on_skew",
+                    flat_skew,
                 )
                 repair_actions = list(bridge.recenter_flat(snapshot.mid_price, snapshot.ts))
             else:
@@ -1103,13 +1124,14 @@ class LiveEngineV0:
                     )
                 logger.warning(
                     "GRID_V2_INTEGRITY_FLAT_PRESERVE symbol=%s entries=%d expected=%d exits=%d "
-                    "extra=%d cleanup_actions=%d reason=reseed_on_flat_disabled",
+                    "extra=%d cleanup_actions=%d reason=reseed_preserve_mode skew=%s",
                     snapshot.symbol,
                     current_entries,
                     expected_entries,
                     current_exits,
                     len(extra),
                     len(repair_actions),
+                    flat_skew,
                 )
         else:
             current_keys = set(current_entry_by_key.keys())
@@ -1301,6 +1323,39 @@ class LiveEngineV0:
             and self._grid_v2_bridge.reconstruction_ok
             and symbol == self._grid_v2_symbol
         )
+
+    @staticmethod
+    def _grid_v2_flat_entry_is_skewed(
+        *,
+        current_entry_by_key: dict[tuple[OrderSide, Decimal], str],
+        expected_entry_keys: set[tuple[OrderSide, Decimal]],
+    ) -> bool:
+        """Whether FLAT ladder is skewed between BUY/SELL entry sides."""
+        current_buy = sum(1 for side, _ in current_entry_by_key if side == OrderSide.BUY)
+        current_sell = sum(1 for side, _ in current_entry_by_key if side == OrderSide.SELL)
+        expected_buy = sum(1 for side, _ in expected_entry_keys if side == OrderSide.BUY)
+        expected_sell = sum(1 for side, _ in expected_entry_keys if side == OrderSide.SELL)
+        return (
+            current_buy != expected_buy
+            or current_sell != expected_sell
+            or current_buy != current_sell
+        )
+
+    @staticmethod
+    def _grid_v2_flat_registry_is_skewed(bridge: GridV2Bridge) -> bool:
+        """Whether reconstructed registry is skewed while FLAT."""
+        buy_count = 0
+        sell_count = 0
+        for cid in bridge.adapter.registry.all_entry_cids:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            if reg.side == OrderSide.BUY:
+                buy_count += 1
+            elif reg.side == OrderSide.SELL:
+                sell_count += 1
+        expected = bridge._config.entry_levels_per_side
+        return buy_count != expected or sell_count != expected or buy_count != sell_count
 
     # --- Grid V2 shadow methods (doc-27 section 24, PR5) ---
 
