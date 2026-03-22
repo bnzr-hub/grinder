@@ -12,7 +12,16 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from scripts.exchange_state import _build_port, cmd_check, cmd_cleanup, cmd_verify, main
+from scripts.exchange_state import (
+    _build_port,
+    cmd_check,
+    cmd_cleanup,
+    cmd_verify,
+    cmd_verify_programmatic,
+    main,
+)
+
+from grinder.connectors.errors import ConnectorTransientError
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -183,6 +192,24 @@ class TestCmdVerify:
         out = capsys.readouterr().out
         assert "status=DIRTY" in out
 
+    def test_verify_programmatic_retries_on_timestamp_ahead_once(self) -> None:
+        """-1021 on first read should retry once and then succeed."""
+        port = _mock_port(orders=[], positions=FLAT_POS)
+        port.fetch_open_orders_raw.side_effect = [
+            ConnectorTransientError("Binance transient error -1021: Timestamp for this request was"),
+            [],
+        ]
+        with (
+            patch("scripts.exchange_state._build_port", return_value=port),
+            patch("scripts.exchange_state.time.sleep") as mock_sleep,
+        ):
+            ok, orders, position = cmd_verify_programmatic("BTCUSDT")
+        assert ok is True
+        assert orders == 0
+        assert position == "FLAT"
+        assert port.fetch_open_orders_raw.call_count == 2
+        mock_sleep.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # cmd_check tests
@@ -231,6 +258,26 @@ class TestCmdCheck:
         with patch("scripts.exchange_state._build_port", return_value=port) as mock_build:
             cmd_check("BTCUSDT")
         mock_build.assert_called_once_with("BTCUSDT", write=False)
+
+    def test_check_retries_on_timestamp_ahead_once(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """-1021 should retry read and still print normal output."""
+        port = _mock_port(orders=[], positions=FLAT_POS)
+        port.fetch_positions_raw.side_effect = [
+            ConnectorTransientError("Binance transient error -1021: Timestamp for this request was"),
+            FLAT_POS,
+        ]
+        with (
+            patch("scripts.exchange_state._build_port", return_value=port),
+            patch("scripts.exchange_state.time.sleep") as mock_sleep,
+        ):
+            cmd_check("BTCUSDT")
+        out = capsys.readouterr().out
+        assert "WARN: exchange_state transient -1021, retrying" in out
+        assert "summary: orders=0 position=FLAT" in out
+        assert port.fetch_positions_raw.call_count == 2
+        mock_sleep.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
