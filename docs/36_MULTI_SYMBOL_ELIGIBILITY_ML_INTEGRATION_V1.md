@@ -23,7 +23,7 @@ What is missing is a single live orchestration path that combines these into one
 - Top-K v0: volatility-proxy deterministic selector.
 - Top-K v1: gated score (`range + liquidity - toxicity - trend`) with deterministic tie-break.
 - Hard gates already defined (toxicity/spread/thin-book/warmup).
-- Additional Phase 0 floor (binding for selector contract): `NATR_14_5m >= 1%` (`>= 100 bps`).
+- Additional Phase 0 floor (binding, configurable): `NATR_14_5m >= min_natr_bps` (default `100 bps` = `1%`).
 
 ### 2.3 ML (implemented as signal layer, limited policy consumption)
 - `MlSignalSnapshot` and ONNX inference flow exist.
@@ -152,7 +152,7 @@ These names are proposed for consistency with existing `GRINDER_*` runtime contr
 - `GRINDER_SYMBOL_SELECTOR_ML_ENABLED` (default `0`)
 - `GRINDER_SYMBOL_SELECTOR_ML_ADJUST_MAX_BPS` (default `0`, bounded adjustment cap)
 
-Note: contract remains candidate until wired and tested in code.
+Thresholds are intentionally configurable via env contract (no hard-coded runtime constants in docs).
 
 ## 9) Phase 0 binding artifacts (docs-only)
 
@@ -188,3 +188,18 @@ All selector metrics are observability-only in Phase 1 shadow mode (no dispatch 
 - Initial reason-code catalog frozen (section 9.1).
 - Initial metrics schema frozen (section 9.2).
 - `STATE.md` + `DECISIONS.md` + `POST_LAUNCH_ROADMAP.md` synchronized to this doc.
+
+## 10) Configurable threshold contract (Phase 0 baseline)
+
+To support operator tuning, hard gates and scoring penalties are parameterized:
+
+- `GRINDER_SYMBOL_SELECTOR_MIN_NATR_BPS` (default `100`) -> exclude if `NATR_14_5m < min_natr_bps` (`NATR_BELOW_MIN`)
+- `GRINDER_SYMBOL_SELECTOR_TREND_PENALTY_W` (default `1.0`) -> multiplier for trend penalty component
+- `GRINDER_SYMBOL_SELECTOR_TREND_HARD_GATE_BPS` (default `0`, disabled) -> if `>0`, exclude when `trend_strength_bps > threshold` (`TREND_TOO_STRONG`)
+- `GRINDER_SYMBOL_SELECTOR_TOXICITY_PENALTY_W` (default `1.0`) -> multiplier for toxicity penalty component
+- `GRINDER_SYMBOL_SELECTOR_LIQUIDITY_WEIGHT_W` (default `1.0`) -> multiplier for liquidity component
+- `GRINDER_SYMBOL_SELECTOR_RANGE_WEIGHT_W` (default `1.0`) -> multiplier for range component
+
+Validation policy (fail-closed in implementation phase):
+- all `*_BPS` thresholds must be `>= 0`
+- all penalty/weight multipliers must be finite and `>= 0`
