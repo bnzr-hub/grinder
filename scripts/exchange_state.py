@@ -136,6 +136,21 @@ def cmd_cleanup(symbol: str) -> None:
 
 def cmd_verify(symbol: str) -> None:
     """Verify clean state: 0 orders + flat position. Exit 1 if not."""
+    ok, orders, position = cmd_verify_programmatic(symbol)
+    status = "CLEAN" if ok else "DIRTY"
+    print(
+        f"EXCHANGE_STATE_VERIFY symbol={symbol} status={status} orders={orders} position={position}"
+    )
+    if not ok:
+        sys.exit(1)
+
+
+def cmd_verify_programmatic(symbol: str) -> tuple[bool, int, str]:
+    """Verify clean state and return structured result.
+
+    Returns (ok, order_count, position_str) without calling sys.exit().
+    Used by launch guard for programmatic pre-start verification.
+    """
     port = _build_port(symbol, write=False)
 
     orders = port.fetch_open_orders_raw(symbol)
@@ -148,14 +163,13 @@ def cmd_verify(symbol: str) -> None:
             pos_qty = qty
 
     ok = len(orders) == 0 and pos_qty == 0
-    status = "CLEAN" if ok else "DIRTY"
+    position_str = "FLAT" if pos_qty == 0 else str(pos_qty)
 
     print(
-        f"EXCHANGE_STATE_VERIFY symbol={symbol} status={status} orders={len(orders)} position={'FLAT' if pos_qty == 0 else str(pos_qty)}"
+        f"EXCHANGE_STATE_VERIFY symbol={symbol} status={'CLEAN' if ok else 'DIRTY'} "
+        f"orders={len(orders)} position={position_str}"
     )
-
-    if not ok:
-        sys.exit(1)
+    return ok, len(orders), position_str
 
 
 def main() -> None:
