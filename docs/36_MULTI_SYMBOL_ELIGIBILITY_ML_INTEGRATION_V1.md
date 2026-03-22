@@ -1,6 +1,6 @@
 # 36 — Multi-Symbol + Eligibility + ML Integration v1
 
-> Status: CANDIDATE DESIGN (implementation plan, non-binding until merged with code)
+> Status: PHASE 0 CONTRACT BASELINE (docs-only, code wiring not started)
 > Scope: integrate multi-symbol live orchestration with deterministic symbol eligibility and ML-aware scoring.
 
 ## 1) Why this exists
@@ -27,6 +27,19 @@ What is missing is a single live orchestration path that combines these into one
 ### 2.3 ML (implemented as signal layer, limited policy consumption)
 - `MlSignalSnapshot` and ONNX inference flow exist.
 - ML policy integration is partially planned in docs (`signal -> policy params` not fully universal in live paths).
+
+### 2.4 Existing formula sources (must reuse, not reinvent)
+- Top-K v1 score shape is already specified in smart-grid SSOT:
+  - `score = range + liquidity - toxicity_penalty - trend_penalty`
+  - Source: `docs/17_ADAPTIVE_SMART_GRID_V1.md` (§17.14), mirrored in `docs/smart_grid/SPEC_V1_2.md`.
+- Prefilter signal fields and components are already specified:
+  - `range_score`, `liquidity_score`, `tox_penalty`, `trend_strength`
+  - Source: `docs/04_PREFILTER_SPEC.md`.
+- ML signal contract and rollout controls are already specified:
+  - `MlSignalSnapshot`, shadow/active rollout, fail-open behavior
+  - Source: `docs/12_ML_SPEC.md` + runbooks `18/19`.
+
+Phase 1/2/3 must consume these existing definitions unless an explicit SSOT amendment is merged first.
 
 ## 3) Target v1 behavior (live)
 
@@ -139,3 +152,37 @@ These names are proposed for consistency with existing `GRINDER_*` runtime contr
 - `GRINDER_SYMBOL_SELECTOR_ML_ADJUST_MAX_BPS` (default `0`, bounded adjustment cap)
 
 Note: contract remains candidate until wired and tested in code.
+
+## 9) Phase 0 binding artifacts (docs-only)
+
+### 9.1 Reason codes (initial, deterministic)
+- `NOT_IN_OPERATOR_UNIVERSE`
+- `VENUE_UNAVAILABLE`
+- `SYMBOL_CONSTRAINTS_MISSING`
+- `WARMUP_INCOMPLETE`
+- `THIN_BOOK`
+- `SPREAD_SPIKE`
+- `TOXICITY_HIGH`
+- `TREND_TOO_STRONG`
+- `MIN_HOLD_ACTIVE`
+- `MAX_CHANGES_BUDGET_EXHAUSTED`
+- `GRACEFUL_EXIT_ONLY_ACTIVE`
+
+These are the initial exclusion/override reason codes for selector audit output.
+Any rename/add/remove requires SSOT + contract test update in implementation PR.
+
+### 9.2 Metrics schema (initial)
+- `grinder_selector_cycle_total{mode,result}`
+- `grinder_selector_candidate_count{stage}` (`input`, `eligible`, `selected`)
+- `grinder_selector_excluded_total{reason}`
+- `grinder_selector_churn_total{kind}` (`added`, `removed`, `deferred`)
+- `grinder_selector_score_bps{symbol,component}` (`range`, `liquidity`, `toxicity`, `trend`, `ml_adjust`, `final`)
+- `grinder_selector_graceful_exit_only_gauge{symbol}`
+
+All selector metrics are observability-only in Phase 1 shadow mode (no dispatch impact).
+
+### 9.3 Phase 0 exit criteria
+- Config contract frozen (section 8).
+- Initial reason-code catalog frozen (section 9.1).
+- Initial metrics schema frozen (section 9.2).
+- `STATE.md` + `DECISIONS.md` + `POST_LAUNCH_ROADMAP.md` synchronized to this doc.
