@@ -196,7 +196,9 @@ class TestCmdVerify:
         """-1021 on first read should retry once and then succeed."""
         port = _mock_port(orders=[], positions=FLAT_POS)
         port.fetch_open_orders_raw.side_effect = [
-            ConnectorTransientError("Binance transient error -1021: Timestamp for this request was"),
+            ConnectorTransientError(
+                "Binance transient error -1021: Timestamp for this request was"
+            ),
             [],
         ]
         with (
@@ -265,7 +267,9 @@ class TestCmdCheck:
         """-1021 should retry read and still print normal output."""
         port = _mock_port(orders=[], positions=FLAT_POS)
         port.fetch_positions_raw.side_effect = [
-            ConnectorTransientError("Binance transient error -1021: Timestamp for this request was"),
+            ConnectorTransientError(
+                "Binance transient error -1021: Timestamp for this request was"
+            ),
             FLAT_POS,
         ]
         with (
