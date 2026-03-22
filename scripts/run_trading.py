@@ -928,7 +928,7 @@ def _parse_max_position_usd() -> float | None:
         return None
 
 
-def build_engine(  # noqa: PLR0915
+def build_engine(  # noqa: PLR0912, PLR0915
     mode: SafeMode,
     *,
     armed: bool = False,
@@ -1087,6 +1087,53 @@ def build_engine(  # noqa: PLR0915
             f"cycle_s={selector_config.cycle_s} min_natr={selector_config.min_natr_bps}bps"
         )
 
+    # Doc-36 Phase 2: active selector (controlled activation, operator universe only)
+    active_selector = None
+    if parse_bool("GRINDER_SYMBOL_SELECTOR_ENABLED", default=False, strict=False):
+        from grinder.selection.active_selector import (  # noqa: PLC0415
+            ActiveSelector,
+            ActiveSelectorConfig,
+        )
+
+        active_config = ActiveSelectorConfig(
+            enabled=True,
+            k=parse_int("GRINDER_SYMBOL_SELECTOR_K", default=3, strict=False) or 3,
+            cycle_s=parse_int("GRINDER_SYMBOL_SELECTOR_CYCLE_S", default=60, strict=False) or 60,
+            min_natr_bps=parse_int(
+                "GRINDER_SYMBOL_SELECTOR_MIN_NATR_BPS", default=100, strict=False
+            )
+            or 100,
+            trend_hard_gate_bps=parse_int(
+                "GRINDER_SYMBOL_SELECTOR_TREND_HARD_GATE_BPS", default=0, strict=False
+            )
+            or 0,
+            range_weight_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_RANGE_WEIGHT_W", 1.0),
+            liquidity_weight_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_LIQUIDITY_WEIGHT_W", 1.0),
+            toxicity_penalty_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_TOXICITY_PENALTY_W", 1.0),
+            trend_penalty_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_TREND_PENALTY_W", 1.0),
+            min_hold_cycles=parse_int(
+                "GRINDER_SYMBOL_SELECTOR_MIN_HOLD_CYCLES", default=5, strict=False
+            )
+            or 5,
+            max_changes_per_cycle=parse_int(
+                "GRINDER_SYMBOL_SELECTOR_MAX_CHANGES_PER_CYCLE", default=1, strict=False
+            )
+            or 1,
+            enter_threshold_bps=parse_int(
+                "GRINDER_SYMBOL_SELECTOR_ENTER_THRESHOLD_BPS", default=0, strict=False
+            )
+            or 0,
+            exit_threshold_bps=parse_int(
+                "GRINDER_SYMBOL_SELECTOR_EXIT_THRESHOLD_BPS", default=0, strict=False
+            )
+            or 0,
+        )
+        active_selector = ActiveSelector(active_config, initial_active=set(symbols or []))
+        print(
+            f"  Active selector enabled: k={active_config.k} "
+            f"hold={active_config.min_hold_cycles} max_chg={active_config.max_changes_per_cycle}"
+        )
+
     return LiveEngineV0(
         paper_engine=paper_engine,
         exchange_port=port,
@@ -1100,6 +1147,7 @@ def build_engine(  # noqa: PLR0915
         grid_planners=grid_planners,
         cycle_layer=cycle_layer,
         shadow_selector=shadow_selector,
+        active_selector=active_selector,
         operator_symbols=symbols,
     )
 

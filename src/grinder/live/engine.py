@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     from grinder.live.grid_planner import LiveGridPlannerV1
     from grinder.ml.fill_model_v0 import FillModelV0
     from grinder.paper.engine import PaperEngine
+    from grinder.selection.active_selector import ActiveSelector
     from grinder.selection.shadow_selector import ShadowSelector
 
 logger = logging.getLogger(__name__)
@@ -385,6 +386,7 @@ class LiveEngineV0:
         grid_planners: dict[str, LiveGridPlannerV1] | None = None,
         cycle_layer: LiveCycleLayerV1 | None = None,
         shadow_selector: ShadowSelector | None = None,
+        active_selector: ActiveSelector | None = None,
         operator_symbols: list[str] | None = None,
     ) -> None:
         """Initialize LiveEngineV0.
@@ -404,7 +406,8 @@ class LiveEngineV0:
             grid_planners: Per-symbol grid planners for live mode (PR-L2). None = disabled.
             cycle_layer: Optional LiveCycleLayerV1 for TP generation (PR-INV-3). None = disabled.
             shadow_selector: Optional ShadowSelector for Phase 1 observability (doc-36). None = disabled.
-            operator_symbols: Operator-configured symbol universe for shadow selector.
+            active_selector: Optional ActiveSelector for Phase 2 controlled activation (doc-36). None = disabled.
+            operator_symbols: Operator-configured symbol universe for selector.
         """
         self._paper_engine = paper_engine
         self._exchange_port = exchange_port
@@ -424,6 +427,8 @@ class LiveEngineV0:
         self._last_account_snapshot: AccountSnapshot | None = None
         # Doc-36 Phase 1: shadow selector (observability only, no dispatch mutation)
         self._shadow_selector = shadow_selector
+        # Doc-36 Phase 2: active selector (controlled activation)
+        self._active_selector = active_selector
         self._operator_symbols = operator_symbols or []
         # Read GRINDER_LIVE_PLANNER_ENABLED once at init (PR-L2)
         self._live_planner_env_override = parse_bool(
@@ -2100,6 +2105,17 @@ class LiveEngineV0:
             except Exception:
                 logger.exception("SELECTOR_SHADOW_ERROR — fail-open, continuing")
 
+        # Doc-36 Phase 2: active selector tick (post-dispatch)
+        if self._active_selector is not None and self._last_feature_snapshot is not None:
+            self._active_selector.update_features(self._last_feature_snapshot)
+            try:
+                non_flat = self._get_non_flat_symbols()
+                self._active_selector.maybe_run(
+                    snapshot.ts, self._operator_symbols, non_flat_symbols=non_flat
+                )
+            except Exception:
+                logger.exception("SELECTOR_ACTIVE_ERROR — fail-safe, continuing")
+
         # Step 3: Build output
         return LiveEngineOutput(
             paper_output=paper_output,
@@ -2108,6 +2124,30 @@ class LiveEngineV0:
             mode=self._config.mode,
             kill_switch_active=self._config.kill_switch_active,
         )
+
+    def _get_non_flat_symbols(self) -> set[str]:
+        """Get symbols with non-flat grid_v2 inventory (for graceful_exit_only).
+
+        Returns empty set if grid_v2 is not active.
+        """
+        bridge = self._grid_v2_bridge
+        if bridge is None:
+            return set()
+        sm = bridge.state_machine
+        if sm is None:
+            return set()
+        if sm.mode.value != "FLAT":
+            return {self._grid_v2_symbol}
+        return set()
+
+    def is_selector_dispatch_allowed(self, symbol: str) -> bool:
+        """Check if active selector allows new entries for symbol.
+
+        Returns True if no active selector configured (fail-open).
+        """
+        if self._active_selector is None:
+            return True
+        return self._active_selector.is_dispatch_allowed(symbol)
 
     def _tick_fsm(self, ts_ms: int, symbol: str) -> None:
         """Tick FSM driver with current runtime signals.

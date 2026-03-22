@@ -95,7 +95,8 @@ class SelectorMetrics:
     """Counter by kind: would_add/would_remove."""
 
     score_bps: dict[tuple[str, str], int] = field(default_factory=dict)
-    """Last gauge by (symbol, component). Capped to top-K + 2 near-cutoff."""
+    """Last gauge by (rank, component). Capped to top-K + 2 near-cutoff.
+    Uses rank label instead of symbol label to avoid cardinality violation (ADR-028)."""
 
     def record_cycle(self, mode: str, result: str) -> None:
         key = (mode, result)
@@ -139,9 +140,9 @@ class SelectorMetrics:
 
         lines.append(f"# HELP {METRIC_SELECTOR_SCORE_BPS} Score components in bps")
         lines.append(f"# TYPE {METRIC_SELECTOR_SCORE_BPS} gauge")
-        for (symbol, component), value in sorted(self.score_bps.items()):
+        for (rank, component), value in sorted(self.score_bps.items()):
             lines.append(
-                f'{METRIC_SELECTOR_SCORE_BPS}{{symbol="{symbol}",component="{component}"}} {value}'
+                f'{METRIC_SELECTOR_SCORE_BPS}{{rank="{rank}",component="{component}"}} {value}'
             )
 
         return lines
@@ -304,7 +305,7 @@ class ShadowSelector:
             metrics.record_churn("would_remove")
 
         # Score components — capped to top-K + near-cutoff
-        # Clear old score entries to prevent stale symbols
+        # Uses rank label instead of symbol to comply with ADR-028 (no symbol= in metrics)
         metrics.score_bps.clear()
         emit_cap = self._config.k + _SCORE_EMIT_EXTRA
         emitted = 0
@@ -313,11 +314,12 @@ class ShadowSelector:
                 break
             if score.gates_failed:
                 continue
-            metrics.set_score(score.symbol, "total", score.score)
-            metrics.set_score(score.symbol, "range", score.range_component)
-            metrics.set_score(score.symbol, "liquidity", score.liquidity_component)
-            metrics.set_score(score.symbol, "toxicity_penalty", score.toxicity_penalty)
-            metrics.set_score(score.symbol, "trend_penalty", score.trend_penalty)
+            rank_label = str(emitted + 1)
+            metrics.set_score(rank_label, "total", score.score)
+            metrics.set_score(rank_label, "range", score.range_component)
+            metrics.set_score(rank_label, "liquidity", score.liquidity_component)
+            metrics.set_score(rank_label, "toxicity_penalty", score.toxicity_penalty)
+            metrics.set_score(rank_label, "trend_penalty", score.trend_penalty)
             emitted += 1
 
         cycle_result = "ok"
