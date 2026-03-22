@@ -1,5 +1,15 @@
 # Documentation vs Implementation Gaps
 
+> **Status:** HISTORICAL GAP SNAPSHOT (reference, needs periodic re-sync)
+>
+> This file is kept for context and idea capture.
+> For authoritative current state and priorities, use:
+> - `docs/STATE.md`
+> - `docs/DECISIONS.md`
+> - `docs/POST_LAUNCH_ROADMAP.md`
+>
+> If a row here conflicts with `STATE.md`, treat `STATE.md` as the source of truth.
+
 > SSOT index of where specs describe target-state behavior beyond current code.
 >
 > Last updated: 2026-03-02 (main @ d7b778f)
