@@ -23,6 +23,7 @@ What is missing is a single live orchestration path that combines these into one
 - Top-K v0: volatility-proxy deterministic selector.
 - Top-K v1: gated score (`range + liquidity - toxicity - trend`) with deterministic tie-break.
 - Hard gates already defined (toxicity/spread/thin-book/warmup).
+- Additional Phase 0 floor (binding for selector contract): `NATR_14_5m >= 1%` (`>= 100 bps`).
 
 ### 2.3 ML (implemented as signal layer, limited policy consumption)
 - `MlSignalSnapshot` and ONNX inference flow exist.
@@ -160,6 +161,7 @@ Note: contract remains candidate until wired and tested in code.
 - `VENUE_UNAVAILABLE`
 - `SYMBOL_CONSTRAINTS_MISSING`
 - `WARMUP_INCOMPLETE`
+- `NATR_BELOW_MIN`
 - `THIN_BOOK`
 - `SPREAD_SPIKE`
 - `TOXICITY_HIGH`
