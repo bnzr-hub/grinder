@@ -28,6 +28,7 @@ See also: [Ops Quickstart](00_OPS_QUICKSTART.md) | [Fill Tracker Triage](26_FILL
 | Account sync fire drill | Mismatch rules (duplicate_key, negative_qty, orphan_order, ts_regression), metrics wiring, contract smoke | `scripts/ops_fill_triage.sh account-sync-drill` | `.artifacts/account_sync_fire_drill/<ts>/` | `drill_a_*.txt` .. `drill_e_*.txt` | `summary.txt` + `sha256sums.txt` |
 | Fill probability evidence | Why an order was blocked/shadowed by fill prob gate — features, model metadata, threshold vs probability | `GRINDER_FILL_PROB_EVIDENCE=1` (env-gated) | `.artifacts/fill_prob/` | `{ts_ms}_{verdict}_{symbol}.json` + `.sha256` | JSON evidence artifact |
 | Grid V2 shadow verification | Shadow runner tests pass, ruff/mypy clean, shadow isolated from dispatch | `scripts/smoke_grid_v2_shadow.sh` | `.artifacts/grid_v2_shadow/<ts>/` | `gate_a_shadow_tests.txt`, `gate_b_full_grid_v2.txt`, `gate_c_ruff.txt`, `gate_d_format.txt`, `gate_e_mypy.txt` | `summary.txt` + `sha256sums.txt` |
+| Grid V2 warning observability smoke | Warning counters and classified warning logs are wired; control window stability proof | `python3 scripts/run_trading.py ... --duration-s 900` + log/metrics scrape | `/tmp/grinder_stable_window_15m.log` | run log + `/metrics` snapshot + final exchange verify | stable-window summary in Runbook 37 |
 
 ---
 
