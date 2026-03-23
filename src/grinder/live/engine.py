@@ -3492,9 +3492,19 @@ class LiveEngineV0:
 
         # Gate 9: Selector gate (doc-36 Phase 2) — blocks INCREASE_RISK for symbols
         # not in active set or in graceful_exit_only. Cancel/reduce allowed.
+        # Bypass: grid_v2 internal actions (repair/seed/recenter/exit_restore) must not
+        # be blocked — they are mandatory for grid integrity, not new risk entries.
+        _is_grid_v2_internal = action.reason.startswith("grid_v2_") or action.reason in (
+            "INTEGRITY_REPAIR",
+            "RECENTER",
+            "RECENTER_REPLACE",
+            "EXIT_RESTORE",
+            "EXIT_RESTORE_SHIFT",
+        )
         if (
             intent == RiskIntent.INCREASE_RISK
             and action.symbol
+            and not _is_grid_v2_internal
             and not self.is_selector_dispatch_allowed(action.symbol)
         ):
             logger.info(
