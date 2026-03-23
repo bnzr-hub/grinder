@@ -1373,21 +1373,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--cleanup-on-exit",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "After trading loop stops, auto-run exchange cleanup for each symbol "
-            "(futures + live_trade + --armed + --mainnet only)."
+            "(futures + live_trade + --armed + --mainnet only). "
+            "Default: enabled. Use --no-cleanup-on-exit to disable."
         ),
     )
     parser.add_argument(
         "--pre-cleanup",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Before start, if exchange state is DIRTY, run cleanup first. "
-            "Without this flag, dirty state = fail-closed (no start). "
-            "Only applies to futures + mainnet + armed."
+            "Only applies to futures + mainnet + armed. "
+            "Default: enabled. Use --no-pre-cleanup to disable."
         ),
     )
     parser.add_argument(
