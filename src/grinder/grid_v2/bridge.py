@@ -56,6 +56,7 @@ BRIDGE_FILL_PROCESSED = "GRID_V2_FILL_PROCESSED"
 BRIDGE_FILL_REJECTED = "GRID_V2_FILL_REJECTED"
 BRIDGE_FILL_FOREIGN = "GRID_V2_FILL_FOREIGN"
 BRIDGE_EXIT_FILL_ORPHAN = "GRID_V2_EXIT_FILL_ORPHAN"
+BRIDGE_FILL_DUPLICATE_SUPPRESSED = "GRID_V2_FILL_DUPLICATE_SUPPRESSED"
 BRIDGE_DISPATCH_BLOCKED = "GRID_V2_DISPATCH_BLOCKED"
 
 
@@ -101,6 +102,9 @@ class GridV2Bridge:
         self._sm: GridV2StateMachine | None = None
         self._reconstruction_ok = False
         self._failed_reason: str | None = None
+        # Recently processed EXIT fill CIDs for stale duplicate suppression.
+        # Prevents poll+user-data duplicate races from surfacing as orphan/rejected noise.
+        self._recent_exit_fills: dict[str, int] = {}
 
     @property
     def symbol(self) -> str:
@@ -212,7 +216,7 @@ class GridV2Bridge:
 
     # --- Fill lifecycle (23.2) ---
 
-    def on_fill(
+    def on_fill(  # noqa: PLR0912
         self,
         client_order_id: str,
         side: OrderSide,
@@ -234,6 +238,30 @@ class GridV2Bridge:
         self._assert_dispatch_ok()
 
         assert self._sm is not None  # guaranteed by _assert_dispatch_ok
+        parsed = self._adapter.parse_cid(client_order_id)
+
+        # Stale duplicate EXIT fills can arrive via poll/user-data races after
+        # successful processing removed CID from registry. Suppress those early.
+        if (
+            allow_stale
+            and parsed is not None
+            and parsed.kind == GridV2OrderKind.EXIT
+            and self._is_recent_exit_fill(client_order_id, ts)
+        ):
+            logger.info(
+                "%s symbol=%s cid=%s",
+                BRIDGE_FILL_DUPLICATE_SUPPRESSED,
+                self._symbol,
+                client_order_id,
+            )
+            return FillResult(
+                translated=None,
+                transition=None,
+                resolved_actions=(),
+                execution_actions=(),
+                rejected=False,
+                reject_reason=None,
+            )
 
         # Step 1: translate
         try:
@@ -324,11 +352,11 @@ class GridV2Bridge:
             )
 
         # Step 3: confirm (remove from registry)
-        parsed = self._adapter.parse_cid(client_order_id)
         if parsed is not None and parsed.kind == GridV2OrderKind.ENTRY:
             self._adapter.confirm_entry_fill(client_order_id)
         elif parsed is not None and parsed.kind == GridV2OrderKind.EXIT:
             self._adapter.confirm_exit_fill(client_order_id)
+            self._mark_recent_exit_fill(client_order_id, ts)
 
         # Step 4: resolve actions
         resolved = self._adapter.resolve_actions(result.actions, ts)
@@ -352,6 +380,21 @@ class GridV2Bridge:
             rejected=False,
             reject_reason=None,
         )
+
+    def _prune_recent_exit_fills(self, ts: int) -> None:
+        """Bound memory for duplicate-suppression cache."""
+        ttl_ms = 300_000  # 5 minutes
+        stale = [cid for cid, seen_ts in self._recent_exit_fills.items() if ts - seen_ts > ttl_ms]
+        for cid in stale:
+            del self._recent_exit_fills[cid]
+
+    def _is_recent_exit_fill(self, client_order_id: str, ts: int) -> bool:
+        self._prune_recent_exit_fills(ts)
+        return client_order_id in self._recent_exit_fills
+
+    def _mark_recent_exit_fill(self, client_order_id: str, ts: int) -> None:
+        self._recent_exit_fills[client_order_id] = ts
+        self._prune_recent_exit_fills(ts)
 
     # --- Cancel ack lifecycle (23.3) ---
 
