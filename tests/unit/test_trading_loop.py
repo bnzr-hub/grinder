@@ -653,11 +653,10 @@ class TestBuildExchangePort:
         monkeypatch.setenv("BINANCE_API_KEY", "test-key")
         monkeypatch.setenv("BINANCE_API_SECRET", "test-secret")
         monkeypatch.setattr(
-            run_trading_mod.urllib.request,
-            "urlopen",
+            "scripts.run_trading.urllib.request.urlopen",
             lambda *_args, **_kwargs: _Resp(),
         )
-        monkeypatch.setattr(run_trading_mod.time, "time", lambda: 1001.5)
+        monkeypatch.setattr("scripts.run_trading.time.time", lambda: 1001.5)
 
         port = build_exchange_port(
             "futures", SafeMode.LIVE_TRADE, True, ["BTCUSDT"], Decimal("100")
@@ -683,11 +682,10 @@ class TestBuildExchangePort:
         monkeypatch.setenv("BINANCE_API_KEY", "test-key")
         monkeypatch.setenv("BINANCE_API_SECRET", "test-secret")
         monkeypatch.setattr(
-            run_trading_mod.urllib.request,
-            "urlopen",
+            "scripts.run_trading.urllib.request.urlopen",
             lambda *_args, **_kwargs: _Resp(),
         )
-        monkeypatch.setattr(run_trading_mod.time, "time", lambda: 999.2)
+        monkeypatch.setattr("scripts.run_trading.time.time", lambda: 999.2)
 
         port = build_exchange_port(
             "futures", SafeMode.LIVE_TRADE, True, ["BTCUSDT"], Decimal("100")
