@@ -138,6 +138,7 @@ If documents conflict, trust order is:
   - `15_ENABLEMENT_CEREMONY.md` — Staged enablement ceremony for ReconcileLoop (LC-15a)
   - `16_RECONCILE_ALERTS_SLOS.md` — Reconcile alerts, SLOs, and triage (LC-15b)
   - `17_LIVE_TRADE_CONNECTOR_ENABLEMENT.md` — LIVE_TRADE connector enablement (LC-22)
+  - `37_GRID_V2_WARNING_OBSERVABILITY_SMOKE.md` — runtime proof for grid_v2 warning metrics + alert readiness
 - `scripts/smoke_live_testnet.py` — Spot smoke test script (testnet/mainnet)
 - `scripts/smoke_futures_mainnet.py` — Futures USDT-M smoke test script (mainnet)
 - `scripts/smoke_reconcile_e2e.py` — E2E reconcile→remediate smoke harness (LC-13)
