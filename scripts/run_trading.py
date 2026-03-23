@@ -382,15 +382,18 @@ def build_exchange_port(
             max_orders_per_run=max_orders_per_run,
         )
 
-        # Compute clock offset vs Binance server (WSL2 clock drift workaround)
+        # Compute signed clock offset vs Binance server (WSL2 clock drift workaround).
+        # Positive: local clock is ahead; negative: local clock is behind.
         ts_offset_ms = 0
         try:
             resp = urllib.request.urlopen(f"{BINANCE_FUTURES_MAINNET_URL}/fapi/v1/time", timeout=5)
             server_ts = json.loads(resp.read())["serverTime"]
             local_ts = int(time.time() * 1000)
-            ts_offset_ms = max(0, local_ts - server_ts)
+            ts_offset_ms = local_ts - server_ts
             if ts_offset_ms > 0:
                 print(f"  CLOCK_OFFSET_MS={ts_offset_ms} (local ahead of Binance)")
+            elif ts_offset_ms < 0:
+                print(f"  CLOCK_OFFSET_MS={ts_offset_ms} (local behind Binance)")
         except Exception:
             pass  # fail-open: offset stays 0
 
