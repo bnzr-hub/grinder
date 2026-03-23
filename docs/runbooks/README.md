@@ -38,6 +38,7 @@ Operational runbooks for GRINDER trading system.
 | [31_FILL_PROB_ROLLOUT](31_FILL_PROB_ROLLOUT.md) | Fill probability enforcement setup and config (Track C) |
 | [32_MAINNET_ROLLOUT_FILL_PROB](32_MAINNET_ROLLOUT_FILL_PROB.md) | Mainnet rollout ceremony for fill-prob enforcement (Track C) |
 | [35_GRID_V2_SHADOW_VERIFICATION](35_GRID_V2_SHADOW_VERIFICATION.md) | Grid V2 shadow verification procedure (doc-27 PR5) |
+| [37_GRID_V2_WARNING_OBSERVABILITY_SMOKE](37_GRID_V2_WARNING_OBSERVABILITY_SMOKE.md) | Grid V2 warning observability smoke and control-window proof |
 
 ## Quick Reference
 

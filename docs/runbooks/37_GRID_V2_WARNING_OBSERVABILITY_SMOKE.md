@@ -1,9 +1,13 @@
 # Runbook 37: Grid V2 Warning Observability Smoke
 
-Purpose: prove that post-PR427 warning observability is live in runtime:
-- warning-path counters are exposed in `/metrics`
+Purpose: prove that warning observability for Grid V2 is live in runtime:
+- warning counters are exposed in `/metrics`
 - unknown user-data warnings include explicit `event_type`
-- run still exits cleanly with cleanup-on-exit
+- live run still exits cleanly
+
+Scope:
+- Observability-only validation (no strategy mutation)
+- control-window evidence capture
 
 ---
 
@@ -12,7 +16,6 @@ Purpose: prove that post-PR427 warning observability is live in runtime:
 - Symbol: `PIPPINUSDT`
 - Port: futures mainnet (`--exchange-port futures --mainnet`)
 - Mode: `live_trade`, armed
-- Duration: `180s` (control smoke)
 - Metrics: `--metrics-port 19092`
 
 Key env:
@@ -25,33 +28,25 @@ Key env:
 
 ---
 
-## Proof (2026-03-23)
+## Runtime Proof A (2026-03-23, 3-minute smoke)
+
+Artifact:
+- `/tmp/grinder_smoke_metrics_3m.log`
 
 ### 1) Metrics contain new counters
-
-Command:
 
 ```bash
 curl -sS http://127.0.0.1:19092/metrics | rg "grinder_live_grid_v2_integrity_mismatch_pending_total|grinder_live_grid_v2_rejected_fill_cleaned_total|grinder_user_data_unknown_events_total"
 ```
 
-Observed lines:
+Expected metrics families:
+- `grinder_user_data_unknown_events_total{event_type=...}`
+- `grinder_live_grid_v2_integrity_mismatch_pending_total{sym=...}`
+- `grinder_live_grid_v2_rejected_fill_cleaned_total{sym=...,source=...,reason=...}`
 
-```text
-# HELP grinder_user_data_unknown_events_total Unknown user-data events by type
-# TYPE grinder_user_data_unknown_events_total counter
-grinder_user_data_unknown_events_total{event_type="none"} 0
-# HELP grinder_live_grid_v2_integrity_mismatch_pending_total Transient grid_v2 integrity mismatches (streak below repair threshold)
-# TYPE grinder_live_grid_v2_integrity_mismatch_pending_total counter
-grinder_live_grid_v2_integrity_mismatch_pending_total{sym="none"} 0
-# HELP grinder_live_grid_v2_rejected_fill_cleaned_total Rejected grid_v2 fills cleaned from adapter registry
-# TYPE grinder_live_grid_v2_rejected_fill_cleaned_total counter
-grinder_live_grid_v2_rejected_fill_cleaned_total{sym="none",source="none",reason="none"} 0
-```
+### 2) Unknown event warning includes explicit type
 
-### 2) Unknown event warnings include explicit type
-
-From run log (`/tmp/grinder_smoke_metrics_3m.log`):
+Example line from log:
 
 ```text
 ... WARNING grinder.execution.futures_events unknown_event_type event_type=TRADE_LITE
@@ -59,20 +54,43 @@ From run log (`/tmp/grinder_smoke_metrics_3m.log`):
 
 ### 3) Run finishes clean
 
-From run log (`/tmp/grinder_smoke_metrics_3m.log`):
-
-```text
-Duration (180s) reached after 2125 ticks.
-Cleanup-on-exit completed successfully.
-EXCHANGE_STATE_VERIFY symbol=PIPPINUSDT status=CLEAN orders=0 position=FLAT
-```
+Expected end markers in log:
+- `Duration (180s) reached ...`
+- `Cleanup-on-exit completed successfully`
+- `EXCHANGE_STATE_VERIFY ... status=CLEAN orders=0 position=FLAT`
 
 ---
 
-## Interpretation
+## Runtime Proof B (2026-03-23, 15-minute control window) — PASS
 
-- Observability additions are active in production runtime.
-- No trading-path behavior change detected in this smoke.
-- New alert thresholds are now actionable via:
+Artifact:
+- `/tmp/grinder_stable_window_15m.log`
+
+Observed:
+- Duration completed by timer (`900s`) with cleanup-on-exit success.
+- End state: `EXCHANGE_STATE_VERIFY symbol=PIPPINUSDT status=CLEAN orders=0 position=FLAT`.
+- Warning/error event counts from log:
+  - `unknown_event_type event_type=...`: `9`
+  - `GRID_V2_INTEGRITY_MISMATCH_PENDING`: `0`
+  - `GRID_V2_REJECTED_FILL_CLEANED`: `0`
+  - `GRID_V2_EXIT_FILL_ORPHAN`: `0`
+  - `GRID_V2_INTEGRITY_REPAIR_TRIGGER`: `0`
+  - `GRID_V2_INTEGRITY_FATAL`: `0`
+  - `Traceback`: `0`
+
+Interpretation:
+- Warning observability contract is healthy for this control window.
+- Alert thresholds were not breached:
   - `GridV2IntegrityMismatchPendingBurst` (>5/15m)
   - `GridV2RejectedFillCleanedBurst` (>3/15m)
+
+---
+
+## Exit Criteria
+
+Smoke PASS when all true:
+
+1. Both Grid V2 warning counters are present in `/metrics`.
+2. Unknown user-data warnings include `event_type`.
+3. No integrity/reject/orphan bursts in control window.
+4. Run ends clean (`orders=0`, `position=FLAT`).
