@@ -391,7 +391,8 @@ class UserDataEvent:
             logger.debug if event_type_str in _NON_ACTIONABLE_USER_DATA_EVENTS else logger.warning
         )
         log_fn(
-            "unknown_event_type",
+            "unknown_event_type event_type=%s",
+            event_type_str,
             extra={"event_type": event_type_str, "raw_data_preview": str(data)[:200]},
         )
         return cls(

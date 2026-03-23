@@ -876,6 +876,10 @@ class LiveEngineV0:
         for cid in confirmed:
             del self._grid_v2_pending_cancels[cid]
 
+    def _record_grid_v2_rejected_fill_cleaned(self, symbol: str, source: str, reason: str) -> None:
+        """Emit metric for rejected fill cleanup (observability only)."""
+        get_live_engine_metrics().record_grid_v2_rejected_fill_cleaned(symbol, source, reason)
+
     def _grid_v2_process_fills(
         self,
         symbol: str,
@@ -939,11 +943,13 @@ class LiveEngineV0:
                     allow_stale=True,
                 )
                 if result.rejected:
+                    reason = result.reject_reason or "?"
                     bridge.adapter.confirm_cancel_entry(cid)
+                    self._record_grid_v2_rejected_fill_cleaned(symbol, "snapshot_diff", reason)
                     logger.warning(
                         "GRID_V2_REJECTED_FILL_CLEANED cid=%s kind=entry reason=%s",
                         cid,
-                        result.reject_reason or "?",
+                        reason,
                     )
                     continue
                 actions.extend(result.execution_actions)
@@ -964,11 +970,13 @@ class LiveEngineV0:
                 allow_stale=True,
             )
             if result.rejected:
+                reason = result.reject_reason or "?"
                 bridge.adapter.confirm_cancel_exit(cid)
+                self._record_grid_v2_rejected_fill_cleaned(symbol, "snapshot_diff", reason)
                 logger.warning(
                     "GRID_V2_REJECTED_FILL_CLEANED cid=%s kind=exit reason=%s",
                     cid,
-                    result.reject_reason or "?",
+                    reason,
                 )
                 continue
             actions.extend(result.execution_actions)
@@ -1073,6 +1081,7 @@ class LiveEngineV0:
             self._grid_v2_integrity_mismatch_streak += 1
         self._grid_v2_integrity_mismatch_last_ts = snapshot.ts
         if self._grid_v2_integrity_mismatch_streak < _GRID_V2_INTEGRITY_MISMATCH_STREAK:
+            get_live_engine_metrics().record_grid_v2_integrity_mismatch_pending(snapshot.symbol)
             logger.warning(
                 "GRID_V2_INTEGRITY_MISMATCH_PENDING symbol=%s entries=%d expected=%d exits=%d "
                 "streak=%d/%d",
@@ -1295,6 +1304,7 @@ class LiveEngineV0:
                 allow_stale=True,
             )
             if result.rejected:
+                reason = result.reject_reason or "?"
                 parsed = bridge.adapter.parse_cid(oe.client_order_id)
                 if parsed is not None:
                     from grinder.grid_v2.adapter import GridV2OrderKind  # noqa: PLC0415
@@ -1303,10 +1313,11 @@ class LiveEngineV0:
                         bridge.adapter.confirm_cancel_entry(oe.client_order_id)
                     else:
                         bridge.adapter.confirm_cancel_exit(oe.client_order_id)
+                self._record_grid_v2_rejected_fill_cleaned(oe.symbol, "user_data", reason)
                 logger.warning(
                     "GRID_V2_REJECTED_FILL_CLEANED cid=%s source=user_data reason=%s",
                     oe.client_order_id,
-                    result.reject_reason or "?",
+                    reason,
                 )
                 self._grid_v2_user_fill_seen.add(oe.client_order_id)
                 return

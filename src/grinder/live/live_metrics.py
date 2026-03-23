@@ -5,6 +5,8 @@ Same singleton pattern as cycle_metrics.py / fsm_metrics.py.
 
 Metric names:
 - grinder_live_reduce_only_enforced_total{sym,side,reason}
+- grinder_live_grid_v2_integrity_mismatch_pending_total{sym}
+- grinder_live_grid_v2_rejected_fill_cleaned_total{sym,source,reason}
 """
 
 from __future__ import annotations
@@ -13,6 +15,8 @@ from dataclasses import dataclass, field
 
 # Metric names (stable contract)
 METRIC_REDUCE_ONLY_ENFORCED = "grinder_live_reduce_only_enforced_total"
+METRIC_GRID_V2_INTEGRITY_MISMATCH_PENDING = "grinder_live_grid_v2_integrity_mismatch_pending_total"
+METRIC_GRID_V2_REJECTED_FILL_CLEANED = "grinder_live_grid_v2_rejected_fill_cleaned_total"
 
 
 @dataclass
@@ -26,6 +30,8 @@ class LiveEngineMetrics:
     """
 
     reduce_only_enforced: dict[tuple[str, str, str], int] = field(default_factory=dict)
+    grid_v2_integrity_mismatch_pending: dict[str, int] = field(default_factory=dict)
+    grid_v2_rejected_fill_cleaned: dict[tuple[str, str, str], int] = field(default_factory=dict)
 
     def record_reduce_only_enforced(self, symbol: str, side: str, reason: str) -> None:
         """Record a reduce_only enforcement event.
@@ -37,6 +43,17 @@ class LiveEngineMetrics:
         """
         key = (symbol, side, reason)
         self.reduce_only_enforced[key] = self.reduce_only_enforced.get(key, 0) + 1
+
+    def record_grid_v2_integrity_mismatch_pending(self, symbol: str) -> None:
+        """Record a transient integrity mismatch observation for grid_v2."""
+        self.grid_v2_integrity_mismatch_pending[symbol] = (
+            self.grid_v2_integrity_mismatch_pending.get(symbol, 0) + 1
+        )
+
+    def record_grid_v2_rejected_fill_cleaned(self, symbol: str, source: str, reason: str) -> None:
+        """Record a rejected fill that was safely cleaned from registry."""
+        key = (symbol, source, reason)
+        self.grid_v2_rejected_fill_cleaned[key] = self.grid_v2_rejected_fill_cleaned.get(key, 0) + 1
 
     def format_metrics(self) -> list[str]:
         """Format metrics as Prometheus text exposition lines."""
@@ -56,6 +73,34 @@ class LiveEngineMetrics:
                 )
         else:
             lines.append(f'{METRIC_REDUCE_ONLY_ENFORCED}{{sym="none",side="none",reason="none"}} 0')
+
+        lines.append(
+            f"# HELP {METRIC_GRID_V2_INTEGRITY_MISMATCH_PENDING}"
+            " Transient grid_v2 integrity mismatches (streak below repair threshold)"
+        )
+        lines.append(f"# TYPE {METRIC_GRID_V2_INTEGRITY_MISMATCH_PENDING} counter")
+        if self.grid_v2_integrity_mismatch_pending:
+            for sym, count in sorted(self.grid_v2_integrity_mismatch_pending.items()):
+                lines.append(f'{METRIC_GRID_V2_INTEGRITY_MISMATCH_PENDING}{{sym="{sym}"}} {count}')
+        else:
+            lines.append(f'{METRIC_GRID_V2_INTEGRITY_MISMATCH_PENDING}{{sym="none"}} 0')
+
+        lines.append(
+            f"# HELP {METRIC_GRID_V2_REJECTED_FILL_CLEANED}"
+            " Rejected grid_v2 fills cleaned from adapter registry"
+        )
+        lines.append(f"# TYPE {METRIC_GRID_V2_REJECTED_FILL_CLEANED} counter")
+        if self.grid_v2_rejected_fill_cleaned:
+            for (sym, source, reason), count in sorted(self.grid_v2_rejected_fill_cleaned.items()):
+                lines.append(
+                    f"{METRIC_GRID_V2_REJECTED_FILL_CLEANED}"
+                    f'{{sym="{sym}",source="{source}",reason="{reason}"}} {count}'
+                )
+        else:
+            lines.append(
+                f"{METRIC_GRID_V2_REJECTED_FILL_CLEANED}"
+                '{sym="none",source="none",reason="none"} 0'
+            )
 
         return lines
 

@@ -522,7 +522,7 @@ class TestUserDataEvent:
         warnings = [
             r
             for r in caplog.records
-            if r.message == "unknown_event_type" and r.levelno >= logging.WARNING
+            if r.message.startswith("unknown_event_type") and r.levelno >= logging.WARNING
         ]
         assert warnings == []
 
@@ -537,9 +537,10 @@ class TestUserDataEvent:
         warnings = [
             r
             for r in caplog.records
-            if r.message == "unknown_event_type" and r.levelno == logging.WARNING
+            if r.message.startswith("unknown_event_type") and r.levelno == logging.WARNING
         ]
         assert len(warnings) == 1
+        assert "event_type=MARGIN_CALL" in warnings[0].message
 
     def test_to_json_is_deterministic(self, order_event: FuturesOrderEvent) -> None:
         wrapper = UserDataEvent(
