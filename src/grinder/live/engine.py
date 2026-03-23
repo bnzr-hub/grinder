@@ -664,10 +664,12 @@ class LiveEngineV0:
                 os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL", "1000")
             ),
             price_tick_size=self._resolve_grid_v2_tick_size(),
-            reseed_on_flat=parse_bool("GRINDER_GRID_V2_RESEED_ON_FLAT", default=True, strict=False),
+            reseed_on_flat=parse_bool(
+                "GRINDER_GRID_V2_RESEED_ON_FLAT", default=False, strict=False
+            ),
             reseed_on_flat_only_on_skew=parse_bool(
                 "GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW",
-                default=False,
+                default=True,
                 strict=False,
             ),
         )

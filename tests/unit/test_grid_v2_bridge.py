@@ -689,6 +689,8 @@ class TestEngineStartupRecenterOnFlat:
         monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
         monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
         monkeypatch.setenv("GRINDER_GRID_V2_STEP_PCT", "0.0025")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW", "0")
 
         # Build pre-existing exchange orders using older spacing (0.5%),
         # simulating a restart after config change.
@@ -770,6 +772,7 @@ class TestEngineStartupRecenterOnFlat:
         monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
         monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
         monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT", "0")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW", "0")
         monkeypatch.setenv("GRINDER_GRID_V2_STEP_PCT", "0.0025")
 
         old_bridge, _ = _fresh_bridge(config=_config(step=Decimal("0.005")))
@@ -907,6 +910,8 @@ class TestEngineNonFlatFailClosed:
         monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
         monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
         monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW", "0")
 
         engine = LiveEngineV0(
             paper_engine=MagicMock(),
@@ -1394,6 +1399,8 @@ class TestEngineFillOrdering:
         monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
         monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
         monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW", "0")
 
         engine = LiveEngineV0(
             paper_engine=MagicMock(),
@@ -1631,6 +1638,7 @@ class TestEngineIntegrityWatchdog:
         monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
         monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
         monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT", "0")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW", "0")
 
         engine = LiveEngineV0(
             paper_engine=MagicMock(),
@@ -1840,6 +1848,7 @@ class TestEngineIntegrityWatchdog:
         monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
         monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
         monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT", "0")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW", "0")
 
         engine = LiveEngineV0(
             paper_engine=MagicMock(),
