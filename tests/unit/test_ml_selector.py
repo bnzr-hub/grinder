@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from unittest.mock import MagicMock
@@ -157,6 +158,19 @@ class TestMlFallback:
         assert result is not None
         metrics = get_selector_metrics()
         assert metrics.ml_fallback == 1
+
+    def test_no_provider_logs_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """ML enabled without provider → explicit PROVIDER_MISSING warning."""
+        config = ShadowSelectorConfig(
+            enabled=True, k=1, cycle_s=0, ml_enabled=True, ml_adjust_max_bps=500
+        )
+        sel = ShadowSelector(config, ml_adjust_provider=None)
+        sel.update_features(_make_feat("AAA"))  # type: ignore[arg-type]
+        with caplog.at_level(logging.WARNING, logger="grinder.selection.shadow_selector"):
+            sel.maybe_run(1000, ["AAA"])
+        assert any("SELECTOR_ML_PROVIDER_MISSING" in msg for msg in caplog.messages)
+        metrics = get_selector_metrics()
+        assert metrics.ml_fallback >= 1
 
     def test_empty_adjusts_fallback(self) -> None:
         config = ShadowSelectorConfig(
