@@ -86,6 +86,28 @@ Interpretation:
 
 ---
 
+## Runtime Proof C (2026-03-23, 5-minute post-fix check) — PASS
+
+Artifact:
+- `/tmp/grinder_trade_lite_5m.log`
+
+Observed:
+- Duration completed by timer (`300s`) after `3678` ticks.
+- End state: `EXCHANGE_STATE_VERIFY symbol=PIPPINUSDT status=CLEAN orders=0 position=FLAT`.
+- Cleanup-on-exit completed successfully.
+- Event counts from log:
+  - `WARNING grinder.execution.futures_events unknown_event_type event_type=TRADE_LITE`: `0`
+  - `unknown_event_type event_type=` (any level): `0`
+  - `GRID_V2_FILL_PROCESSED`: `2`
+  - `GRID_V2_INTEGRITY_FATAL`: `0`
+  - `Traceback`: `0`
+
+Interpretation:
+- P2 tuning from PR #431 is validated in runtime: benign `TRADE_LITE` warning noise is eliminated.
+- Trading loop and cleanup behavior remain stable.
+
+---
+
 ## Exit Criteria
 
 Smoke PASS when all true:
