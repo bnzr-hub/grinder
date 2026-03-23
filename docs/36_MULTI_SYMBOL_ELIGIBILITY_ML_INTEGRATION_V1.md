@@ -101,10 +101,14 @@ This track must not bypass current operational hardening priorities.
 - Metrics: `grinder_selector_active_set_size` (gauge), `grinder_selector_transition_total{kind,result}` (counter), `grinder_selector_graceful_exit_only_gauge` (gauge, count of symbols in graceful-exit mode).
 - Flagged by `GRINDER_SYMBOL_SELECTOR_ENABLED=1`.
 
-### Phase 3 — ML-assisted scoring (shadow then active)
-- Add bounded ML adjustment term after baseline Top-K v1 score.
-- Keep fail-open fallback to non-ML score.
-- Flagged by `GRINDER_SYMBOL_SELECTOR_ML_ENABLED=1` (proposal; shadow-first rollout).
+### Phase 3 — ML-assisted scoring (shadow only) **[DELIVERED]**
+- Bounded ML adjustment term applied after baseline Top-K v1 scoring, capped by `ML_ADJUST_MAX_BPS`.
+- `ml_adjust_provider` callback interface for decoupled ML signal injection.
+- Fail-open: provider error/unavailable/empty → fallback to baseline score, no crash.
+- Re-ranks after adjustment with deterministic tie-break.
+- Metrics: `grinder_selector_ml_adjust_applied_total` (counter), `grinder_selector_ml_fallback_total` (counter), `grinder_selector_ml_adjust_bps{rank}` (gauge).
+- Env: `GRINDER_SYMBOL_SELECTOR_ML_ENABLED=1`, `GRINDER_SYMBOL_SELECTOR_ML_ADJUST_MAX_BPS`.
+- **Shadow only** — no dispatch mutation. Active-mode ML integration deferred to Phase 3b.
 
 ### 5.4 Grid_v2 interaction policy (P0 decision)
 

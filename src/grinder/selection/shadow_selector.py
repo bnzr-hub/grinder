@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 from grinder.selection.topk_v1 import (
     SelectionCandidate,
     SelectionResult,
+    SymbolScoreV1,
     TopKConfigV1,
     select_topk_v1,
 )
@@ -54,6 +55,9 @@ class ShadowSelectorConfig:
     liquidity_weight_w: float = 1.0
     toxicity_penalty_w: float = 1.0
     trend_penalty_w: float = 1.0
+    # Phase 3: ML-assisted scoring (shadow only)
+    ml_enabled: bool = False
+    ml_adjust_max_bps: int = 0  # 0 = no ML adjust cap (effectively disabled)
 
     def to_topk_config(self) -> TopKConfigV1:
         """Convert to TopKConfigV1 for scoring."""
@@ -76,6 +80,9 @@ METRIC_SELECTOR_CANDIDATE_COUNT = "grinder_selector_candidate_count"
 METRIC_SELECTOR_EXCLUDED = "grinder_selector_excluded_total"
 METRIC_SELECTOR_CHURN = "grinder_selector_churn_total"
 METRIC_SELECTOR_SCORE_BPS = "grinder_selector_score_bps"
+METRIC_SELECTOR_ML_ADJUST = "grinder_selector_ml_adjust_applied_total"
+METRIC_SELECTOR_ML_FALLBACK = "grinder_selector_ml_fallback_total"
+METRIC_SELECTOR_ML_ADJUST_BPS = "grinder_selector_ml_adjust_bps"
 
 
 @dataclass
@@ -97,6 +104,14 @@ class SelectorMetrics:
     score_bps: dict[tuple[str, str], int] = field(default_factory=dict)
     """Last gauge by (rank, component). Capped to top-K + 2 near-cutoff.
     Uses rank label instead of symbol label to avoid cardinality violation (ADR-028)."""
+
+    # Phase 3 ML metrics
+    ml_adjust_applied: int = 0
+    """Counter: cycles where ML adjust was applied."""
+    ml_fallback: int = 0
+    """Counter: cycles where ML fallback to baseline occurred."""
+    ml_adjust_bps: dict[str, int] = field(default_factory=dict)
+    """Last gauge by rank: ML adjust value in bps."""
 
     def record_cycle(self, mode: str, result: str) -> None:
         key = (mode, result)
@@ -145,6 +160,20 @@ class SelectorMetrics:
                 f'{METRIC_SELECTOR_SCORE_BPS}{{rank="{rank}",component="{component}"}} {value}'
             )
 
+        # Phase 3: ML metrics
+        lines.append(f"# HELP {METRIC_SELECTOR_ML_ADJUST} ML adjust applied cycles")
+        lines.append(f"# TYPE {METRIC_SELECTOR_ML_ADJUST} counter")
+        lines.append(f"{METRIC_SELECTOR_ML_ADJUST} {self.ml_adjust_applied}")
+
+        lines.append(f"# HELP {METRIC_SELECTOR_ML_FALLBACK} ML fallback to baseline cycles")
+        lines.append(f"# TYPE {METRIC_SELECTOR_ML_FALLBACK} counter")
+        lines.append(f"{METRIC_SELECTOR_ML_FALLBACK} {self.ml_fallback}")
+
+        lines.append(f"# HELP {METRIC_SELECTOR_ML_ADJUST_BPS} ML adjust value in bps by rank")
+        lines.append(f"# TYPE {METRIC_SELECTOR_ML_ADJUST_BPS} gauge")
+        for rank, value in sorted(self.ml_adjust_bps.items()):
+            lines.append(f'{METRIC_SELECTOR_ML_ADJUST_BPS}{{rank="{rank}"}} {value}')
+
         return lines
 
 
@@ -183,22 +212,32 @@ class ShadowSelectorResult:
     excluded_reasons: dict[str, list[str]]
 
 
+# Type alias for ML adjust provider: returns {symbol: adjust_bps}
+MlAdjustProvider = Any  # Callable[[], dict[str, int]] — Any to avoid runtime import
+
+
 class ShadowSelector:
-    """Shadow symbol selector (Phase 1, observability only).
+    """Shadow symbol selector (Phase 1+3, observability only).
 
     Accumulates FeatureSnapshots per symbol, runs Top-K v1 scoring
-    on timestamp-based cooldown. Emits metrics/logs only.
+    on timestamp-based cooldown. Optionally applies bounded ML adjust (Phase 3).
+    Emits metrics/logs only.
 
     NEVER modifies the active dispatch universe.
     """
 
-    def __init__(self, config: ShadowSelectorConfig) -> None:
+    def __init__(
+        self,
+        config: ShadowSelectorConfig,
+        ml_adjust_provider: MlAdjustProvider | None = None,
+    ) -> None:
         self._config = config
         self._topk_config = config.to_topk_config()
         self._feature_cache: dict[str, FeatureSnapshot] = {}
         self._last_run_ts_ms: int = -(config.cycle_s * 1000)  # ensures first tick runs
         self._last_selected: set[str] = set()
         self._metrics = get_selector_metrics()
+        self._ml_adjust_provider = ml_adjust_provider
 
     @property
     def config(self) -> ShadowSelectorConfig:
@@ -231,7 +270,7 @@ class ShadowSelector:
         self._last_run_ts_ms = now_ts_ms
         return self._run(operator_universe)
 
-    def _run(self, operator_universe: list[str]) -> ShadowSelectorResult:  # noqa: PLR0912
+    def _run(self, operator_universe: list[str]) -> ShadowSelectorResult:  # noqa: PLR0912, PLR0915
         """Execute one selector cycle."""
         metrics = self._metrics
 
@@ -281,6 +320,10 @@ class ShadowSelector:
         # Run topk_v1
         result = select_topk_v1(candidates, self._topk_config)
 
+        # Phase 3: apply bounded ML adjust (shadow only, fail-open)
+        ml_adjusts: dict[str, int] = {}
+        result = self._apply_ml_adjust(result, ml_adjusts)
+
         # Collect additional exclusions from topk_v1 gates
         for score in result.scores:
             if score.gates_failed:
@@ -322,8 +365,22 @@ class ShadowSelector:
             metrics.set_score(rank_label, "trend_penalty", score.trend_penalty)
             emitted += 1
 
+        # ML adjust bps per rank (capped same as score)
+        metrics.ml_adjust_bps.clear()
+        if ml_adjusts:
+            emitted_ml = 0
+            for score in result.scores:
+                if emitted_ml >= emit_cap:
+                    break
+                if score.gates_failed:
+                    continue
+                adj = ml_adjusts.get(score.symbol, 0)
+                metrics.ml_adjust_bps[str(emitted_ml + 1)] = adj
+                emitted_ml += 1
+
         cycle_result = "ok"
-        metrics.record_cycle("shadow", cycle_result)
+        cycle_mode = "shadow_ml" if ml_adjusts else "shadow"
+        metrics.record_cycle(cycle_mode, cycle_result)
 
         logger.info(
             "SELECTOR_SHADOW_CYCLE input=%d eligible=%d selected=%d "
@@ -343,10 +400,109 @@ class ShadowSelector:
             excluded_reasons=excluded_reasons,
         )
 
+    def _apply_ml_adjust(
+        self, result: SelectionResult, ml_adjusts_out: dict[str, int]
+    ) -> SelectionResult:
+        """Apply bounded ML adjustment to scores and re-rank.
+
+        Fail-open: if ML disabled, unavailable, or errors → return original result.
+        Modifies ml_adjusts_out in-place with applied adjustments.
+        """
+        metrics = self._metrics
+        if not self._config.ml_enabled or self._config.ml_adjust_max_bps <= 0:
+            return result
+
+        # Get ML adjustments from provider
+        raw_adjusts: dict[str, int] = {}
+        if self._ml_adjust_provider is not None:
+            try:
+                raw_adjusts = self._ml_adjust_provider()
+            except Exception:
+                logger.warning("SELECTOR_ML_PROVIDER_ERROR — fallback to baseline")
+                metrics.ml_fallback += 1
+                return result
+
+        if not raw_adjusts:
+            metrics.ml_fallback += 1
+            return result
+
+        # Apply bounded adjustments to eligible scores
+        cap = self._config.ml_adjust_max_bps
+        adjusted_scores: list[SymbolScoreV1] = []
+        for score in result.scores:
+            if score.gates_failed:
+                adjusted_scores.append(score)
+                continue
+            raw_adj = raw_adjusts.get(score.symbol, 0)
+            bounded_adj = max(-cap, min(cap, raw_adj))
+            ml_adjusts_out[score.symbol] = bounded_adj
+            new_total = score.score + bounded_adj
+            adjusted_scores.append(
+                SymbolScoreV1(
+                    symbol=score.symbol,
+                    score=new_total,
+                    range_component=score.range_component,
+                    liquidity_component=score.liquidity_component,
+                    toxicity_penalty=score.toxicity_penalty,
+                    trend_penalty=score.trend_penalty,
+                    gates_failed=score.gates_failed,
+                    selected=False,
+                    rank=0,
+                )
+            )
+
+        # Re-rank by (-score, symbol) — deterministic tie-break
+        eligible = [(s.score, s.symbol, s) for s in adjusted_scores if not s.gates_failed]
+        eligible.sort(key=lambda x: (-x[0], x[1]))
+
+        selected_symbols = [sym for _, sym, _ in eligible[: self._config.k]]
+        selected_set = set(selected_symbols)
+
+        # Update selected/rank in scores
+        final_scores: list[SymbolScoreV1] = []
+        for score in adjusted_scores:
+            if score.symbol in selected_set:
+                rank = selected_symbols.index(score.symbol) + 1
+                final_scores.append(
+                    SymbolScoreV1(
+                        symbol=score.symbol,
+                        score=score.score,
+                        range_component=score.range_component,
+                        liquidity_component=score.liquidity_component,
+                        toxicity_penalty=score.toxicity_penalty,
+                        trend_penalty=score.trend_penalty,
+                        gates_failed=score.gates_failed,
+                        selected=True,
+                        rank=rank,
+                    )
+                )
+            else:
+                final_scores.append(score)
+
+        final_scores.sort(
+            key=lambda s: (0 if s.selected else 1, s.rank if s.selected else 0, s.symbol)
+        )
+
+        metrics.ml_adjust_applied += 1
+        logger.info(
+            "SELECTOR_ML_ADJUST applied=%d symbols cap=%d",
+            len(ml_adjusts_out),
+            cap,
+        )
+
+        return SelectionResult(
+            selected=selected_symbols,
+            scores=final_scores,
+            k=result.k,
+            total_candidates=result.total_candidates,
+            gate_excluded=result.gate_excluded,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize last state for diagnostics."""
         return {
             "enabled": self._config.enabled,
+            "ml_enabled": self._config.ml_enabled,
             "last_run_ts_ms": self._last_run_ts_ms,
             "last_selected": sorted(self._last_selected),
             "feature_cache_symbols": sorted(self._feature_cache.keys()),
