@@ -233,6 +233,34 @@ groups:
           description: "readyz returning not-ready while process is up. Check HA role (standby/unknown) or whether loop failed to start."
           runbook_url: "docs/runbooks/02_HEALTH_TRIAGE.md#readyz-not-ready"
 
+      # Warning: transient grid_v2 integrity mismatches are frequent (pre-repair streaks)
+      - alert: GridV2IntegrityMismatchPendingBurst
+        expr: |
+          sum(increase(grinder_live_grid_v2_integrity_mismatch_pending_total{sym!="none"}[15m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+          component: engine
+          category: integrity
+        annotations:
+          summary: "Grid V2 transient integrity mismatches are frequent"
+          description: "More than 5 pending integrity mismatches over 15 minutes. Investigate exchange/account-sync timing and watchdog convergence."
+          runbook_url: "docs/runbooks/06_ALERT_RESPONSE.md#warning-alerts"
+
+      # Warning: rejected fills auto-cleaned too often (orphan/duplicate/race pressure)
+      - alert: GridV2RejectedFillCleanedBurst
+        expr: |
+          sum(increase(grinder_live_grid_v2_rejected_fill_cleaned_total{sym!="none"}[15m])) > 3
+        for: 5m
+        labels:
+          severity: warning
+          component: engine
+          category: integrity
+        annotations:
+          summary: "Grid V2 rejected-fill cleanup burst detected"
+          description: "More than 3 rejected-fill cleanup events over 15 minutes. Check reasons (EXIT_LOT_NOT_FOUND, DUPLICATE_ENTRY_FILL) and user-data stream conditions."
+          runbook_url: "docs/runbooks/06_ALERT_RESPONSE.md#warning-alerts"
+
   - name: grinder_risk
     rules:
       # Critical: Kill-switch has been triggered
