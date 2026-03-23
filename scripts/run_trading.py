@@ -545,6 +545,13 @@ GridV2PreflightStatus = Literal[
     "account_sync_disabled",
 ]
 
+PippinOrderSizeLockStatus = Literal[
+    "skipped",
+    "passed",
+    "mismatch",
+    "invalid",
+]
+
 
 # ---------------------------------------------------------------------------
 # Launch Guard v2: preflight → (optional cleanup) → verify → start
@@ -651,6 +658,15 @@ class GridV2PreflightResult:
     status: GridV2PreflightStatus
 
 
+@dataclass(frozen=True)
+class PippinOrderSizeLockResult:
+    """Result of optional PIPPINUSDT order-size lock preflight."""
+
+    status: PippinOrderSizeLockStatus
+    expected: str = "80"
+    actual: str = ""
+
+
 def evaluate_futures_preflight(
     symbols: list[str],
     exchange_port: str,
@@ -690,6 +706,50 @@ def evaluate_grid_v2_account_sync_preflight(
     if not account_sync_enabled:
         return GridV2PreflightResult(status="account_sync_disabled")
     return GridV2PreflightResult(status="passed")
+
+
+def evaluate_pippin_order_size_lock_preflight(
+    *,
+    exchange_port: str,
+    fixture_path: str | None,
+    lock_enabled: bool,
+    grid_v2_enabled: bool,
+    grid_v2_symbol: str,
+    order_size_raw: str,
+) -> PippinOrderSizeLockResult:
+    """Optional fail-closed profile lock for PIPPINUSDT order size.
+
+    Active only when:
+    - GRINDER_PIPPIN_ORDER_SIZE_LOCK_ENABLED=1
+    - futures mode
+    - no fixture
+    - grid_v2 enabled for PIPPINUSDT
+    """
+    if (
+        not lock_enabled
+        or exchange_port != "futures"
+        or fixture_path is not None
+        or not grid_v2_enabled
+        or grid_v2_symbol != "PIPPINUSDT"
+    ):
+        return PippinOrderSizeLockResult(status="skipped")
+
+    try:
+        order_size = Decimal(order_size_raw)
+    except Exception:
+        return PippinOrderSizeLockResult(
+            status="invalid",
+            expected="80",
+            actual=order_size_raw,
+        )
+
+    if order_size != Decimal("80"):
+        return PippinOrderSizeLockResult(
+            status="mismatch",
+            expected="80",
+            actual=order_size_raw,
+        )
+    return PippinOrderSizeLockResult(status="passed", expected="80", actual=order_size_raw)
 
 
 def _validate_futures_preflight_or_exit(
@@ -748,6 +808,31 @@ def _validate_grid_v2_account_sync_or_exit(
         "ERROR: GRINDER_GRID_V2_ENABLED=true with --exchange-port futures requires "
         "GRINDER_ACCOUNT_SYNC_ENABLED=1. Without account-sync, grid_v2 may miss "
         "fill/cancel reconciliation and stop updating order placement."
+    )
+    sys.exit(1)
+
+
+def _validate_pippin_order_size_lock_or_exit(
+    exchange_port: str,
+    fixture_path: str | None,
+) -> None:
+    """Optional fail-closed launcher lock for PIPPINUSDT profile."""
+    result = evaluate_pippin_order_size_lock_preflight(
+        exchange_port=exchange_port,
+        fixture_path=fixture_path,
+        lock_enabled=parse_bool(
+            "GRINDER_PIPPIN_ORDER_SIZE_LOCK_ENABLED", default=False, strict=False
+        ),
+        grid_v2_enabled=parse_bool("GRINDER_GRID_V2_ENABLED", default=False, strict=False),
+        grid_v2_symbol=os.environ.get("GRINDER_GRID_V2_SYMBOL", ""),
+        order_size_raw=os.environ.get("GRINDER_GRID_V2_ORDER_SIZE", ""),
+    )
+    if result.status in {"skipped", "passed"}:
+        return
+    print(
+        "ERROR: PIPPIN profile lock FAILED: GRINDER_GRID_V2_ORDER_SIZE must be 80 "
+        "when GRINDER_GRID_V2_SYMBOL=PIPPINUSDT and lock is enabled "
+        f"(actual={result.actual!r})."
     )
     sys.exit(1)
 
@@ -1592,6 +1677,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # Futures preflight: validate symbols exist on futures venue (fail-closed).
     _validate_futures_preflight_or_exit(symbols, args.exchange_port, args.fixture)
     _validate_grid_v2_account_sync_or_exit(args.exchange_port, args.fixture)
+    _validate_pippin_order_size_lock_or_exit(args.exchange_port, args.fixture)
 
     # Launch guard v2: verify exchange state clean before start (fail-closed).
     if not args.skip_launch_guard:

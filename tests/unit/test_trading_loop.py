@@ -36,6 +36,7 @@ from scripts.run_trading import (
     evaluate_futures_preflight,
     evaluate_grid_v2_account_sync_preflight,
     evaluate_launch_guard,
+    evaluate_pippin_order_size_lock_preflight,
     is_trading_ready,
     reset_trading_state,
     trading_loop,
@@ -386,6 +387,54 @@ class TestGridV2AccountSyncPreflight:
         monkeypatch.setenv("GRINDER_ACCOUNT_SYNC_ENABLED", "0")
         with pytest.raises(SystemExit) as exc_info:
             run_trading_mod._validate_grid_v2_account_sync_or_exit("futures", None)
+        assert exc_info.value.code == 1
+
+
+class TestPippinOrderSizeLockPreflight:
+    """Optional profile lock: PIPPINUSDT requires order_size=80 when enabled."""
+
+    def test_lock_skipped_when_disabled(self) -> None:
+        result = evaluate_pippin_order_size_lock_preflight(
+            exchange_port="futures",
+            fixture_path=None,
+            lock_enabled=False,
+            grid_v2_enabled=True,
+            grid_v2_symbol="PIPPINUSDT",
+            order_size_raw="60",
+        )
+        assert result.status == "skipped"
+
+    def test_lock_passes_with_80(self) -> None:
+        result = evaluate_pippin_order_size_lock_preflight(
+            exchange_port="futures",
+            fixture_path=None,
+            lock_enabled=True,
+            grid_v2_enabled=True,
+            grid_v2_symbol="PIPPINUSDT",
+            order_size_raw="80",
+        )
+        assert result.status == "passed"
+
+    def test_lock_mismatch_with_non_80(self) -> None:
+        result = evaluate_pippin_order_size_lock_preflight(
+            exchange_port="futures",
+            fixture_path=None,
+            lock_enabled=True,
+            grid_v2_enabled=True,
+            grid_v2_symbol="PIPPINUSDT",
+            order_size_raw="60",
+        )
+        assert result.status == "mismatch"
+
+    def test_lock_wrapper_exits_when_enabled_and_mismatch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GRINDER_PIPPIN_ORDER_SIZE_LOCK_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "PIPPINUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_ORDER_SIZE", "60")
+        with pytest.raises(SystemExit) as exc_info:
+            run_trading_mod._validate_pippin_order_size_lock_or_exit("futures", None)
         assert exc_info.value.code == 1
 
 
