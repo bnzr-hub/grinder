@@ -1081,8 +1081,19 @@ def build_engine(  # noqa: PLR0912, PLR0915
             liquidity_weight_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_LIQUIDITY_WEIGHT_W", 1.0),
             toxicity_penalty_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_TOXICITY_PENALTY_W", 1.0),
             trend_penalty_w=_parse_weight("GRINDER_SYMBOL_SELECTOR_TREND_PENALTY_W", 1.0),
+            ml_enabled=parse_bool(
+                "GRINDER_SYMBOL_SELECTOR_ML_ENABLED", default=False, strict=False
+            ),
+            ml_adjust_max_bps=parse_int(
+                "GRINDER_SYMBOL_SELECTOR_ML_ADJUST_MAX_BPS", default=0, strict=False
+            )
+            or 0,
         )
         shadow_selector = ShadowSelector(selector_config)
+        if selector_config.ml_enabled:
+            print(
+                f"  Shadow selector ML enabled: max_adjust={selector_config.ml_adjust_max_bps}bps"
+            )
         print(
             f"  Shadow selector enabled: k={selector_config.k} "
             f"cycle_s={selector_config.cycle_s} min_natr={selector_config.min_natr_bps}bps"
