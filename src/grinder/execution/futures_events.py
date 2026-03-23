@@ -28,6 +28,9 @@ _NON_ACTIONABLE_USER_DATA_EVENTS: frozenset[str] = frozenset(
     {
         "ACCOUNT_CONFIG_UPDATE",
         "STRATEGY_UPDATE",
+        # Binance sends this informational event frequently on futures user-data WS.
+        # It is tracked via metrics but should not page operators as WARNING noise.
+        "TRADE_LITE",
     }
 )
 
