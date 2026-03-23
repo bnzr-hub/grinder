@@ -1140,8 +1140,20 @@ def build_engine(  # noqa: PLR0912, PLR0915
                 "GRINDER_SYMBOL_SELECTOR_EXIT_THRESHOLD_BPS", default=0, strict=False
             )
             or 0,
+            ml_enabled=parse_bool(
+                "GRINDER_SYMBOL_SELECTOR_ML_ENABLED", default=False, strict=False
+            ),
+            ml_adjust_max_bps=parse_int(
+                "GRINDER_SYMBOL_SELECTOR_ML_ADJUST_MAX_BPS", default=0, strict=False
+            )
+            or 0,
         )
         active_selector = ActiveSelector(active_config, initial_active=set(symbols or []))
+        if active_config.ml_enabled:
+            print(f"  Active selector ML enabled: max_adjust={active_config.ml_adjust_max_bps}bps")
+            print("  WARNING: ML provider not wired in run_trading — baseline fallback expected")
+            if active_config.ml_adjust_max_bps <= 0:
+                print("  WARNING: ML_ADJUST_MAX_BPS=0, ML adjust effectively disabled")
         print(
             f"  Active selector enabled: k={active_config.k} "
             f"hold={active_config.min_hold_cycles} max_chg={active_config.max_changes_per_cycle}"

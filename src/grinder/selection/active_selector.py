@@ -62,9 +62,12 @@ class ActiveSelectorConfig:
     max_changes_per_cycle: int = 1
     enter_threshold_bps: int = 0
     exit_threshold_bps: int = 0
+    # Phase 3b: ML-assisted scoring in active mode
+    ml_enabled: bool = False
+    ml_adjust_max_bps: int = 0
 
     def to_shadow_config(self) -> ShadowSelectorConfig:
-        """Build Phase 1 shadow config for scoring delegation."""
+        """Build shadow config for scoring delegation (includes ML settings)."""
         return ShadowSelectorConfig(
             enabled=True,
             k=self.k,
@@ -75,6 +78,8 @@ class ActiveSelectorConfig:
             liquidity_weight_w=self.liquidity_weight_w,
             toxicity_penalty_w=self.toxicity_penalty_w,
             trend_penalty_w=self.trend_penalty_w,
+            ml_enabled=self.ml_enabled,
+            ml_adjust_max_bps=self.ml_adjust_max_bps,
         )
 
 
@@ -165,9 +170,12 @@ class ActiveSelector:
         self,
         config: ActiveSelectorConfig,
         initial_active: set[str] | None = None,
+        ml_adjust_provider: Any | None = None,
     ) -> None:
         self._config = config
-        self._shadow = ShadowSelector(config.to_shadow_config())
+        self._shadow = ShadowSelector(
+            config.to_shadow_config(), ml_adjust_provider=ml_adjust_provider
+        )
         self._active_set: set[str] = set(initial_active or set())
         self._graceful_exit_only: set[str] = set()
         self._hold_cycles: dict[str, int] = {}  # symbol -> cycles in active set
