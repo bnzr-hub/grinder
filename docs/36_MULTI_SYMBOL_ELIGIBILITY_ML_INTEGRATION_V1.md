@@ -111,13 +111,13 @@ This track must not bypass current operational hardening priorities.
 - **Shadow only** — no dispatch mutation.
 - Provider-missing observability: explicit `SELECTOR_ML_PROVIDER_MISSING` warning + startup hint when ML enabled without wired provider.
 
-### Phase 3b — Active ML plumbing **[DELIVERED — contract/plumbing only, provider not wired]**
+### Phase 3b — Active ML integration **[DELIVERED — provider wired via ONNX]**
 - ML adjust contract wired into `ActiveSelector` via `ShadowSelector` delegation.
 - Same bounded model: `base_score + clamp(ml_adjust, [-MAX_BPS, +MAX_BPS])`.
 - All Phase 2 safety invariants preserved: hysteresis, change budget, graceful_exit_only, fail-safe.
 - Env: reuses `GRINDER_SYMBOL_SELECTOR_ML_ENABLED` + `ML_ADJUST_MAX_BPS` (no new env).
 - Fail-open: ML error/unavailable/no provider → baseline fallback, no crash.
-- **Note:** `ml_adjust_provider` is not wired in `run_trading.py` — ONNX pipeline integration pending. Runtime with `ML_ENABLED=1` produces `SELECTOR_ML_PROVIDER_MISSING` warning and baseline fallback.
+- ONNX provider wired in `run_trading.py` via `GRINDER_ML_REGIME_MODEL_DIR`. Regime → adjust mapping: HIGH=+base, MID=0, LOW=-base. Fail-open: model load error → baseline fallback.
 - 9 tests covering ML ranking, fallback, determinism, hysteresis+budget+graceful preservation.
 
 ### 5.4 Grid_v2 interaction policy (P0 decision)
