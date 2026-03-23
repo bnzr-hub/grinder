@@ -86,6 +86,32 @@ Interpretation:
 
 ---
 
+## Runtime Proof C (2026-03-23, 15-minute live control window) — PASS
+
+Artifact:
+- `/tmp/grinder_control_15m.log`
+
+Observed:
+- Duration completed by timer (`900s`) after `13890` ticks.
+- End state: `EXCHANGE_STATE_VERIFY symbol=PIPPINUSDT status=CLEAN orders=0 position=FLAT`.
+- Cleanup-on-exit completed successfully.
+- Warning/event counts from log:
+  - `GRID_V2_FILL_PROCESSED`: `10`
+  - `unknown_event_type event_type=...`: `10` (all classified as `TRADE_LITE`)
+  - `GRID_V2_INTEGRITY_MISMATCH_PENDING`: `1` (transient)
+  - `GRID_V2_REJECTED_FILL_CLEANED`: `1` (self-healed)
+  - `GRID_V2_EXIT_FILL_ORPHAN`: `0`
+  - `GRID_V2_INTEGRITY_REPAIR_TRIGGER`: `0`
+  - `GRID_V2_INTEGRITY_FATAL`: `0`
+  - `Traceback`: `0`
+
+Interpretation:
+- Trading path remained stable under active fills.
+- One transient mismatch and one rejected-fill cleanup were observed but remained below alert burst thresholds.
+- No fatal integrity path and no orphan exits in this window.
+
+---
+
 ## Exit Criteria
 
 Smoke PASS when all true:
