@@ -1151,6 +1151,7 @@ def build_engine(  # noqa: PLR0912, PLR0915
         active_selector = ActiveSelector(active_config, initial_active=set(symbols or []))
         if active_config.ml_enabled:
             print(f"  Active selector ML enabled: max_adjust={active_config.ml_adjust_max_bps}bps")
+            print("  WARNING: ML provider not wired in run_trading — baseline fallback expected")
             if active_config.ml_adjust_max_bps <= 0:
                 print("  WARNING: ML_ADJUST_MAX_BPS=0, ML adjust effectively disabled")
         print(
