@@ -1057,6 +1057,23 @@ def build_engine(  # noqa: PLR0912, PLR0915
             print(f"  WARNING: invalid {env_var}={raw!r}, using default {default}")
             return default
 
+    # Doc-36: load ONNX model for ML-assisted selector scoring (shared by shadow + active)
+    _ml_onnx_model = None
+    _ml_selector_enabled = parse_bool(
+        "GRINDER_SYMBOL_SELECTOR_ML_ENABLED", default=False, strict=False
+    )
+    _ml_model_dir = os.environ.get("GRINDER_ML_REGIME_MODEL_DIR", "").strip()
+    if _ml_selector_enabled and _ml_model_dir:
+        try:
+            from grinder.ml.onnx.model import OnnxMlModel  # noqa: PLC0415
+
+            _ml_onnx_model = OnnxMlModel.load_from_dir(_ml_model_dir)
+            print(f"  Selector ONNX model loaded: {_ml_model_dir}")
+        except Exception as exc:
+            print(f"  Selector ONNX model load FAILED (fail-open): {exc}")
+    elif _ml_selector_enabled:
+        print("  Selector ML enabled but GRINDER_ML_REGIME_MODEL_DIR not set — baseline fallback")
+
     # Doc-36 Phase 1: shadow selector (observability only, no dispatch mutation)
     shadow_selector = None
     if parse_bool("GRINDER_SYMBOL_SELECTOR_SHADOW", default=False, strict=False):
@@ -1089,12 +1106,27 @@ def build_engine(  # noqa: PLR0912, PLR0915
             )
             or 0,
         )
+        _shadow_provider = None
+        if selector_config.ml_enabled and _ml_onnx_model is not None:
+            # Deferred: provider wired after init to capture feature_cache ref
+            pass
         shadow_selector = ShadowSelector(selector_config)
-        if selector_config.ml_enabled:
-            print(
-                f"  Shadow selector ML enabled: max_adjust={selector_config.ml_adjust_max_bps}bps"
+        if selector_config.ml_enabled and _ml_onnx_model is not None:
+            from grinder.selection.ml_provider import (  # noqa: PLC0415
+                build_ml_adjust_provider,
             )
-            print("  WARNING: ML provider not wired in run_trading — baseline fallback expected")
+
+            _shadow_provider = build_ml_adjust_provider(
+                _ml_onnx_model,
+                shadow_selector._feature_cache,
+                adjust_base_bps=max(1, selector_config.ml_adjust_max_bps // 2),
+            )
+            shadow_selector._ml_adjust_provider = _shadow_provider
+            print(
+                f"  Shadow selector ML provider WIRED: max_adjust={selector_config.ml_adjust_max_bps}bps"
+            )
+        elif selector_config.ml_enabled:
+            print("  Shadow selector ML enabled but model unavailable — baseline fallback")
         print(
             f"  Shadow selector enabled: k={selector_config.k} "
             f"cycle_s={selector_config.cycle_s} min_natr={selector_config.min_natr_bps}bps"
@@ -1148,10 +1180,27 @@ def build_engine(  # noqa: PLR0912, PLR0915
             )
             or 0,
         )
+        _active_provider = None
+        if active_config.ml_enabled and _ml_onnx_model is not None:
+            # Deferred: provider wired after init
+            pass
         active_selector = ActiveSelector(active_config, initial_active=set(symbols or []))
-        if active_config.ml_enabled:
-            print(f"  Active selector ML enabled: max_adjust={active_config.ml_adjust_max_bps}bps")
-            print("  WARNING: ML provider not wired in run_trading — baseline fallback expected")
+        if active_config.ml_enabled and _ml_onnx_model is not None:
+            from grinder.selection.ml_provider import (  # noqa: PLC0415
+                build_ml_adjust_provider,
+            )
+
+            _active_provider = build_ml_adjust_provider(
+                _ml_onnx_model,
+                active_selector._shadow._feature_cache,
+                adjust_base_bps=max(1, active_config.ml_adjust_max_bps // 2),
+            )
+            active_selector._shadow._ml_adjust_provider = _active_provider
+            print(
+                f"  Active selector ML provider WIRED: max_adjust={active_config.ml_adjust_max_bps}bps"
+            )
+        elif active_config.ml_enabled:
+            print("  Active selector ML enabled but model unavailable — baseline fallback")
             if active_config.ml_adjust_max_bps <= 0:
                 print("  WARNING: ML_ADJUST_MAX_BPS=0, ML adjust effectively disabled")
         print(
