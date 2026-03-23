@@ -637,6 +637,66 @@ class TestBuildExchangePort:
         assert isinstance(port, BinanceFuturesPort)
         assert port.config.max_orders_per_run == 50
 
+    def test_futures_clock_offset_applies_when_local_ahead(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Signed clock offset should be positive when local clock is ahead."""
+
+        class _Resp:
+            def read(self) -> bytes:
+                return json.dumps({"serverTime": 1_000_000}).encode("utf-8")
+
+        monkeypatch.setenv("ALLOW_MAINNET_TRADE", "1")
+        monkeypatch.setenv("GRINDER_REAL_PORT_ACK", "YES_I_REALLY_WANT_MAINNET")
+        monkeypatch.setenv("BINANCE_API_KEY", "test-key")
+        monkeypatch.setenv("BINANCE_API_SECRET", "test-secret")
+        monkeypatch.setattr(
+            run_trading_mod.urllib.request,
+            "urlopen",
+            lambda *_args, **_kwargs: _Resp(),
+        )
+        monkeypatch.setattr(run_trading_mod.time, "time", lambda: 1001.5)
+
+        port = build_exchange_port(
+            "futures", SafeMode.LIVE_TRADE, True, ["BTCUSDT"], Decimal("100")
+        )
+        assert isinstance(port, BinanceFuturesPort)
+        assert port._ts_offset_ms == 1500
+        out = capsys.readouterr().out
+        assert "CLOCK_OFFSET_MS=1500 (local ahead of Binance)" in out
+
+    def test_futures_clock_offset_applies_when_local_behind(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Signed clock offset should be negative when local clock is behind."""
+
+        class _Resp:
+            def read(self) -> bytes:
+                return json.dumps({"serverTime": 1_000_000}).encode("utf-8")
+
+        monkeypatch.setenv("ALLOW_MAINNET_TRADE", "1")
+        monkeypatch.setenv("GRINDER_REAL_PORT_ACK", "YES_I_REALLY_WANT_MAINNET")
+        monkeypatch.setenv("BINANCE_API_KEY", "test-key")
+        monkeypatch.setenv("BINANCE_API_SECRET", "test-secret")
+        monkeypatch.setattr(
+            run_trading_mod.urllib.request,
+            "urlopen",
+            lambda *_args, **_kwargs: _Resp(),
+        )
+        monkeypatch.setattr(run_trading_mod.time, "time", lambda: 999.2)
+
+        port = build_exchange_port(
+            "futures", SafeMode.LIVE_TRADE, True, ["BTCUSDT"], Decimal("100")
+        )
+        assert isinstance(port, BinanceFuturesPort)
+        assert port._ts_offset_ms == -800
+        out = capsys.readouterr().out
+        assert "CLOCK_OFFSET_MS=-800 (local behind Binance)" in out
+
 
 class TestValidateMaxOrdersAck:
     """Test validate_max_orders_ack() ACK guard."""
