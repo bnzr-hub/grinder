@@ -1094,6 +1094,7 @@ def build_engine(  # noqa: PLR0912, PLR0915
             print(
                 f"  Shadow selector ML enabled: max_adjust={selector_config.ml_adjust_max_bps}bps"
             )
+            print("  WARNING: ML provider not wired in run_trading — baseline fallback expected")
         print(
             f"  Shadow selector enabled: k={selector_config.k} "
             f"cycle_s={selector_config.cycle_s} min_natr={selector_config.min_natr_bps}bps"

@@ -414,13 +414,20 @@ class ShadowSelector:
 
         # Get ML adjustments from provider
         raw_adjusts: dict[str, int] = {}
-        if self._ml_adjust_provider is not None:
-            try:
-                raw_adjusts = self._ml_adjust_provider()
-            except Exception:
-                logger.warning("SELECTOR_ML_PROVIDER_ERROR — fallback to baseline")
-                metrics.ml_fallback += 1
-                return result
+        if self._ml_adjust_provider is None:
+            logger.warning(
+                "SELECTOR_ML_PROVIDER_MISSING — ml_enabled=True but no provider wired, "
+                "fallback to baseline"
+            )
+            metrics.ml_fallback += 1
+            return result
+
+        try:
+            raw_adjusts = self._ml_adjust_provider()
+        except Exception:
+            logger.warning("SELECTOR_ML_PROVIDER_ERROR — fallback to baseline")
+            metrics.ml_fallback += 1
+            return result
 
         if not raw_adjusts:
             metrics.ml_fallback += 1

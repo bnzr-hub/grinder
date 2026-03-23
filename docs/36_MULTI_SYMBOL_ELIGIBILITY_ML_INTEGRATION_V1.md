@@ -109,6 +109,7 @@ This track must not bypass current operational hardening priorities.
 - Metrics: `grinder_selector_ml_adjust_applied_total` (counter), `grinder_selector_ml_fallback_total` (counter), `grinder_selector_ml_adjust_bps{rank}` (gauge).
 - Env: `GRINDER_SYMBOL_SELECTOR_ML_ENABLED=1`, `GRINDER_SYMBOL_SELECTOR_ML_ADJUST_MAX_BPS`.
 - **Shadow only** — no dispatch mutation. Active-mode ML integration deferred to Phase 3b.
+- Provider-missing observability: explicit `SELECTOR_ML_PROVIDER_MISSING` warning + startup hint when ML enabled without wired provider.
 
 ### 5.4 Grid_v2 interaction policy (P0 decision)
 
