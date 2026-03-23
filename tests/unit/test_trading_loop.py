@@ -31,6 +31,7 @@ from scripts.run_trading import (
     build_connector,
     build_engine,
     build_exchange_port,
+    build_parser,
     evaluate_cleanup_on_exit_policy,
     evaluate_futures_preflight,
     evaluate_grid_v2_account_sync_preflight,
@@ -183,6 +184,19 @@ class TestCleanupOnExitPolicy:
         )
         assert enabled is False
         assert reason == "not_duration_timeout"
+
+
+class TestParserDefaults:
+    def test_cleanup_flags_enabled_by_default(self) -> None:
+        args = build_parser().parse_args([])
+        assert args.cleanup_on_exit is True
+        assert args.pre_cleanup is True
+        assert args.skip_launch_guard is False
+
+    def test_cleanup_flags_can_be_disabled_explicitly(self) -> None:
+        args = build_parser().parse_args(["--no-cleanup-on-exit", "--no-pre-cleanup"])
+        assert args.cleanup_on_exit is False
+        assert args.pre_cleanup is False
 
 
 class TestRunCleanupOnExit:
