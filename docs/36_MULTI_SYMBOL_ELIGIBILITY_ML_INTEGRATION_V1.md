@@ -108,8 +108,16 @@ This track must not bypass current operational hardening priorities.
 - Re-ranks after adjustment with deterministic tie-break.
 - Metrics: `grinder_selector_ml_adjust_applied_total` (counter), `grinder_selector_ml_fallback_total` (counter), `grinder_selector_ml_adjust_bps{rank}` (gauge).
 - Env: `GRINDER_SYMBOL_SELECTOR_ML_ENABLED=1`, `GRINDER_SYMBOL_SELECTOR_ML_ADJUST_MAX_BPS`.
-- **Shadow only** — no dispatch mutation. Active-mode ML integration deferred to Phase 3b.
+- **Shadow only** — no dispatch mutation.
 - Provider-missing observability: explicit `SELECTOR_ML_PROVIDER_MISSING` warning + startup hint when ML enabled without wired provider.
+
+### Phase 3b — Active ML integration **[DELIVERED]**
+- ML adjust wired into `ActiveSelector` via `ShadowSelector` delegation.
+- Same bounded model: `base_score + clamp(ml_adjust, [-MAX_BPS, +MAX_BPS])`.
+- All Phase 2 safety invariants preserved: hysteresis, change budget, graceful_exit_only, fail-safe.
+- Env: reuses `GRINDER_SYMBOL_SELECTOR_ML_ENABLED` + `ML_ADJUST_MAX_BPS` (no new env).
+- Fail-open: ML error/unavailable → baseline fallback, no crash.
+- 9 tests covering ML ranking, fallback, determinism, hysteresis+budget+graceful preservation.
 
 ### 5.4 Grid_v2 interaction policy (P0 decision)
 
