@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from grinder.connectors.live_connector import SafeMode
+from grinder.core import OrderSide
 from grinder.execution.port import NoOpExchangePort
 from grinder.execution.types import ActionType, ExecutionAction
 from grinder.live import LiveEngineConfig, LiveEngineV0
@@ -365,6 +366,117 @@ class TestEngineDispatchGating:
         result = engine._process_action(action, 1000)
         # Should not be SELECTOR_BLOCKED (cancel is reduce/cancel intent)
         assert result.block_reason != BlockReason.SELECTOR_BLOCKED
+
+    def test_grid_v2_integrity_repair_bypasses_selector(self) -> None:
+        """Grid_v2 integrity repair PLACE must not be blocked by selector."""
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+
+        active_config = _base_config(k=1, max_changes_per_cycle=10)
+        selector = ActiveSelector(active_config, initial_active={"AAA"})
+
+        engine = LiveEngineV0(
+            paper_engine=paper,
+            exchange_port=NoOpExchangePort(),
+            config=config,
+            active_selector=selector,
+            operator_symbols=["AAA", "BBB"],
+        )
+
+        # Grid_v2 integrity repair PLACE for BBB (not in active set)
+        action = ExecutionAction(
+            action_type=ActionType.PLACE,
+            symbol="BBB",
+            reason="INTEGRITY_REPAIR",
+            side=OrderSide.BUY,
+            price=Decimal("100"),
+            quantity=Decimal("0.001"),
+        )
+        result = engine._process_action(action, 1000)
+        assert result.block_reason != BlockReason.SELECTOR_BLOCKED
+
+    def test_grid_v2_recenter_bypasses_selector(self) -> None:
+        """Grid_v2 RECENTER PLACE must not be blocked by selector."""
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+
+        active_config = _base_config(k=1, max_changes_per_cycle=10)
+        selector = ActiveSelector(active_config, initial_active={"AAA"})
+
+        engine = LiveEngineV0(
+            paper_engine=paper,
+            exchange_port=NoOpExchangePort(),
+            config=config,
+            active_selector=selector,
+            operator_symbols=["AAA", "BBB"],
+        )
+
+        for reason in ("RECENTER", "RECENTER_REPLACE", "EXIT_RESTORE", "EXIT_RESTORE_SHIFT"):
+            action = ExecutionAction(
+                action_type=ActionType.PLACE,
+                symbol="BBB",
+                reason=reason,
+                side=OrderSide.BUY,
+                price=Decimal("100"),
+                quantity=Decimal("0.001"),
+            )
+            result = engine._process_action(action, 1000)
+            assert result.block_reason != BlockReason.SELECTOR_BLOCKED, (
+                f"reason={reason} should bypass selector gate"
+            )
+
+    def test_grid_v2_prefixed_reason_bypasses_selector(self) -> None:
+        """Actions with grid_v2_ reason prefix bypass selector gate."""
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+
+        active_config = _base_config(k=1, max_changes_per_cycle=10)
+        selector = ActiveSelector(active_config, initial_active={"AAA"})
+
+        engine = LiveEngineV0(
+            paper_engine=paper,
+            exchange_port=NoOpExchangePort(),
+            config=config,
+            active_selector=selector,
+            operator_symbols=["AAA", "BBB"],
+        )
+
+        action = ExecutionAction(
+            action_type=ActionType.CANCEL,
+            symbol="BBB",
+            reason="grid_v2_INTEGRITY_CANCEL_ENTRY",
+            order_id="test-1",
+        )
+        result = engine._process_action(action, 1000)
+        assert result.block_reason != BlockReason.SELECTOR_BLOCKED
+
+    def test_non_grid_place_still_blocked(self) -> None:
+        """Regular PLACE for excluded symbol is still blocked."""
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+
+        active_config = _base_config(k=1, max_changes_per_cycle=10)
+        selector = ActiveSelector(active_config, initial_active={"AAA"})
+
+        engine = LiveEngineV0(
+            paper_engine=paper,
+            exchange_port=NoOpExchangePort(),
+            config=config,
+            active_selector=selector,
+            operator_symbols=["AAA", "BBB"],
+        )
+
+        action = ExecutionAction(
+            action_type=ActionType.PLACE,
+            symbol="BBB",
+            reason="GRID_SHIFT",
+        )
+        result = engine._process_action(action, 1000)
+        assert result.block_reason == BlockReason.SELECTOR_BLOCKED
 
 
 # ---------------------------------------------------------------
