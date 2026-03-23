@@ -1330,6 +1330,11 @@ class TestActionReasons:
 
 
 class TestConfigValidation:
+    def test_default_flat_reseed_mode_is_skew_only(self) -> None:
+        cfg = GridV2Config(Decimal("0.01"), 3, Decimal("1"), 5, Decimal("10000"))
+        assert cfg.reseed_on_flat is False
+        assert cfg.reseed_on_flat_only_on_skew is True
+
     def test_step_zero_raises(self) -> None:
         with pytest.raises(ValueError, match="grid_step_pct must be positive"):
             GridV2Config(Decimal("0"), 3, Decimal("1"), 5, Decimal("10000"))

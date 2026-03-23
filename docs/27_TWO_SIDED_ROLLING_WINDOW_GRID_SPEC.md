@@ -1296,8 +1296,8 @@ class CancelAckResult:
 | `GRINDER_GRID_V2_ORDER_SIZE` | `0.001` | `order_size` |
 | `GRINDER_GRID_V2_MAX_INV_LEVELS` | `3` | `max_inventory_levels` |
 | `GRINDER_GRID_V2_MAX_INV_NOTIONAL` | `1000` | `max_inventory_notional_usd` |
-| `GRINDER_GRID_V2_RESEED_ON_FLAT` | `true` | `reseed_on_flat` |
-| `GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW` | `false` | `reseed_on_flat_only_on_skew` |
+| `GRINDER_GRID_V2_RESEED_ON_FLAT` | `false` | `reseed_on_flat` |
+| `GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW` | `true` | `reseed_on_flat_only_on_skew` |
 
 **When disabled** (`GRINDER_GRID_V2_ENABLED=False`, default):
 - `_grid_v2_bridge` is `None`
@@ -1437,10 +1437,10 @@ until the first account sync confirms orders are visible.
 
 Flat normalization supports three runtime modes:
 
-- `reseed_on_flat=true` (default): always recenter/reseed when full unwind reaches `FLAT`.
+- `reseed_on_flat=true`: always recenter/reseed when full unwind reaches `FLAT`.
 - `reseed_on_flat=false` and `reseed_on_flat_only_on_skew=false`: preserve rolled window on
   unwind; integrity repair cleans extras but does not force reseed.
-- `reseed_on_flat=false` and `reseed_on_flat_only_on_skew=true`: reseed only when flat ladder is
+- `reseed_on_flat=false` and `reseed_on_flat_only_on_skew=true` (default): reseed only when flat ladder is
   skewed (BUY/SELL imbalance or side-vs-expected mismatch), otherwise preserve.
 
 Startup reconstruction follows the same rule: after successful reconstruction in `FLAT` with
