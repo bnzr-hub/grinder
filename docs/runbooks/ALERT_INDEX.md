@@ -30,7 +30,7 @@ rg -n 'alert: <NAME>' monitoring/alert_rules.yml
 
 ## Alert routing table
 
-53 alerts across 13 groups. Sorted by severity (critical → page → warning → ticket → info).
+56 alerts across 13 groups. Sorted by severity (critical → page → warning → ticket → info).
 
 ### Critical (9 alerts)
 
@@ -57,11 +57,13 @@ rg -n 'alert: <NAME>' monitoring/alert_rules.yml
 | `FillIngestNoPolls` | fills | availability | `grinder-overview` | [26_FILL_TRACKER_TRIAGE](26_FILL_TRACKER_TRIAGE.md#fillingestnopolls) | Reconcile loop may be stuck |
 | `FillCursorSaveErrors` | fills | integrity | `grinder-overview` | [26_FILL_TRACKER_TRIAGE](26_FILL_TRACKER_TRIAGE.md#fillcursorsaveerrors) | Check disk permissions, path |
 
-### Warning (28 alerts)
+### Warning (30 alerts)
 
 | Alert | component | category | `dashboard_uid` | Runbook | First look |
 |-------|-----------|----------|-----------------|---------|------------|
 | `ReadyzNotReady` | readyz | availability | — | [02_HEALTH_TRIAGE](02_HEALTH_TRIAGE.md#readyz-not-ready) | Check HA role (standby is normal) |
+| `GridV2IntegrityMismatchPendingBurst` | engine | integrity | — | [06_ALERT_RESPONSE](06_ALERT_RESPONSE.md#warning-alerts) | Frequent pre-repair mismatch streaks in grid_v2 watchdog |
+| `GridV2RejectedFillCleanedBurst` | engine | integrity | — | [06_ALERT_RESPONSE](06_ALERT_RESPONSE.md#warning-alerts) | Rejected-fill auto-clean events are spiking (race/orphan/duplicate pressure) |
 | `HighGatingBlocks` | gating | safety | — | [06_ALERT_RESPONSE](06_ALERT_RESPONSE.md#warning-alerts) | Check block reasons |
 | `ToxicityTriggers` | gating | safety | — | [06_ALERT_RESPONSE](06_ALERT_RESPONSE.md#warning-alerts) | Spread spike or price impact |
 | `HighDrawdown` | risk | safety | — | [04_KILL_SWITCH](04_KILL_SWITCH.md) | Monitor; kill-switch at 5% |
@@ -119,11 +121,11 @@ rg -n 'alert: <NAME>' monitoring/alert_rules.yml
 |----------|-------|---------------------|
 | critical | 9 | 9 (100%) |
 | page | 6 | 6 (100%) |
-| warning | 28 | 0 |
+| warning | 30 | 0 |
 | ticket | 4 | 0 |
 | info | 7 | 0 |
 
-| **Total** | **54** | **15** |
+| **Total** | **56** | **15** |
 
 > `dashboard_uid` is required for `critical` and `page` alerts (OBS-3/OBS-4 contract).
 > Enforced by `scripts/verify_alert_rules.py`.
