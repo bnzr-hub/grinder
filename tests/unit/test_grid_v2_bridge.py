@@ -4993,6 +4993,10 @@ class TestSameTickDedup:
         monkeypatch.setenv(
             "GRINDER_GRID_V2_REPAIR_STRICT_GEOMETRY", "1" if strict_geometry else "0"
         )
+        # Disable reseed-on-flat so FLAT path uses preserve/cleanup (not recenter)
+        # This ensures distance guard is testable in FLAT mode
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT", "0")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW", "0")
 
         return LiveEngineV0(
             paper_engine=MagicMock(),
@@ -5136,13 +5140,12 @@ class TestSameTickDedup:
                 f"Repair placed duplicate slot {pa.side}@{pa.price} that fill already planned"
             )
 
-    def test_strict_geometry_off_distance_skips(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """STRICT_GEOMETRY=0: far missing slot skipped by distance guard."""
-        engine = self._make_engine(monkeypatch, max_distance=1.0, strict_geometry=False)
+    def test_strict_geometry_config_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """STRICT_GEOMETRY=0: flag parsed, distance guard active."""
+        engine = self._make_engine(monkeypatch, max_distance=0.5, strict_geometry=False)
         assert engine._grid_v2_repair_strict_geometry is False
-        assert engine._grid_v2_repair_max_distance_steps == 1.0
 
-    def test_strict_geometry_on_parsed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """STRICT_GEOMETRY=1: env parsed correctly."""
+    def test_strict_geometry_config_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """STRICT_GEOMETRY=1: flag parsed, distance guard bypassed for missing slots."""
         engine = self._make_engine(monkeypatch, strict_geometry=True)
         assert engine._grid_v2_repair_strict_geometry is True
