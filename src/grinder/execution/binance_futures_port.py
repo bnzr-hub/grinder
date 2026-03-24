@@ -592,7 +592,8 @@ class BinanceFuturesPort:
         # --- Parse positions -> PositionSnap ---
         positions: list[PositionSnap] = []
         for p in raw_positions:
-            qty = abs(Decimal(str(p.get("positionAmt", "0"))))
+            raw_amt = Decimal(str(p.get("positionAmt", "0")))
+            qty = abs(raw_amt)
             if qty == 0:
                 continue
             positions.append(
@@ -600,6 +601,7 @@ class BinanceFuturesPort:
                     symbol=p.get("symbol", ""),
                     side=p.get("positionSide", "BOTH"),
                     qty=qty,
+                    signed_qty=raw_amt,
                     entry_price=Decimal(str(p.get("entryPrice", "0"))),
                     mark_price=Decimal(str(p.get("markPrice", "0"))),
                     unrealized_pnl=Decimal(str(p.get("unRealizedProfit", "0"))),
