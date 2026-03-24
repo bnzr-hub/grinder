@@ -324,6 +324,82 @@ class TestFillLifecycleExit:
         assert len(cancel_actions) < 5
 
 
+class TestNetOffBridge:
+    """Bridge-level tests for net-off transition (Variant B)."""
+
+    def test_netoff_enabled_opposite_fill_not_rejected(self) -> None:
+        """LONG + SELL fill with netoff → not rejected, cancel exit emitted."""
+        cfg = _config()
+        cfg_netoff = GridV2Config(
+            grid_step_pct=cfg.grid_step_pct,
+            entry_levels_per_side=cfg.entry_levels_per_side,
+            order_size=cfg.order_size,
+            max_inventory_levels=cfg.max_inventory_levels,
+            max_inventory_notional_usd=cfg.max_inventory_notional_usd,
+            price_tick_size=cfg.price_tick_size,
+            netoff_enabled=True,
+        )
+        bridge = GridV2Bridge(cfg_netoff, "BTCUSDT")
+        bridge.startup_fresh(Decimal("50000"), _BASE_TS)
+
+        # Find and fill a BUY entry
+        buy_cid = None
+        for cid in bridge.adapter.registry.all_entry_cids:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg and reg.side == OrderSide.BUY:
+                buy_cid = cid
+                buy_price = reg.price
+                break
+        assert buy_cid is not None
+        r1 = bridge.on_fill(buy_cid, OrderSide.BUY, buy_price, Decimal("0.01"), _BASE_TS + 1)
+        assert not r1.rejected
+        assert bridge.state_machine is not None
+        assert bridge.state_machine.snapshot.mode == BranchMode.LONG_BRANCH
+
+        # Fill a SELL entry (opposite) → should net-off, not reject
+        sell_cid = None
+        for cid in bridge.adapter.registry.all_entry_cids:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg and reg.side == OrderSide.SELL:
+                sell_cid = cid
+                sell_price = reg.price
+                break
+        assert sell_cid is not None
+        r2 = bridge.on_fill(sell_cid, OrderSide.SELL, sell_price, Decimal("0.01"), _BASE_TS + 2)
+        assert not r2.rejected
+        assert bridge.state_machine.snapshot.mode == BranchMode.FLAT  # type: ignore[comparison-overlap]
+        # Should have CANCEL action for paired exit
+        cancel_actions = [a for a in r2.execution_actions if a.action_type == ActionType.CANCEL]
+        assert len(cancel_actions) >= 1
+
+    def test_netoff_disabled_rejects_at_bridge(self) -> None:
+        """Without netoff, opposite fill is BRANCH_INCOMPATIBLE at bridge level."""
+        bridge = GridV2Bridge(_config(), "BTCUSDT")
+        bridge.startup_fresh(Decimal("50000"), _BASE_TS)
+
+        buy_cid = None
+        for cid in bridge.adapter.registry.all_entry_cids:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg and reg.side == OrderSide.BUY:
+                buy_cid = cid
+                buy_price = reg.price
+                break
+        assert buy_cid is not None
+        bridge.on_fill(buy_cid, OrderSide.BUY, buy_price, Decimal("0.01"), _BASE_TS + 1)
+
+        sell_cid = None
+        for cid in bridge.adapter.registry.all_entry_cids:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg and reg.side == OrderSide.SELL:
+                sell_cid = cid
+                sell_price = reg.price
+                break
+        assert sell_cid is not None
+        r2 = bridge.on_fill(sell_cid, OrderSide.SELL, sell_price, Decimal("0.01"), _BASE_TS + 2)
+        assert r2.rejected
+        assert r2.reject_reason == "BRANCH_INCOMPATIBLE"
+
+
 class TestFillRejected:
     """REQ-002 supplement: rejected transitions produce no dispatch."""
 
