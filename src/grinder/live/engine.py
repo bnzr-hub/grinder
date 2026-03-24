@@ -685,7 +685,7 @@ class LiveEngineV0:
             "Set it to the exchange tick size (e.g., 0.10 for BTCUSDT futures)."
         )
 
-    def _grid_v2_try_startup(self, snapshot: Snapshot) -> None:
+    def _grid_v2_try_startup(self, snapshot: Snapshot) -> None:  # noqa: PLR0912
         """Attempt grid_v2 bridge startup on first tick with account data.
 
         Fresh start only if no exchange orders AND position is flat.
@@ -722,6 +722,24 @@ class LiveEngineV0:
                     self._grid_v2_symbol,
                     bridge.failed_reason,
                 )
+            elif bridge.f2_protective_recovery:
+                # F2 recovery: non-flat position with no exit orders on exchange.
+                # Emit protective reduce-only exits. Block entries until exits confirmed.
+                f2_exits = bridge.get_f2_protective_exit_actions(snapshot.ts)
+                if f2_exits:
+                    self._grid_v2_seed_actions = list(f2_exits)
+                    self._grid_v2_awaiting_sync = True
+                    self._grid_v2_pending_seed_cids = frozenset(
+                        ea.client_order_id
+                        for ea in f2_exits
+                        if ea.action_type == ActionType.PLACE and ea.client_order_id is not None
+                    )
+                logger.warning(
+                    "GRID_V2_F2_PROTECTIVE_RECOVERY symbol=%s protective_exits=%d pos_qty=%s",
+                    self._grid_v2_symbol,
+                    len(f2_exits),
+                    pos_qty,
+                )
             elif (
                 pos_qty == 0
                 and bridge.state_machine is not None
@@ -746,14 +764,34 @@ class LiveEngineV0:
                     )
             self._grid_v2_started = True
         elif pos_qty != 0:
-            # P0-2: Non-flat position with no grid_v2 orders = fail-closed.
-            # Cannot seed fresh grid when already exposed. Manual intervention required.
-            logger.error(
-                "GRID_V2_STARTUP_BLOCKED symbol=%s reason=non_flat_position_no_orders pos_qty=%s",
-                self._grid_v2_symbol,
-                pos_qty,
-            )
-            self._grid_v2_started = True  # prevent retry; stays blocked (reconstruction_ok=False)
+            # Non-flat position with no grid_v2 orders: F2 recovery path.
+            # Pass empty orders list to reconstruct_snapshot which will synthesize
+            # a protective lot + exit from position_qty.
+            ok = bridge.startup([], pos_qty, snapshot.mid_price, snapshot.ts)
+            if not ok:
+                logger.error(
+                    "GRID_V2_STARTUP_FAILED symbol=%s reason=%s",
+                    self._grid_v2_symbol,
+                    bridge.failed_reason,
+                )
+            elif bridge.f2_protective_recovery:
+                f2_exits = bridge.get_f2_protective_exit_actions(snapshot.ts)
+                if f2_exits:
+                    self._grid_v2_seed_actions = list(f2_exits)
+                    self._grid_v2_awaiting_sync = True
+                    self._grid_v2_pending_seed_cids = frozenset(
+                        ea.client_order_id
+                        for ea in f2_exits
+                        if ea.action_type == ActionType.PLACE and ea.client_order_id is not None
+                    )
+                logger.warning(
+                    "GRID_V2_F2_PROTECTIVE_RECOVERY symbol=%s protective_exits=%d pos_qty=%s "
+                    "reason=no_grid_v2_orders",
+                    self._grid_v2_symbol,
+                    len(f2_exits),
+                    pos_qty,
+                )
+            self._grid_v2_started = True
         else:
             # Flat position, no orders: fresh start
             seed = bridge.startup_fresh(snapshot.mid_price, snapshot.ts)
@@ -2070,6 +2108,40 @@ class LiveEngineV0:
                         # (e.g. -1111 precision, -4014 tick, -4164 notional).
                         # Order was NOT placed — safe to clean.
                         self._grid_v2_clean_failed_place(action.client_order_id)
+
+                # F2 protective exits: clear from pending_seed_cids on definitive failure
+                # to prevent awaiting_sync deadlock.
+                # Definitive = BLOCKED, SKIPPED, FAILED+pre_send, or FAILED+non-ambiguous code.
+                # Ambiguous FAILED (no code / -2010-like) stays pending for snapshot resolution.
+                seed_definitive_fail = (
+                    action.client_order_id is not None
+                    and action.client_order_id in self._grid_v2_pending_seed_cids
+                    and (
+                        live_action.status in (LiveActionStatus.BLOCKED, LiveActionStatus.SKIPPED)
+                        or (live_action.status == LiveActionStatus.FAILED and live_action.pre_send)
+                        or (
+                            live_action.status == LiveActionStatus.FAILED
+                            and not live_action.pre_send
+                            and not _grid_v2_is_exchange_code_ambiguous(live_action.exchange_code)
+                        )
+                    )
+                )
+                if seed_definitive_fail and action.client_order_id is not None:
+                    self._grid_v2_pending_seed_cids = self._grid_v2_pending_seed_cids - {
+                        action.client_order_id
+                    }
+                    logger.warning(
+                        "GRID_V2_SEED_CID_CLEARED cid=%s status=%s code=%s",
+                        action.client_order_id,
+                        live_action.status.value,
+                        live_action.exchange_code,
+                    )
+                    if not self._grid_v2_pending_seed_cids:
+                        self._grid_v2_awaiting_sync = False
+                        logger.warning(
+                            "GRID_V2_AWAITING_SYNC_CLEARED_ON_SEED_FAILURE "
+                            "reason=all_seeds_definitively_failed"
+                        )
 
             # ADR-090 follow-up: record dispatched CANCEL CID for per-sync-cycle dedup.
             if (

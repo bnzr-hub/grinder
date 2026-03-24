@@ -797,12 +797,16 @@ class TestReconstructionFailClosed:
         with pytest.raises(ValueError, match="F1"):
             a.reconstruct_snapshot(orders, _ORDER_SIZE, _REF_PRICE, _BASE_TS)
 
-    def test_f2_nonfat_pos_no_exits(self) -> None:
+    def test_f2_nonfat_pos_no_exits_triggers_protective_recovery(self) -> None:
         a = _adapter()
         entry_cid = a.generate_entry_cid(_BASE_TS)
         orders = [(entry_cid, OrderSide.BUY, Decimal("49750"), _ORDER_SIZE)]
-        with pytest.raises(ValueError, match="F2"):
-            a.reconstruct_snapshot(orders, _ORDER_SIZE, _REF_PRICE, _BASE_TS)
+        snapshot = a.reconstruct_snapshot(orders, _ORDER_SIZE, _REF_PRICE, _BASE_TS)
+        assert a.f2_protective_recovery is True
+        assert snapshot.mode == BranchMode.LONG_BRANCH
+        assert len(snapshot.open_lots) == 1
+        assert len(snapshot.exit_orders) == 1
+        assert snapshot.exit_orders[0].side == OrderSide.SELL
 
     def test_f3_flat_pos_exits_exist(self) -> None:
         a = _adapter()
