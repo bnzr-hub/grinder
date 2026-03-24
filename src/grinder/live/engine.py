@@ -70,7 +70,7 @@ from grinder.execution.smart_order_router import (
 from grinder.execution.sor_metrics import get_sor_metrics
 from grinder.execution.types import ActionType, ExecutionAction
 from grinder.grid_v2.adapter import GRID_V2_STRATEGY_ID
-from grinder.grid_v2.bridge import GridV2Bridge
+from grinder.grid_v2.bridge import FillResult, GridV2Bridge
 from grinder.grid_v2.shadow import GridV2ShadowRunner
 from grinder.grid_v2.state import ActionIntent, ActionIntentKind, BranchMode, GridV2Config, LotSide
 from grinder.live.grid_planner import GridPlanResult
@@ -93,6 +93,12 @@ from grinder.risk.drawdown_guard_v1 import DrawdownGuardV1
 from grinder.risk.drawdown_guard_v1 import OrderIntent as RiskIntent
 from grinder.risk.emergency_exit import EmergencyExitExecutor
 from grinder.risk.emergency_exit_metrics import get_emergency_exit_metrics
+from grinder.risk.symbol_risk_manager import (
+    SymbolRiskConfig,
+    SymbolRiskManager,
+    SymbolRiskSnapshot,
+    SymbolRiskState,
+)
 
 if TYPE_CHECKING:
     from grinder.account.contracts import AccountSnapshot, OpenOrderSnap
@@ -190,6 +196,8 @@ class BlockReason(Enum):
     TP_CLOSE_PLACE_FAILED = "TP_CLOSE_PLACE_FAILED"
     CANCEL_ALREADY_FAILED = "CANCEL_ALREADY_FAILED"
     SELECTOR_BLOCKED = "SELECTOR_BLOCKED"
+    SYMBOL_RISK_CAPPED = "SYMBOL_RISK_CAPPED"
+    SYMBOL_RISK_EXIT_ONLY = "SYMBOL_RISK_EXIT_ONLY"
 
 
 class LiveActionStatus(Enum):
@@ -683,6 +691,37 @@ class LiveEngineV0:
                     "(GRINDER_GRID_V2_SHADOW=true but GRINDER_GRID_V2_SYMBOL is empty)"
                 )
 
+        # Symbol Risk Manager v1 (per-symbol safety layer)
+        _sr_enabled = parse_bool("GRINDER_SYMBOL_RISK_ENABLED", default=False, strict=False)
+        self._symbol_risk_manager = SymbolRiskManager(
+            SymbolRiskConfig(
+                enabled=_sr_enabled,
+                max_notional_usd=float(os.environ.get("GRINDER_SYMBOL_RISK_MAX_NOTIONAL_USD", "0")),
+                max_position_qty=float(os.environ.get("GRINDER_SYMBOL_RISK_MAX_POSITION_QTY", "0")),
+                max_consecutive_losses=int(
+                    os.environ.get("GRINDER_SYMBOL_RISK_MAX_CONSECUTIVE_LOSSES", "0")
+                ),
+                cooldown_s=float(os.environ.get("GRINDER_SYMBOL_RISK_COOLDOWN_S", "120")),
+                exit_only_ttl_s=float(os.environ.get("GRINDER_SYMBOL_RISK_EXIT_ONLY_TTL_S", "300")),
+                applies_to_grid_v2_only=parse_bool(
+                    "GRINDER_SYMBOL_RISK_APPLIES_TO_GRID_V2_ONLY", default=True, strict=False
+                ),
+            )
+        )
+        # Per-symbol consecutive loss counters (reset on win, increment on loss)
+        self._symbol_consecutive_losses: dict[str, int] = {}
+        self._symbol_closed_lots_seen: dict[str, int] = {}
+        if _sr_enabled:
+            logger.info(
+                "SYMBOL_RISK_MANAGER_ENABLED max_notional=%.2f max_qty=%.4f max_losses=%d "
+                "cooldown=%.0fs exit_only_ttl=%.0fs",
+                self._symbol_risk_manager.config.max_notional_usd,
+                self._symbol_risk_manager.config.max_position_qty,
+                self._symbol_risk_manager.config.max_consecutive_losses,
+                self._symbol_risk_manager.config.cooldown_s,
+                self._symbol_risk_manager.config.exit_only_ttl_s,
+            )
+
     # --- Grid V2 runtime methods (doc-27 section 23, PR4) ---
 
     def _create_grid_v2_bridge(self) -> GridV2Bridge:
@@ -919,6 +958,9 @@ class LiveEngineV0:
         self._grid_v2_pending_seed_cids = frozenset(
             ea.client_order_id for ea in seed if ea.client_order_id is not None
         )
+        # Reset risk tracking counters for clean baseline
+        self._symbol_consecutive_losses.pop(symbol, None)
+        self._symbol_closed_lots_seen.pop(symbol, None)
         logger.warning(
             "GRID_V2_RECOVERY_CLEANUP_RESEED_OK symbol=%s seeds=%d",
             symbol,
@@ -1111,6 +1153,7 @@ class LiveEngineV0:
                         reason,
                     )
                     continue
+                self._maybe_track_lot_closure(symbol, result)
                 actions.extend(result.execution_actions)
                 continue
 
@@ -1138,6 +1181,7 @@ class LiveEngineV0:
                     reason,
                 )
                 continue
+            self._maybe_track_lot_closure(symbol, result)
             actions.extend(result.execution_actions)
 
         return actions
@@ -1528,6 +1572,7 @@ class LiveEngineV0:
                 return
 
             self._grid_v2_user_fill_seen.add(oe.client_order_id)
+            self._maybe_track_lot_closure(oe.symbol, result)
             if result.execution_actions:
                 self._grid_v2_dispatch_immediate_actions(list(result.execution_actions), oe.ts)
             return
@@ -2865,6 +2910,9 @@ class LiveEngineV0:
         # PR-A4: update position notional from confirmed snapshot
         if result.snapshot is not None:
             self._position_notional_usd = AccountSyncer.compute_position_notional(result.snapshot)
+            # Symbol risk evaluation (per-symbol, post account sync)
+            if self._symbol_risk_manager.config.enabled:
+                self._evaluate_symbol_risk(result.snapshot)
             # PR-L2: Store full snapshot for LiveGridPlannerV1 (open_orders as exchange truth)
             self._last_account_snapshot = result.snapshot
             # PR6: clear awaiting-sync flag only when ALL seed CIDs are visible
@@ -3626,6 +3674,73 @@ class LiveEngineV0:
         self._grid_anchor_mid[symbol] = mid_price
         return actions
 
+    def _maybe_track_lot_closure(self, symbol: str, result: FillResult) -> None:
+        """Check fill result for lot closure and update consecutive loss tracker.
+
+        Detects newly closed lots by comparing closed_lots count before/after.
+        The SM appends closed lots to the tuple, so the last N are new.
+        """
+        if not self._symbol_risk_manager.config.enabled:
+            return
+        if result.transition is None:
+            return
+        snap = result.transition.snapshot
+        prev_count = self._symbol_closed_lots_seen.get(symbol, 0)
+        current_count = len(snap.closed_lots)
+        if current_count > prev_count:
+            for lot in snap.closed_lots[prev_count:]:
+                self._record_grid_v2_lot_closed(
+                    symbol,
+                    lot.entry_price,
+                    lot.exit_price,
+                    lot.side.value,
+                )
+        self._symbol_closed_lots_seen[symbol] = current_count
+
+    def _evaluate_symbol_risk(self, acct: AccountSnapshot) -> None:
+        """Evaluate per-symbol risk after account sync."""
+        cfg = self._symbol_risk_manager.config
+        if cfg.applies_to_grid_v2_only and not self._grid_v2_enabled:
+            return
+
+        # Build position lookup from account snapshot
+        pos_by_sym: dict[str, tuple[float, float]] = {}
+        for pos in acct.positions:
+            sym = pos.symbol
+            if cfg.applies_to_grid_v2_only and sym != self._grid_v2_symbol:
+                continue
+            pos_by_sym[sym] = (float(abs(pos.qty) * pos.mark_price), float(abs(pos.qty)))
+
+        # Evaluate all tracked symbols (including those with zero position)
+        # to allow de-escalation when position closes
+        tracked = set(pos_by_sym.keys()) | set(self._symbol_risk_manager._states.keys())
+        if cfg.applies_to_grid_v2_only and self._grid_v2_symbol:
+            tracked.add(self._grid_v2_symbol)
+
+        for sym in tracked:
+            notional, qty = pos_by_sym.get(sym, (0.0, 0.0))
+            losses = self._symbol_consecutive_losses.get(sym, 0)
+            snap = SymbolRiskSnapshot(
+                position_notional_usd=notional,
+                position_qty=qty,
+                consecutive_losses=losses,
+            )
+            self._symbol_risk_manager.evaluate(sym, snap)
+
+    def _record_grid_v2_lot_closed(
+        self, symbol: str, entry_price: Decimal, exit_price: Decimal, side: str
+    ) -> None:
+        """Track lot close for consecutive loss counting."""
+        is_loss = (side == "LONG" and exit_price < entry_price) or (
+            side == "SHORT" and exit_price > entry_price
+        )
+        if is_loss:
+            self._symbol_consecutive_losses[symbol] = (
+                self._symbol_consecutive_losses.get(symbol, 0) + 1
+            )
+        else:
+            self._symbol_consecutive_losses[symbol] = 0
+
     def _process_action(self, action: ExecutionAction, ts: int) -> LiveAction:  # noqa: PLR0911, PLR0912
         """Process single action through safety gates and execute.
 
@@ -3788,6 +3903,55 @@ class LiveEngineV0:
                 block_reason=BlockReason.SELECTOR_BLOCKED,
                 intent=intent,
             )
+
+        # Gate 10: Symbol Risk Manager (per-symbol CAPPED/EXIT_ONLY blocking)
+        # Only safety-critical grid_v2 actions bypass: cancel, reduce-only exits,
+        # integrity cancel. Regular grid_v2 entries (PLACE_ENTRY) are subject to
+        # risk gating — this is the whole point of the risk manager.
+        _is_grid_v2_safety_only = (
+            action.reduce_only
+            or action.action_type == ActionType.CANCEL
+            or (
+                action.reason
+                in (
+                    "grid_v2_INTEGRITY_CANCEL_ENTRY",
+                    "grid_v2_INTEGRITY_CANCEL_EXIT",
+                    "EXIT_RESTORE",
+                    "EXIT_RESTORE_SHIFT",
+                )
+            )
+        )
+        if (
+            intent == RiskIntent.INCREASE_RISK
+            and action.symbol
+            and not _is_grid_v2_safety_only
+            and self._symbol_risk_manager.config.enabled
+        ):
+            sr_state = self._symbol_risk_manager.get_state(action.symbol)
+            if sr_state == SymbolRiskState.EXIT_ONLY:
+                logger.info(
+                    "Action blocked: SYMBOL_RISK_EXIT_ONLY symbol=%s action=%s",
+                    action.symbol,
+                    action.action_type.value,
+                )
+                return LiveAction(
+                    action=action,
+                    status=LiveActionStatus.BLOCKED,
+                    block_reason=BlockReason.SYMBOL_RISK_EXIT_ONLY,
+                    intent=intent,
+                )
+            if sr_state == SymbolRiskState.CAPPED:
+                logger.info(
+                    "Action blocked: SYMBOL_RISK_CAPPED symbol=%s action=%s",
+                    action.symbol,
+                    action.action_type.value,
+                )
+                return LiveAction(
+                    action=action,
+                    status=LiveActionStatus.BLOCKED,
+                    block_reason=BlockReason.SYMBOL_RISK_CAPPED,
+                    intent=intent,
+                )
 
         # SOR routing (Launch-14 PR2): after all safety gates, before execution
         if self._is_sor_enabled() and action.action_type in (
