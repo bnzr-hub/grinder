@@ -102,6 +102,10 @@ class SymbolUnloadController:
         s = self._states.get(symbol)
         return s.status if s else UnloadStatus.INACTIVE
 
+    def tracked_symbols(self) -> set[str]:
+        """Return set of symbols with active unload tracking."""
+        return set(self._states.keys())
+
     def activate(self, symbol: str, now: float | None = None) -> None:
         """Start unload for symbol (called when entering EXIT_ONLY)."""
         if not self._config.enabled:

@@ -3772,24 +3772,33 @@ class LiveEngineV0:
     def _try_symbol_unload_steps(self, acct: AccountSnapshot) -> None:
         """Attempt staged unload steps for symbols in EXIT_ONLY."""
         signed_by_sym: dict[str, float] = {}
+        mark_by_sym: dict[str, Decimal] = {}
         for pos in acct.positions:
             sq = float(pos.signed_qty) if pos.signed_qty is not None else float(pos.qty)
             signed_by_sym[pos.symbol] = sq
+            mark_by_sym[pos.symbol] = pos.mark_price
 
-        for sym in list(self._symbol_unload._states.keys()):
+        for sym in list(self._symbol_unload.tracked_symbols()):
             if self._symbol_unload.get_status(sym).value not in ("ACTIVE",):
                 continue
             signed_qty = signed_by_sym.get(sym, 0.0)
             step = self._symbol_unload.try_step(sym, signed_qty)
             if step is None:
                 continue
-            # Dispatch reduce-only order
+            mark = mark_by_sym.get(sym)
+            if mark is None or mark <= 0:
+                logger.warning(
+                    "SYMBOL_UNLOAD_STEP_SKIPPED symbol=%s reason=no_mark_price",
+                    sym,
+                )
+                continue
+            # Use mark price for limit order (aggressive fill expected)
             side = OrderSide.BUY if step.side == "BUY" else OrderSide.SELL
             action = ExecutionAction(
                 action_type=ActionType.PLACE,
                 symbol=step.symbol,
                 side=side,
-                price=None,  # market or best price (engine/SOR will handle)
+                price=mark,
                 quantity=Decimal(str(step.qty)),
                 reduce_only=True,
                 reason="SYMBOL_UNLOAD_STEP",
