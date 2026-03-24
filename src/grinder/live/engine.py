@@ -1615,6 +1615,29 @@ class LiveEngineV0:
                         len(geometry_mismatches),
                     )
 
+        # Final dedup: remove PLACE actions for slots already planned by fill path this tick.
+        # This covers both FLAT reseed and branch repair paths.
+        planned_this_tick = planned_slots_this_tick or set()
+        if planned_this_tick:
+            before = len(repair_actions)
+            repair_actions = [
+                a
+                for a in repair_actions
+                if not (
+                    a.action_type == ActionType.PLACE
+                    and a.side is not None
+                    and a.price is not None
+                    and (a.side, a.price) in planned_this_tick
+                )
+            ]
+            dropped = before - len(repair_actions)
+            if dropped:
+                logger.info(
+                    "GRID_V2_REPAIR_DEDUP_PLANNED_SLOT symbol=%s dropped=%d",
+                    snapshot.symbol,
+                    dropped,
+                )
+
         if repair_actions:
             logger.info(
                 "GRID_V2_INTEGRITY_REPAIR_DISPATCH symbol=%s mode=%s actions=%d",

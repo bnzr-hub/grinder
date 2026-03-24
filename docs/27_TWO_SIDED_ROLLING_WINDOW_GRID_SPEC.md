@@ -1445,3 +1445,14 @@ Flat normalization supports three runtime modes:
 
 Startup reconstruction follows the same rule: after successful reconstruction in `FLAT` with
 `pos_qty == 0`, optional recenter executes only if configured mode requires it.
+
+### 26. Integrity repair guards (runtime)
+
+Integrity repair applies the following guards to PLACE_ENTRY actions:
+
+1. **Same-tick planned-slot dedup:** If a slot `(side, price)` is already planned by the fill path in the current tick, repair skips it. Prevents duplicate orders at same price from fill+repair overlap.
+2. **Pending-slot dedup:** Skip if `(side, price)` has a CID in `pending_place_cids`.
+3. **Distance guard:** Skip if `abs(price - mid) / mid / step > max_distance_steps` (`GRINDER_GRID_V2_REPAIR_MAX_DISTANCE_STEPS`, default 5). Bypassed when strict geometry enabled.
+4. **Budget cap:** Max N PLACE actions per repair cycle (`GRINDER_GRID_V2_REPAIR_MAX_ACTIONS_PER_CYCLE`, default 5).
+5. **Geometry tolerance:** Orders within `epsilon_ticks × tick_size` of expected price are silently matched (no false structural mismatch). `GRINDER_GRID_V2_GEOMETRY_REPAIR_ENABLED=1` default, `GRINDER_GRID_V2_GEOMETRY_EPSILON_TICKS=1`.
+6. **Strict geometry mode:** `GRINDER_GRID_V2_REPAIR_STRICT_GEOMETRY=0` (default off). When enabled, structural missing slots bypass the distance guard (budget cap still applies). Closes visible step gaps under volatility.
