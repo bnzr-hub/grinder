@@ -328,6 +328,7 @@ class GridV2Adapter:
         self._entry_seq = 0
         self._exit_seq = 0
         self._max_seq = _compute_max_seq(symbol)
+        self._f2_protective_recovery = False
 
     @property
     def registry(self) -> GridV2OrderRegistry:
@@ -336,6 +337,11 @@ class GridV2Adapter:
     @property
     def symbol(self) -> str:
         return self._symbol
+
+    @property
+    def f2_protective_recovery(self) -> bool:
+        """True if startup recovered from F2 (non-flat, no exits)."""
+        return self._f2_protective_recovery
 
     # --- CID helpers (22.1) ---
 
@@ -784,9 +790,49 @@ class GridV2Adapter:
         pos_flat = position_qty == 0
 
         if not pos_flat and not has_lots:
-            raise ValueError(
-                "Position non-flat but no exit orders found: unprotected position (F2)"
+            # F2 recovery: synthesize protective lot + exit from position
+            import logging  # noqa: PLC0415
+
+            _f2_logger = logging.getLogger(__name__)
+            _f2_logger.warning(
+                "GRID_V2_F2_PROTECTIVE_RECOVERY symbol=grid_v2 position_qty=%s "
+                "reference_price=%s — synthesizing protective exit",
+                position_qty,
+                reference_price,
             )
+            if position_qty > 0:
+                lot_side = LotSide.LONG
+                exit_side = OrderSide.SELL
+                exit_price = reference_price * (Decimal(1) + self._config.grid_step_pct)
+            else:
+                lot_side = LotSide.SHORT
+                exit_side = OrderSide.BUY
+                exit_price = reference_price * (Decimal(1) - self._config.grid_step_pct)
+
+            f2_lot_id = "lot-f2-protective-0"
+            f2_exit_order_id = "exit-f2-protective-0"
+            f2_lot = InventoryLot(
+                lot_id=f2_lot_id,
+                side=lot_side,
+                entry_price=reference_price,
+                qty=abs(position_qty),
+                opened_at_ts=ts,
+                source_entry_order_id="f2-reconstructed",
+                exit_price=exit_price,
+                exit_order_id=f2_exit_order_id,
+                status=LotStatus.OPEN,
+            )
+            f2_exit = ExitOrder(
+                exit_order_id=f2_exit_order_id,
+                lot_id=f2_lot_id,
+                side=exit_side,
+                price=exit_price,
+                qty=abs(position_qty),
+                status=ExitOrderStatus.OPEN,
+            )
+            inferred_lots.append(f2_lot)
+            inferred_exits.append(f2_exit)
+            self._f2_protective_recovery = True
         if pos_flat and has_lots:
             raise ValueError("Position flat but exit orders exist: inconsistent state (F3)")
         if has_lots:
@@ -843,7 +889,8 @@ class GridV2Adapter:
             self._registry.register_entry(cid, OrderSide.BUY, price)
         for price, cid in entry_sells:
             self._registry.register_entry(cid, OrderSide.SELL, price)
-        for exit_cid, exit_order in zip(exit_cids, inferred_exits, strict=True):
+        # Register only exits with exchange CIDs (F2 synthetic exits have no CID yet).
+        for exit_cid, exit_order in zip(exit_cids, inferred_exits, strict=False):
             self._registry.register_exit(exit_cid, exit_order.exit_order_id, exit_order.lot_id)
 
         # Recover seq counters (22.10)

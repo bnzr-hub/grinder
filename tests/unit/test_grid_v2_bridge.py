@@ -928,11 +928,11 @@ class TestEngineStartupRecenterOnFlat:
 class TestEngineNonFlatFailClosed:
     """P0-2: Non-flat position + no g-orders must fail-closed."""
 
-    def test_non_flat_no_orders_blocks_startup(
+    def test_non_flat_no_orders_triggers_f2_recovery(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Non-flat position with no grid_v2 orders → startup blocked, no actions."""
+        """Non-flat position with no grid_v2 orders → F2 protective recovery."""
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         from grinder.account.contracts import AccountSnapshot, PositionSnap  # noqa: PLC0415
@@ -985,14 +985,262 @@ class TestEngineNonFlatFailClosed:
 
         output = engine.process_snapshot(snapshot)
 
-        # Startup should have been attempted but blocked (non-flat, no g-orders)
+        # F2 recovery: startup succeeds with protective exits
         assert engine._grid_v2_started is True
         assert engine._grid_v2_bridge is not None
-        # Bridge reconstruction_ok stays False → _is_grid_v2_active() = False
-        assert engine._grid_v2_bridge.reconstruction_ok is False
-        # No actions dispatched (blocked mode)
-        executed = [a for a in output.live_actions if a.status.value == "EXECUTED"]
-        assert len(executed) == 0
+        assert engine._grid_v2_bridge.reconstruction_ok is True
+        assert engine._grid_v2_bridge.f2_protective_recovery is True
+        # Protective reduce-only SELL exit dispatched in live_actions
+        f2_actions = [a for a in output.live_actions if "F2_PROTECTIVE" in (a.action.reason or "")]
+        assert len(f2_actions) == 1
+        assert f2_actions[0].action.reduce_only is True
+        assert f2_actions[0].action.side == OrderSide.SELL  # LONG pos → SELL exit
+
+
+class TestF2ProtectiveRecovery:
+    """F2 hotfix: non-flat startup without exits → protective recovery."""
+
+    def test_f2_recovery_blocks_increase_risk_entries(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F2 recovery emits only reduce-risk exits, no PLACE_ENTRY."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, PositionSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(
+                PositionSnap(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    qty=Decimal("0.01"),
+                    entry_price=Decimal("50000"),
+                    mark_price=Decimal("50100"),
+                    unrealized_pnl=Decimal("1"),
+                    leverage=1,
+                    ts=_BASE_TS,
+                ),
+            ),
+            open_orders=(),
+            ts=_BASE_TS,
+            source="test",
+        )
+
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+
+        output = engine.process_snapshot(snap)
+
+        # All emitted grid actions must be reduce-only (no entries)
+        for la in output.live_actions:
+            if la.action.action_type.value == "PLACE" and "grid_v2" in (la.action.reason or ""):
+                assert la.action.reduce_only is True, (
+                    f"F2 recovery must not place increase-risk entries: {la.action.reason}"
+                )
+
+    def test_f2_recovery_short_position(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F2 recovery with SHORT position → protective BUY exit."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, PositionSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(
+                PositionSnap(
+                    symbol="BTCUSDT",
+                    side="SHORT",
+                    qty=Decimal("-0.01"),
+                    entry_price=Decimal("50000"),
+                    mark_price=Decimal("49900"),
+                    unrealized_pnl=Decimal("1"),
+                    leverage=1,
+                    ts=_BASE_TS,
+                ),
+            ),
+            open_orders=(),
+            ts=_BASE_TS,
+            source="test",
+        )
+
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+
+        output = engine.process_snapshot(snap)
+
+        f2_actions = [a for a in output.live_actions if "F2_PROTECTIVE" in (a.action.reason or "")]
+        assert len(f2_actions) == 1
+        assert f2_actions[0].action.side == OrderSide.BUY  # SHORT pos → BUY exit
+        assert f2_actions[0].action.reduce_only is True
+
+    def test_f2_recovery_idempotent_restart(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repeated restart with F2 produces same single protective exit."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, PositionSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        def _make_engine() -> LiveEngineV0:
+            e = LiveEngineV0(
+                paper_engine=MagicMock(),
+                exchange_port=MagicMock(),
+                config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+            )
+            e._last_account_snapshot = AccountSnapshot(
+                positions=(
+                    PositionSnap(
+                        symbol="BTCUSDT",
+                        side="LONG",
+                        qty=Decimal("0.01"),
+                        entry_price=Decimal("50000"),
+                        mark_price=Decimal("50100"),
+                        unrealized_pnl=Decimal("1"),
+                        leverage=1,
+                        ts=_BASE_TS,
+                    ),
+                ),
+                open_orders=(),
+                ts=_BASE_TS,
+                source="test",
+            )
+            return e
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+
+        out1 = _make_engine().process_snapshot(snap)
+        out2 = _make_engine().process_snapshot(snap)
+
+        f2_1 = [a for a in out1.live_actions if "F2_PROTECTIVE" in (a.action.reason or "")]
+        f2_2 = [a for a in out2.live_actions if "F2_PROTECTIVE" in (a.action.reason or "")]
+        assert len(f2_1) == len(f2_2) == 1
+
+    def test_f2_awaiting_sync_clears_on_definitive_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If F2 protective exit is BLOCKED/SKIPPED, awaiting_sync must clear (no deadlock)."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, PositionSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        # NOT armed → all PLACEs will be BLOCKED by gate
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW", "0")
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=False, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(
+                PositionSnap(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    qty=Decimal("0.01"),
+                    entry_price=Decimal("50000"),
+                    mark_price=Decimal("50100"),
+                    unrealized_pnl=Decimal("1"),
+                    leverage=1,
+                    ts=_BASE_TS,
+                ),
+            ),
+            open_orders=(),
+            ts=_BASE_TS,
+            source="test",
+        )
+
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+
+        engine.process_snapshot(snap)
+
+        # Not armed → protective exit BLOCKED → awaiting_sync must clear (not deadlock)
+        assert engine._grid_v2_awaiting_sync is False, (
+            "awaiting_sync must clear when all F2 protective seeds fail definitively"
+        )
 
 
 class TestEngineCancelAckRouting:
@@ -2614,11 +2862,11 @@ class TestFullLifecycle:
 class TestEngineBlockedBypassesCycleLayer:
     """P0: blocked grid_v2 + cycle layer enabled => zero dispatched actions."""
 
-    def test_blocked_grid_v2_no_cycle_layer_actions(
+    def test_f2_recovery_grid_v2_no_cycle_layer_actions(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """When grid_v2 startup is blocked, cycle layer must NOT add actions."""
+        """F2 recovery: cycle layer gated while awaiting protective exit sync."""
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         from grinder.account.contracts import AccountSnapshot, PositionSnap  # noqa: PLC0415
@@ -2639,7 +2887,7 @@ class TestEngineBlockedBypassesCycleLayer:
             config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
         )
 
-        # Non-flat position, no grid_v2 orders → startup blocked
+        # Non-flat position, no grid_v2 orders → F2 recovery
         engine._last_account_snapshot = AccountSnapshot(
             positions=(
                 PositionSnap(
@@ -2671,9 +2919,14 @@ class TestEngineBlockedBypassesCycleLayer:
 
         output = engine.process_snapshot(snap)
 
-        # Blocked: no actions at all, even with cycle layer enabled
-        executed = [a for a in output.live_actions if a.status.value == "EXECUTED"]
-        assert len(executed) == 0, "Blocked grid_v2 must not dispatch cycle layer actions"
+        # F2 recovery succeeds, but awaiting_sync gates cycle layer
+        assert engine._grid_v2_bridge is not None
+        assert engine._grid_v2_bridge.f2_protective_recovery is True
+        assert engine._grid_v2_awaiting_sync is True
+        # Only protective exit actions (no cycle layer actions)
+        grid_actions = [a for a in output.live_actions if "grid_v2" in (a.action.reason or "")]
+        for a in grid_actions:
+            assert a.action.reason == "grid_v2_F2_PROTECTIVE_EXIT"
 
 
 class TestEngineBlockedBypassesReplenish:

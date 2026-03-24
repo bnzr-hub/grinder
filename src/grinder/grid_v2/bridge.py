@@ -115,6 +115,11 @@ class GridV2Bridge:
         return self._reconstruction_ok
 
     @property
+    def f2_protective_recovery(self) -> bool:
+        """True if startup recovered from F2 (non-flat, no exits on exchange)."""
+        return self._adapter.f2_protective_recovery
+
+    @property
     def failed_reason(self) -> str | None:
         return self._failed_reason
 
@@ -170,6 +175,33 @@ class GridV2Bridge:
                 self._failed_reason,
             )
             return False
+
+    def get_f2_protective_exit_actions(self, ts: int) -> tuple[ExecutionAction, ...]:
+        """Generate PLACE_EXIT actions for F2 protective recovery.
+
+        Called once after startup when f2_protective_recovery is True.
+        Creates real CIDs, registers exits, and returns reduce-only PLACE actions.
+        """
+        if not self._adapter.f2_protective_recovery or self._sm is None:
+            return ()
+
+        result: list[ExecutionAction] = []
+        for exit_order in self._sm.snapshot.exit_orders:
+            cid = self._adapter.generate_exit_cid(ts)
+            self._adapter.registry.register_exit(cid, exit_order.exit_order_id, exit_order.lot_id)
+            result.append(
+                ExecutionAction(
+                    action_type=ActionType.PLACE,
+                    symbol=self._symbol,
+                    side=exit_order.side,
+                    price=self._quantize_price(exit_order.price, exit_order.side),
+                    quantity=exit_order.qty,
+                    client_order_id=cid,
+                    reason="grid_v2_F2_PROTECTIVE_EXIT",
+                    reduce_only=True,
+                )
+            )
+        return tuple(result)
 
     def startup_fresh(
         self,
