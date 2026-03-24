@@ -655,6 +655,9 @@ class LiveEngineV0:
             os.environ.get("GRINDER_GRID_V2_GEOMETRY_COOLDOWN_MS", "5000")
         )
         self._grid_v2_geometry_last_repair_ts = 0
+        self._grid_v2_repair_strict_geometry = parse_bool(
+            "GRINDER_GRID_V2_REPAIR_STRICT_GEOMETRY", default=False, strict=False
+        )
         # Adaptive Step Controller v1 (volatility-aware grid spacing)
         # Must be initialized BEFORE _create_grid_v2_bridge() so effective step
         # is available on cold start, not only on subsequent recreations.
@@ -1276,7 +1279,9 @@ class LiveEngineV0:
         return actions
 
     def _grid_v2_integrity_repair(  # noqa: PLR0911, PLR0912, PLR0915
-        self, snapshot: Snapshot
+        self,
+        snapshot: Snapshot,
+        planned_slots_this_tick: set[tuple[OrderSide, Decimal]] | None = None,
     ) -> list[ExecutionAction]:
         """Continuously validate grid integrity and auto-repair drift."""
         if not self._is_grid_v2_active(snapshot.symbol):
@@ -1494,25 +1499,33 @@ class LiveEngineV0:
                 )
 
             # Place missing entries with anti-churn guards:
+            # 0) Skip if slot already planned by fill path this tick (same-tick dedup)
             # 1) Skip if slot already pending (pending_place_cids dedup)
-            # 2) Skip if too far from mid (distance guard)
+            # 2) Skip if too far from mid (distance guard) — unless strict geometry
             # 3) Cap total PLACE actions per repair cycle (budget guard)
             pending_prices = self._grid_v2_pending_place_entry_prices(bridge)
+            planned_this_tick = planned_slots_this_tick or set()
             mid = snapshot.mid_price
             step = bridge._config.grid_step_pct
             max_dist = self._grid_v2_repair_max_distance_steps
             budget = self._grid_v2_repair_max_actions
+            strict_geo = self._grid_v2_repair_strict_geometry
 
             intents: list[ActionIntent] = []
             skipped_pending = 0
             skipped_distance = 0
+            skipped_planned_slot = 0
             for side, price in sorted(missing, key=lambda item: (item[0].value, item[1])):
+                # Guard 0: same-tick fill dedup
+                if (side, price) in planned_this_tick:
+                    skipped_planned_slot += 1
+                    continue
                 # Guard 1: pending slot dedup
                 if (side, price) in pending_prices:
                     skipped_pending += 1
                     continue
-                # Guard 2: distance from mid
-                if mid > 0:
+                # Guard 2: distance from mid (bypassed in strict geometry mode)
+                if mid > 0 and not strict_geo:
                     distance_steps = float(abs(price - mid) / mid / step)
                     if distance_steps > max_dist:
                         skipped_distance += 1
@@ -1540,11 +1553,12 @@ class LiveEngineV0:
                         reason="INTEGRITY_REPAIR",
                     )
                 )
-            if skipped_pending or skipped_distance:
+            if skipped_pending or skipped_distance or skipped_planned_slot:
                 logger.info(
-                    "GRID_V2_REPAIR_GUARDS symbol=%s skipped_pending=%d skipped_distance=%d "
-                    "budget_used=%d/%d",
+                    "GRID_V2_REPAIR_GUARDS symbol=%s skipped_planned_slot=%d "
+                    "skipped_pending=%d skipped_distance=%d budget_used=%d/%d",
                     snapshot.symbol,
+                    skipped_planned_slot,
                     skipped_pending,
                     skipped_distance,
                     len(intents),
@@ -1620,6 +1634,22 @@ class LiveEngineV0:
             if reg is not None:
                 result.add((reg.side, reg.price))
         return result
+
+    @staticmethod
+    def _extract_planned_entry_slots(
+        actions: list[ExecutionAction],
+    ) -> set[tuple[OrderSide, Decimal]]:
+        """Extract (side, price) slots from PLACE actions in fill-path output."""
+        slots: set[tuple[OrderSide, Decimal]] = set()
+        for a in actions:
+            if (
+                a.action_type == ActionType.PLACE
+                and a.side is not None
+                and a.price is not None
+                and "ENTRY" in a.reason.upper()
+            ):
+                slots.add((a.side, a.price))
+        return slots
 
     def _grid_v2_dispatch_immediate_actions(
         self,
@@ -2102,7 +2132,12 @@ class LiveEngineV0:
                     snapshot.symbol,
                     snapshot.ts,
                 )
-                grid_v2_integrity_actions = self._grid_v2_integrity_repair(snapshot)
+                # Same-tick dedup: extract PLACE_ENTRY slots from fill path
+                # to prevent integrity repair from duplicating them.
+                planned_slots = self._extract_planned_entry_slots(grid_v2_fill_actions)
+                grid_v2_integrity_actions = self._grid_v2_integrity_repair(
+                    snapshot, planned_slots_this_tick=planned_slots
+                )
             else:
                 grid_v2_fill_actions = []
                 grid_v2_integrity_actions = []
