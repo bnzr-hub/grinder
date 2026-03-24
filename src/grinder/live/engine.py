@@ -129,6 +129,9 @@ _CONVERGENCE_TIMEOUT_MS = 30_000  # 30s safety valve for inflight latch
 _GRID_V2_INTEGRITY_MISMATCH_STREAK = 2
 _GRID_V2_INTEGRITY_REPAIR_COOLDOWN_MS = 5_000
 _GRID_V2_INTEGRITY_MISMATCH_WINDOW_MS = 30_000
+# Anti-churn guard defaults (env-overridable)
+_GRID_V2_REPAIR_MAX_DISTANCE_STEPS = 5.0  # max distance from mid in grid steps
+_GRID_V2_REPAIR_MAX_ACTIONS_PER_CYCLE = 5  # max PLACE actions per repair cycle
 
 
 @dataclass
@@ -616,6 +619,17 @@ class LiveEngineV0:
         self._grid_v2_integrity_mismatch_streak = 0
         self._grid_v2_integrity_mismatch_last_ts = 0
         self._grid_v2_integrity_repair_cooldown_until_ts = 0
+        self._grid_v2_repair_max_distance_steps = float(
+            os.environ.get(
+                "GRINDER_GRID_V2_REPAIR_MAX_DISTANCE_STEPS", str(_GRID_V2_REPAIR_MAX_DISTANCE_STEPS)
+            )
+        )
+        self._grid_v2_repair_max_actions = int(
+            os.environ.get(
+                "GRINDER_GRID_V2_REPAIR_MAX_ACTIONS_PER_CYCLE",
+                str(_GRID_V2_REPAIR_MAX_ACTIONS_PER_CYCLE),
+            )
+        )
         if self._grid_v2_enabled:
             if not self._grid_v2_symbol:
                 raise ValueError(
@@ -1330,9 +1344,34 @@ class LiveEngineV0:
                     )
                 )
 
-            # Place missing entries; drop stale registry slots first if they disappeared on exchange.
+            # Place missing entries with anti-churn guards:
+            # 1) Skip if slot already pending (pending_place_cids dedup)
+            # 2) Skip if too far from mid (distance guard)
+            # 3) Cap total PLACE actions per repair cycle (budget guard)
+            pending_prices = self._grid_v2_pending_place_entry_prices(bridge)
+            mid = snapshot.mid_price
+            step = bridge._config.grid_step_pct
+            max_dist = self._grid_v2_repair_max_distance_steps
+            budget = self._grid_v2_repair_max_actions
+
             intents: list[ActionIntent] = []
+            skipped_pending = 0
+            skipped_distance = 0
             for side, price in sorted(missing, key=lambda item: (item[0].value, item[1])):
+                # Guard 1: pending slot dedup
+                if (side, price) in pending_prices:
+                    skipped_pending += 1
+                    continue
+                # Guard 2: distance from mid
+                if mid > 0:
+                    distance_steps = float(abs(price - mid) / mid / step)
+                    if distance_steps > max_dist:
+                        skipped_distance += 1
+                        continue
+                # Guard 3: budget cap
+                if len(intents) >= budget:
+                    break
+
                 stale_cid = bridge.adapter.registry.cid_for_entry(side, price)
                 if stale_cid is not None and stale_cid not in current_cids:
                     bridge.adapter.confirm_cancel_entry(stale_cid)
@@ -1351,6 +1390,16 @@ class LiveEngineV0:
                         qty=bridge._config.order_size,
                         reason="INTEGRITY_REPAIR",
                     )
+                )
+            if skipped_pending or skipped_distance:
+                logger.info(
+                    "GRID_V2_REPAIR_GUARDS symbol=%s skipped_pending=%d skipped_distance=%d "
+                    "budget_used=%d/%d",
+                    snapshot.symbol,
+                    skipped_pending,
+                    skipped_distance,
+                    len(intents),
+                    budget,
                 )
             if intents:
                 try:
@@ -1371,6 +1420,17 @@ class LiveEngineV0:
                 len(repair_actions),
             )
         return list(repair_actions)
+
+    def _grid_v2_pending_place_entry_prices(
+        self, bridge: GridV2Bridge
+    ) -> set[tuple[OrderSide, Decimal]]:
+        """Get (side, price) set for entries with pending PLACE CIDs."""
+        result: set[tuple[OrderSide, Decimal]] = set()
+        for cid in self._grid_v2_pending_place_cids:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is not None:
+                result.add((reg.side, reg.price))
+        return result
 
     def _grid_v2_dispatch_immediate_actions(
         self,
