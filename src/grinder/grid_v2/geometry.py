@@ -73,12 +73,17 @@ def match_entries_with_tolerance(
                 best_key = act_key
 
         if best_key is not None:
+            # Within epsilon = fully matched, no repair needed.
+            # The order is "close enough" — silent match.
             matched.add((exp_side, exp_price))
             actual_used.add(best_key)
-            if best_key != exact_key:
-                cid = actual_entries[best_key]
-                geometry_mismatches.append((exp_side, exp_price, best_key[1], cid))
 
     truly_missing = expected_keys - matched
     truly_extra = set(actual_entries.keys()) - actual_used
+
+    # Geometry mismatches: orders in truly_extra that are close to a truly_missing
+    # expected key but outside epsilon. These need cancel+place correction.
+    # (Orders within epsilon were already silently matched above.)
+    # For v1: truly_extra/truly_missing are handled by structural repair.
+    # geometry_mismatches is empty — all fuzzy matches are accepted as-is.
     return matched, truly_missing, truly_extra, geometry_mismatches

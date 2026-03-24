@@ -52,22 +52,17 @@ class TestMatchEntriesWithTolerance:
         assert not extra
         assert not geo
 
-    def test_geometry_mismatch_detected(self) -> None:
-        """Order exists but price off by 1 tick (within epsilon) -> geometry mismatch."""
+    def test_within_epsilon_silently_matched(self) -> None:
+        """Order within epsilon = silently matched, no geometry mismatch, no repair."""
         expected = {("BUY", Decimal("100.00"))}
-        actual = {("BUY", Decimal("100.10")): "cid_b"}  # 1 tick off
+        actual = {("BUY", Decimal("100.10")): "cid_b"}  # 1 tick off, within epsilon=1
         matched, missing, extra, geo = match_entries_with_tolerance(
             expected, actual, Decimal("0.10"), epsilon_ticks=1
         )
         assert len(matched) == 1
         assert not missing
         assert not extra
-        assert len(geo) == 1
-        side, exp_p, act_p, cid = geo[0]
-        assert side == "BUY"
-        assert exp_p == Decimal("100.00")
-        assert act_p == Decimal("100.10")
-        assert cid == "cid_b"
+        assert not geo  # within epsilon = no mismatch, no repair
 
     def test_beyond_epsilon_is_structural(self) -> None:
         """Order too far from expected -> structural missing + extra."""
@@ -96,8 +91,7 @@ class TestMatchEntriesWithTolerance:
         assert len(matched) == 2
         assert not missing
         assert not extra
-        assert len(geo) == 1
-        assert geo[0][0] == "SELL"
+        assert not geo  # within epsilon = silently matched
 
     def test_truly_missing_entry(self) -> None:
         expected = {("BUY", Decimal("100.00")), ("SELL", Decimal("101.00"))}
@@ -128,13 +122,13 @@ class TestMatchEntriesWithTolerance:
         """Same inputs -> same outputs on repeated calls."""
         expected = {("BUY", Decimal("100.00")), ("SELL", Decimal("101.00"))}
         actual = {
-            ("BUY", Decimal("100.10")): "cid_b",
-            ("SELL", Decimal("101.10")): "cid_s",
+            ("BUY", Decimal("100.30")): "cid_b",  # outside epsilon=1
+            ("SELL", Decimal("101.30")): "cid_s",  # outside epsilon=1
         }
         results = []
         for _ in range(3):
-            _, _, _, geo = match_entries_with_tolerance(
+            _matched, missing, extra, _geo = match_entries_with_tolerance(
                 expected, actual, Decimal("0.10"), epsilon_ticks=1
             )
-            results.append([(g[0], str(g[1]), str(g[2]), g[3]) for g in geo])
+            results.append(sorted((str(m), str(e)) for m in missing for e in extra))
         assert results[0] == results[1] == results[2]
