@@ -1511,3 +1511,107 @@ class TestCleanupStructural:
         assert not hasattr(result, "realized_pnl")
         assert not hasattr(result, "unrealized_pnl")
         assert not hasattr(result, "pnl")
+
+
+# ---------------------------------------------------------------------------
+# Net-off tests (Variant B: opposite fill closes lot)
+# ---------------------------------------------------------------------------
+
+
+def _netoff_config() -> GridV2Config:
+    """Config with netoff enabled, reusing _config defaults."""
+    base = _config()
+    return GridV2Config(
+        grid_step_pct=base.grid_step_pct,
+        entry_levels_per_side=base.entry_levels_per_side,
+        order_size=base.order_size,
+        max_inventory_levels=base.max_inventory_levels,
+        max_inventory_notional_usd=base.max_inventory_notional_usd,
+        price_tick_size=base.price_tick_size,
+        reseed_on_flat=base.reseed_on_flat,
+        netoff_enabled=True,
+    )
+
+
+class TestNetOff:
+    """Variant B: opposite-side entry fill closes closest lot (net-off)."""
+
+    def test_long_sell_fill_closes_lot(self) -> None:
+        """LONG + SELL entry fill → close LONG lot, no SHORT lot opened."""
+        sm = GridV2StateMachine.create_initial(_netoff_config(), _REF_PRICE, _BASE_TS)
+        buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("e1", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1))
+        assert sm.snapshot.mode == BranchMode.LONG_BRANCH
+        assert len(sm.snapshot.open_lots) == 1
+
+        sell_price = sm.snapshot.entry_window.sell_entry_prices[0]
+        r = sm.apply(EntryFilled("e2", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 2))
+        assert not r.rejected
+        assert sm.snapshot.mode == BranchMode.FLAT  # type: ignore[comparison-overlap]
+        assert len(sm.snapshot.open_lots) == 0
+        # No SHORT lot should exist
+        assert all(lot.side != LotSide.SHORT for lot in sm.snapshot.open_lots)
+
+    def test_short_buy_fill_closes_lot(self) -> None:
+        """SHORT + BUY entry fill → close SHORT lot."""
+        sm = GridV2StateMachine.create_initial(_netoff_config(), _REF_PRICE, _BASE_TS)
+        sell_price = sm.snapshot.entry_window.sell_entry_prices[0]
+        sm.apply(EntryFilled("e1", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 1))
+        assert sm.snapshot.mode == BranchMode.SHORT_BRANCH
+
+        buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
+        r = sm.apply(EntryFilled("e2", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 2))
+        assert not r.rejected
+        assert sm.snapshot.mode == BranchMode.FLAT  # type: ignore[comparison-overlap]
+        assert len(sm.snapshot.open_lots) == 0
+
+    def test_partial_netoff_stays_in_branch(self) -> None:
+        """2 LONG lots + 1 SELL fill → 1 LONG lot remains, mode stays LONG_BRANCH."""
+        sm = GridV2StateMachine.create_initial(_netoff_config(), _REF_PRICE, _BASE_TS)
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("e1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
+        buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("e2", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 2))
+        assert len(sm.snapshot.open_lots) == 2
+
+        sell_price = sm.snapshot.entry_window.sell_entry_prices[0]
+        r = sm.apply(EntryFilled("e3", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 3))
+        assert not r.rejected
+        assert sm.snapshot.mode == BranchMode.LONG_BRANCH
+        assert len(sm.snapshot.open_lots) == 1
+
+    def test_netoff_cancels_paired_exit(self) -> None:
+        """Net-off emits CANCEL_EXIT for the closed lot's paired exit."""
+        sm = GridV2StateMachine.create_initial(_netoff_config(), _REF_PRICE, _BASE_TS)
+        buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("e1", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1))
+
+        sell_price = sm.snapshot.entry_window.sell_entry_prices[0]
+        r = sm.apply(EntryFilled("e2", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 2))
+        cancel_exit_actions = [a for a in r.actions if a.kind == ActionIntentKind.CANCEL_EXIT]
+        assert len(cancel_exit_actions) == 1
+        assert cancel_exit_actions[0].reason == "NETOFF_CANCEL_PAIRED_EXIT"
+
+    def test_netoff_disabled_rejects_as_branch_incompatible(self) -> None:
+        """With netoff disabled (default), opposite fill is still BRANCH_INCOMPATIBLE."""
+        sm = GridV2StateMachine.create_initial(_config(), _REF_PRICE, _BASE_TS)
+        buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("e1", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1))
+
+        sell_price = sm.snapshot.entry_window.sell_entry_prices[0]
+        r = sm.apply(EntryFilled("e2", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 2))
+        assert r.rejected
+        assert r.reject_reason == "BRANCH_INCOMPATIBLE"
+
+    def test_netoff_mixed_inventory_impossible(self) -> None:
+        """Net-off never creates mixed inventory (LONG + SHORT simultaneously)."""
+        sm = GridV2StateMachine.create_initial(_netoff_config(), _REF_PRICE, _BASE_TS)
+        buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("e1", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1))
+
+        sell_price = sm.snapshot.entry_window.sell_entry_prices[0]
+        sm.apply(EntryFilled("e2", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 2))
+
+        # After net-off, should be FLAT — no mixed lots
+        sides = {lot.side for lot in sm.snapshot.open_lots}
+        assert len(sides) <= 1  # only one side or empty

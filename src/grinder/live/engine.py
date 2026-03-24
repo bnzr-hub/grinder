@@ -690,6 +690,11 @@ class LiveEngineV0:
                 default=True,
                 strict=False,
             ),
+            netoff_enabled=parse_bool(
+                "GRINDER_GRID_V2_NETOFF_ENABLED",
+                default=False,
+                strict=False,
+            ),
         )
         return GridV2Bridge(config, self._grid_v2_symbol)
 

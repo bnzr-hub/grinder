@@ -285,7 +285,7 @@ SSOT for order ownership.
 * no short lots allowed
 * each long lot has paired sell exit
 * entry window stays two-sided but rolls with each accepted buy fill
-* opposite-side sell-entry fills are rejected while mode remains `LONG_BRANCH` (`BRANCH_INCOMPATIBLE`)
+* opposite-side sell-entry fills: when `GRINDER_GRID_V2_NETOFF_ENABLED=1`, closes closest LONG lot (net-off); when disabled, rejected as `BRANCH_INCOMPATIBLE`
 
 ### 8.3 SHORT_BRANCH
 
@@ -293,7 +293,7 @@ SSOT for order ownership.
 * no long lots allowed
 * each short lot has paired buy exit
 * entry window stays two-sided but rolls with each accepted sell fill
-* opposite-side buy-entry fills are rejected while mode remains `SHORT_BRANCH` (`BRANCH_INCOMPATIBLE`)
+* opposite-side buy-entry fills: when `GRINDER_GRID_V2_NETOFF_ENABLED=1`, closes closest SHORT lot (net-off); when disabled, rejected as `BRANCH_INCOMPATIBLE`
 
 ---
 
@@ -465,14 +465,14 @@ Recenter forbidden if ANY condition true:
 * maintain buy-entry chain below (up to `N_buy` levels)
 * maintain sell-entry chain above (opposite side, trimmed by rolling)
 * sell-exit orders above for open long lots
-* opposite-side fill attempts are rejected by branch gate (`BRANCH_INCOMPATIBLE`)
+* opposite-side sell-entry fills: when `netoff_enabled`, close closest LONG lot (net-off); otherwise rejected as `BRANCH_INCOMPATIBLE`
 
 ### During SHORT_BRANCH
 
 * maintain sell-entry chain above (up to `N_sell` levels)
 * maintain buy-entry chain below (opposite side, trimmed by rolling)
 * buy-exit orders below for open short lots
-* opposite-side fill attempts are rejected by branch gate (`BRANCH_INCOMPATIBLE`)
+* opposite-side buy-entry fills: when `netoff_enabled`, close closest SHORT lot (net-off); otherwise rejected as `BRANCH_INCOMPATIBLE`
 
 ---
 
@@ -852,7 +852,7 @@ Closed set of `reason` strings for `ActionIntent`:
 | `"MAX_INVENTORY_LEVELS"` | at lot count cap |
 | `"MAX_INVENTORY_NOTIONAL_USD"` | at notional cap (21.10) |
 | `"DUPLICATE_ENTRY_FILL"` | same order_id already sourced a lot (I8) |
-| `"BRANCH_INCOMPATIBLE"` | BUY in SHORT or SELL in LONG (I4) |
+| `"BRANCH_INCOMPATIBLE"` | BUY in SHORT or SELL in LONG (I4). When `netoff_enabled=True`, this triggers net-off (close closest lot) instead of rejection. |
 | `"UNKNOWN_LOT_ID"` | ExitFilled for nonexistent lot (21.5) |
 | `"UNKNOWN_EXIT_ORDER_ID"` | ExitFilled for nonexistent exit (21.5) |
 | `"EXIT_LOT_MISMATCH"` | exit.lot_id != event.lot_id (21.5) |

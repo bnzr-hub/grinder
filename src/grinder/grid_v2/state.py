@@ -74,6 +74,7 @@ class GridV2Config:
     reseed_on_flat_only_on_skew: bool = (
         True  # Default: in preserve mode, reseed only when BUY/SELL ladder is skewed
     )
+    netoff_enabled: bool = False  # When True, opposite-side entry fill = close lot (net-off)
 
     def __post_init__(self) -> None:
         if self.grid_step_pct <= 0:
@@ -393,6 +394,9 @@ class GridV2StateMachine:
     def _apply_entry_filled(self, event: EntryFilled) -> TransitionResult:
         rejection = self._validate_entry(event)
         if rejection is not None:
+            # Net-off: opposite-side entry fill closes closest lot instead of rejecting
+            if rejection.reject_reason == "BRANCH_INCOMPATIBLE" and self._config.netoff_enabled:
+                return self._execute_netoff(event)
             return rejection
         return self._execute_entry(event)
 
@@ -490,6 +494,95 @@ class GridV2StateMachine:
             open_lots=(*snap.open_lots, lot),
             closed_lots=snap.closed_lots,
             exit_orders=(*snap.exit_orders, exit_order),
+            emergency_stopped=snap.emergency_stopped,
+            last_recenter_ts=snap.last_recenter_ts,
+        )
+        return self._commit(new_snapshot, tuple(actions))
+
+    def _execute_netoff(self, event: EntryFilled) -> TransitionResult:
+        """Close closest lot via opposite-side entry fill (net-off).
+
+        LONG + SELL fill → close closest LONG lot.
+        SHORT + BUY fill → close closest SHORT lot.
+        """
+        snap = self._snapshot
+
+        # Find closest lot to fill price
+        closest_lot: InventoryLot | None = None
+        closest_distance = Decimal("Infinity")
+        for lot in snap.open_lots:
+            dist = abs(lot.entry_price - event.price)
+            if dist < closest_distance:
+                closest_distance = dist
+                closest_lot = lot
+
+        if closest_lot is None:
+            return self._reject("NETOFF_NO_LOT_TO_CLOSE")
+
+        # Close the lot
+        closed_lot = InventoryLot(
+            lot_id=closest_lot.lot_id,
+            side=closest_lot.side,
+            entry_price=closest_lot.entry_price,
+            qty=closest_lot.qty,
+            opened_at_ts=closest_lot.opened_at_ts,
+            source_entry_order_id=closest_lot.source_entry_order_id,
+            exit_price=event.price,
+            exit_order_id=closest_lot.exit_order_id,
+            status=LotStatus.CLOSED,
+        )
+
+        # Cancel the paired exit order
+        actions: list[ActionIntent] = []
+        target_exit: ExitOrder | None = None
+        for eo in snap.exit_orders:
+            if eo.lot_id == closest_lot.lot_id and eo.status == ExitOrderStatus.OPEN:
+                target_exit = eo
+                break
+
+        if target_exit is not None:
+            actions.append(
+                ActionIntent(
+                    kind=ActionIntentKind.CANCEL_EXIT,
+                    side=target_exit.side,
+                    price=target_exit.price,
+                    qty=target_exit.qty,
+                    lot_id=target_exit.lot_id,
+                    order_id=target_exit.exit_order_id,
+                    reason="NETOFF_CANCEL_PAIRED_EXIT",
+                )
+            )
+
+        new_open = tuple(item for item in snap.open_lots if item.lot_id != closest_lot.lot_id)
+        new_closed = (*snap.closed_lots, closed_lot)
+
+        # Mark paired exit as CANCELED (not FILLED — exit was not filled on exchange)
+        cancelled_exit_id = target_exit.exit_order_id if target_exit else None
+        new_exits = tuple(
+            ExitOrder(
+                exit_order_id=eo.exit_order_id,
+                lot_id=eo.lot_id,
+                side=eo.side,
+                price=eo.price,
+                qty=eo.qty,
+                status=ExitOrderStatus.CANCELED,
+            )
+            if eo.exit_order_id == cancelled_exit_id
+            else eo
+            for eo in snap.exit_orders
+        )
+
+        # Apply rolling window update (entry consumed, extend/trim)
+        new_window, rolling_actions = self._update_window_after_fill(event)
+        actions.extend(rolling_actions)
+
+        new_mode = BranchMode.FLAT if not new_open else snap.mode
+        new_snapshot = GridV2Snapshot(
+            mode=new_mode,
+            entry_window=new_window,
+            open_lots=new_open,
+            closed_lots=new_closed,
+            exit_orders=new_exits,
             emergency_stopped=snap.emergency_stopped,
             last_recenter_ts=snap.last_recenter_ts,
         )
