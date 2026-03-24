@@ -161,6 +161,13 @@ def _extract_binance_error_code(error: str | None) -> int | None:
     return int(m.group(1)) if m else None
 
 
+class GridV2RecoveryMode(Enum):
+    """Startup recovery mode for grid_v2 when reconstruction fails."""
+
+    RESTORE_THEN_BLOCK = "restore_then_block"
+    RESTORE_THEN_CLEANUP_RESEED = "restore_then_cleanup_reseed"
+
+
 class BlockReason(Enum):
     """Reason why an action was blocked at engine level."""
 
@@ -615,9 +622,20 @@ class LiveEngineV0:
                     "GRINDER_GRID_V2_ENABLED=True requires GRINDER_GRID_V2_SYMBOL to be set"
                 )
             self._grid_v2_bridge = self._create_grid_v2_bridge()
+            raw_mode = os.environ.get(
+                "GRINDER_GRID_V2_RECOVERY_MODE", "restore_then_cleanup_reseed"
+            )
+            try:
+                self._grid_v2_recovery_mode = GridV2RecoveryMode(raw_mode)
+            except ValueError:
+                valid = [m.value for m in GridV2RecoveryMode]
+                raise ValueError(
+                    f"Invalid GRINDER_GRID_V2_RECOVERY_MODE={raw_mode!r}, must be one of {valid}"
+                ) from None
             logger.info(
-                "GRID_V2_ENABLED symbol=%s",
+                "GRID_V2_ENABLED symbol=%s recovery_mode=%s",
                 self._grid_v2_symbol,
+                self._grid_v2_recovery_mode.value,
             )
 
         # PR5 (doc-27): Grid V2 shadow mode — run grid_v2 in parallel without dispatch.
@@ -685,7 +703,7 @@ class LiveEngineV0:
             "Set it to the exchange tick size (e.g., 0.10 for BTCUSDT futures)."
         )
 
-    def _grid_v2_try_startup(self, snapshot: Snapshot) -> None:  # noqa: PLR0912
+    def _grid_v2_try_startup(self, snapshot: Snapshot) -> None:  # noqa: PLR0912, PLR0915
         """Attempt grid_v2 bridge startup on first tick with account data.
 
         Fresh start only if no exchange orders AND position is flat.
@@ -718,10 +736,17 @@ class LiveEngineV0:
             ok = bridge.startup(g_orders, pos_qty, snapshot.mid_price, snapshot.ts)
             if not ok:
                 logger.error(
-                    "GRID_V2_STARTUP_FAILED symbol=%s reason=%s",
+                    "GRID_V2_STARTUP_FAILED symbol=%s reason=%s mode=%s",
                     self._grid_v2_symbol,
                     bridge.failed_reason,
+                    self._grid_v2_recovery_mode.value,
                 )
+                if (
+                    self._grid_v2_recovery_mode == GridV2RecoveryMode.RESTORE_THEN_CLEANUP_RESEED
+                    and self._grid_v2_cleanup_and_reseed(snapshot)
+                ):
+                    self._grid_v2_started = True
+                    return
             elif bridge.f2_protective_recovery:
                 # F2 recovery: non-flat position with no exit orders on exchange.
                 # Emit protective reduce-only exits. Block entries until exits confirmed.
@@ -770,10 +795,17 @@ class LiveEngineV0:
             ok = bridge.startup([], pos_qty, snapshot.mid_price, snapshot.ts)
             if not ok:
                 logger.error(
-                    "GRID_V2_STARTUP_FAILED symbol=%s reason=%s",
+                    "GRID_V2_STARTUP_FAILED symbol=%s reason=%s mode=%s",
                     self._grid_v2_symbol,
                     bridge.failed_reason,
+                    self._grid_v2_recovery_mode.value,
                 )
+                if (
+                    self._grid_v2_recovery_mode == GridV2RecoveryMode.RESTORE_THEN_CLEANUP_RESEED
+                    and self._grid_v2_cleanup_and_reseed(snapshot)
+                ):
+                    self._grid_v2_started = True
+                    return
             elif bridge.f2_protective_recovery:
                 f2_exits = bridge.get_f2_protective_exit_actions(snapshot.ts)
                 if f2_exits:
@@ -804,6 +836,76 @@ class LiveEngineV0:
             self._grid_v2_pending_seed_cids = frozenset(
                 ea.client_order_id for ea in seed if ea.client_order_id is not None
             )
+
+    def _grid_v2_cleanup_and_reseed(self, snapshot: Snapshot) -> bool:
+        """Fallback: cleanup exchange state and startup fresh.
+
+        Only runs in restore_then_cleanup_reseed mode after reconstruction failure.
+        Returns True on success, False on failure (fail-closed).
+        """
+        from scripts.exchange_state import cmd_cleanup, cmd_verify_programmatic  # noqa: PLC0415
+
+        symbol = self._grid_v2_symbol
+
+        # Pre-check write gate: cmd_cleanup calls sys.exit(1) without it.
+        allow_write = os.environ.get("ALLOW_MAINNET_TRADE", "").lower() in ("1", "true", "yes")
+        if not allow_write:
+            logger.error(
+                "GRID_V2_RECOVERY_CLEANUP_BLOCKED symbol=%s reason=ALLOW_MAINNET_TRADE_not_set",
+                symbol,
+            )
+            return False
+
+        logger.warning(
+            "GRID_V2_RECOVERY_CLEANUP_RESEED symbol=%s — attempting cleanup fallback",
+            symbol,
+        )
+
+        try:
+            cmd_cleanup(symbol)
+        except BaseException as exc:  # catch SystemExit from cmd_cleanup
+            logger.error(
+                "GRID_V2_RECOVERY_CLEANUP_FAILED symbol=%s reason=%s type=%s",
+                symbol,
+                exc,
+                type(exc).__name__,
+            )
+            return False
+
+        try:
+            ok, orders, position = cmd_verify_programmatic(symbol)
+        except Exception as exc:
+            logger.error(
+                "GRID_V2_RECOVERY_VERIFY_FAILED symbol=%s reason=%s",
+                symbol,
+                exc,
+            )
+            return False
+
+        if not ok:
+            logger.error(
+                "GRID_V2_RECOVERY_VERIFY_DIRTY symbol=%s orders=%d position=%s",
+                symbol,
+                orders,
+                position,
+            )
+            return False
+
+        # Clean state confirmed — fresh start
+        bridge_fresh = self._create_grid_v2_bridge()
+        seed = bridge_fresh.startup_fresh(snapshot.mid_price, snapshot.ts)
+        self._grid_v2_bridge = bridge_fresh
+        self._grid_v2_seed_actions = list(seed)
+        self._grid_v2_awaiting_sync = True
+        self._grid_v2_pending_seed_cids = frozenset(
+            ea.client_order_id for ea in seed if ea.client_order_id is not None
+        )
+        logger.warning(
+            "GRID_V2_RECOVERY_CLEANUP_RESEED_OK symbol=%s seeds=%d",
+            symbol,
+            len(seed),
+        )
+        return True
 
     def _grid_v2_exchange_cids(self, symbol: str) -> set[str]:
         """Get current grid_v2 CIDs on exchange from last account snapshot."""

@@ -5,6 +5,8 @@ from decimal import Decimal
 
 import pytest
 
+from grinder.account.contracts import AccountSnapshot
+from grinder.contracts import Snapshot
 from grinder.core import OrderSide, OrderState
 from grinder.execution.futures_events import FuturesOrderEvent, UserDataEvent, UserDataEventType
 from grinder.execution.types import ActionType, ExecutionAction
@@ -1242,6 +1244,325 @@ class TestF2ProtectiveRecovery:
         assert engine._grid_v2_awaiting_sync is False, (
             "awaiting_sync must clear when all F2 protective seeds fail definitively"
         )
+
+
+class TestGridV2RecoveryModes:
+    """Startup recovery modes: restore_then_block vs restore_then_cleanup_reseed."""
+
+    @staticmethod
+    def _bad_reconstruct_acct() -> AccountSnapshot:
+        """Create account with duplicate grid_v2 entry orders (same side+price = F6 failure)."""
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.grid_v2.adapter import GridV2Adapter  # noqa: PLC0415
+
+        adapter = GridV2Adapter(_config(), "BTCUSDT")
+        cid1 = adapter.generate_entry_cid(_BASE_TS)
+        cid2 = adapter.generate_entry_cid(_BASE_TS)
+
+        return AccountSnapshot(
+            positions=(),
+            open_orders=(
+                OpenOrderSnap(
+                    order_id=cid1,
+                    symbol="BTCUSDT",
+                    side="BUY",
+                    order_type="LIMIT",
+                    price=Decimal("49875"),
+                    qty=Decimal("0.01"),
+                    filled_qty=Decimal("0"),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS,
+                ),
+                OpenOrderSnap(
+                    order_id=cid2,
+                    symbol="BTCUSDT",
+                    side="BUY",
+                    order_type="LIMIT",
+                    price=Decimal("49875"),  # same price = F6 duplicate
+                    qty=Decimal("0.01"),
+                    filled_qty=Decimal("0"),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS,
+                ),
+            ),
+            ts=_BASE_TS,
+            source="test",
+        )
+
+    @staticmethod
+    def _snap() -> Snapshot:
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+
+        return Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+
+    def test_default_mode_is_restore_then_cleanup_reseed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With env unset, engine chooses cleanup-reseed as default."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import GridV2RecoveryMode, LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.delenv("GRINDER_GRID_V2_RECOVERY_MODE", raising=False)
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        assert engine._grid_v2_recovery_mode == GridV2RecoveryMode.RESTORE_THEN_CLEANUP_RESEED
+
+    def test_explicit_restore_then_block_mode_parsed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Explicit restore_then_block mode is respected."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import GridV2RecoveryMode, LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("GRINDER_GRID_V2_RECOVERY_MODE", "restore_then_block")
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        assert engine._grid_v2_recovery_mode == GridV2RecoveryMode.RESTORE_THEN_BLOCK
+
+    def test_invalid_recovery_mode_raises_at_init(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Bad env value → fail-fast ValueError at init."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("GRINDER_GRID_V2_RECOVERY_MODE", "bad_value")
+
+        with pytest.raises(ValueError, match="Invalid GRINDER_GRID_V2_RECOVERY_MODE"):
+            LiveEngineV0(
+                paper_engine=MagicMock(),
+                exchange_port=MagicMock(),
+                config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+            )
+
+    def test_restore_then_block_on_reconstruct_fail(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Block mode: reconstruction fail → no dispatch, blocked state."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("GRINDER_GRID_V2_RECOVERY_MODE", "restore_then_block")
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        engine._last_account_snapshot = self._bad_reconstruct_acct()
+        engine.process_snapshot(self._snap())
+
+        assert engine._grid_v2_started is True
+        assert engine._grid_v2_bridge is not None
+        assert engine._grid_v2_bridge.reconstruction_ok is False
+
+    def test_restore_then_cleanup_reseed_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Cleanup-reseed mode: reconstruction fail → cleanup → fresh seed."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        import scripts.exchange_state as es_mod  # noqa: PLC0415
+
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("ALLOW_MAINNET_TRADE", "1")
+        monkeypatch.delenv("GRINDER_GRID_V2_RECOVERY_MODE", raising=False)
+
+        monkeypatch.setattr(es_mod, "cmd_cleanup", lambda _s: None)
+        monkeypatch.setattr(es_mod, "cmd_verify_programmatic", lambda _s: (True, 0, "FLAT"))
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        engine._last_account_snapshot = self._bad_reconstruct_acct()
+        output = engine.process_snapshot(self._snap())
+
+        assert engine._grid_v2_started is True
+        assert engine._grid_v2_bridge is not None
+        assert engine._grid_v2_bridge.reconstruction_ok is True
+        seed_actions = [
+            a
+            for a in output.live_actions
+            if a.action.action_type.value == "PLACE" and "grid_v2" in (a.action.reason or "")
+        ]
+        assert len(seed_actions) > 0
+
+    def test_restore_then_cleanup_reseed_cleanup_fail_blocks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cleanup-reseed mode: cleanup raises → fail-closed."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        import scripts.exchange_state as es_mod  # noqa: PLC0415
+
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("ALLOW_MAINNET_TRADE", "1")
+        monkeypatch.delenv("GRINDER_GRID_V2_RECOVERY_MODE", raising=False)
+
+        def _boom(_s: str) -> None:
+            msg = "cleanup exploded"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(es_mod, "cmd_cleanup", _boom)
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        engine._last_account_snapshot = self._bad_reconstruct_acct()
+        engine.process_snapshot(self._snap())
+
+        assert engine._grid_v2_started is True
+        assert engine._grid_v2_bridge is not None
+        assert engine._grid_v2_bridge.reconstruction_ok is False
+
+    def test_restore_then_cleanup_reseed_verify_fail_blocks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cleanup-reseed mode: cleanup OK but verify dirty → fail-closed."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        import scripts.exchange_state as es_mod  # noqa: PLC0415
+
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("ALLOW_MAINNET_TRADE", "1")
+        monkeypatch.delenv("GRINDER_GRID_V2_RECOVERY_MODE", raising=False)
+
+        monkeypatch.setattr(es_mod, "cmd_cleanup", lambda _s: None)
+        monkeypatch.setattr(es_mod, "cmd_verify_programmatic", lambda _s: (False, 2, "0.01"))
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        engine._last_account_snapshot = self._bad_reconstruct_acct()
+        engine.process_snapshot(self._snap())
+
+        assert engine._grid_v2_started is True
+        assert engine._grid_v2_bridge is not None
+        assert engine._grid_v2_bridge.reconstruction_ok is False
+
+    def test_cleanup_reseed_no_write_gate_blocks_safely(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ALLOW_MAINNET_TRADE unset → cleanup skipped, fail-closed (no sys.exit)."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.delenv("GRINDER_GRID_V2_RECOVERY_MODE", raising=False)
+        monkeypatch.delenv("ALLOW_MAINNET_TRADE", raising=False)
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        engine._last_account_snapshot = self._bad_reconstruct_acct()
+        engine.process_snapshot(self._snap())
+
+        # Should NOT crash (sys.exit), should fail-closed
+        assert engine._grid_v2_started is True
+        assert engine._grid_v2_bridge is not None
+        assert engine._grid_v2_bridge.reconstruction_ok is False
+
+    def test_cleanup_reseed_system_exit_caught_safely(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """cmd_cleanup raises SystemExit → caught, fail-closed (no process crash)."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        import scripts.exchange_state as es_mod  # noqa: PLC0415
+
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("ALLOW_MAINNET_TRADE", "1")
+        monkeypatch.delenv("GRINDER_GRID_V2_RECOVERY_MODE", raising=False)
+
+        def _sys_exit(_s: str) -> None:
+            raise SystemExit(1)
+
+        monkeypatch.setattr(es_mod, "cmd_cleanup", _sys_exit)
+
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+        engine._last_account_snapshot = self._bad_reconstruct_acct()
+        engine.process_snapshot(self._snap())
+
+        # Should NOT crash, should fail-closed
+        assert engine._grid_v2_started is True
+        assert engine._grid_v2_bridge is not None
+        assert engine._grid_v2_bridge.reconstruction_ok is False
 
 
 class TestEngineCancelAckRouting:
