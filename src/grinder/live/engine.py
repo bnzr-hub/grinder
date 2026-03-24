@@ -89,6 +89,7 @@ from grinder.reconcile.identity import (
     is_tp_order,
     parse_client_order_id,
 )
+from grinder.risk.adaptive_step import AdaptiveStepConfig, AdaptiveStepController, StepFailMode
 from grinder.risk.drawdown_guard_v1 import DrawdownGuardV1
 from grinder.risk.drawdown_guard_v1 import OrderIntent as RiskIntent
 from grinder.risk.emergency_exit import EmergencyExitExecutor
@@ -390,7 +391,7 @@ class LiveEngineV0:
         retry_policy: Optional RetryPolicy for transient error retries
     """
 
-    def __init__(  # noqa: PLR0915
+    def __init__(  # noqa: PLR0915, PLR0912
         self,
         paper_engine: PaperEngine,
         exchange_port: ExchangePort,
@@ -755,12 +756,54 @@ class LiveEngineV0:
                 self._symbol_unload.config.order_ttl_s,
             )
 
+        # Adaptive Step Controller v1 (volatility-aware grid spacing)
+        _as_enabled = parse_bool(
+            "GRINDER_GRID_V2_ADAPTIVE_STEP_ENABLED", default=False, strict=False
+        )
+        raw_fail = os.environ.get("GRINDER_GRID_V2_STEP_FAIL_MODE", "freeze_last")
+        try:
+            _fail_mode = StepFailMode(raw_fail)
+        except ValueError:
+            _fail_mode = StepFailMode.FREEZE_LAST
+        self._adaptive_step = AdaptiveStepController(
+            AdaptiveStepConfig(
+                enabled=_as_enabled,
+                step_min_pct=float(os.environ.get("GRINDER_GRID_V2_STEP_MIN_PCT", "0.0020")),
+                step_max_pct=float(os.environ.get("GRINDER_GRID_V2_STEP_MAX_PCT", "0.0100")),
+                step_base_pct=float(os.environ.get("GRINDER_GRID_V2_STEP_BASE_PCT", "0.0025")),
+                vol_ref_bps=float(os.environ.get("GRINDER_GRID_V2_STEP_VOL_REF_BPS", "100")),
+                update_cooldown_s=float(
+                    os.environ.get("GRINDER_GRID_V2_STEP_UPDATE_COOLDOWN_S", "60")
+                ),
+                hysteresis_bps=float(os.environ.get("GRINDER_GRID_V2_STEP_HYSTERESIS_BPS", "10")),
+                fail_mode=_fail_mode,
+            )
+        )
+        if _as_enabled:
+            logger.info(
+                "ADAPTIVE_STEP_ENABLED base=%.4f min=%.4f max=%.4f vol_ref=%.0f cooldown=%.0fs",
+                self._adaptive_step.config.step_base_pct,
+                self._adaptive_step.config.step_min_pct,
+                self._adaptive_step.config.step_max_pct,
+                self._adaptive_step.config.vol_ref_bps,
+                self._adaptive_step.config.update_cooldown_s,
+            )
+
     # --- Grid V2 runtime methods (doc-27 section 23, PR4) ---
 
     def _create_grid_v2_bridge(self) -> GridV2Bridge:
         """Construct GridV2Bridge from env-var config. Fail-closed on bad config."""
+        # Use adaptive step if enabled and available, else env default
+        base_step = os.environ.get("GRINDER_GRID_V2_STEP_PCT", "0.005")
+        if (
+            hasattr(self, "_adaptive_step")
+            and self._adaptive_step.config.enabled
+            and self._grid_v2_symbol
+        ):
+            effective = self._adaptive_step.get_effective_step(self._grid_v2_symbol)
+            base_step = f"{effective:.8f}"
         config = GridV2Config(
-            grid_step_pct=Decimal(os.environ.get("GRINDER_GRID_V2_STEP_PCT", "0.005")),
+            grid_step_pct=Decimal(base_step),
             entry_levels_per_side=int(os.environ.get("GRINDER_GRID_V2_ENTRY_LEVELS", "3")),
             order_size=Decimal(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE", "0.001")),
             max_inventory_levels=int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "3")),
@@ -1813,6 +1856,12 @@ class LiveEngineV0:
         # PR-L0: Feed FeatureEngine (must run every tick for bar building, even in FSM defer)
         if self._feature_engine is not None:
             self._last_feature_snapshot = self._feature_engine.process_snapshot(snapshot)
+
+        # Adaptive step evaluation (post-feature, pre-dispatch)
+        if self._adaptive_step.config.enabled and self._last_feature_snapshot is not None:
+            vol_bps = float(self._last_feature_snapshot.natr_bps)
+            sym = self._last_feature_snapshot.symbol
+            self._adaptive_step.evaluate(sym, vol_bps if vol_bps > 0 else None)
 
         # Record price for toxicity gate (needs history before check, PR-A1)
         if self._toxicity_gate is not None:
