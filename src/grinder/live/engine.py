@@ -640,6 +640,41 @@ class LiveEngineV0:
                 str(_GRID_V2_REPAIR_MAX_ACTIONS_PER_CYCLE),
             )
         )
+        # Adaptive Step Controller v1 (volatility-aware grid spacing)
+        # Must be initialized BEFORE _create_grid_v2_bridge() so effective step
+        # is available on cold start, not only on subsequent recreations.
+        _as_enabled = parse_bool(
+            "GRINDER_GRID_V2_ADAPTIVE_STEP_ENABLED", default=False, strict=False
+        )
+        raw_fail = os.environ.get("GRINDER_GRID_V2_STEP_FAIL_MODE", "freeze_last")
+        try:
+            _fail_mode = StepFailMode(raw_fail)
+        except ValueError:
+            _fail_mode = StepFailMode.FREEZE_LAST
+        self._adaptive_step = AdaptiveStepController(
+            AdaptiveStepConfig(
+                enabled=_as_enabled,
+                step_min_pct=float(os.environ.get("GRINDER_GRID_V2_STEP_MIN_PCT", "0.0020")),
+                step_max_pct=float(os.environ.get("GRINDER_GRID_V2_STEP_MAX_PCT", "0.0100")),
+                step_base_pct=float(os.environ.get("GRINDER_GRID_V2_STEP_BASE_PCT", "0.0025")),
+                vol_ref_bps=float(os.environ.get("GRINDER_GRID_V2_STEP_VOL_REF_BPS", "100")),
+                update_cooldown_s=float(
+                    os.environ.get("GRINDER_GRID_V2_STEP_UPDATE_COOLDOWN_S", "60")
+                ),
+                hysteresis_bps=float(os.environ.get("GRINDER_GRID_V2_STEP_HYSTERESIS_BPS", "10")),
+                fail_mode=_fail_mode,
+            )
+        )
+        if _as_enabled:
+            logger.info(
+                "ADAPTIVE_STEP_ENABLED base=%.4f min=%.4f max=%.4f vol_ref=%.0f cooldown=%.0fs",
+                self._adaptive_step.config.step_base_pct,
+                self._adaptive_step.config.step_min_pct,
+                self._adaptive_step.config.step_max_pct,
+                self._adaptive_step.config.vol_ref_bps,
+                self._adaptive_step.config.update_cooldown_s,
+            )
+
         if self._grid_v2_enabled:
             if not self._grid_v2_symbol:
                 raise ValueError(
@@ -756,50 +791,13 @@ class LiveEngineV0:
                 self._symbol_unload.config.order_ttl_s,
             )
 
-        # Adaptive Step Controller v1 (volatility-aware grid spacing)
-        _as_enabled = parse_bool(
-            "GRINDER_GRID_V2_ADAPTIVE_STEP_ENABLED", default=False, strict=False
-        )
-        raw_fail = os.environ.get("GRINDER_GRID_V2_STEP_FAIL_MODE", "freeze_last")
-        try:
-            _fail_mode = StepFailMode(raw_fail)
-        except ValueError:
-            _fail_mode = StepFailMode.FREEZE_LAST
-        self._adaptive_step = AdaptiveStepController(
-            AdaptiveStepConfig(
-                enabled=_as_enabled,
-                step_min_pct=float(os.environ.get("GRINDER_GRID_V2_STEP_MIN_PCT", "0.0020")),
-                step_max_pct=float(os.environ.get("GRINDER_GRID_V2_STEP_MAX_PCT", "0.0100")),
-                step_base_pct=float(os.environ.get("GRINDER_GRID_V2_STEP_BASE_PCT", "0.0025")),
-                vol_ref_bps=float(os.environ.get("GRINDER_GRID_V2_STEP_VOL_REF_BPS", "100")),
-                update_cooldown_s=float(
-                    os.environ.get("GRINDER_GRID_V2_STEP_UPDATE_COOLDOWN_S", "60")
-                ),
-                hysteresis_bps=float(os.environ.get("GRINDER_GRID_V2_STEP_HYSTERESIS_BPS", "10")),
-                fail_mode=_fail_mode,
-            )
-        )
-        if _as_enabled:
-            logger.info(
-                "ADAPTIVE_STEP_ENABLED base=%.4f min=%.4f max=%.4f vol_ref=%.0f cooldown=%.0fs",
-                self._adaptive_step.config.step_base_pct,
-                self._adaptive_step.config.step_min_pct,
-                self._adaptive_step.config.step_max_pct,
-                self._adaptive_step.config.vol_ref_bps,
-                self._adaptive_step.config.update_cooldown_s,
-            )
-
     # --- Grid V2 runtime methods (doc-27 section 23, PR4) ---
 
     def _create_grid_v2_bridge(self) -> GridV2Bridge:
         """Construct GridV2Bridge from env-var config. Fail-closed on bad config."""
-        # Use adaptive step if enabled and available, else env default
+        # Use adaptive step if enabled, else env default
         base_step = os.environ.get("GRINDER_GRID_V2_STEP_PCT", "0.005")
-        if (
-            hasattr(self, "_adaptive_step")
-            and self._adaptive_step.config.enabled
-            and self._grid_v2_symbol
-        ):
+        if self._adaptive_step.config.enabled and self._grid_v2_symbol:
             effective = self._adaptive_step.get_effective_step(self._grid_v2_symbol)
             base_step = f"{effective:.8f}"
         config = GridV2Config(
