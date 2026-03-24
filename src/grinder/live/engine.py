@@ -99,6 +99,7 @@ from grinder.risk.symbol_risk_manager import (
     SymbolRiskSnapshot,
     SymbolRiskState,
 )
+from grinder.risk.symbol_unload import SymbolUnloadController, UnloadConfig
 
 if TYPE_CHECKING:
     from grinder.account.contracts import AccountSnapshot, OpenOrderSnap
@@ -720,6 +721,38 @@ class LiveEngineV0:
                 self._symbol_risk_manager.config.max_consecutive_losses,
                 self._symbol_risk_manager.config.cooldown_s,
                 self._symbol_risk_manager.config.exit_only_ttl_s,
+            )
+
+        # Symbol Unload Controller v1 (staged reduce-only in EXIT_ONLY)
+        _su_enabled = parse_bool("GRINDER_SYMBOL_UNLOAD_ENABLED", default=False, strict=False)
+        self._symbol_unload = SymbolUnloadController(
+            UnloadConfig(
+                enabled=_su_enabled,
+                step_pct=float(os.environ.get("GRINDER_SYMBOL_UNLOAD_STEP_PCT", "0.20")),
+                min_step_qty=float(os.environ.get("GRINDER_SYMBOL_UNLOAD_MIN_STEP_QTY", "0")),
+                step_cooldown_s=float(
+                    os.environ.get("GRINDER_SYMBOL_UNLOAD_STEP_COOLDOWN_S", "20")
+                ),
+                max_steps_per_hour=int(
+                    os.environ.get("GRINDER_SYMBOL_UNLOAD_MAX_STEPS_PER_HOUR", "60")
+                ),
+                order_ttl_s=float(os.environ.get("GRINDER_SYMBOL_UNLOAD_ORDER_TTL_S", "60")),
+                max_reprices_per_step=int(
+                    os.environ.get("GRINDER_SYMBOL_UNLOAD_MAX_REPRICES_PER_STEP", "3")
+                ),
+                reprice_max_bps=int(os.environ.get("GRINDER_SYMBOL_UNLOAD_REPRICE_MAX_BPS", "30")),
+                exit_only_required=parse_bool(
+                    "GRINDER_SYMBOL_UNLOAD_EXIT_ONLY_REQUIRED", default=True, strict=False
+                ),
+            )
+        )
+        if _su_enabled:
+            logger.info(
+                "SYMBOL_UNLOAD_ENABLED step_pct=%.2f cooldown=%.0fs max_steps/h=%d ttl=%.0fs",
+                self._symbol_unload.config.step_pct,
+                self._symbol_unload.config.step_cooldown_s,
+                self._symbol_unload.config.max_steps_per_hour,
+                self._symbol_unload.config.order_ttl_s,
             )
 
     # --- Grid V2 runtime methods (doc-27 section 23, PR4) ---
@@ -3725,7 +3758,70 @@ class LiveEngineV0:
                 position_qty=qty,
                 consecutive_losses=losses,
             )
-            self._symbol_risk_manager.evaluate(sym, snap)
+            decision = self._symbol_risk_manager.evaluate(sym, snap)
+            # Activate/deactivate unload based on risk state transitions
+            if decision.escalation_reason and decision.state == SymbolRiskState.EXIT_ONLY:
+                self._symbol_unload.activate(sym)
+            if decision.deescalation_reason and decision.state != SymbolRiskState.EXIT_ONLY:
+                self._symbol_unload.clear(sym)
+
+        # Try unload steps for active symbols
+        if self._symbol_unload.config.enabled:
+            self._try_symbol_unload_steps(acct)
+
+    def _try_symbol_unload_steps(self, acct: AccountSnapshot) -> None:
+        """Attempt staged unload steps for symbols in EXIT_ONLY."""
+        signed_by_sym: dict[str, float] = {}
+        mark_by_sym: dict[str, Decimal] = {}
+        for pos in acct.positions:
+            sq = float(pos.signed_qty) if pos.signed_qty is not None else float(pos.qty)
+            signed_by_sym[pos.symbol] = sq
+            mark_by_sym[pos.symbol] = pos.mark_price
+
+        for sym in list(self._symbol_unload.tracked_symbols()):
+            if self._symbol_unload.get_status(sym).value not in ("ACTIVE",):
+                continue
+            signed_qty = signed_by_sym.get(sym, 0.0)
+            step = self._symbol_unload.try_step(sym, signed_qty)
+            if step is None:
+                continue
+            mark = mark_by_sym.get(sym)
+            if mark is None or mark <= 0:
+                logger.warning(
+                    "SYMBOL_UNLOAD_STEP_SKIPPED symbol=%s reason=no_mark_price",
+                    sym,
+                )
+                continue
+            # Use mark price for limit order (aggressive fill expected)
+            side = OrderSide.BUY if step.side == "BUY" else OrderSide.SELL
+            action = ExecutionAction(
+                action_type=ActionType.PLACE,
+                symbol=step.symbol,
+                side=side,
+                price=mark,
+                quantity=Decimal(str(step.qty)),
+                reduce_only=True,
+                reason="SYMBOL_UNLOAD_STEP",
+            )
+            ts = int(time.time() * 1000)
+            result = self._process_action(action, ts)
+            if result.status == LiveActionStatus.EXECUTED:
+                self._symbol_unload.record_step_success(sym)
+                logger.info(
+                    "SYMBOL_UNLOAD_STEP_EXECUTED symbol=%s side=%s qty=%.6f",
+                    sym,
+                    step.side,
+                    step.qty,
+                )
+            elif result.status == LiveActionStatus.FAILED:
+                self._symbol_unload.record_step_failure(sym)
+                logger.warning(
+                    "SYMBOL_UNLOAD_STEP_FAILED symbol=%s side=%s qty=%.6f reason=%s",
+                    sym,
+                    step.side,
+                    step.qty,
+                    result.block_reason.value if result.block_reason else "EXECUTION_ERROR",
+                )
 
     def _record_grid_v2_lot_closed(
         self, symbol: str, entry_price: Decimal, exit_price: Decimal, side: str
