@@ -711,7 +711,7 @@ class LiveEngineV0:
             if parsed is not None and parsed.strategy_id == GRID_V2_STRATEGY_ID:
                 g_orders.append((o.order_id, OrderSide(o.side), o.price, o.qty))
 
-        pos_qty = self._get_position_qty(self._grid_v2_symbol) or Decimal(0)
+        pos_qty = self._get_signed_position_qty(self._grid_v2_symbol)
 
         if g_orders:
             # Reconstruct from exchange state
@@ -1448,7 +1448,7 @@ class LiveEngineV0:
                 if parsed is not None and parsed.strategy_id == GRID_V2_STRATEGY_ID:
                     g_orders.append((o.order_id, OrderSide(o.side), o.price, o.qty))
 
-            pos_qty = self._get_position_qty(self._grid_v2_symbol) or Decimal(0)
+            pos_qty = self._get_signed_position_qty(self._grid_v2_symbol)
             shadow.try_startup(g_orders, pos_qty, snapshot.mid_price, snapshot.ts)
 
         # Collect exchange CIDs and pending cancels for shadow fill detection
@@ -2946,6 +2946,24 @@ class LiveEngineV0:
         for p in snap.positions:
             if p.symbol == symbol:
                 return p.qty
+        return Decimal("0")
+
+    def _get_signed_position_qty(self, symbol: str) -> Decimal:
+        """Get signed position quantity for symbol.
+
+        Returns:
+            Positive for LONG, negative for SHORT, zero if flat/no snapshot.
+            Uses signed_qty from PositionSnap (original positionAmt from exchange).
+            Falls back to positive qty if signed_qty not available.
+        """
+        snap = self._last_account_snapshot
+        if snap is None:
+            return Decimal("0")
+        for p in snap.positions:
+            if p.symbol == symbol:
+                if p.signed_qty is not None:
+                    return p.signed_qty
+                return p.qty  # fallback: positive (legacy PositionSnap without signed_qty)
         return Decimal("0")
 
     def _has_grinder_orders(self, symbol: str) -> bool:

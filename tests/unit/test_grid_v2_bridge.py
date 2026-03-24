@@ -1089,7 +1089,8 @@ class TestF2ProtectiveRecovery:
                 PositionSnap(
                     symbol="BTCUSDT",
                     side="SHORT",
-                    qty=Decimal("-0.01"),
+                    qty=Decimal("0.01"),
+                    signed_qty=Decimal("-0.01"),
                     entry_price=Decimal("50000"),
                     mark_price=Decimal("49900"),
                     unrealized_pnl=Decimal("1"),

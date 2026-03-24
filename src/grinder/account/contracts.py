@@ -21,6 +21,7 @@ class PositionSnap:
         symbol: Trading pair (e.g. "BTCUSDT").
         side: "LONG" | "SHORT" | "BOTH" (Binance hedge mode).
         qty: Absolute quantity (>= 0).
+        signed_qty: Original positionAmt (positive=LONG, negative=SHORT).
         entry_price: Average entry price.
         mark_price: Current mark price (for uPnL calc).
         unrealized_pnl: Exchange-reported unrealized PnL.
@@ -36,6 +37,7 @@ class PositionSnap:
     unrealized_pnl: Decimal
     leverage: int
     ts: int
+    signed_qty: Decimal | None = None
 
     def sort_key(self) -> tuple[str, str]:
         """Canonical sort key: (symbol, side) -- Spec 15.4."""
@@ -43,7 +45,7 @@ class PositionSnap:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict."""
-        return {
+        d: dict[str, Any] = {
             "symbol": self.symbol,
             "side": self.side,
             "qty": str(self.qty),
@@ -53,10 +55,14 @@ class PositionSnap:
             "leverage": self.leverage,
             "ts": self.ts,
         }
+        if self.signed_qty is not None:
+            d["signed_qty"] = str(self.signed_qty)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> PositionSnap:
         """Deserialize from dict."""
+        signed_qty = Decimal(d["signed_qty"]) if "signed_qty" in d else None
         return cls(
             symbol=d["symbol"],
             side=d["side"],
@@ -66,6 +72,7 @@ class PositionSnap:
             unrealized_pnl=Decimal(d["unrealized_pnl"]),
             leverage=d["leverage"],
             ts=d["ts"],
+            signed_qty=signed_qty,
         )
 
 
