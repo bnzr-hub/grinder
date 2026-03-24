@@ -958,6 +958,9 @@ class LiveEngineV0:
         self._grid_v2_pending_seed_cids = frozenset(
             ea.client_order_id for ea in seed if ea.client_order_id is not None
         )
+        # Reset risk tracking counters for clean baseline
+        self._symbol_consecutive_losses.pop(symbol, None)
+        self._symbol_closed_lots_seen.pop(symbol, None)
         logger.warning(
             "GRID_V2_RECOVERY_CLEANUP_RESEED_OK symbol=%s seeds=%d",
             symbol,
@@ -3699,12 +3702,23 @@ class LiveEngineV0:
         cfg = self._symbol_risk_manager.config
         if cfg.applies_to_grid_v2_only and not self._grid_v2_enabled:
             return
+
+        # Build position lookup from account snapshot
+        pos_by_sym: dict[str, tuple[float, float]] = {}
         for pos in acct.positions:
             sym = pos.symbol
             if cfg.applies_to_grid_v2_only and sym != self._grid_v2_symbol:
                 continue
-            notional = float(abs(pos.qty) * pos.mark_price)
-            qty = float(abs(pos.qty))
+            pos_by_sym[sym] = (float(abs(pos.qty) * pos.mark_price), float(abs(pos.qty)))
+
+        # Evaluate all tracked symbols (including those with zero position)
+        # to allow de-escalation when position closes
+        tracked = set(pos_by_sym.keys()) | set(self._symbol_risk_manager._states.keys())
+        if cfg.applies_to_grid_v2_only and self._grid_v2_symbol:
+            tracked.add(self._grid_v2_symbol)
+
+        for sym in tracked:
+            notional, qty = pos_by_sym.get(sym, (0.0, 0.0))
             losses = self._symbol_consecutive_losses.get(sym, 0)
             snap = SymbolRiskSnapshot(
                 position_notional_usd=notional,
@@ -3891,11 +3905,26 @@ class LiveEngineV0:
             )
 
         # Gate 10: Symbol Risk Manager (per-symbol CAPPED/EXIT_ONLY blocking)
-        # grid_v2 internal actions bypass — they are mandatory for safety.
+        # Only safety-critical grid_v2 actions bypass: cancel, reduce-only exits,
+        # integrity cancel. Regular grid_v2 entries (PLACE_ENTRY) are subject to
+        # risk gating — this is the whole point of the risk manager.
+        _is_grid_v2_safety_only = (
+            action.reduce_only
+            or action.action_type == ActionType.CANCEL
+            or (
+                action.reason
+                in (
+                    "grid_v2_INTEGRITY_CANCEL_ENTRY",
+                    "grid_v2_INTEGRITY_CANCEL_EXIT",
+                    "EXIT_RESTORE",
+                    "EXIT_RESTORE_SHIFT",
+                )
+            )
+        )
         if (
             intent == RiskIntent.INCREASE_RISK
             and action.symbol
-            and not _is_grid_v2_internal
+            and not _is_grid_v2_safety_only
             and self._symbol_risk_manager.config.enabled
         ):
             sr_state = self._symbol_risk_manager.get_state(action.symbol)

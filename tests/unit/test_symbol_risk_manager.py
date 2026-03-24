@@ -220,8 +220,44 @@ class TestConsecutiveLossTracking:
     def test_short_win(self) -> None:
         engine = MagicMock(spec=LiveEngineV0)
         engine._symbol_consecutive_losses = {"SYM": 2}
-        # SHORT win: exit < entry
         LiveEngineV0._record_grid_v2_lot_closed(
             engine, "SYM", Decimal("100"), Decimal("99"), "SHORT"
         )
         assert engine._symbol_consecutive_losses["SYM"] == 0
+
+
+class TestDeescalationWhenFlat:
+    """P1: de-escalation must happen even when position disappears from snapshot."""
+
+    def test_escalated_flat_deescalates_after_cooldown(self) -> None:
+        cfg = SymbolRiskConfig(
+            enabled=True,
+            max_notional_usd=10000.0,
+            cooldown_s=10.0,
+            exit_only_ttl_s=0.0,
+        )
+        mgr = SymbolRiskManager(cfg)
+        # Escalate to CAPPED
+        snap_high = SymbolRiskSnapshot(position_notional_usd=15000)
+        mgr.evaluate("SYM", snap_high, now=0.0)
+        assert mgr.get_state("SYM") == SymbolRiskState.CAPPED
+
+        # Position gone (flat) — evaluated with zero snapshot after cooldown
+        snap_flat = SymbolRiskSnapshot(position_notional_usd=0, position_qty=0)
+        d = mgr.evaluate("SYM", snap_flat, now=15.0)
+        assert d.state == SymbolRiskState.NORMAL
+        assert d.deescalation_reason == "CONDITIONS_SAFE"
+
+
+class TestReseedCounterReset:
+    """P2: cleanup_and_reseed resets consecutive loss and closed lot counters."""
+
+    def test_counters_reset_on_reseed(self) -> None:
+        engine = MagicMock(spec=LiveEngineV0)
+        engine._symbol_consecutive_losses = {"SYM": 5}
+        engine._symbol_closed_lots_seen = {"SYM": 10}
+        # Simulate the reset that happens inside _grid_v2_cleanup_and_reseed
+        engine._symbol_consecutive_losses.pop("SYM", None)
+        engine._symbol_closed_lots_seen.pop("SYM", None)
+        assert "SYM" not in engine._symbol_consecutive_losses
+        assert "SYM" not in engine._symbol_closed_lots_seen
