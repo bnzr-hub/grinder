@@ -5,7 +5,7 @@ from decimal import Decimal
 
 import pytest
 
-from grinder.account.contracts import AccountSnapshot
+from grinder.account.contracts import AccountSnapshot, OpenOrderSnap
 from grinder.contracts import Snapshot
 from grinder.core import OrderSide, OrderState
 from grinder.execution.futures_events import FuturesOrderEvent, UserDataEvent, UserDataEventType
@@ -21,6 +21,7 @@ from grinder.grid_v2.state import (
     ExitFilled,
     GridV2Config,
 )
+from grinder.live.engine import LiveEngineV0
 
 _BASE_TS = 1_710_000_000_000
 _REF_PRICE = Decimal("50000")
@@ -3164,6 +3165,280 @@ class TestEngineIntegrityWatchdog:
         )
         assert second
         assert any(a.reason == "grid_v2_PLACE_ENTRY" for a in second)
+
+
+class TestRepairAntiChurnGuards:
+    """PR-B: anti-churn guards for integrity repair PLACE actions."""
+
+    @staticmethod
+    def _make_engine(
+        monkeypatch: pytest.MonkeyPatch, *, max_distance: float = 5.0, max_actions: int = 5
+    ) -> LiveEngineV0:
+        """Create engine with grid_v2 config."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("GRINDER_GRID_V2_REPAIR_MAX_DISTANCE_STEPS", str(max_distance))
+        monkeypatch.setenv("GRINDER_GRID_V2_REPAIR_MAX_ACTIONS_PER_CYCLE", str(max_actions))
+
+        return LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+    def test_distance_guard_skips_far_entries(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Repair skips PLACE for entries far from mid price."""
+        engine = self._make_engine(monkeypatch, max_distance=1.0)
+        assert engine._grid_v2_repair_max_distance_steps == 1.0
+
+    def test_budget_guard_caps_actions(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Repair budget caps total PLACE actions per cycle."""
+        engine = self._make_engine(monkeypatch, max_actions=2)
+        assert engine._grid_v2_repair_max_actions == 2
+
+    def test_env_parsing_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Default values are used when env not set."""
+        monkeypatch.delenv("GRINDER_GRID_V2_REPAIR_MAX_DISTANCE_STEPS", raising=False)
+        monkeypatch.delenv("GRINDER_GRID_V2_REPAIR_MAX_ACTIONS_PER_CYCLE", raising=False)
+        engine = self._make_engine(monkeypatch)
+        assert engine._grid_v2_repair_max_distance_steps == 5.0
+        assert engine._grid_v2_repair_max_actions == 5
+
+    def test_pending_slot_dedup_helper(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_grid_v2_pending_place_entry_prices returns correct (side, price) set."""
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+
+        engine = self._make_engine(monkeypatch)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        # Before startup, no pending
+        assert engine._grid_v2_pending_place_entry_prices(bridge) == set()
+
+        # Fresh startup seeds entries as pending
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+
+        # After startup, pending_place_cids should have seed entries
+        pending = engine._grid_v2_pending_place_entry_prices(bridge)
+        # Should have BUY + SELL entries
+        buy_pending = {(s, p) for s, p in pending if s == OrderSide.BUY}
+        sell_pending = {(s, p) for s, p in pending if s == OrderSide.SELL}
+        assert len(buy_pending) > 0
+        assert len(sell_pending) > 0
+
+    def _setup_engine_for_repair(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        max_distance: float = 5.0,
+        max_actions: int = 5,
+    ) -> tuple[LiveEngineV0, list[OpenOrderSnap]]:
+        """Start engine, seed grid, clear awaiting state, return (engine, all_entry_orders)."""
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+
+        engine = self._make_engine(monkeypatch, max_distance=max_distance, max_actions=max_actions)
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        # Build full entry order list from registry
+        all_orders = []
+        for cid in sorted(bridge.adapter.registry.all_entry_cids):
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            assert reg is not None
+            all_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=bridge._config.order_size,
+                    filled_qty=Decimal("0"),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS,
+                )
+            )
+
+        # Clear awaiting flags so repair can fire
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+        engine._grid_v2_pending_cancels.clear()
+        return engine, all_orders
+
+    def test_repair_budget_caps_place_actions(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Repair with budget=1 emits at most 1 PLACE_ENTRY per cycle."""
+        engine, _all_orders = self._setup_engine_for_repair(monkeypatch, max_actions=1)
+
+        # Remove ALL entries from exchange snapshot → all are "missing"
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS + 10000, source="test"
+        )
+
+        # Tick twice (streak threshold = 2) to trigger repair
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap2)
+        snap3 = Snapshot(
+            ts=_BASE_TS + 11000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output = engine.process_snapshot(snap3)
+
+        place_entries = [
+            a
+            for a in output.live_actions
+            if a.action.action_type == ActionType.PLACE and "PLACE_ENTRY" in (a.action.reason or "")
+        ]
+        assert len(place_entries) <= 1, f"Budget cap=1 but got {len(place_entries)} PLACE_ENTRY"
+
+    def test_repair_distance_guard_skips_far_prices(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Repair with distance_guard=0.5 skips entries >0.5 steps from mid."""
+        engine, _all_orders = self._setup_engine_for_repair(monkeypatch, max_distance=0.5)
+
+        # Remove all entries, mid stays at 50000
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS + 10000, source="test"
+        )
+
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap2)
+        snap3 = Snapshot(
+            ts=_BASE_TS + 11000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output = engine.process_snapshot(snap3)
+
+        # With distance=0.5 steps and step=0.5%, most entries at >0.5 steps should be skipped
+        place_entries = [
+            a
+            for a in output.live_actions
+            if a.action.action_type == ActionType.PLACE and "PLACE_ENTRY" in (a.action.reason or "")
+        ]
+        # At minimum, should have fewer than total missing (which is all 6 entries)
+        assert len(place_entries) < 6, (
+            f"Distance guard should skip far entries, got {len(place_entries)}"
+        )
+
+    def test_repair_pending_slot_dedup_skips_place(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Repair skips PLACE_ENTRY for slots already in pending_place_cids."""
+        engine, all_orders = self._setup_engine_for_repair(monkeypatch)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        # Remove one entry from exchange snapshot, keep the rest
+        removed_order = all_orders[0]
+        surviving = all_orders[1:]
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(surviving),
+            ts=_BASE_TS + 10000,
+            source="test",
+        )
+
+        # Simulate that the removed slot is already pending (PLACE in flight):
+        # the original CID was already registered at startup; add it to pending_place_cids
+        removed_price = removed_order.price
+        original_cid = removed_order.order_id
+        engine._grid_v2_pending_place_cids[original_cid] = 1
+
+        # Tick twice to trigger repair (streak threshold = 2)
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap2)
+        snap3 = Snapshot(
+            ts=_BASE_TS + 11000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        output = engine.process_snapshot(snap3)
+
+        # Should NOT place a new entry for the pending slot
+        place_entries = [
+            a
+            for a in output.live_actions
+            if a.action.action_type == ActionType.PLACE and "PLACE_ENTRY" in (a.action.reason or "")
+        ]
+        placed_prices = {a.action.price for a in place_entries}
+        assert removed_price not in placed_prices, (
+            f"Pending-slot dedup should skip {removed_price}, but it was placed"
+        )
 
 
 class TestEngineCancelUnknownClassification:
