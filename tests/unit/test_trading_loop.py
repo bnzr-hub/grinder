@@ -1012,9 +1012,9 @@ class TestLaunchGuard:
         )
         assert result.status == "verify_clean"
 
-    def test_verify_dirty_no_cleanup_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Dirty state + no --pre-cleanup → fail-closed."""
-        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (False, 3, "0.002"))
+    def test_verify_dirty_flat_no_cleanup_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """FLAT + dirty (orders only) + no --pre-cleanup → fail-closed."""
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (False, 3, "FLAT"))
         result = evaluate_launch_guard(
             exchange_port="futures",
             mainnet=True,
@@ -1025,17 +1025,19 @@ class TestLaunchGuard:
         )
         assert result.status == "verify_dirty_no_cleanup"
         assert result.orders == 3
-        assert result.position == "0.002"
+        assert result.position == "FLAT"
 
     def test_cleanup_then_clean(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Dirty → cleanup → clean → guard passes."""
+        """FLAT + dirty → stable → cleanup → clean → guard passes."""
+        monkeypatch.setattr(time_module, "sleep", lambda _: None)
         call_count = 0
 
         def mock_verify(symbol: str) -> tuple[bool, int, str]:
             nonlocal call_count
             call_count += 1
-            if call_count == 1:
-                return (False, 5, "0.001")  # first call: dirty
+            if call_count <= 3:
+                # Calls 1-3: dirty but FLAT (initial + 2 stability checks)
+                return (False, 5, "FLAT")
             return (True, 0, "FLAT")  # after cleanup: clean
 
         monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", mock_verify)
@@ -1051,8 +1053,9 @@ class TestLaunchGuard:
         assert result.status == "cleanup_then_clean"
 
     def test_cleanup_then_still_dirty(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Dirty → cleanup → still dirty → fail-closed."""
-        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (False, 2, "0.005"))
+        """FLAT + dirty → stable → cleanup → still dirty → fail-closed."""
+        monkeypatch.setattr(time_module, "sleep", lambda _: None)
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (False, 2, "FLAT"))
         monkeypatch.setattr(self._es_mod, "cmd_cleanup", lambda _s: None)
         result = evaluate_launch_guard(
             exchange_port="futures",
@@ -1065,12 +1068,12 @@ class TestLaunchGuard:
         assert result.status == "cleanup_then_still_dirty"
         assert result.orders == 2
 
-    def test_multi_symbol_first_dirty_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Multiple symbols, first is dirty → fail-closed on first."""
+    def test_multi_symbol_first_dirty_flat_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Multiple symbols, first is FLAT+dirty → fail-closed on first."""
 
         def mock_verify(symbol: str) -> tuple[bool, int, str]:
             if symbol == "BTCUSDT":
-                return (False, 1, "0.001")
+                return (False, 1, "FLAT")
             return (True, 0, "FLAT")
 
         monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", mock_verify)
@@ -1118,7 +1121,8 @@ class TestLaunchGuard:
 
     def test_cleanup_error_on_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Cleanup throws exception → verify_error."""
-        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (False, 1, "0.001"))
+        monkeypatch.setattr(time_module, "sleep", lambda _: None)
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (False, 1, "FLAT"))
 
         def _boom(_s: str) -> None:
             msg = "API rate limit"
@@ -1140,6 +1144,123 @@ class TestLaunchGuard:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """--pre-cleanup + already clean → verify_clean (not cleanup_then_clean)."""
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (True, 0, "FLAT"))
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=True,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "verify_clean"
+
+    # --- Crash-safe recovery policy tests ---
+
+    def test_recovery_non_flat_dirty_skips_cleanup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Non-flat position + dirty → cleanup skipped, startup allowed for reconstruction."""
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (False, 5, "0.003"))
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=True,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "recovery_non_flat_skip_cleanup"
+
+    def test_recovery_non_flat_no_pre_cleanup_still_allowed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-flat + no --pre-cleanup → recovery still proceeds (skip cleanup, allow startup)."""
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (False, 3, "0.002"))
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=False,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "recovery_non_flat_skip_cleanup"
+
+    def test_recovery_flat_dirty_stable_snapshots_cleanup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """FLAT + dirty + stable snapshots → cleanup proceeds normally."""
+        monkeypatch.setattr(time_module, "sleep", lambda _: None)
+        call_count = 0
+
+        def mock_verify(symbol: str) -> tuple[bool, int, str]:
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 3:
+                return (False, 2, "FLAT")  # initial + 2 stability checks
+            return (True, 0, "FLAT")  # post-cleanup
+
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", mock_verify)
+        monkeypatch.setattr(self._es_mod, "cmd_cleanup", lambda _s: None)
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=True,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "cleanup_then_clean"
+
+    def test_recovery_flat_dirty_unstable_snapshots_fail_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """FLAT + dirty + unstable snapshots → fail-closed (no cleanup)."""
+        monkeypatch.setattr(time_module, "sleep", lambda _: None)
+        call_count = 0
+
+        def mock_verify(symbol: str) -> tuple[bool, int, str]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (False, 2, "FLAT")  # initial: dirty
+            if call_count == 2:
+                return (False, 2, "FLAT")  # stability check 1
+            return (False, 3, "FLAT")  # stability check 2: orders changed!
+
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", mock_verify)
+        result = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=True,
+            symbols=["BTCUSDT"],
+        )
+        assert result.status == "recovery_snapshot_unstable"
+
+    def test_recovery_double_restart_idempotent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Recovery is idempotent: repeated calls with same state → same result."""
+        monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (False, 5, "0.003"))
+        result1 = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=True,
+            symbols=["BTCUSDT"],
+        )
+        result2 = evaluate_launch_guard(
+            exchange_port="futures",
+            mainnet=True,
+            armed=True,
+            fixture_path=None,
+            pre_cleanup=True,
+            symbols=["BTCUSDT"],
+        )
+        assert result1.status == result2.status == "recovery_non_flat_skip_cleanup"
+
+    def test_normal_mode_behavior_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Regression: clean state + normal mode → verify_clean (no recovery logic triggered)."""
         monkeypatch.setattr(self._es_mod, "cmd_verify_programmatic", lambda _s: (True, 0, "FLAT"))
         result = evaluate_launch_guard(
             exchange_port="futures",

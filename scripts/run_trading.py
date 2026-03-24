@@ -564,6 +564,8 @@ LaunchGuardStatus = Literal[
     "cleanup_then_clean",
     "cleanup_then_still_dirty",
     "verify_error",
+    "recovery_non_flat_skip_cleanup",
+    "recovery_snapshot_unstable",
 ]
 
 
@@ -577,6 +579,24 @@ class LaunchGuardResult:
     position: str = "FLAT"
 
 
+def _snapshot_is_stable(symbol: str) -> bool:
+    """Take two snapshots ~1s apart; return True if orders+position match."""
+    import time  # noqa: PLC0415
+
+    from scripts.exchange_state import cmd_verify_programmatic  # noqa: PLC0415
+
+    try:
+        _, orders1, position1 = cmd_verify_programmatic(symbol)
+    except Exception:
+        return False
+    time.sleep(1)
+    try:
+        _, orders2, position2 = cmd_verify_programmatic(symbol)
+    except Exception:
+        return False
+    return orders1 == orders2 and position1 == position2
+
+
 def evaluate_launch_guard(  # noqa: PLR0911
     *,
     exchange_port: str,
@@ -588,8 +608,12 @@ def evaluate_launch_guard(  # noqa: PLR0911
 ) -> LaunchGuardResult:
     """Pure launch-guard evaluation (calls exchange_state helpers).
 
-    Sequence: check → (optional cleanup) → verify.
+    Sequence: check → recovery policy → (optional cleanup) → verify.
     Only active for futures + mainnet + armed + no-fixture (live mainnet path).
+
+    Recovery policy (crash-safe):
+    - position != FLAT → skip cleanup, allow startup for reconstruction
+    - position == FLAT + dirty → require stable snapshots before cleanup
     """
     if exchange_port != "futures" or not mainnet or not armed or fixture_path is not None:
         return LaunchGuardResult(status="skipped", reason="not_live_mainnet_futures")
@@ -597,6 +621,7 @@ def evaluate_launch_guard(  # noqa: PLR0911
     from scripts.exchange_state import cmd_verify_programmatic  # noqa: PLC0415
 
     cleanup_performed = False
+    recovery_non_flat = False
     for symbol in symbols:
         try:
             ok, orders, position = cmd_verify_programmatic(symbol)
@@ -608,7 +633,20 @@ def evaluate_launch_guard(  # noqa: PLR0911
         if ok:
             continue
 
-        # Dirty state detected
+        # Dirty state detected — apply recovery policy
+        is_non_flat = position != "FLAT"
+
+        if is_non_flat:
+            # Non-flat position: NEVER cleanup (would close position).
+            # Allow startup so grid_v2 reconstruction can recover.
+            print(
+                f"  RECOVERY_NON_FLAT_SKIP_CLEANUP symbol={symbol} "
+                f"orders={orders} position={position}"
+            )
+            recovery_non_flat = True
+            continue
+
+        # FLAT + dirty (orders exist but no position)
         if not pre_cleanup:
             return LaunchGuardResult(
                 status="verify_dirty_no_cleanup",
@@ -617,7 +655,19 @@ def evaluate_launch_guard(  # noqa: PLR0911
                 position=position,
             )
 
-        # Cleanup requested
+        # Before cleanup: require stable snapshots (guard against pending fills)
+        if not _snapshot_is_stable(symbol):
+            return LaunchGuardResult(
+                status="recovery_snapshot_unstable",
+                reason=(
+                    f"symbol={symbol} snapshots unstable (orders/position changed between reads), "
+                    f"cleanup unsafe"
+                ),
+                orders=orders,
+                position=position,
+            )
+
+        # Cleanup safe: FLAT + stable snapshots
         from scripts.exchange_state import cmd_cleanup  # noqa: PLC0415
 
         try:
@@ -645,6 +695,11 @@ def evaluate_launch_guard(  # noqa: PLR0911
                 position=position2,
             )
 
+    if recovery_non_flat:
+        return LaunchGuardResult(
+            status="recovery_non_flat_skip_cleanup",
+            reason="non-flat position detected, cleanup skipped for reconstruction",
+        )
     return LaunchGuardResult(
         status="cleanup_then_clean" if cleanup_performed else "verify_clean",
         reason="all symbols clean",
@@ -1700,6 +1755,18 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         if guard_result.status == "verify_error":
             print(f"ERROR: Launch guard verify error — {guard_result.reason}. Cannot start safely.")
             sys.exit(1)
+        if guard_result.status == "recovery_snapshot_unstable":
+            print(
+                f"ERROR: Launch guard FAILED — snapshots unstable, cleanup unsafe. "
+                f"orders={guard_result.orders} position={guard_result.position}. "
+                f"Wait for pending fills to settle and retry."
+            )
+            sys.exit(1)
+        if guard_result.status == "recovery_non_flat_skip_cleanup":
+            print(
+                "  RECOVERY_MODE_ACTIVE — non-flat position detected, cleanup skipped. "
+                "Startup reconstruction will recover grid state."
+            )
     else:
         print("  LAUNCH_GUARD status=skipped reason=--skip-launch-guard")
 
