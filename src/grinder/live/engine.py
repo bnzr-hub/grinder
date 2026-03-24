@@ -71,6 +71,7 @@ from grinder.execution.sor_metrics import get_sor_metrics
 from grinder.execution.types import ActionType, ExecutionAction
 from grinder.grid_v2.adapter import GRID_V2_STRATEGY_ID
 from grinder.grid_v2.bridge import FillResult, GridV2Bridge
+from grinder.grid_v2.geometry import match_entries_with_tolerance
 from grinder.grid_v2.shadow import GridV2ShadowRunner
 from grinder.grid_v2.state import ActionIntent, ActionIntentKind, BranchMode, GridV2Config, LotSide
 from grinder.live.grid_planner import GridPlanResult
@@ -640,6 +641,20 @@ class LiveEngineV0:
                 str(_GRID_V2_REPAIR_MAX_ACTIONS_PER_CYCLE),
             )
         )
+        # Geometry repair config
+        self._grid_v2_geometry_repair_enabled = parse_bool(
+            "GRINDER_GRID_V2_GEOMETRY_REPAIR_ENABLED", default=True, strict=False
+        )
+        self._grid_v2_geometry_epsilon_ticks = int(
+            os.environ.get("GRINDER_GRID_V2_GEOMETRY_EPSILON_TICKS", "1")
+        )
+        self._grid_v2_geometry_max_actions = int(
+            os.environ.get("GRINDER_GRID_V2_GEOMETRY_MAX_ACTIONS_PER_CYCLE", "3")
+        )
+        self._grid_v2_geometry_cooldown_ms = int(
+            os.environ.get("GRINDER_GRID_V2_GEOMETRY_COOLDOWN_MS", "5000")
+        )
+        self._grid_v2_geometry_last_repair_ts = 0
         # Adaptive Step Controller v1 (volatility-aware grid spacing)
         # Must be initialized BEFORE _create_grid_v2_bridge() so effective step
         # is available on cold start, not only on subsequent recreations.
@@ -1339,8 +1354,24 @@ class LiveEngineV0:
             target_entry_keys = set()
         expected_entries = len(target_entry_keys)
 
+        # Geometry-aware matching: detect structural + price-drift mismatches
+        geometry_mismatches: list[tuple[str, Decimal, Decimal, str]] = []
         if sm.mode == BranchMode.FLAT:
             mismatch = current_entries != expected_entries or current_exits != 0
+        elif self._grid_v2_geometry_repair_enabled and bridge._config.price_tick_size > 0:
+            # Convert keys to string-side for geometry module
+            str_expected = {(s.value, p) for s, p in target_entry_keys}
+            str_actual = {(s.value, p): cid for (s, p), cid in current_entry_by_key.items()}
+            _matched, truly_missing, truly_extra, geometry_mismatches = (
+                match_entries_with_tolerance(
+                    str_expected,
+                    str_actual,
+                    bridge._config.price_tick_size,
+                    self._grid_v2_geometry_epsilon_ticks,
+                )
+            )
+            structural_mismatch = bool(truly_missing or truly_extra)
+            mismatch = structural_mismatch or bool(geometry_mismatches)
         else:
             mismatch = set(current_entry_by_key.keys()) != target_entry_keys
         if not mismatch:
@@ -1530,6 +1561,46 @@ class LiveEngineV0:
                     )
                 else:
                     repair_actions.extend(bridge._to_execution_actions(resolved))
+
+            # Geometry repair: cancel+place for orders at wrong price
+            if (
+                geometry_mismatches
+                and self._grid_v2_geometry_repair_enabled
+                and snapshot.ts
+                >= self._grid_v2_geometry_last_repair_ts + self._grid_v2_geometry_cooldown_ms
+            ):
+                geo_budget = self._grid_v2_geometry_max_actions
+                geo_count = 0
+                for side_str, expected_price, actual_price, cid in geometry_mismatches:
+                    if geo_count >= geo_budget:
+                        break
+                    # Cancel the misaligned order
+                    repair_actions.append(
+                        ExecutionAction(
+                            action_type=ActionType.CANCEL,
+                            order_id=cid,
+                            symbol=snapshot.symbol,
+                            reason="grid_v2_GEOMETRY_CANCEL_ENTRY",
+                        )
+                    )
+                    geo_count += 1
+                    logger.warning(
+                        "GRID_V2_GEOMETRY_MISMATCH symbol=%s side=%s expected=%s actual=%s cid=%s",
+                        snapshot.symbol,
+                        side_str,
+                        expected_price,
+                        actual_price,
+                        cid,
+                    )
+                if geo_count > 0:
+                    self._grid_v2_geometry_last_repair_ts = snapshot.ts
+                    logger.info(
+                        "GRID_V2_GEOMETRY_REPAIR_DISPATCH symbol=%s repairs=%d/%d",
+                        snapshot.symbol,
+                        geo_count,
+                        len(geometry_mismatches),
+                    )
+
         if repair_actions:
             logger.info(
                 "GRID_V2_INTEGRITY_REPAIR_DISPATCH symbol=%s mode=%s actions=%d",
