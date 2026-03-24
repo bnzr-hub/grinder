@@ -5178,7 +5178,8 @@ class TestSameTickDedup:
 
         # Simulate BUY fill to enter LONG_BRANCH
         buy_cids = [
-            c for c in sorted(bridge2.adapter.registry.all_entry_cids)
+            c
+            for c in sorted(bridge2.adapter.registry.all_entry_cids)
             if bridge2.adapter.registry.lookup_entry(c) is not None
             and bridge2.adapter.registry.lookup_entry(c).side == OrderSide.BUY  # type: ignore[union-attr]
         ]
@@ -5203,16 +5204,21 @@ class TestSameTickDedup:
                 continue
             remaining_orders.append(
                 OpenOrderSnap(
-                    order_id=c, symbol="BTCUSDT", side=r.side.value,
-                    order_type="LIMIT", price=r.price, qty=bridge2._config.order_size,
-                    filled_qty=Decimal("0"), reduce_only=False, status="NEW", ts=_BASE_TS,
+                    order_id=c,
+                    symbol="BTCUSDT",
+                    side=r.side.value,
+                    order_type="LIMIT",
+                    price=r.price,
+                    qty=bridge2._config.order_size,
+                    filled_qty=Decimal("0"),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS,
                 )
             )
         return engine, remaining_orders
 
-    def test_strict_geometry_off_skips_far_in_branch(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_strict_geometry_off_skips_far_in_branch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """STRICT_GEOMETRY=0 in branch mode: far missing slot skipped by distance."""
         engine, remaining = self._setup_branch_engine(monkeypatch, strict=False, max_distance=0.5)
 
@@ -5224,17 +5230,25 @@ class TestSameTickDedup:
             positions=(), open_orders=tuple(sell_only), ts=_BASE_TS + 20000, source="test"
         )
         far_snap = Snapshot(
-            ts=_BASE_TS + 20000, symbol="BTCUSDT",
-            bid_price=Decimal("59999"), ask_price=Decimal("60001"),
-            bid_qty=Decimal("1"), ask_qty=Decimal("1"),
-            last_price=Decimal("60000"), last_qty=Decimal("1"),
+            ts=_BASE_TS + 20000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("59999"),
+            ask_price=Decimal("60001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("60000"),
+            last_qty=Decimal("1"),
         )
         engine._grid_v2_integrity_repair(far_snap)
         far_snap2 = Snapshot(
-            ts=_BASE_TS + 21000, symbol="BTCUSDT",
-            bid_price=Decimal("59999"), ask_price=Decimal("60001"),
-            bid_qty=Decimal("1"), ask_qty=Decimal("1"),
-            last_price=Decimal("60000"), last_qty=Decimal("1"),
+            ts=_BASE_TS + 21000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("59999"),
+            ask_price=Decimal("60001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("60000"),
+            last_qty=Decimal("1"),
         )
         engine._last_account_snapshot = AccountSnapshot(
             positions=(), open_orders=tuple(sell_only), ts=_BASE_TS + 21000, source="test"
@@ -5260,17 +5274,25 @@ class TestSameTickDedup:
             positions=(), open_orders=tuple(sell_only), ts=_BASE_TS + 20000, source="test"
         )
         far_snap = Snapshot(
-            ts=_BASE_TS + 20000, symbol="BTCUSDT",
-            bid_price=Decimal("59999"), ask_price=Decimal("60001"),
-            bid_qty=Decimal("1"), ask_qty=Decimal("1"),
-            last_price=Decimal("60000"), last_qty=Decimal("1"),
+            ts=_BASE_TS + 20000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("59999"),
+            ask_price=Decimal("60001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("60000"),
+            last_qty=Decimal("1"),
         )
         engine._grid_v2_integrity_repair(far_snap)
         far_snap2 = Snapshot(
-            ts=_BASE_TS + 21000, symbol="BTCUSDT",
-            bid_price=Decimal("59999"), ask_price=Decimal("60001"),
-            bid_qty=Decimal("1"), ask_qty=Decimal("1"),
-            last_price=Decimal("60000"), last_qty=Decimal("1"),
+            ts=_BASE_TS + 21000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("59999"),
+            ask_price=Decimal("60001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("60000"),
+            last_qty=Decimal("1"),
         )
         engine._last_account_snapshot = AccountSnapshot(
             positions=(), open_orders=tuple(sell_only), ts=_BASE_TS + 21000, source="test"
