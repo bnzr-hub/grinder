@@ -80,6 +80,7 @@ from grinder.risk.drawdown_guard_v1 import (
 from grinder.risk.drawdown_guard_v1 import (
     OrderIntent as RiskIntent,
 )
+from grinder.risk.risk_base_metrics import get_risk_base_metrics, reset_risk_base_metrics
 
 # --- Fixtures ---
 
@@ -6339,3 +6340,118 @@ class TestCancelFailedSuppression:
 
         # Dedup set cleared
         assert len(engine._cancel_dispatched_pending_sync) == 0
+
+
+# ---------------------------------------------------------------------------
+# PR-1 (ADR-091): Risk Base Plumbing
+# ---------------------------------------------------------------------------
+
+
+class TestRiskBasePlumbing:
+    """Engine-level tests for risk base plumbing (PR-1).
+
+    Verifies:
+    - Config is parsed and stored.
+    - _update_risk_base works with a mock port that has get_account_info.
+    - _update_risk_base is a no-op when port lacks get_account_info.
+    - Metrics are updated correctly.
+    - No dispatch behavior change (same inputs → same live_actions).
+    """
+
+    @staticmethod
+    def _make_engine(
+        port: Any = None,
+        risk_base_enabled: bool = True,
+    ) -> LiveEngineV0:
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+        if port is None:
+            port = NoOpExchangePort()
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        env_vars = {
+            "GRINDER_RISK_BASE_ENABLED": "1" if risk_base_enabled else "0",
+            "GRINDER_RISK_BASE_MODE": "total_margin_balance",
+            "GRINDER_RISK_BASE_MIN_USD": "50",
+            "GRINDER_RISK_BASE_STALE_TTL_S": "30",
+            "GRINDER_RISK_BASE_MAX_AGE_HARD_S": "60",
+        }
+        with patch.dict("os.environ", env_vars):
+            return LiveEngineV0(paper, port, config)
+
+    def test_config_parsed_when_enabled(self) -> None:
+        engine = self._make_engine(risk_base_enabled=True)
+        assert engine._risk_base_enabled is True
+        assert engine._risk_base_config.mode.value == "total_margin_balance"
+        assert engine._risk_base_config.min_usd == 50.0
+        assert engine._risk_base_config.stale_ttl_s == 30
+        assert engine._risk_base_config.max_age_hard_s == 60
+        assert engine._risk_base_snapshot is None
+
+    def test_config_parsed_when_disabled(self) -> None:
+        engine = self._make_engine(risk_base_enabled=False)
+        assert engine._risk_base_enabled is False
+        assert engine._risk_base_snapshot is None
+
+    def test_update_risk_base_with_mock_port(self) -> None:
+        reset_risk_base_metrics()
+
+        port = MagicMock()
+        account_info = MagicMock()
+        account_info.margin_balance = Decimal("1500")
+        account_info.total_balance_usdt = Decimal("1400")
+        account_info.available_balance_usdt = Decimal("1200")
+        port.get_account_info.return_value = account_info
+
+        engine = self._make_engine(port=port, risk_base_enabled=True)
+        engine._update_risk_base()
+
+        assert engine._risk_base_snapshot is not None
+        assert engine._risk_base_snapshot.value_usd == Decimal("1500")
+        assert engine._risk_base_snapshot.mode == "total_margin_balance"
+        assert engine._risk_base_snapshot.is_stale_soft is False
+
+        reset_risk_base_metrics()
+
+    def test_update_risk_base_noop_without_get_account_info(self) -> None:
+        """NoOpExchangePort lacks get_account_info → _update_risk_base is no-op."""
+        engine = self._make_engine(port=NoOpExchangePort(), risk_base_enabled=True)
+        engine._update_risk_base()
+        assert engine._risk_base_snapshot is None
+
+    def test_update_risk_base_handles_fetch_error(self) -> None:
+        reset_risk_base_metrics()
+
+        port = MagicMock()
+        port.get_account_info.side_effect = RuntimeError("connection timeout")
+
+        engine = self._make_engine(port=port, risk_base_enabled=True)
+        engine._update_risk_base()
+
+        assert engine._risk_base_snapshot is None
+        m = get_risk_base_metrics()
+        assert m.status == 0  # UNAVAILABLE
+
+        reset_risk_base_metrics()
+
+    def test_no_dispatch_change_with_feature_on(self) -> None:
+        """Same process_snapshot inputs produce same output regardless of risk_base_enabled."""
+        snap = Snapshot(
+            ts=1000000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("50000"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1.0"),
+            ask_qty=Decimal("1.0"),
+            last_price=Decimal("50000.5"),
+            last_qty=Decimal("0.5"),
+        )
+        # Engine with feature off
+        engine_off = self._make_engine(risk_base_enabled=False)
+        result_off = engine_off.process_snapshot(snap)
+
+        # Engine with feature on
+        engine_on = self._make_engine(risk_base_enabled=True)
+        result_on = engine_on.process_snapshot(snap)
+
+        # Same output: no dispatch behavior change in PR-1
+        assert len(result_off.live_actions) == len(result_on.live_actions)

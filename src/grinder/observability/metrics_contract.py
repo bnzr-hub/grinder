@@ -289,6 +289,16 @@ REQUIRED_METRICS_PATTERNS = [
     "# HELP grinder_port_order_lookup_total",
     "# TYPE grinder_port_order_lookup_total",
     "grinder_port_order_lookup_total{port=",
+    # PR-1 (ADR-092): Risk base metrics
+    "# HELP grinder_risk_base_usd",
+    "# TYPE grinder_risk_base_usd",
+    "grinder_risk_base_usd",
+    "# HELP grinder_risk_base_stale_seconds",
+    "# TYPE grinder_risk_base_stale_seconds",
+    "grinder_risk_base_stale_seconds",
+    "# HELP grinder_risk_base_status",
+    "# TYPE grinder_risk_base_status",
+    "grinder_risk_base_status",
 ]
 
 # PR6: Concrete series patterns requiring fill ingest to be running.

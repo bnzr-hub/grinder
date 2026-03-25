@@ -1539,6 +1539,14 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
   - Planner suppressed for remaining run (no new PLACE/CANCEL generation)
   - Eliminates 80k+ spam lines when budget exhausted
   - Log: `ORDER_BUDGET_EXHAUSTED symbol=X — planner suppressed`
+- **Risk base from exchange balance** (PR-1 plumbing, ADR-092):
+  - `RiskBaseSnapshot` derived from exchange balance on each account sync tick.
+  - Modes: `total_margin_balance` (default), `wallet_balance`, `available_balance`.
+  - Dual stale model: soft TTL (`GRINDER_RISK_BASE_STALE_TTL_S`, default 30s) + hard max age (`GRINDER_RISK_BASE_MAX_AGE_HARD_S`, default 60s).
+  - Env: `GRINDER_RISK_BASE_ENABLED`, `GRINDER_RISK_BASE_MODE`, `GRINDER_RISK_BASE_MIN_USD`, `GRINDER_RISK_BASE_STALE_TTL_S`, `GRINDER_RISK_BASE_MAX_AGE_HARD_S`.
+  - Metrics: `grinder_risk_base_usd`, `grinder_risk_base_stale_seconds`, `grinder_risk_base_status`.
+  - Logs: `RISK_BASE_UPDATED`, `RISK_BASE_UNAVAILABLE`, `RISK_BASE_FETCH_FAILED`.
+  - **PR-1 = plumbing only. No dispatch blocking. Enforcement in PR-2.**
 
 ## Partially implemented
 - Package structure `src/grinder/*` (core, protocols/interfaces) -- scaffolding.
