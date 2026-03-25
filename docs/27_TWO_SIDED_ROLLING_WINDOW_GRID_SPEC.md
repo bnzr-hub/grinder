@@ -1446,13 +1446,28 @@ Flat normalization supports three runtime modes:
 Startup reconstruction follows the same rule: after successful reconstruction in `FLAT` with
 `pos_qty == 0`, optional recenter executes only if configured mode requires it.
 
-### 26. Integrity repair guards (runtime)
+### 26. Integrity repair guards and role separation (runtime)
 
-Integrity repair applies the following guards to PLACE_ENTRY actions:
+Integrity repair is **role-separated**: ENTRY and EXIT checks are distinct.
 
-1. **Same-tick planned-slot dedup:** If a slot `(side, price)` is already planned by the fill path in the current tick, repair skips it. Prevents duplicate orders at same price from fill+repair overlap.
-2. **Pending-slot dedup:** Skip if `(side, price)` has a CID in `pending_place_cids`.
-3. **Distance guard:** Skip if `abs(price - mid) / mid / step > max_distance_steps` (`GRINDER_GRID_V2_REPAIR_MAX_DISTANCE_STEPS`, default 5). Bypassed when strict geometry enabled.
-4. **Budget cap:** Max N PLACE actions per repair cycle (`GRINDER_GRID_V2_REPAIR_MAX_ACTIONS_PER_CYCLE`, default 5).
-5. **Geometry tolerance:** Orders within `epsilon_ticks × tick_size` of expected price are silently matched (no false structural mismatch). `GRINDER_GRID_V2_GEOMETRY_REPAIR_ENABLED=1` default, `GRINDER_GRID_V2_GEOMETRY_EPSILON_TICKS=1`.
-6. **Strict geometry mode:** `GRINDER_GRID_V2_REPAIR_STRICT_GEOMETRY=0` (default off). When enabled, structural missing slots in branch repair path bypass the distance guard (budget cap still applies). Only applies where repair places missing entries (branch mode); FLAT preserve mode does not place missing entries by design.
+**ENTRY integrity (geometry-aware):**
+- Expected ENTRY slots come from SM `entry_window` (quantized prices).
+- Actual ENTRY orders identified by CID kind = `ENTRY`.
+- Geometry tolerance: orders within `epsilon_ticks × tick_size` are silently matched.
+- Guards on PLACE_ENTRY:
+  1. **Same-tick planned-slot dedup:** skip if fill path already plans this `(side, price)`.
+  2. **Pending-slot dedup:** skip if `(side, price)` has a CID in `pending_place_cids`.
+  3. **Distance guard:** skip if far from mid (bypassed in strict geometry mode, branch only).
+  4. **Budget cap:** max N PLACE actions per repair cycle.
+- ENTRY cancel targets only ENTRY CIDs.
+
+**EXIT integrity (ledger-based):**
+- Expected EXIT CIDs come from SM `exit_orders` lot ledger mapping.
+- Actual EXIT orders identified by CID kind = `EXIT`.
+- Missing exits in branch mode logged as `GRID_V2_EXIT_INTEGRITY_MISMATCH` for observability.
+- EXIT cancel (in FLAT preserve) targets only non-ENTRY CIDs.
+
+**Config:**
+- `GRINDER_GRID_V2_GEOMETRY_REPAIR_ENABLED=1` (default ON)
+- `GRINDER_GRID_V2_GEOMETRY_EPSILON_TICKS=1`
+- `GRINDER_GRID_V2_REPAIR_STRICT_GEOMETRY=0` (default OFF; branch repair only)
