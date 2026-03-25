@@ -4967,3 +4967,341 @@ class TestPreSendClassification:
             assert bridge.adapter.registry.lookup_entry(m_cid) is None, (
                 f"-2019 CID {m_cid} must be cleaned from registry"
             )
+
+
+class TestSameTickDedup:
+    """Same-tick fill/repair dedup: fill-path PLACE slots excluded from repair."""
+
+    @staticmethod
+    def _make_engine(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        max_distance: float = 10.0,
+        max_actions: int = 10,
+        strict_geometry: bool = False,
+    ) -> LiveEngineV0:
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("GRINDER_GRID_V2_REPAIR_MAX_DISTANCE_STEPS", str(max_distance))
+        monkeypatch.setenv("GRINDER_GRID_V2_REPAIR_MAX_ACTIONS_PER_CYCLE", str(max_actions))
+        monkeypatch.setenv(
+            "GRINDER_GRID_V2_REPAIR_STRICT_GEOMETRY", "1" if strict_geometry else "0"
+        )
+        # Disable reseed-on-flat so FLAT path uses preserve/cleanup (not recenter)
+        # This ensures distance guard is testable in FLAT mode
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT", "0")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW", "0")
+
+        return LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+    def test_extract_planned_entry_slots(self) -> None:
+        """Fill-path PLACE_ENTRY actions produce (side, price) slots for dedup."""
+        actions = [
+            ExecutionAction(
+                action_type=ActionType.PLACE,
+                symbol="SYM",
+                side=OrderSide.SELL,
+                price=Decimal("100.50"),
+                reason="grid_v2_PLACE_ENTRY",
+            ),
+            ExecutionAction(
+                action_type=ActionType.CANCEL,
+                order_id="cid1",
+                symbol="SYM",
+                reason="grid_v2_CANCEL_EXIT",
+            ),
+        ]
+        slots = LiveEngineV0._extract_planned_entry_slots(actions)
+        assert (OrderSide.SELL, Decimal("100.50")) in slots
+        assert len(slots) == 1
+
+    def test_planned_slots_prevent_repair_duplicate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Integrity repair skips slot already planned by fill path in same tick."""
+        engine = self._make_engine(monkeypatch)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        # Seed the grid
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+
+        # Clear awaiting
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        # Build order list with one BUY entry missing
+        bridge2 = engine._grid_v2_bridge
+        assert bridge2 is not None
+        all_cids = sorted(bridge2.adapter.registry.all_entry_cids)
+        assert len(all_cids) > 0
+
+        # Find a BUY entry
+        buy_cid = None
+        buy_reg = None
+        for c in all_cids:
+            r = bridge2.adapter.registry.lookup_entry(c)
+            if r is not None and r.side == OrderSide.BUY:
+                buy_cid = c
+                buy_reg = r
+                break
+        assert buy_cid is not None and buy_reg is not None
+
+        # Build orders without the BUY entry (simulate missing)
+        orders_minus_one = []
+        for c in all_cids:
+            if c == buy_cid:
+                continue
+            r = bridge2.adapter.registry.lookup_entry(c)
+            if r is None:
+                continue
+            orders_minus_one.append(
+                OpenOrderSnap(
+                    order_id=c,
+                    symbol="BTCUSDT",
+                    side=r.side.value,
+                    order_type="LIMIT",
+                    price=r.price,
+                    qty=bridge2._config.order_size,
+                    filled_qty=Decimal("0"),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(orders_minus_one),
+            ts=_BASE_TS + 10000,
+            source="test",
+        )
+
+        # Simulate that fill path already plans PLACE for the missing slot
+        planned_slots = {(buy_reg.side, buy_reg.price)}
+
+        # Call repair with planned slots — should skip the missing slot
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        # First tick: streak=1
+        engine._grid_v2_integrity_repair(snap2, planned_slots_this_tick=planned_slots)
+        # Second tick: streak=2 → triggers repair
+        snap3 = Snapshot(
+            ts=_BASE_TS + 11000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(orders_minus_one),
+            ts=_BASE_TS + 11000,
+            source="test",
+        )
+        repair2 = engine._grid_v2_integrity_repair(snap3, planned_slots_this_tick=planned_slots)
+
+        # The missing slot should be SKIPPED because it's in planned_slots
+        place_actions = [a for a in repair2 if a.action_type == ActionType.PLACE]
+        for pa in place_actions:
+            assert (pa.side, pa.price) != (buy_reg.side, buy_reg.price), (
+                f"Repair placed duplicate slot {pa.side}@{pa.price} that fill already planned"
+            )
+
+    def _setup_branch_engine(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        strict: bool,
+        max_distance: float = 0.5,
+    ) -> tuple[LiveEngineV0, list[OpenOrderSnap]]:
+        """Setup engine in LONG_BRANCH mode via simulated fill."""
+        engine = self._make_engine(
+            monkeypatch, max_distance=max_distance, max_actions=10, strict_geometry=strict
+        )
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        bridge2 = engine._grid_v2_bridge
+        assert bridge2 is not None
+
+        # Simulate BUY fill to enter LONG_BRANCH
+        buy_cids = [
+            c
+            for c in sorted(bridge2.adapter.registry.all_entry_cids)
+            if bridge2.adapter.registry.lookup_entry(c) is not None
+            and bridge2.adapter.registry.lookup_entry(c).side == OrderSide.BUY  # type: ignore[union-attr]
+        ]
+        assert len(buy_cids) > 0
+        fill_cid = buy_cids[0]
+        fill_reg = bridge2.adapter.registry.lookup_entry(fill_cid)
+        assert fill_reg is not None
+        result = bridge2.on_fill(
+            fill_cid, fill_reg.side, fill_reg.price, bridge2._config.order_size, _BASE_TS + 1000
+        )
+        assert not result.rejected
+
+        sm = bridge2.state_machine
+        assert sm is not None
+        assert sm.mode.value != "FLAT", f"Expected branch mode after fill, got {sm.mode.value}"
+
+        # Build remaining orders from registry (minus the filled one)
+        remaining_orders: list[OpenOrderSnap] = []
+        for c in sorted(bridge2.adapter.registry.all_entry_cids):
+            r = bridge2.adapter.registry.lookup_entry(c)
+            if r is None:
+                continue
+            remaining_orders.append(
+                OpenOrderSnap(
+                    order_id=c,
+                    symbol="BTCUSDT",
+                    side=r.side.value,
+                    order_type="LIMIT",
+                    price=r.price,
+                    qty=bridge2._config.order_size,
+                    filled_qty=Decimal("0"),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS,
+                )
+            )
+        return engine, remaining_orders
+
+    def test_strict_geometry_off_skips_far_in_branch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """STRICT_GEOMETRY=0 in branch mode: far missing slot skipped by distance."""
+        engine, remaining = self._setup_branch_engine(monkeypatch, strict=False, max_distance=0.5)
+
+        # Remove BUY entries to create missing slots
+        sell_only = [o for o in remaining if o.side == "SELL"]
+
+        # Move mid far away
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=tuple(sell_only), ts=_BASE_TS + 20000, source="test"
+        )
+        far_snap = Snapshot(
+            ts=_BASE_TS + 20000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("59999"),
+            ask_price=Decimal("60001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("60000"),
+            last_qty=Decimal("1"),
+        )
+        engine._grid_v2_integrity_repair(far_snap)
+        far_snap2 = Snapshot(
+            ts=_BASE_TS + 21000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("59999"),
+            ask_price=Decimal("60001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("60000"),
+            last_qty=Decimal("1"),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=tuple(sell_only), ts=_BASE_TS + 21000, source="test"
+        )
+        repair = engine._grid_v2_integrity_repair(far_snap2)
+
+        place_buy = [
+            a for a in repair if a.action_type == ActionType.PLACE and a.side == OrderSide.BUY
+        ]
+        assert len(place_buy) == 0, (
+            f"Expected 0 BUY PLACE (distance skip in branch), got {len(place_buy)}"
+        )
+
+    def test_strict_geometry_on_bypasses_distance_in_branch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """STRICT_GEOMETRY=1 in branch mode: far missing slot placed (distance bypass)."""
+        engine, remaining = self._setup_branch_engine(monkeypatch, strict=True, max_distance=0.5)
+
+        sell_only = [o for o in remaining if o.side == "SELL"]
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=tuple(sell_only), ts=_BASE_TS + 20000, source="test"
+        )
+        far_snap = Snapshot(
+            ts=_BASE_TS + 20000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("59999"),
+            ask_price=Decimal("60001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("60000"),
+            last_qty=Decimal("1"),
+        )
+        engine._grid_v2_integrity_repair(far_snap)
+        far_snap2 = Snapshot(
+            ts=_BASE_TS + 21000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("59999"),
+            ask_price=Decimal("60001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("60000"),
+            last_qty=Decimal("1"),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=tuple(sell_only), ts=_BASE_TS + 21000, source="test"
+        )
+        repair = engine._grid_v2_integrity_repair(far_snap2)
+
+        place_buy = [
+            a for a in repair if a.action_type == ActionType.PLACE and a.side == OrderSide.BUY
+        ]
+        assert len(place_buy) > 0, (
+            "Expected BUY PLACE (strict geometry bypasses distance in branch), got 0"
+        )
