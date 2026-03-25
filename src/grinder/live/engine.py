@@ -1365,13 +1365,17 @@ class LiveEngineV0:
         expected_exit_cids: set[str] = set()
         exit_registry_orphans = 0
         for eo in sm.snapshot.exit_orders:
-            if eo.exit_order_id is not None:
-                reg_cid = bridge.adapter.registry.cid_for_exit(eo.exit_order_id)
-                if reg_cid is not None:
-                    expected_exit_cids.add(reg_cid)
-                else:
-                    # Registry lost mapping for a known exit — integrity issue
-                    exit_registry_orphans += 1
+            # Only OPEN exits are expected to have active registry/exchange presence.
+            # Historical FILLED/CANCELED exits are kept in snapshot for ledger history
+            # and must not be treated as active integrity orphans.
+            if eo.status.value != "OPEN":
+                continue
+            reg_cid = bridge.adapter.registry.cid_for_exit(eo.exit_order_id)
+            if reg_cid is not None:
+                expected_exit_cids.add(reg_cid)
+            else:
+                # Registry lost mapping for a currently OPEN exit — integrity issue
+                exit_registry_orphans += 1
         exit_mismatch = bool(
             sm.mode != BranchMode.FLAT
             and (

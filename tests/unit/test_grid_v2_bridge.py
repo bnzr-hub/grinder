@@ -1,6 +1,7 @@
 """Tests for grid_v2 runtime bridge (doc-27 section 23, PR4)."""
 
 import pathlib
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -19,6 +20,8 @@ from grinder.grid_v2.state import (
     BranchMode,
     EntryFilled,
     ExitFilled,
+    ExitOrder,
+    ExitOrderStatus,
     GridV2Config,
 )
 from grinder.live.engine import LiveEngineV0
@@ -5545,3 +5548,102 @@ class TestRoleAwareRepair:
                 ]
             )
         assert results[0] == results[1] == results[2]
+
+    def test_closed_exit_records_do_not_create_orphans(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Closed exit ledger rows (FILLED/CANCELED) must not trigger EXIT orphan mismatch."""
+        engine = self._make_engine(monkeypatch)
+        _ = self._seed_engine(engine)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        # Move to LONG branch and create an OPEN exit.
+        entry_cid = sorted(bridge.adapter.registry.all_entry_cids)[0]
+        reg = bridge.adapter.registry.lookup_entry(entry_cid)
+        assert reg is not None
+        _ = bridge.on_fill(
+            entry_cid,
+            reg.side,
+            reg.price,
+            bridge._config.order_size,
+            _BASE_TS + 20_000,
+        )
+        sm = bridge.state_machine
+        assert sm is not None
+        assert sm.snapshot.mode == BranchMode.LONG_BRANCH
+
+        # Inject a historical FILLED exit row with no registry mapping.
+        historical_filled_exit = ExitOrder(
+            exit_order_id="x_hist_filled",
+            lot_id="lot_hist",
+            side=OrderSide.SELL,
+            price=Decimal("99999"),
+            qty=bridge._config.order_size,
+            status=ExitOrderStatus.FILLED,
+        )
+        sm._snapshot = replace(
+            sm.snapshot,
+            exit_orders=(*sm.snapshot.exit_orders, historical_filled_exit),
+        )
+
+        # Build exchange truth from active registry/state (no ghost historical exits on exchange).
+        open_orders: list[OpenOrderSnap] = []
+        for cid in sorted(bridge.adapter.registry.all_entry_cids):
+            e = bridge.adapter.registry.lookup_entry(cid)
+            if e is None:
+                continue
+            open_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=e.side.value,
+                    order_type="LIMIT",
+                    price=e.price,
+                    qty=bridge._config.order_size,
+                    filled_qty=Decimal("0"),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 21_000,
+                )
+            )
+        for eo in sm.snapshot.exit_orders:
+            if eo.status != ExitOrderStatus.OPEN:
+                continue
+            exit_cid = bridge.adapter.registry.cid_for_exit(eo.exit_order_id)
+            if exit_cid is None:
+                continue
+            open_orders.append(
+                OpenOrderSnap(
+                    order_id=exit_cid,
+                    symbol="BTCUSDT",
+                    side=eo.side.value,
+                    order_type="LIMIT",
+                    price=eo.price,
+                    qty=eo.qty,
+                    filled_qty=Decimal("0"),
+                    reduce_only=True,
+                    status="NEW",
+                    ts=_BASE_TS + 21_000,
+                )
+            )
+
+        snap = Snapshot(
+            ts=_BASE_TS + 21_000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(open_orders),
+            ts=_BASE_TS + 21_000,
+            source="test",
+        )
+        repair = engine._grid_v2_integrity_repair(snap)
+        assert repair == [], "Historical closed exits must not create active integrity mismatch"
