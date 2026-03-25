@@ -1,15 +1,18 @@
-"""Portfolio-level risk evaluation (PR-2, ADR-092).
+"""Portfolio-level risk evaluation (ADR-092, %-model extension).
 
-Evaluates symbol-level and portfolio-level notional caps relative to the
-exchange-balance risk base (RiskBaseSnapshot from PR-1).
+Evaluates symbol and portfolio risk limits relative to exchange-balance risk base.
+Backward-compatible with fraction-style caps while supporting pct-style inputs in engine.
 
 Conventions:
 - signed notional: long > 0, short < 0.
 - gross = sum(abs(notional_i)) across all positions.
 - net = abs(sum(signed_notional_i)) across all positions.
 - mark_price from PositionSnap as price source.
+- drawdown% = max(0, -unrealized_pnl / risk_base) * 100.
 
-Fail-closed: if risk base is unavailable, stale, or below min → block INCREASE_RISK.
+Fail-closed:
+- if risk base is unavailable/stale/below min -> block INCREASE_RISK.
+- if any cap or DD gate cannot be evaluated -> block INCREASE_RISK.
 """
 
 from __future__ import annotations
@@ -36,19 +39,31 @@ class RiskGateReason(Enum):
     SYMBOL_CAP_EXCEEDED = "SYMBOL_CAP_EXCEEDED"
     PORTFOLIO_GROSS_CAP_EXCEEDED = "PORTFOLIO_GROSS_CAP_EXCEEDED"
     PORTFOLIO_NET_CAP_EXCEEDED = "PORTFOLIO_NET_CAP_EXCEEDED"
+    SYMBOL_DD_FREEZE = "SYMBOL_DD_FREEZE"
+    SYMBOL_DD_UNLOAD = "SYMBOL_DD_UNLOAD"
+    SYMBOL_DD_FORCED_FLAT = "SYMBOL_DD_FORCED_FLAT"
+    PORTFOLIO_DD_FREEZE = "PORTFOLIO_DD_FREEZE"
+    PORTFOLIO_DD_FORCE_REDUCE = "PORTFOLIO_DD_FORCE_REDUCE"
+    PORTFOLIO_DD_KILL_SWITCH = "PORTFOLIO_DD_KILL_SWITCH"
 
 
 @dataclass(frozen=True)
 class PortfolioRiskConfig:
     """Configuration for portfolio risk enforcement.
 
-    All pct values are fractions (0.10 = 10%).
+    Cap fields are fractions (0.10 = 10%).
     A value of 0.0 means the check is disabled.
     """
 
     symbol_max_notional_pct: float = 0.0
     portfolio_max_gross_notional_pct: float = 0.0
     portfolio_max_net_notional_pct: float = 0.0
+    symbol_freeze_dd_pct: float = 0.0
+    symbol_unload_dd_pct: float = 0.0
+    symbol_forced_flat_dd_pct: float = 0.0
+    portfolio_dd_freeze_pct: float = 0.0
+    portfolio_dd_force_reduce_pct: float = 0.0
+    portfolio_dd_kill_switch_pct: float = 0.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -59,11 +74,36 @@ class PortfolioRiskConfig:
             val = getattr(self, name)
             if val < 0:
                 raise ValueError(f"{name} must be >= 0, got {val}")
-            if val > 1.0:
+            if val > 10.0:
                 raise ValueError(
                     f"{name}={val} looks like a percentage, not a fraction. "
-                    f"Expected 0.0-1.0 (e.g. 0.10 = 10%), got {val}"
+                    f"Expected fraction in [0.0, 10.0], got {val}"
                 )
+        for name in (
+            "symbol_freeze_dd_pct",
+            "symbol_unload_dd_pct",
+            "symbol_forced_flat_dd_pct",
+            "portfolio_dd_freeze_pct",
+            "portfolio_dd_force_reduce_pct",
+            "portfolio_dd_kill_switch_pct",
+        ):
+            val = getattr(self, name)
+            if val < 0:
+                raise ValueError(f"{name} must be >= 0, got {val}")
+            if val > 100:
+                raise ValueError(f"{name} must be <= 100, got {val}")
+        _assert_dd_order(
+            self.symbol_freeze_dd_pct,
+            self.symbol_unload_dd_pct,
+            self.symbol_forced_flat_dd_pct,
+            "symbol",
+        )
+        _assert_dd_order(
+            self.portfolio_dd_freeze_pct,
+            self.portfolio_dd_force_reduce_pct,
+            self.portfolio_dd_kill_switch_pct,
+            "portfolio",
+        )
 
 
 @dataclass(frozen=True)
@@ -79,6 +119,17 @@ class RiskGateDecision:
     allowed: bool
     reason: RiskGateReason | None = None
     detail: str = ""
+    symbol_drawdown_pct: float = 0.0
+    portfolio_drawdown_pct: float = 0.0
+
+
+def _assert_dd_order(freeze: float, reduce: float, kill: float, scope: str) -> None:
+    if freeze > 0 and reduce > 0 and reduce < freeze:
+        raise ValueError(f"{scope} dd thresholds invalid: reduce({reduce}) < freeze({freeze})")
+    if reduce > 0 and kill > 0 and kill < reduce:
+        raise ValueError(f"{scope} dd thresholds invalid: kill({kill}) < reduce({reduce})")
+    if freeze > 0 and kill > 0 and reduce == 0 and kill < freeze:
+        raise ValueError(f"{scope} dd thresholds invalid: kill({kill}) < freeze({freeze})")
 
 
 def compute_symbol_notional(
@@ -122,7 +173,42 @@ def compute_portfolio_notionals(
     return gross, abs(signed_sum)
 
 
-def evaluate_risk_gate(  # noqa: PLR0911
+def compute_symbol_drawdown_pct(
+    snapshot: AccountSnapshot,
+    symbol: str,
+    symbol_budget_usd: Decimal,
+) -> float:
+    """Compute symbol drawdown% relative to budget.
+
+    Uses exchange unrealized_pnl summed across position sides for the symbol.
+    """
+    if symbol_budget_usd <= 0:
+        return 0.0
+    upnl = Decimal(0)
+    for p in snapshot.positions:
+        if p.symbol == symbol:
+            upnl += p.unrealized_pnl
+    if upnl >= 0:
+        return 0.0
+    return float((-upnl / symbol_budget_usd) * Decimal(100))
+
+
+def compute_portfolio_drawdown_pct(
+    snapshot: AccountSnapshot,
+    risk_base_usd: Decimal,
+) -> float:
+    """Compute portfolio drawdown% relative to risk base."""
+    if risk_base_usd <= 0:
+        return 0.0
+    upnl = Decimal(0)
+    for p in snapshot.positions:
+        upnl += p.unrealized_pnl
+    if upnl >= 0:
+        return 0.0
+    return float((-upnl / risk_base_usd) * Decimal(100))
+
+
+def evaluate_risk_gate(  # noqa: PLR0911, PLR0912
     risk_base: RiskBaseSnapshot | None,
     snapshot: AccountSnapshot | None,
     config: PortfolioRiskConfig,
@@ -194,6 +280,37 @@ def evaluate_risk_gate(  # noqa: PLR0911
                 f"(base={base_usd:.2f} * pct={config.symbol_max_notional_pct})",
             )
 
+    # 4b. Symbol DD ladder
+    symbol_dd = 0.0
+    if (
+        config.symbol_freeze_dd_pct > 0
+        or config.symbol_unload_dd_pct > 0
+        or config.symbol_forced_flat_dd_pct > 0
+    ) and config.symbol_max_notional_pct > 0:
+        sym_budget = risk_base.value_usd * Decimal(str(config.symbol_max_notional_pct))
+        symbol_dd = compute_symbol_drawdown_pct(snapshot, symbol, sym_budget)
+        if config.symbol_forced_flat_dd_pct > 0 and symbol_dd >= config.symbol_forced_flat_dd_pct:
+            return RiskGateDecision(
+                allowed=False,
+                reason=RiskGateReason.SYMBOL_DD_FORCED_FLAT,
+                detail=f"symbol={symbol} dd={symbol_dd:.2f}% >= forced_flat={config.symbol_forced_flat_dd_pct:.2f}%",
+                symbol_drawdown_pct=symbol_dd,
+            )
+        if config.symbol_unload_dd_pct > 0 and symbol_dd >= config.symbol_unload_dd_pct:
+            return RiskGateDecision(
+                allowed=False,
+                reason=RiskGateReason.SYMBOL_DD_UNLOAD,
+                detail=f"symbol={symbol} dd={symbol_dd:.2f}% >= unload={config.symbol_unload_dd_pct:.2f}%",
+                symbol_drawdown_pct=symbol_dd,
+            )
+        if config.symbol_freeze_dd_pct > 0 and symbol_dd >= config.symbol_freeze_dd_pct:
+            return RiskGateDecision(
+                allowed=False,
+                reason=RiskGateReason.SYMBOL_DD_FREEZE,
+                detail=f"symbol={symbol} dd={symbol_dd:.2f}% >= freeze={config.symbol_freeze_dd_pct:.2f}%",
+                symbol_drawdown_pct=symbol_dd,
+            )
+
     # 5. Portfolio gross cap
     if config.portfolio_max_gross_notional_pct > 0 or config.portfolio_max_net_notional_pct > 0:
         gross, net = compute_portfolio_notionals(snapshot)
@@ -218,5 +335,40 @@ def evaluate_risk_gate(  # noqa: PLR0911
                     detail=f"net={float(net):.2f} >= limit={net_limit:.2f} "
                     f"(base={base_usd:.2f} * pct={config.portfolio_max_net_notional_pct})",
                 )
+
+    # 7. Portfolio DD ladder
+    if (
+        config.portfolio_dd_freeze_pct > 0
+        or config.portfolio_dd_force_reduce_pct > 0
+        or config.portfolio_dd_kill_switch_pct > 0
+    ):
+        portfolio_dd = compute_portfolio_drawdown_pct(snapshot, risk_base.value_usd)
+        if (
+            config.portfolio_dd_kill_switch_pct > 0
+            and portfolio_dd >= config.portfolio_dd_kill_switch_pct
+        ):
+            return RiskGateDecision(
+                allowed=False,
+                reason=RiskGateReason.PORTFOLIO_DD_KILL_SWITCH,
+                detail=f"portfolio_dd={portfolio_dd:.2f}% >= kill_switch={config.portfolio_dd_kill_switch_pct:.2f}%",
+                portfolio_drawdown_pct=portfolio_dd,
+            )
+        if (
+            config.portfolio_dd_force_reduce_pct > 0
+            and portfolio_dd >= config.portfolio_dd_force_reduce_pct
+        ):
+            return RiskGateDecision(
+                allowed=False,
+                reason=RiskGateReason.PORTFOLIO_DD_FORCE_REDUCE,
+                detail=f"portfolio_dd={portfolio_dd:.2f}% >= force_reduce={config.portfolio_dd_force_reduce_pct:.2f}%",
+                portfolio_drawdown_pct=portfolio_dd,
+            )
+        if config.portfolio_dd_freeze_pct > 0 and portfolio_dd >= config.portfolio_dd_freeze_pct:
+            return RiskGateDecision(
+                allowed=False,
+                reason=RiskGateReason.PORTFOLIO_DD_FREEZE,
+                detail=f"portfolio_dd={portfolio_dd:.2f}% >= freeze={config.portfolio_dd_freeze_pct:.2f}%",
+                portfolio_drawdown_pct=portfolio_dd,
+            )
 
     return RiskGateDecision(allowed=True)

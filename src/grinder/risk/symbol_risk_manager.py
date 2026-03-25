@@ -100,6 +100,10 @@ class SymbolRiskManager:
         s = self._states.get(symbol)
         return s.state if s else SymbolRiskState.NORMAL
 
+    def tracked_symbols(self) -> set[str]:
+        """Get symbols currently tracked by risk manager."""
+        return set(self._states.keys())
+
     def evaluate(
         self,
         symbol: str,
