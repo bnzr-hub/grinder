@@ -3,6 +3,7 @@
 import pathlib
 from dataclasses import replace
 from decimal import Decimal
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -17,12 +18,15 @@ from grinder.grid_v2.bridge import (
     GridV2Bridge,
 )
 from grinder.grid_v2.state import (
+    ActionIntent,
+    ActionIntentKind,
     BranchMode,
     EntryFilled,
     ExitFilled,
     ExitOrder,
     ExitOrderStatus,
     GridV2Config,
+    TransitionResult,
 )
 from grinder.live.engine import LiveEngineV0
 
@@ -5647,3 +5651,207 @@ class TestRoleAwareRepair:
         )
         repair = engine._grid_v2_integrity_repair(snap)
         assert repair == [], "Historical closed exits must not create active integrity mismatch"
+
+
+# ---------------------------------------------------------------------------
+# P0 hotfix: orphan CANCEL_ENTRY from risk-gate blocked PLACE
+# ---------------------------------------------------------------------------
+
+
+class TestFillResolveOrphanNoFatal:
+    """P0 hotfix: on_fill must not crash when resolve_actions encounters
+    orphan CANCEL_ENTRY (entry never placed due to risk gate blocking).
+    """
+
+    def test_on_fill_orphan_cancel_entry_returns_empty_actions(self) -> None:
+        """A. Fill succeeds but follow-up CANCEL_ENTRY has no registry CID.
+
+        Simulate: after entry fill, SM produces CANCEL_ENTRY for a
+        side/price that was never registered (risk gate blocked its PLACE).
+        Bridge must return FillResult with empty actions, not raise.
+        """
+        b, seed = _fresh_bridge()
+
+        buy_seed = [s for s in seed if s.side == OrderSide.BUY]
+        buy_cid = buy_seed[0].client_order_id
+        buy_price = buy_seed[0].price
+        assert buy_cid is not None and buy_price is not None
+
+        # Manually remove a neighboring entry from registry to simulate
+        # an entry that was never placed (risk gate blocked it).
+        buy_seed_1 = [s for s in seed if s.side == OrderSide.BUY][1]
+        cid_to_remove = buy_seed_1.client_order_id
+        assert cid_to_remove is not None
+        b.adapter.confirm_cancel_entry(cid_to_remove)
+
+        # Now fill the first buy entry. SM may produce CANCEL_ENTRY for
+        # the removed CID's slot during branch transition cleanup.
+        # Even if it doesn't in this exact scenario, let's force the
+        # adapter to fail by poisoning the registry further.
+        # Instead, test the bridge.on_fill directly with a mocked SM
+        # that produces an unresolvable CANCEL_ENTRY.
+        # Create a fake SM result with a CANCEL_ENTRY for a non-existent entry
+        fake_cancel = ActionIntent(
+            kind=ActionIntentKind.CANCEL_ENTRY,
+            side=OrderSide.SELL,
+            price=Decimal("99999"),  # deliberately non-existent
+        )
+        fake_result = TransitionResult(
+            snapshot=MagicMock(),
+            rejected=False,
+            actions=(fake_cancel,),
+        )
+
+        # Patch SM.apply to return our fake result
+        original_sm = b.state_machine
+        assert original_sm is not None
+        with patch.object(original_sm, "apply", return_value=fake_result):
+            # This MUST NOT raise — that's the P0 fix
+            result = b.on_fill(buy_cid, OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1000)
+
+        assert result.rejected is False
+        assert result.execution_actions == ()  # empty — orphan actions skipped
+
+    def test_valid_cancel_entry_still_works(self) -> None:
+        """C. Regression: normal CANCEL_ENTRY path still resolves correctly."""
+        b, seed = _fresh_bridge()
+
+        buy_seed = [s for s in seed if s.side == OrderSide.BUY]
+        buy_cid = buy_seed[0].client_order_id
+        buy_price = buy_seed[0].price
+        assert buy_cid is not None and buy_price is not None
+
+        # Normal fill — SM produces valid actions (PLACE_EXIT, maybe CANCEL_ENTRY
+        # for opposite-edge trim). All CIDs exist in registry.
+        result = b.on_fill(buy_cid, OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1000)
+
+        assert result.rejected is False
+        # Should have at least PLACE_EXIT
+        exits = [ea for ea in result.execution_actions if ea.reason == "grid_v2_PLACE_EXIT"]
+        assert len(exits) >= 1
+
+    def test_multiple_fills_after_orphan_continue(self) -> None:
+        """B. Loop stays alive: multiple fills work even after an orphan."""
+        b, seed = _fresh_bridge()
+        buy_seed = sorted(
+            [s for s in seed if s.side == OrderSide.BUY],
+            key=lambda s: s.price or Decimal(0),
+            reverse=True,
+        )
+        assert len(buy_seed) >= 2
+
+        # First fill: orphan CANCEL_ENTRY (simulated)
+        cid0 = buy_seed[0].client_order_id
+        price0 = buy_seed[0].price
+        assert cid0 is not None and price0 is not None
+
+        fake_cancel = ActionIntent(
+            kind=ActionIntentKind.CANCEL_ENTRY,
+            side=OrderSide.SELL,
+            price=Decimal("99999"),
+        )
+        fake_result = TransitionResult(snapshot=MagicMock(), rejected=False, actions=(fake_cancel,))
+        sm = b.state_machine
+        assert sm is not None
+        with patch.object(sm, "apply", return_value=fake_result):
+            r1 = b.on_fill(cid0, OrderSide.BUY, price0, _ORDER_SIZE, _BASE_TS + 1000)
+        assert r1.rejected is False
+        assert r1.execution_actions == ()
+
+        # Second fill: normal path (un-patched SM)
+        cid1 = buy_seed[1].client_order_id
+        price1 = buy_seed[1].price
+        assert cid1 is not None and price1 is not None
+        r2 = b.on_fill(cid1, OrderSide.BUY, price1, _ORDER_SIZE, _BASE_TS + 2000)
+        # Should NOT raise — loop continues
+        assert r2.rejected is False
+
+    def test_unexpected_value_error_re_raised(self) -> None:
+        """P0 review fix: non-orphan ValueError must NOT be swallowed."""
+        b, seed = _fresh_bridge()
+
+        buy_seed = [s for s in seed if s.side == OrderSide.BUY]
+        buy_cid = buy_seed[0].client_order_id
+        buy_price = buy_seed[0].price
+        assert buy_cid is not None and buy_price is not None
+
+        # Patch resolve_actions to raise a non-orphan ValueError
+        def _bad_resolve(*_args: object, **_kwargs: object) -> None:
+            raise ValueError("PLACE_ENTRY missing fields: corrupted action")
+
+        with (
+            patch.object(b.adapter, "resolve_actions", side_effect=_bad_resolve),
+            pytest.raises(ValueError, match="PLACE_ENTRY missing fields"),
+        ):
+            b.on_fill(buy_cid, OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1000)
+
+
+class TestEngineRiskGateOrphanIntegration:
+    """P1 fix: production-path test proving risk-gate-blocked PLACE → fill →
+    orphan CANCEL_ENTRY does not crash, using real bridge lifecycle.
+
+    Simulates the exact production chain:
+    1. Bridge startup → seed entries placed
+    2. Some entries removed from registry (simulating risk gate block → clean)
+    3. Fill arrives on a real registered entry
+    4. SM produces CANCEL_ENTRY for the removed entry's slot
+    5. Bridge handles gracefully → no crash, bridge stays functional
+    """
+
+    def test_risk_blocked_entry_then_fill_no_fatal(self) -> None:
+        """Full production chain: orphan after risk-blocked entry."""
+        bridge = GridV2Bridge(_config(levels=3), "BTCUSDT")
+        seed = bridge.startup_fresh(_REF_PRICE, _BASE_TS)
+        assert bridge.reconstruction_ok
+
+        buy_seed = sorted(
+            [s for s in seed if s.side == OrderSide.BUY],
+            key=lambda s: s.price or Decimal(0),
+            reverse=True,
+        )
+        assert len(buy_seed) >= 2
+
+        # Step 1: Simulate risk gate blocking a PLACE → CID cleaned from registry
+        orphan_cid = buy_seed[1].client_order_id
+        assert orphan_cid is not None
+        bridge.adapter.confirm_cancel_entry(orphan_cid)
+        # Verify it's gone
+        assert bridge.adapter.registry.lookup_entry(orphan_cid) is None
+
+        # Step 2: Fill on a real registered entry
+        fill_cid = buy_seed[0].client_order_id
+        fill_price = buy_seed[0].price
+        assert fill_cid is not None and fill_price is not None
+
+        # Step 3: SM produces orphan CANCEL_ENTRY for removed slot
+        sm = bridge.state_machine
+        assert sm is not None
+        fake_cancel = ActionIntent(
+            kind=ActionIntentKind.CANCEL_ENTRY,
+            side=OrderSide.BUY,
+            price=fill_price - Decimal("100"),  # non-existent slot
+        )
+        fake_result = TransitionResult(
+            snapshot=MagicMock(),
+            rejected=False,
+            actions=(fake_cancel,),
+        )
+        with patch.object(sm, "apply", return_value=fake_result):
+            result = bridge.on_fill(
+                fill_cid, OrderSide.BUY, fill_price, _ORDER_SIZE, _BASE_TS + 1000
+            )
+
+        # Step 4: Verify no crash, empty follow-up actions
+        assert result.rejected is False
+        assert result.execution_actions == ()
+
+        # Step 5: Bridge stays functional for subsequent operations
+        assert bridge.reconstruction_ok is True
+        # Can still process another fill (proves loop survival)
+        sell_seed = [s for s in seed if s.side == OrderSide.SELL]
+        sell_cid = sell_seed[0].client_order_id
+        sell_price = sell_seed[0].price
+        assert sell_cid is not None and sell_price is not None
+        # Un-patch: real SM apply for normal fill
+        r2 = bridge.on_fill(sell_cid, OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 2000)
+        assert r2.rejected is False

@@ -1554,6 +1554,7 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
   - `CANCEL` and `REDUCE_RISK` never blocked by this gate.
   - Portfolio breach blocks ALL symbols (not just the breaching one).
   - Metric: `grinder_risk_gate_blocks_total{reason=...}` counter.
+  - **P0 hotfix**: `bridge.on_fill()` catches orphan `CANCEL_ENTRY` from SM when entry was never placed (risk gate blocked). Returns empty actions instead of crashing loop. Log: `GRID_V2_FILL_RESOLVE_ORPHAN`.
 
 ## Partially implemented
 - Package structure `src/grinder/*` (core, protocols/interfaces) -- scaffolding.
