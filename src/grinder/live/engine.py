@@ -95,6 +95,14 @@ from grinder.risk.drawdown_guard_v1 import DrawdownGuardV1
 from grinder.risk.drawdown_guard_v1 import OrderIntent as RiskIntent
 from grinder.risk.emergency_exit import EmergencyExitExecutor
 from grinder.risk.emergency_exit_metrics import get_emergency_exit_metrics
+from grinder.risk.risk_base import (
+    BalanceData,
+    RiskBaseConfig,
+    RiskBaseMode,
+    RiskBaseSnapshot,
+    build_risk_base_snapshot,
+)
+from grinder.risk.risk_base_metrics import get_risk_base_metrics
 from grinder.risk.symbol_risk_manager import (
     SymbolRiskConfig,
     SymbolRiskManager,
@@ -604,6 +612,37 @@ class LiveEngineV0:
                 )
         ee_metrics = get_emergency_exit_metrics()
         ee_metrics.set_enabled(self._emergency_exit_enabled)
+
+        # PR-1 (ADR-092): Risk base from exchange balance (plumbing only, no dispatch blocking)
+        _rb_enabled = parse_bool("GRINDER_RISK_BASE_ENABLED", default=False, strict=False)
+        _rb_mode_raw = parse_enum(
+            "GRINDER_RISK_BASE_MODE",
+            allowed={"total_margin_balance", "wallet_balance", "available_balance"},
+            default="total_margin_balance",
+            strict=False,
+        )
+        self._risk_base_config = RiskBaseConfig(
+            mode=RiskBaseMode(_rb_mode_raw) if _rb_mode_raw else RiskBaseMode.TOTAL_MARGIN_BALANCE,
+            min_usd=float(os.environ.get("GRINDER_RISK_BASE_MIN_USD", "50")),
+            stale_ttl_s=parse_int(
+                "GRINDER_RISK_BASE_STALE_TTL_S", default=30, min_value=0, strict=False
+            )
+            or 30,
+            max_age_hard_s=parse_int(
+                "GRINDER_RISK_BASE_MAX_AGE_HARD_S", default=60, min_value=0, strict=False
+            )
+            or 60,
+        )
+        self._risk_base_enabled = _rb_enabled
+        self._risk_base_snapshot: RiskBaseSnapshot | None = None
+        if _rb_enabled:
+            logger.info(
+                "RISK_BASE_ENABLED mode=%s min_usd=%.2f stale_ttl=%ds hard_age=%ds",
+                self._risk_base_config.mode.value,
+                self._risk_base_config.min_usd,
+                self._risk_base_config.stale_ttl_s,
+                self._risk_base_config.max_age_hard_s,
+            )
 
         # PR-ROLL-1b: log enforcement status at startup
         logger.info(
@@ -3229,6 +3268,10 @@ class LiveEngineV0:
             if evidence_dir is not None:
                 logger.info("Account sync evidence written to %s", evidence_dir)
 
+        # PR-1 (ADR-092): Update risk base snapshot from exchange balance
+        if self._risk_base_enabled and result.snapshot is not None:
+            self._update_risk_base(asof_ts_ms=result.snapshot.ts)
+
         # P0-2: correlate recent PLACEs with AccountSync open_orders
         if self._debug_open_orders and result.snapshot is not None:
             open_ids = {o.order_id for o in result.snapshot.open_orders}
@@ -3292,6 +3335,61 @@ class LiveEngineV0:
             # P0-2b: bound dedup set
             if len(self._looked_up_ids) > 100:
                 self._looked_up_ids.clear()
+
+    def _update_risk_base(self, asof_ts_ms: int) -> None:
+        """Fetch balance from exchange and update risk base snapshot (PR-1 plumbing).
+
+        Args:
+            asof_ts_ms: Exchange timestamp from account snapshot (not wall-clock).
+                Used as BalanceData.ts_ms so stale model measures exchange data age.
+
+        Uses duck-type check for get_account_info() on the exchange port.
+        If the port doesn't support it, logs once and returns.
+        """
+        port = self._exchange_port
+        if not hasattr(port, "get_account_info"):
+            return
+
+        rb_metrics = get_risk_base_metrics()
+        try:
+            info = port.get_account_info()
+            balance = BalanceData(
+                total_margin_balance=info.margin_balance,
+                wallet_balance=info.total_balance_usdt,
+                available_balance=info.available_balance_usdt,
+                ts_ms=asof_ts_ms,
+            )
+        except Exception:
+            logger.warning("RISK_BASE_FETCH_FAILED", exc_info=True)
+            rb_metrics.record_unavailable()
+            self._risk_base_snapshot = None
+            return
+
+        now_ms = int(time.time() * 1000)
+        snap = build_risk_base_snapshot(balance, self._risk_base_config, now_ms)
+
+        if snap is None:
+            rb_metrics.record_unavailable()
+            self._risk_base_snapshot = None
+            return
+
+        self._risk_base_snapshot = snap
+        rb_metrics.record_snapshot(
+            value_usd=float(snap.value_usd),
+            age_s=snap.age_s,
+            is_stale_soft=snap.is_stale_soft,
+            is_stale_hard=snap.is_stale_hard,
+        )
+        logger.info(
+            "RISK_BASE_UPDATED mode=%s value_usd=%.2f age_s=%d "
+            "stale_soft=%s stale_hard=%s below_min=%s",
+            snap.mode,
+            float(snap.value_usd),
+            snap.age_s,
+            snap.is_stale_soft,
+            snap.is_stale_hard,
+            snap.is_below_min,
+        )
 
     def _get_position_sign(self, symbol: str) -> int | None:
         """Determine net position direction for a symbol (PR-INV-1).

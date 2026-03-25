@@ -35,6 +35,7 @@ from grinder.observability.fill_metrics import get_fill_metrics
 from grinder.observability.latency_metrics import get_http_metrics
 from grinder.reconcile.metrics import get_reconcile_metrics
 from grinder.risk.emergency_exit_metrics import get_emergency_exit_metrics
+from grinder.risk.risk_base_metrics import get_risk_base_metrics
 from grinder.selection.active_selector import get_active_selector_metrics
 from grinder.selection.shadow_selector import get_selector_metrics
 
@@ -177,6 +178,9 @@ class MetricsBuilder:
 
         # Emergency exit metrics (RISK-EE-1)
         lines.extend(self._build_emergency_exit_metrics())
+
+        # Risk base metrics (PR-1, ADR-092)
+        lines.extend(self._build_risk_base_metrics())
 
         # Cycle layer metrics (PR-INV-3b)
         lines.extend(self._build_cycle_metrics())
@@ -377,6 +381,10 @@ class MetricsBuilder:
         """Build emergency exit metrics (RISK-EE-1)."""
         ee_metrics = get_emergency_exit_metrics()
         return ee_metrics.to_prometheus_lines()
+
+    def _build_risk_base_metrics(self) -> list[str]:
+        """Build risk base metrics (PR-1, ADR-092)."""
+        return get_risk_base_metrics().to_prometheus_lines()
 
     def _build_cycle_metrics(self) -> list[str]:
         """Build cycle layer metrics (PR-INV-3b)."""
