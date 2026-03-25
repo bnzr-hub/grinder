@@ -1320,6 +1320,7 @@ class LiveEngineV0:
         current_entries = 0
         current_exits = 0
         current_entry_by_key: dict[tuple[OrderSide, Decimal], str] = {}
+        current_exit_cids: set[str] = set()
         if acct is not None:
             for o in acct.open_orders:
                 if o.symbol != snapshot.symbol:
@@ -1327,13 +1328,14 @@ class LiveEngineV0:
                 parsed = bridge.adapter.parse_cid(o.order_id)
                 if parsed is None:
                     continue
-                if parsed.kind.value != "ENTRY":
-                    continue
-                try:
-                    side = OrderSide(o.side)
-                except ValueError:
-                    continue
-                current_entry_by_key[(side, o.price)] = o.order_id
+                if parsed.kind.value == "ENTRY":
+                    try:
+                        side = OrderSide(o.side)
+                    except ValueError:
+                        continue
+                    current_entry_by_key[(side, o.price)] = o.order_id
+                elif parsed.kind.value == "EXIT":
+                    current_exit_cids.add(o.order_id)
         for cid in current_cids:
             parsed = bridge.adapter.parse_cid(cid)
             if parsed is None:
@@ -1359,7 +1361,20 @@ class LiveEngineV0:
             target_entry_keys = set()
         expected_entries = len(target_entry_keys)
 
-        # Geometry-aware matching: detect structural + price-drift mismatches
+        # EXIT integrity: expected exits from lot ledger
+        expected_exit_cids: set[str] = set()
+        for eo in sm.snapshot.exit_orders:
+            if eo.exit_order_id is not None:
+                reg_cid = bridge.adapter.registry.cid_for_exit(eo.exit_order_id)
+                if reg_cid is not None:
+                    expected_exit_cids.add(reg_cid)
+        exit_mismatch = bool(
+            sm.mode != BranchMode.FLAT
+            and expected_exit_cids
+            and not expected_exit_cids.issubset(current_exit_cids)
+        )
+
+        # Geometry-aware matching: detect structural + price-drift mismatches (ENTRY only)
         geometry_mismatches: list[tuple[str, Decimal, Decimal, str]] = []
         if sm.mode == BranchMode.FLAT:
             mismatch = current_entries != expected_entries or current_exits != 0
@@ -1376,9 +1391,9 @@ class LiveEngineV0:
                 )
             )
             structural_mismatch = bool(truly_missing or truly_extra)
-            mismatch = structural_mismatch or bool(geometry_mismatches)
+            mismatch = structural_mismatch or bool(geometry_mismatches) or exit_mismatch
         else:
-            mismatch = set(current_entry_by_key.keys()) != target_entry_keys
+            mismatch = set(current_entry_by_key.keys()) != target_entry_keys or exit_mismatch
         if not mismatch:
             self._grid_v2_integrity_mismatch_streak = 0
             self._grid_v2_integrity_mismatch_last_ts = 0
@@ -1475,16 +1490,27 @@ class LiveEngineV0:
             current_keys = set(current_entry_by_key.keys())
             missing = target_entry_keys - current_keys
             extra = current_keys - target_entry_keys
+            missing_exits = expected_exit_cids - current_exit_cids
             logger.warning(
                 "GRID_V2_INTEGRITY_REPAIR_TRIGGER symbol=%s mode=%s entries=%d expected=%d "
-                "missing=%d extra=%d",
+                "missing=%d extra=%d missing_exits=%d",
                 snapshot.symbol,
                 sm.mode.value,
                 len(current_keys),
                 len(expected_entry_keys),
                 len(missing),
                 len(extra),
+                len(missing_exits),
             )
+            if missing_exits:
+                logger.warning(
+                    "GRID_V2_EXIT_INTEGRITY_MISMATCH symbol=%s missing_exit_cids=%d "
+                    "expected=%d current=%d",
+                    snapshot.symbol,
+                    len(missing_exits),
+                    len(expected_exit_cids),
+                    len(current_exit_cids),
+                )
 
             # Cancel entry orders that exist on exchange but are outside expected window.
             for side, price in sorted(extra, key=lambda item: (item[0].value, item[1])):

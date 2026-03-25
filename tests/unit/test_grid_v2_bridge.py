@@ -5305,3 +5305,218 @@ class TestSameTickDedup:
         assert len(place_buy) > 0, (
             "Expected BUY PLACE (strict geometry bypasses distance in branch), got 0"
         )
+
+
+class TestRoleAwareRepair:
+    """Role-aware integrity repair: ENTRY geometry vs EXIT ledger integrity."""
+
+    @staticmethod
+    def _make_engine(monkeypatch: pytest.MonkeyPatch) -> LiveEngineV0:
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT", "0")
+        monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW", "0")
+
+        return LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=MagicMock(),
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+    def _seed_engine(self, engine: LiveEngineV0) -> list[OpenOrderSnap]:
+        """Seed grid and return all entry orders."""
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+        orders: list[OpenOrderSnap] = []
+        for c in sorted(bridge.adapter.registry.all_entry_cids):
+            r = bridge.adapter.registry.lookup_entry(c)
+            if r is None:
+                continue
+            orders.append(
+                OpenOrderSnap(
+                    order_id=c,
+                    symbol="BTCUSDT",
+                    side=r.side.value,
+                    order_type="LIMIT",
+                    price=r.price,
+                    qty=bridge._config.order_size,
+                    filled_qty=Decimal("0"),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS,
+                )
+            )
+        return orders
+
+    def test_entry_geometry_ignores_exit_orders(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test A: EXIT orders on exchange don't trigger false ENTRY geometry repair."""
+        engine = self._make_engine(monkeypatch)
+        entry_orders = self._seed_engine(engine)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        # Add a fake EXIT order to open_orders — it should be ignored by ENTRY check
+        fake_exit = OpenOrderSnap(
+            order_id="g_g_BTCUSDT_x99_1710000000_0",
+            symbol="BTCUSDT",
+            side="SELL",
+            order_type="LIMIT",
+            price=Decimal("51000"),
+            qty=Decimal("0.001"),
+            filled_qty=Decimal("0"),
+            reduce_only=True,
+            status="NEW",
+            ts=_BASE_TS,
+        )
+        all_orders = [*list(entry_orders), fake_exit]
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=tuple(all_orders), ts=_BASE_TS + 10000, source="test"
+        )
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        repair = engine._grid_v2_integrity_repair(snap2)
+        # No repair needed — all ENTRY orders match, EXIT is separate
+        assert len(repair) == 0, f"Expected 0 repair actions, got {len(repair)}"
+
+    def test_entry_cancel_targets_only_entry_cids(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test B: ENTRY extra-cancel targets only ENTRY CIDs, not EXIT CIDs."""
+        engine = self._make_engine(monkeypatch)
+        entry_orders = self._seed_engine(engine)
+
+        # Add an extra fake ENTRY that's not in expected window
+        fake_extra_entry = OpenOrderSnap(
+            order_id="g_g_BTCUSDT_e99_1710000000_0",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            price=Decimal("45000"),
+            qty=Decimal("0.001"),
+            filled_qty=Decimal("0"),
+            reduce_only=False,
+            status="NEW",
+            ts=_BASE_TS,
+        )
+        all_orders = [*list(entry_orders), fake_extra_entry]
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=tuple(all_orders), ts=_BASE_TS + 10000, source="test"
+        )
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine._grid_v2_integrity_repair(snap2)
+        snap3 = Snapshot(
+            ts=_BASE_TS + 11000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=tuple(all_orders), ts=_BASE_TS + 11000, source="test"
+        )
+        repair = engine._grid_v2_integrity_repair(snap3)
+
+        # All CANCEL_ENTRY actions should target ENTRY CIDs only
+        entry_cancels = [
+            a
+            for a in repair
+            if a.action_type == ActionType.CANCEL and a.reason == "grid_v2_INTEGRITY_CANCEL_ENTRY"
+        ]
+        for ec in entry_cancels:
+            assert ec.order_id is not None
+            parsed = engine._grid_v2_bridge.adapter.parse_cid(ec.order_id)  # type: ignore[union-attr]
+            if parsed is not None:
+                assert parsed.kind.value == "ENTRY", (
+                    f"ENTRY cancel targeted non-ENTRY CID: {ec.order_id} kind={parsed.kind.value}"
+                )
+
+    def test_entry_repair_deterministic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test E: same input → same repair actions, deterministic ordering."""
+        results = []
+        for _ in range(3):
+            engine = self._make_engine(monkeypatch)
+            entry_orders = self._seed_engine(engine)
+
+            # Remove 2 BUY entries
+            buy_orders = [o for o in entry_orders if o.side == "BUY"]
+            sell_orders = [o for o in entry_orders if o.side == "SELL"]
+            remaining = buy_orders[2:] + sell_orders
+
+            engine._last_account_snapshot = AccountSnapshot(
+                positions=(), open_orders=tuple(remaining), ts=_BASE_TS + 10000, source="test"
+            )
+            snap2 = Snapshot(
+                ts=_BASE_TS + 10000,
+                symbol="BTCUSDT",
+                bid_price=Decimal("49999"),
+                ask_price=Decimal("50001"),
+                bid_qty=Decimal("1"),
+                ask_qty=Decimal("1"),
+                last_price=Decimal("50000"),
+                last_qty=Decimal("1"),
+            )
+            engine._grid_v2_integrity_repair(snap2)
+            snap3 = Snapshot(
+                ts=_BASE_TS + 11000,
+                symbol="BTCUSDT",
+                bid_price=Decimal("49999"),
+                ask_price=Decimal("50001"),
+                bid_qty=Decimal("1"),
+                ask_qty=Decimal("1"),
+                last_price=Decimal("50000"),
+                last_qty=Decimal("1"),
+            )
+            engine._last_account_snapshot = AccountSnapshot(
+                positions=(), open_orders=tuple(remaining), ts=_BASE_TS + 11000, source="test"
+            )
+            repair = engine._grid_v2_integrity_repair(snap3)
+            results.append(
+                [
+                    (a.action_type.value, a.side.value if a.side else "", str(a.price or ""))
+                    for a in repair
+                ]
+            )
+        assert results[0] == results[1] == results[2]
