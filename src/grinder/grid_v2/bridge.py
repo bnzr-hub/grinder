@@ -391,7 +391,29 @@ class GridV2Bridge:
             self._mark_recent_exit_fill(client_order_id, ts)
 
         # Step 4: resolve actions
-        resolved = self._adapter.resolve_actions(result.actions, ts)
+        # P0 hotfix: resolve_actions may raise ValueError if SM produces
+        # CANCEL_ENTRY for an entry that was never placed (e.g., risk gate
+        # blocked the PLACE). The fill itself is valid — only follow-up
+        # actions are unresolvable. Return empty actions, not a crash.
+        try:
+            resolved = self._adapter.resolve_actions(result.actions, ts)
+        except ValueError as exc:
+            logger.warning(
+                "GRID_V2_FILL_RESOLVE_ORPHAN symbol=%s cid=%s reason=%s "
+                "sm_actions=%d — follow-up actions skipped (no crash)",
+                self._symbol,
+                client_order_id,
+                exc,
+                len(result.actions),
+            )
+            return FillResult(
+                translated=translated,
+                transition=result,
+                resolved_actions=(),
+                execution_actions=(),
+                rejected=False,
+                reject_reason=None,
+            )
 
         # Step 5: convert to ExecutionActions
         exec_actions = self._to_execution_actions(resolved)
