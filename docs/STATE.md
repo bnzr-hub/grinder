@@ -1539,22 +1539,27 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
   - Planner suppressed for remaining run (no new PLACE/CANCEL generation)
   - Eliminates 80k+ spam lines when budget exhausted
   - Log: `ORDER_BUDGET_EXHAUSTED symbol=X — planner suppressed`
-- **Risk base from exchange balance** (PR-1 plumbing, ADR-092):
+- **Risk base from exchange balance** (ADR-092):
   - `RiskBaseSnapshot` derived from exchange balance on each account sync tick.
   - Modes: `total_margin_balance` (default), `wallet_balance`, `available_balance`.
   - Dual stale model: soft TTL (`GRINDER_RISK_BASE_STALE_TTL_S`, default 30s) + hard max age (`GRINDER_RISK_BASE_MAX_AGE_HARD_S`, default 60s).
   - Env: `GRINDER_RISK_BASE_ENABLED`, `GRINDER_RISK_BASE_MODE`, `GRINDER_RISK_BASE_MIN_USD`, `GRINDER_RISK_BASE_STALE_TTL_S`, `GRINDER_RISK_BASE_MAX_AGE_HARD_S`.
   - Metrics: `grinder_risk_base_usd`, `grinder_risk_base_stale_seconds`, `grinder_risk_base_status`.
   - Logs: `RISK_BASE_UPDATED`, `RISK_BASE_UNAVAILABLE`, `RISK_BASE_FETCH_FAILED`.
-  - **PR-1 = plumbing (delivered). PR-2 = enforcement (delivered).**
-  - PR-2 enforcement: Gate 5.5 in `_process_action` blocks `INCREASE_RISK` when risk base unavailable/stale/below_min or cap exceeded.
-  - Symbol cap: `GRINDER_SYMBOL_RISK_MAX_NOTIONAL_PCT` (fraction, e.g. `0.10` = 10%).
-  - Portfolio gross cap: `GRINDER_PORTFOLIO_RISK_MAX_GROSS_NOTIONAL_PCT`.
-  - Portfolio net cap: `GRINDER_PORTFOLIO_RISK_MAX_NET_NOTIONAL_PCT`.
+  - **PR-1 = plumbing (delivered), PR-2 = cap enforcement (delivered), PR-3 = percent/leverage + DD ladder + flat-only auto-size (delivered).**
+  - Gate 5.5 in `_process_action` blocks `INCREASE_RISK` when risk base unavailable/stale/below_min, cap exceeded, or DD thresholds breached.
+  - Percent/leverage symbol cap (new): `GRINDER_SYMBOL_RISK_BUDGET_PCT` × `GRINDER_SYMBOL_RISK_LEVERAGE_X`.
+  - Legacy symbol cap (still supported): `GRINDER_SYMBOL_RISK_MAX_NOTIONAL_PCT` (fraction).
+  - Portfolio caps (new % mode): `GRINDER_PORTFOLIO_RISK_GROSS_CAP_PCT`, `GRINDER_PORTFOLIO_RISK_NET_CAP_PCT`.
+  - Legacy portfolio caps (still supported): `GRINDER_PORTFOLIO_RISK_MAX_GROSS_NOTIONAL_PCT`, `GRINDER_PORTFOLIO_RISK_MAX_NET_NOTIONAL_PCT`.
+  - Symbol DD ladder: `GRINDER_SYMBOL_RISK_FREEZE_DD_PCT`, `GRINDER_SYMBOL_RISK_UNLOAD_DD_PCT`, `GRINDER_SYMBOL_RISK_FORCED_FLAT_DD_PCT`.
+  - Portfolio DD ladder: `GRINDER_PORTFOLIO_RISK_DD_FREEZE_PCT`, `GRINDER_PORTFOLIO_RISK_DD_FORCE_REDUCE_PCT`, `GRINDER_PORTFOLIO_RISK_DD_KILL_SWITCH_PCT`.
+  - New block reasons: `RISK_SYMBOL_DD_*` and `RISK_PORTFOLIO_DD_*`.
   - `CANCEL` and `REDUCE_RISK` never blocked by this gate.
   - Portfolio breach blocks ALL symbols (not just the breaching one).
   - Metric: `grinder_risk_gate_blocks_total{reason=...}` counter.
   - **P0 hotfix**: `bridge.on_fill()` catches orphan `CANCEL_ENTRY` from SM when entry was never placed (risk gate blocked). Returns empty actions instead of crashing loop. Log: `GRID_V2_FILL_RESOLVE_ORPHAN`.
+  - Flat-only order-size auto policy (new): `GRINDER_GRID_V2_ORDER_SIZE_POLICY_ENABLED` + `..._FLAT_ONLY` + `..._DELTA_THRESHOLD_PCT` + `..._UPDATE_COOLDOWN_S`; computes target size from risk headroom + NATR + effective step + bounded ML adjust and triggers controlled reseed only when delta threshold is met.
 
 ## Partially implemented
 - Package structure `src/grinder/*` (core, protocols/interfaces) -- scaffolding.

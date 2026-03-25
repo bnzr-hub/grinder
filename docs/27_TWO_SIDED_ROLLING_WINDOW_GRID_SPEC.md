@@ -1471,3 +1471,47 @@ Integrity repair is **role-separated**: ENTRY and EXIT checks are distinct.
 - `GRINDER_GRID_V2_GEOMETRY_REPAIR_ENABLED=1` (default ON)
 - `GRINDER_GRID_V2_GEOMETRY_EPSILON_TICKS=1`
 - `GRINDER_GRID_V2_REPAIR_STRICT_GEOMETRY=0` (default OFF; branch repair only)
+
+## 27. Risk Percent Model + Flat-Only Auto Size (post-PR454)
+
+### 27.1 Percent/leverage caps
+
+Risk caps are computed from exchange-balance risk base.
+
+- Symbol cap (new): `symbol_cap = risk_base * (SYMBOL_RISK_BUDGET_PCT / 100) * SYMBOL_RISK_LEVERAGE_X`
+- Portfolio gross cap (new): `risk_base * (PORTFOLIO_RISK_GROSS_CAP_PCT / 100)`
+- Portfolio net cap (new): `risk_base * (PORTFOLIO_RISK_NET_CAP_PCT / 100)`
+
+Legacy fraction env vars remain supported as fallback for backward compatibility.
+
+### 27.2 Drawdown ladders
+
+Additional Gate 5.5 block reasons:
+
+- Symbol DD ladder:
+  - `SYMBOL_DD_FREEZE`
+  - `SYMBOL_DD_UNLOAD`
+  - `SYMBOL_DD_FORCED_FLAT`
+- Portfolio DD ladder:
+  - `PORTFOLIO_DD_FREEZE`
+  - `PORTFOLIO_DD_FORCE_REDUCE`
+  - `PORTFOLIO_DD_KILL_SWITCH`
+
+As with other risk gate blocks, `CANCEL` and reduce-risk actions are still allowed.
+
+### 27.3 Flat-only auto order-size policy
+
+`order_size` can be updated automatically using:
+
+- risk headroom
+- NATR volatility
+- effective adaptive step
+- optional bounded ML multiplier
+
+Contract:
+
+- Update only in `FLAT` (no open lots, no active position).
+- Cooldown + delta-threshold prevent churn.
+- If target size delta is below threshold: no reseed.
+- If target size delta exceeds threshold: controlled reseed (cancel existing grid_v2 CIDs, startup fresh with new size).
+- Hard safety (tick/lot/min-notional/risk gates) remains authoritative.

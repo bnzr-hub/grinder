@@ -4363,7 +4363,7 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 
 ### ADR-092: Exchange-Balance Risk Base (2026-03-25)
 
-- **Status:** PR-1 delivered (plumbing only). PR-2 planned (enforcement).
+- **Status:** PR-1 delivered (plumbing), PR-2 delivered (cap enforcement), PR-3 delivered (percent/leverage + DD ladder + flat-only auto-size policy).
 - **Decision:** All risk limits (portfolio and symbol) will be computed relative to the exchange account balance, not local constants. Single `RiskBaseSnapshot` derived from exchange balance on each account sync tick.
 - **Context:** Previously, symbol risk caps used static `GRINDER_SYMBOL_RISK_MAX_NOTIONAL_USD` config. This doesn't adapt to changing account balance. Portfolio-level risk limits didn't exist. Need a unified, dynamic risk base.
 - **Modes:** `total_margin_balance` (default, recommended — includes uPnL), `wallet_balance` (stable, excludes uPnL), `available_balance` (conservative, accounts for used margin — feedback-loop prone).
@@ -4372,5 +4372,15 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Notional conventions (for PR-2):** `long > 0`, `short < 0`. `gross = sum(abs(notional_i))`. `net = abs(sum(signed_notional_i))`. Price source: `mark_price` from account snapshot.
 - **Portfolio breach semantics (for PR-2):** Portfolio gross/net breach blocks `INCREASE_RISK` for ALL symbols. Reduce/cancel always allowed.
 - **PR-1 scope:** Contract + plumbing + metrics + logs. No dispatch blocking. Feature-flagged: `GRINDER_RISK_BASE_ENABLED=0` default.
-- **PR-2 scope (delivered):** Symbol cap (`GRINDER_SYMBOL_RISK_MAX_NOTIONAL_PCT`), portfolio gross cap (`GRINDER_PORTFOLIO_RISK_MAX_GROSS_NOTIONAL_PCT`), portfolio net cap (`GRINDER_PORTFOLIO_RISK_MAX_NET_NOTIONAL_PCT`). Gate 5.5 in `_process_action`. Fail-closed on unavailable/stale/below_min. `evaluate_risk_gate()` in `portfolio_risk.py`. BlockReasons: `RISK_BASE_UNAVAILABLE`, `RISK_BASE_STALE`, `RISK_BASE_BELOW_MIN`, `RISK_SYMBOL_CAP`, `RISK_PORTFOLIO_GROSS_CAP`, `RISK_PORTFOLIO_NET_CAP`. Counter metric `grinder_risk_gate_blocks_total{reason=...}`. All pct values are fractions (0.10 = 10%), default 0 = disabled.
+- **PR-2 scope (delivered):** Symbol cap (`GRINDER_SYMBOL_RISK_MAX_NOTIONAL_PCT`), portfolio gross cap (`GRINDER_PORTFOLIO_RISK_MAX_GROSS_NOTIONAL_PCT`), portfolio net cap (`GRINDER_PORTFOLIO_RISK_MAX_NET_NOTIONAL_PCT`). Gate 5.5 in `_process_action`. Fail-closed on unavailable/stale/below_min. `evaluate_risk_gate()` in `portfolio_risk.py`. BlockReasons: `RISK_BASE_UNAVAILABLE`, `RISK_BASE_STALE`, `RISK_BASE_BELOW_MIN`, `RISK_SYMBOL_CAP`, `RISK_PORTFOLIO_GROSS_CAP`, `RISK_PORTFOLIO_NET_CAP`. Counter metric `grinder_risk_gate_blocks_total{reason=...}`.
+- **PR-3 scope (delivered):**
+  - Percent/leverage symbol caps: `GRINDER_SYMBOL_RISK_BUDGET_PCT` × `GRINDER_SYMBOL_RISK_LEVERAGE_X` (legacy fraction envs remain as fallback for compatibility).
+  - Percent portfolio caps: `GRINDER_PORTFOLIO_RISK_GROSS_CAP_PCT`, `GRINDER_PORTFOLIO_RISK_NET_CAP_PCT` (legacy fraction envs remain as fallback).
+  - Symbol DD ladder reasons: `SYMBOL_DD_FREEZE`, `SYMBOL_DD_UNLOAD`, `SYMBOL_DD_FORCED_FLAT`.
+  - Portfolio DD ladder reasons: `PORTFOLIO_DD_FREEZE`, `PORTFOLIO_DD_FORCE_REDUCE`, `PORTFOLIO_DD_KILL_SWITCH`.
+  - Engine block reasons mapped one-to-one: `RISK_SYMBOL_DD_*`, `RISK_PORTFOLIO_DD_*`.
+  - `SymbolRiskManager` public `tracked_symbols()` API added (remove private `_states` access from engine).
+  - New flat-only grid_v2 auto-size policy (`src/grinder/risk/order_size_policy.py`):
+    deterministic core (risk headroom + NATR + effective step) + optional bounded ML multiplier,
+    update only in FLAT, cooldown + delta-threshold guarded, apply via controlled reseed.
 - **P0 hotfix (post-PR-2 live):** `bridge.on_fill()` `resolve_actions` can raise ValueError when SM produces `CANCEL_ENTRY` for entry that was never placed (risk gate blocked PLACE → CID never registered). Fix: try/except ValueError in `on_fill()`, return FillResult with empty actions. Adapter contract stays strict. Log code: `GRID_V2_FILL_RESOLVE_ORPHAN`. Reproven in live: PIPPINUSDT ceremony with RISK_SYMBOL_CAP active.
