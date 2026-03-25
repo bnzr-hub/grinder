@@ -1546,7 +1546,14 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
   - Env: `GRINDER_RISK_BASE_ENABLED`, `GRINDER_RISK_BASE_MODE`, `GRINDER_RISK_BASE_MIN_USD`, `GRINDER_RISK_BASE_STALE_TTL_S`, `GRINDER_RISK_BASE_MAX_AGE_HARD_S`.
   - Metrics: `grinder_risk_base_usd`, `grinder_risk_base_stale_seconds`, `grinder_risk_base_status`.
   - Logs: `RISK_BASE_UPDATED`, `RISK_BASE_UNAVAILABLE`, `RISK_BASE_FETCH_FAILED`.
-  - **PR-1 = plumbing only. No dispatch blocking. Enforcement in PR-2.**
+  - **PR-1 = plumbing (delivered). PR-2 = enforcement (delivered).**
+  - PR-2 enforcement: Gate 5.5 in `_process_action` blocks `INCREASE_RISK` when risk base unavailable/stale/below_min or cap exceeded.
+  - Symbol cap: `GRINDER_SYMBOL_RISK_MAX_NOTIONAL_PCT` (fraction, e.g. `0.10` = 10%).
+  - Portfolio gross cap: `GRINDER_PORTFOLIO_RISK_MAX_GROSS_NOTIONAL_PCT`.
+  - Portfolio net cap: `GRINDER_PORTFOLIO_RISK_MAX_NET_NOTIONAL_PCT`.
+  - `CANCEL` and `REDUCE_RISK` never blocked by this gate.
+  - Portfolio breach blocks ALL symbols (not just the breaching one).
+  - Metric: `grinder_risk_gate_blocks_total{reason=...}` counter.
 
 ## Partially implemented
 - Package structure `src/grinder/*` (core, protocols/interfaces) -- scaffolding.

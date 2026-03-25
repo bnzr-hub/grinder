@@ -299,6 +299,10 @@ REQUIRED_METRICS_PATTERNS = [
     "# HELP grinder_risk_base_status",
     "# TYPE grinder_risk_base_status",
     "grinder_risk_base_status",
+    # PR-2 (ADR-092): Risk gate block counter
+    "# HELP grinder_risk_gate_blocks_total",
+    "# TYPE grinder_risk_gate_blocks_total",
+    "grinder_risk_gate_blocks_total{reason=",
 ]
 
 # PR6: Concrete series patterns requiring fill ingest to be running.
