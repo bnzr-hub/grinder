@@ -5407,9 +5407,34 @@ class TestRoleAwareRepair:
             last_price=Decimal("50000"),
             last_qty=Decimal("1"),
         )
-        repair = engine._grid_v2_integrity_repair(snap2)
-        # No repair needed — all ENTRY orders match, EXIT is separate
-        assert len(repair) == 0, f"Expected 0 repair actions, got {len(repair)}"
+        # Tick 1: streak=1
+        engine._grid_v2_integrity_repair(snap2)
+        # Tick 2: triggers repair (EXIT in FLAT = cleanup target)
+        snap3 = Snapshot(
+            ts=_BASE_TS + 11000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=tuple(all_orders), ts=_BASE_TS + 11000, source="test"
+        )
+        repair2 = engine._grid_v2_integrity_repair(snap3)
+        # EXIT in FLAT is cleaned up, but no ENTRY actions should be affected
+        entry_actions = [
+            a
+            for a in repair2
+            if a.reason == "grid_v2_INTEGRITY_CANCEL_ENTRY"
+            or (a.action_type == ActionType.PLACE and "ENTRY" in a.reason.upper())
+        ]
+        assert len(entry_actions) == 0, f"EXIT presence caused false ENTRY repair: {entry_actions}"
+        # EXIT cleanup is expected (correct role-aware behavior)
+        exit_cancels = [a for a in repair2 if a.reason == "grid_v2_INTEGRITY_CANCEL_EXIT"]
+        assert len(exit_cancels) == 1, "Expected EXIT cleanup in FLAT"
 
     def test_entry_cancel_targets_only_entry_cids(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test B: ENTRY extra-cancel targets only ENTRY CIDs, not EXIT CIDs."""

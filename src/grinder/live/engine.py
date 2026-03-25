@@ -1363,15 +1363,21 @@ class LiveEngineV0:
 
         # EXIT integrity: expected exits from lot ledger
         expected_exit_cids: set[str] = set()
+        exit_registry_orphans = 0
         for eo in sm.snapshot.exit_orders:
             if eo.exit_order_id is not None:
                 reg_cid = bridge.adapter.registry.cid_for_exit(eo.exit_order_id)
                 if reg_cid is not None:
                     expected_exit_cids.add(reg_cid)
+                else:
+                    # Registry lost mapping for a known exit — integrity issue
+                    exit_registry_orphans += 1
         exit_mismatch = bool(
             sm.mode != BranchMode.FLAT
-            and expected_exit_cids
-            and not expected_exit_cids.issubset(current_exit_cids)
+            and (
+                (expected_exit_cids and not expected_exit_cids.issubset(current_exit_cids))
+                or exit_registry_orphans > 0
+            )
         )
 
         # Geometry-aware matching: detect structural + price-drift mismatches (ENTRY only)
@@ -1502,14 +1508,15 @@ class LiveEngineV0:
                 len(extra),
                 len(missing_exits),
             )
-            if missing_exits:
+            if missing_exits or exit_registry_orphans:
                 logger.warning(
                     "GRID_V2_EXIT_INTEGRITY_MISMATCH symbol=%s missing_exit_cids=%d "
-                    "expected=%d current=%d",
+                    "expected=%d current=%d registry_orphans=%d",
                     snapshot.symbol,
                     len(missing_exits),
                     len(expected_exit_cids),
                     len(current_exit_cids),
+                    exit_registry_orphans,
                 )
 
             # Cancel entry orders that exist on exchange but are outside expected window.
