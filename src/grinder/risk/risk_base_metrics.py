@@ -56,6 +56,7 @@ class RiskBaseMetrics:
     def record_unavailable(self) -> None:
         """Record that risk base could not be derived."""
         self.value_usd = 0.0
+        self.age_s = 0
         self.status = STATUS_UNAVAILABLE
 
     def to_prometheus_lines(self) -> list[str]:

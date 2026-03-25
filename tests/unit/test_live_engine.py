@@ -27,6 +27,7 @@ See ADR-036 for design decisions.
 from __future__ import annotations
 
 import logging
+import time
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -6403,11 +6404,14 @@ class TestRiskBasePlumbing:
         port.get_account_info.return_value = account_info
 
         engine = self._make_engine(port=port, risk_base_enabled=True)
-        engine._update_risk_base()
+        # Pass exchange timestamp (recent enough to be fresh)
+        now_ms = int(time.time() * 1000)
+        engine._update_risk_base(asof_ts_ms=now_ms)
 
         assert engine._risk_base_snapshot is not None
         assert engine._risk_base_snapshot.value_usd == Decimal("1500")
         assert engine._risk_base_snapshot.mode == "total_margin_balance"
+        assert engine._risk_base_snapshot.asof_ts_ms == now_ms
         assert engine._risk_base_snapshot.is_stale_soft is False
 
         reset_risk_base_metrics()
@@ -6415,7 +6419,7 @@ class TestRiskBasePlumbing:
     def test_update_risk_base_noop_without_get_account_info(self) -> None:
         """NoOpExchangePort lacks get_account_info → _update_risk_base is no-op."""
         engine = self._make_engine(port=NoOpExchangePort(), risk_base_enabled=True)
-        engine._update_risk_base()
+        engine._update_risk_base(asof_ts_ms=1000)
         assert engine._risk_base_snapshot is None
 
     def test_update_risk_base_handles_fetch_error(self) -> None:
@@ -6425,11 +6429,39 @@ class TestRiskBasePlumbing:
         port.get_account_info.side_effect = RuntimeError("connection timeout")
 
         engine = self._make_engine(port=port, risk_base_enabled=True)
-        engine._update_risk_base()
+        engine._update_risk_base(asof_ts_ms=1000)
 
         assert engine._risk_base_snapshot is None
         m = get_risk_base_metrics()
         assert m.status == 0  # UNAVAILABLE
+        assert m.age_s == 0  # P2 fix: age_s reset on unavailable
+
+        reset_risk_base_metrics()
+
+    def test_update_risk_base_stale_with_old_exchange_ts(self) -> None:
+        """P1 fix: exchange ts in the past → stale flags fire correctly."""
+        reset_risk_base_metrics()
+
+        port = MagicMock()
+        account_info = MagicMock()
+        account_info.margin_balance = Decimal("1000")
+        account_info.total_balance_usdt = Decimal("900")
+        account_info.available_balance_usdt = Decimal("800")
+        port.get_account_info.return_value = account_info
+
+        engine = self._make_engine(port=port, risk_base_enabled=True)
+        # Exchange ts 45 seconds in the past → soft stale (TTL=30s)
+        old_ts_ms = int(time.time() * 1000) - 45_000
+        engine._update_risk_base(asof_ts_ms=old_ts_ms)
+
+        assert engine._risk_base_snapshot is not None
+        assert engine._risk_base_snapshot.asof_ts_ms == old_ts_ms
+        assert engine._risk_base_snapshot.is_stale_soft is True
+        assert engine._risk_base_snapshot.is_stale_hard is False
+        assert engine._risk_base_snapshot.age_s >= 44  # ~45s, allow 1s margin
+
+        m = get_risk_base_metrics()
+        assert m.status == 2  # STATUS_SOFT_STALE
 
         reset_risk_base_metrics()
 

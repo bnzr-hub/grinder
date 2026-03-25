@@ -3270,7 +3270,7 @@ class LiveEngineV0:
 
         # PR-1 (ADR-092): Update risk base snapshot from exchange balance
         if self._risk_base_enabled and result.snapshot is not None:
-            self._update_risk_base()
+            self._update_risk_base(asof_ts_ms=result.snapshot.ts)
 
         # P0-2: correlate recent PLACEs with AccountSync open_orders
         if self._debug_open_orders and result.snapshot is not None:
@@ -3336,8 +3336,12 @@ class LiveEngineV0:
             if len(self._looked_up_ids) > 100:
                 self._looked_up_ids.clear()
 
-    def _update_risk_base(self) -> None:
+    def _update_risk_base(self, asof_ts_ms: int) -> None:
         """Fetch balance from exchange and update risk base snapshot (PR-1 plumbing).
+
+        Args:
+            asof_ts_ms: Exchange timestamp from account snapshot (not wall-clock).
+                Used as BalanceData.ts_ms so stale model measures exchange data age.
 
         Uses duck-type check for get_account_info() on the exchange port.
         If the port doesn't support it, logs once and returns.
@@ -3353,7 +3357,7 @@ class LiveEngineV0:
                 total_margin_balance=info.margin_balance,
                 wallet_balance=info.total_balance_usdt,
                 available_balance=info.available_balance_usdt,
-                ts_ms=int(time.time() * 1000),
+                ts_ms=asof_ts_ms,
             )
         except Exception:
             logger.warning("RISK_BASE_FETCH_FAILED", exc_info=True)

@@ -314,6 +314,16 @@ class TestRiskBaseMetrics:
         m.record_unavailable()
         assert m.status == STATUS_UNAVAILABLE
         assert m.value_usd == 0.0
+        assert m.age_s == 0  # P2 fix: age_s reset on unavailable
+
+    def test_record_unavailable_resets_age_from_stale(self) -> None:
+        """P2 fix: after stale snapshot, unavailable must reset age_s to 0."""
+        m = get_risk_base_metrics()
+        m.record_snapshot(value_usd=1000.0, age_s=45, is_stale_soft=True, is_stale_hard=False)
+        assert m.age_s == 45
+        m.record_unavailable()
+        assert m.age_s == 0
+        assert m.status == STATUS_UNAVAILABLE
 
     def test_prometheus_lines(self) -> None:
         m = get_risk_base_metrics()
