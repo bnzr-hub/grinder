@@ -253,6 +253,59 @@ class TestEvaluateRiskGatePortfolioCaps:
         assert d.allowed
 
 
+class TestEvaluateRiskGateDrawdown:
+    def test_symbol_dd_freeze_blocks(self) -> None:
+        acct = AccountSnapshot(
+            positions=(
+                PositionSnap(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    qty=Decimal("1"),
+                    signed_qty=Decimal("1"),
+                    entry_price=Decimal("100"),
+                    mark_price=Decimal("95"),
+                    unrealized_pnl=Decimal("-30"),
+                    leverage=1,
+                    ts=1000,
+                ),
+            ),
+            open_orders=(),
+            ts=1000,
+            source="test",
+        )
+        cfg = PortfolioRiskConfig(
+            symbol_max_notional_pct=0.2,  # budget=200
+            symbol_freeze_dd_pct=10.0,  # dd = 15%
+        )
+        d = evaluate_risk_gate(_snap("1000"), acct, cfg, "BTCUSDT")
+        assert not d.allowed
+        assert d.reason == RiskGateReason.SYMBOL_DD_FREEZE
+
+    def test_portfolio_dd_force_reduce_blocks(self) -> None:
+        acct = AccountSnapshot(
+            positions=(
+                PositionSnap(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    qty=Decimal("1"),
+                    signed_qty=Decimal("1"),
+                    entry_price=Decimal("100"),
+                    mark_price=Decimal("95"),
+                    unrealized_pnl=Decimal("-90"),
+                    leverage=1,
+                    ts=1000,
+                ),
+            ),
+            open_orders=(),
+            ts=1000,
+            source="test",
+        )
+        cfg = PortfolioRiskConfig(portfolio_dd_force_reduce_pct=8.0)
+        d = evaluate_risk_gate(_snap("1000"), acct, cfg, "BTCUSDT")
+        assert not d.allowed
+        assert d.reason == RiskGateReason.PORTFOLIO_DD_FORCE_REDUCE
+
+
 class TestEvaluateRiskGateMultiSymbol:
     def test_portfolio_breach_blocks_all_symbols(self) -> None:
         """Gross breach on portfolio blocks INCREASE_RISK for ANY symbol."""
@@ -492,17 +545,21 @@ class TestPortfolioRiskConfigValidation:
         assert cfg.portfolio_max_gross_notional_pct == 0.0
         assert cfg.portfolio_max_net_notional_pct == 0.0
 
-    def test_pct_over_1_sym_raises(self) -> None:
-        """P2 fix: fraction > 1.0 is likely operator error (10 instead of 0.10)."""
-        with pytest.raises(ValueError, match="fraction"):
-            PortfolioRiskConfig(symbol_max_notional_pct=10)
-
-    def test_pct_over_1_gross_raises(self) -> None:
-        with pytest.raises(ValueError, match="fraction"):
-            PortfolioRiskConfig(
-                portfolio_max_gross_notional_pct=0.80, portfolio_max_net_notional_pct=2.0
-            )
-
     def test_pct_exactly_1_allowed(self) -> None:
         cfg = PortfolioRiskConfig(symbol_max_notional_pct=1.0)
         assert cfg.symbol_max_notional_pct == 1.0
+
+    def test_pct_above_1_allowed_for_leverage(self) -> None:
+        cfg = PortfolioRiskConfig(portfolio_max_gross_notional_pct=3.0)
+        assert cfg.portfolio_max_gross_notional_pct == 3.0
+
+    def test_pct_over_10_raises(self) -> None:
+        with pytest.raises(ValueError, match="fraction"):
+            PortfolioRiskConfig(portfolio_max_net_notional_pct=10.1)
+
+    def test_dd_threshold_order_validation(self) -> None:
+        with pytest.raises(ValueError, match="thresholds invalid"):
+            PortfolioRiskConfig(
+                symbol_freeze_dd_pct=5.0,
+                symbol_unload_dd_pct=2.5,
+            )

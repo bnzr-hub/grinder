@@ -95,9 +95,16 @@ from grinder.risk.drawdown_guard_v1 import DrawdownGuardV1
 from grinder.risk.drawdown_guard_v1 import OrderIntent as RiskIntent
 from grinder.risk.emergency_exit import EmergencyExitExecutor
 from grinder.risk.emergency_exit_metrics import get_emergency_exit_metrics
+from grinder.risk.order_size_policy import (
+    OrderSizeInputs,
+    OrderSizePolicyConfig,
+    compute_target_order_size,
+)
 from grinder.risk.portfolio_risk import (
     PortfolioRiskConfig,
     RiskGateReason,
+    compute_portfolio_notionals,
+    compute_symbol_notional,
     evaluate_risk_gate,
 )
 from grinder.risk.risk_base import (
@@ -219,8 +226,14 @@ class BlockReason(Enum):
     RISK_BASE_STALE = "RISK_BASE_STALE"
     RISK_BASE_BELOW_MIN = "RISK_BASE_BELOW_MIN"
     RISK_SYMBOL_CAP = "RISK_SYMBOL_CAP"
+    RISK_SYMBOL_DD_FREEZE = "RISK_SYMBOL_DD_FREEZE"
+    RISK_SYMBOL_DD_UNLOAD = "RISK_SYMBOL_DD_UNLOAD"
+    RISK_SYMBOL_DD_FORCED_FLAT = "RISK_SYMBOL_DD_FORCED_FLAT"
     RISK_PORTFOLIO_GROSS_CAP = "RISK_PORTFOLIO_GROSS_CAP"
     RISK_PORTFOLIO_NET_CAP = "RISK_PORTFOLIO_NET_CAP"
+    RISK_PORTFOLIO_DD_FREEZE = "RISK_PORTFOLIO_DD_FREEZE"
+    RISK_PORTFOLIO_DD_FORCE_REDUCE = "RISK_PORTFOLIO_DD_FORCE_REDUCE"
+    RISK_PORTFOLIO_DD_KILL_SWITCH = "RISK_PORTFOLIO_DD_KILL_SWITCH"
 
 
 # PR-2 (ADR-092): Map RiskGateReason → BlockReason for risk base enforcement gate.
@@ -229,8 +242,14 @@ _RISK_GATE_TO_BLOCK: dict[RiskGateReason | None, BlockReason] = {
     RiskGateReason.RISK_BASE_STALE: BlockReason.RISK_BASE_STALE,
     RiskGateReason.RISK_BASE_BELOW_MIN: BlockReason.RISK_BASE_BELOW_MIN,
     RiskGateReason.SYMBOL_CAP_EXCEEDED: BlockReason.RISK_SYMBOL_CAP,
+    RiskGateReason.SYMBOL_DD_FREEZE: BlockReason.RISK_SYMBOL_DD_FREEZE,
+    RiskGateReason.SYMBOL_DD_UNLOAD: BlockReason.RISK_SYMBOL_DD_UNLOAD,
+    RiskGateReason.SYMBOL_DD_FORCED_FLAT: BlockReason.RISK_SYMBOL_DD_FORCED_FLAT,
     RiskGateReason.PORTFOLIO_GROSS_CAP_EXCEEDED: BlockReason.RISK_PORTFOLIO_GROSS_CAP,
     RiskGateReason.PORTFOLIO_NET_CAP_EXCEEDED: BlockReason.RISK_PORTFOLIO_NET_CAP,
+    RiskGateReason.PORTFOLIO_DD_FREEZE: BlockReason.RISK_PORTFOLIO_DD_FREEZE,
+    RiskGateReason.PORTFOLIO_DD_FORCE_REDUCE: BlockReason.RISK_PORTFOLIO_DD_FORCE_REDUCE,
+    RiskGateReason.PORTFOLIO_DD_KILL_SWITCH: BlockReason.RISK_PORTFOLIO_DD_KILL_SWITCH,
 }
 
 
@@ -658,29 +677,97 @@ class LiveEngineV0:
         )
         self._risk_base_enabled = _rb_enabled
         self._risk_base_snapshot: RiskBaseSnapshot | None = None
-        # PR-2 (ADR-092): Portfolio risk enforcement config
+
+        # PR-2/extended: Portfolio risk enforcement config
+        def _frac_from_env(new_pct_var: str, legacy_frac_var: str, default: float = 0.0) -> float:
+            """Parse percentage or legacy fraction env into fraction value.
+
+            Priority:
+            1) new_pct_var: integer/float percentage semantics (e.g. 33 = 33%).
+            2) legacy_frac_var: fraction semantics (e.g. 0.33 = 33%).
+            """
+            raw_new = os.environ.get(new_pct_var, "").strip()
+            if raw_new:
+                try:
+                    pct = float(raw_new)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{new_pct_var} must be numeric percentage, got {raw_new!r}"
+                    ) from exc
+                if pct < 0:
+                    raise ValueError(f"{new_pct_var} must be >= 0, got {pct}")
+                return pct / 100.0
+            raw_old = os.environ.get(legacy_frac_var, "").strip()
+            if raw_old:
+                try:
+                    frac = float(raw_old)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{legacy_frac_var} must be numeric fraction, got {raw_old!r}"
+                    ) from exc
+                if frac < 0:
+                    raise ValueError(f"{legacy_frac_var} must be >= 0, got {frac}")
+                return frac
+            return default
+
+        _symbol_budget_frac = _frac_from_env(
+            "GRINDER_SYMBOL_RISK_BUDGET_PCT",
+            "GRINDER_SYMBOL_RISK_MAX_NOTIONAL_PCT",
+            default=0.0,
+        )
+        _symbol_leverage_x = float(os.environ.get("GRINDER_SYMBOL_RISK_LEVERAGE_X", "1.0"))
+        if _symbol_leverage_x < 1.0:
+            raise ValueError(
+                f"GRINDER_SYMBOL_RISK_LEVERAGE_X must be >= 1.0, got {_symbol_leverage_x}"
+            )
+        _symbol_cap_frac = _symbol_budget_frac * _symbol_leverage_x
         self._portfolio_risk_config = PortfolioRiskConfig(
-            symbol_max_notional_pct=float(
-                os.environ.get("GRINDER_SYMBOL_RISK_MAX_NOTIONAL_PCT", "0")
+            symbol_max_notional_pct=_symbol_cap_frac,
+            portfolio_max_gross_notional_pct=_frac_from_env(
+                "GRINDER_PORTFOLIO_RISK_GROSS_CAP_PCT",
+                "GRINDER_PORTFOLIO_RISK_MAX_GROSS_NOTIONAL_PCT",
+                default=0.0,
             ),
-            portfolio_max_gross_notional_pct=float(
-                os.environ.get("GRINDER_PORTFOLIO_RISK_MAX_GROSS_NOTIONAL_PCT", "0")
+            portfolio_max_net_notional_pct=_frac_from_env(
+                "GRINDER_PORTFOLIO_RISK_NET_CAP_PCT",
+                "GRINDER_PORTFOLIO_RISK_MAX_NET_NOTIONAL_PCT",
+                default=0.0,
             ),
-            portfolio_max_net_notional_pct=float(
-                os.environ.get("GRINDER_PORTFOLIO_RISK_MAX_NET_NOTIONAL_PCT", "0")
+            symbol_freeze_dd_pct=float(os.environ.get("GRINDER_SYMBOL_RISK_FREEZE_DD_PCT", "0")),
+            symbol_unload_dd_pct=float(os.environ.get("GRINDER_SYMBOL_RISK_UNLOAD_DD_PCT", "0")),
+            symbol_forced_flat_dd_pct=float(
+                os.environ.get("GRINDER_SYMBOL_RISK_FORCED_FLAT_DD_PCT", "0")
+            ),
+            portfolio_dd_freeze_pct=float(
+                os.environ.get("GRINDER_PORTFOLIO_RISK_DD_FREEZE_PCT", "0")
+            ),
+            portfolio_dd_force_reduce_pct=float(
+                os.environ.get("GRINDER_PORTFOLIO_RISK_DD_FORCE_REDUCE_PCT", "0")
+            ),
+            portfolio_dd_kill_switch_pct=float(
+                os.environ.get("GRINDER_PORTFOLIO_RISK_DD_KILL_SWITCH_PCT", "0")
             ),
         )
         if _rb_enabled:
             logger.info(
                 "RISK_BASE_ENABLED mode=%s min_usd=%.2f stale_ttl=%ds hard_age=%ds "
-                "sym_pct=%.4f gross_pct=%.4f net_pct=%.4f",
+                "sym_cap=%.4f (budget=%.4f * lev=%.2f) gross_cap=%.4f net_cap=%.4f "
+                "sym_dd(f/u/ff)=%.2f/%.2f/%.2f pf_dd(f/r/k)=%.2f/%.2f/%.2f",
                 self._risk_base_config.mode.value,
                 self._risk_base_config.min_usd,
                 self._risk_base_config.stale_ttl_s,
                 self._risk_base_config.max_age_hard_s,
                 self._portfolio_risk_config.symbol_max_notional_pct,
+                _symbol_budget_frac,
+                _symbol_leverage_x,
                 self._portfolio_risk_config.portfolio_max_gross_notional_pct,
                 self._portfolio_risk_config.portfolio_max_net_notional_pct,
+                self._portfolio_risk_config.symbol_freeze_dd_pct,
+                self._portfolio_risk_config.symbol_unload_dd_pct,
+                self._portfolio_risk_config.symbol_forced_flat_dd_pct,
+                self._portfolio_risk_config.portfolio_dd_freeze_pct,
+                self._portfolio_risk_config.portfolio_dd_force_reduce_pct,
+                self._portfolio_risk_config.portfolio_dd_kill_switch_pct,
             )
 
         # PR-ROLL-1b: log enforcement status at startup
@@ -769,6 +856,69 @@ class LiveEngineV0:
                 self._adaptive_step.config.step_max_pct,
                 self._adaptive_step.config.vol_ref_bps,
                 self._adaptive_step.config.update_cooldown_s,
+            )
+
+        # Grid v2 order-size policy (flat-only automatic sizing)
+        _os_enabled = parse_bool(
+            "GRINDER_GRID_V2_ORDER_SIZE_POLICY_ENABLED", default=False, strict=False
+        )
+        _base_order_size = float(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE", "0.001"))
+        self._grid_v2_order_size_effective = Decimal(str(_base_order_size))
+        self._grid_v2_order_size_last_update_ts = 0
+        self._grid_v2_order_size_policy = OrderSizePolicyConfig(
+            enabled=_os_enabled,
+            flat_only=parse_bool(
+                "GRINDER_GRID_V2_ORDER_SIZE_FLAT_ONLY", default=True, strict=False
+            ),
+            update_cooldown_s=float(
+                os.environ.get("GRINDER_GRID_V2_ORDER_SIZE_UPDATE_COOLDOWN_S", "60")
+            ),
+            delta_threshold_pct=float(
+                os.environ.get("GRINDER_GRID_V2_ORDER_SIZE_DELTA_THRESHOLD_PCT", "12")
+            ),
+            base_size=_base_order_size,
+            min_size=float(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE_MIN", str(_base_order_size))),
+            max_size=float(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE_MAX", str(_base_order_size))),
+            natr_ref_bps=float(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE_NATR_REF_BPS", "100")),
+            step_ref_bps=float(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE_STEP_REF_BPS", "25")),
+            vol_k=float(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE_VOL_K", "1.0")),
+            step_k=float(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE_STEP_K", "0.5")),
+            ml_enabled=parse_bool(
+                "GRINDER_GRID_V2_ORDER_SIZE_ML_ENABLED", default=False, strict=False
+            ),
+            ml_adjust_max_pct=float(
+                os.environ.get("GRINDER_GRID_V2_ORDER_SIZE_ML_ADJUST_MAX_PCT", "80")
+            ),
+        )
+        self._grid_v2_order_size_ml_model: Any | None = None
+        if self._grid_v2_order_size_policy.enabled and self._grid_v2_order_size_policy.ml_enabled:
+            model_dir = os.environ.get("GRINDER_ML_REGIME_MODEL_DIR", "").strip()
+            if model_dir:
+                try:
+                    from grinder.ml.onnx.model import OnnxMlModel  # noqa: PLC0415
+
+                    self._grid_v2_order_size_ml_model = OnnxMlModel.load_from_dir(model_dir)
+                    logger.info("GRID_V2_ORDER_SIZE_ML_PROVIDER_WIRED model_dir=%s", model_dir)
+                except Exception:
+                    logger.warning(
+                        "GRID_V2_ORDER_SIZE_ML_PROVIDER_MISSING reason=model_load_failed model_dir=%s",
+                        model_dir,
+                        exc_info=True,
+                    )
+            else:
+                logger.warning("GRID_V2_ORDER_SIZE_ML_PROVIDER_MISSING reason=model_dir_unset")
+        if self._grid_v2_order_size_policy.enabled:
+            logger.info(
+                "GRID_V2_ORDER_SIZE_POLICY_ENABLED flat_only=%s cooldown=%.0fs "
+                "delta=%.2f base=%.6f min=%.6f max=%.6f ml=%s ml_max=%.2f",
+                self._grid_v2_order_size_policy.flat_only,
+                self._grid_v2_order_size_policy.update_cooldown_s,
+                self._grid_v2_order_size_policy.delta_threshold_pct,
+                self._grid_v2_order_size_policy.base_size,
+                self._grid_v2_order_size_policy.min_size,
+                self._grid_v2_order_size_policy.max_size,
+                self._grid_v2_order_size_policy.ml_enabled,
+                self._grid_v2_order_size_policy.ml_adjust_max_pct,
             )
 
         if self._grid_v2_enabled:
@@ -889,7 +1039,7 @@ class LiveEngineV0:
 
     # --- Grid V2 runtime methods (doc-27 section 23, PR4) ---
 
-    def _create_grid_v2_bridge(self) -> GridV2Bridge:
+    def _create_grid_v2_bridge(self, order_size_override: Decimal | None = None) -> GridV2Bridge:
         """Construct GridV2Bridge from env-var config. Fail-closed on bad config."""
         # Use adaptive step if enabled, else env default
         base_step = os.environ.get("GRINDER_GRID_V2_STEP_PCT", "0.005")
@@ -899,7 +1049,9 @@ class LiveEngineV0:
         config = GridV2Config(
             grid_step_pct=Decimal(base_step),
             entry_levels_per_side=int(os.environ.get("GRINDER_GRID_V2_ENTRY_LEVELS", "3")),
-            order_size=Decimal(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE", "0.001")),
+            order_size=order_size_override
+            if order_size_override is not None
+            else self._grid_v2_order_size_effective,
             max_inventory_levels=int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "3")),
             max_inventory_notional_usd=Decimal(
                 os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL", "1000")
@@ -930,6 +1082,190 @@ class LiveEngineV0:
             f"GRINDER_GRID_V2_TICK_SIZE required for grid_v2 symbol={self._grid_v2_symbol}. "
             "Set it to the exchange tick size (e.g., 0.10 for BTCUSDT futures)."
         )
+
+    @staticmethod
+    def _feature_to_policy_inputs(features: FeatureSnapshot) -> dict[str, Any]:
+        return {
+            "natr_bps": features.natr_bps,
+            "spread_bps": features.spread_bps,
+            "range_score": features.range_score,
+            "net_return_bps": features.net_return_bps,
+            "imbalance_l1_bps": features.imbalance_l1_bps,
+            "warmup_bars": features.warmup_bars,
+        }
+
+    def _grid_v2_order_size_ml_adjust_pct(self, symbol: str) -> float:
+        """Compute ML adjustment percent for order-size policy.
+
+        Regime mapping:
+        - HIGH volatility -> reduce size
+        - MID -> no change
+        - LOW -> increase size
+        """
+        model = self._grid_v2_order_size_ml_model
+        features = self._last_feature_snapshot
+        policy = self._grid_v2_order_size_policy
+        if (
+            model is None
+            or features is None
+            or not policy.ml_enabled
+            or policy.ml_adjust_max_pct <= 0
+            or features.symbol != symbol
+        ):
+            return 0.0
+        try:
+            signal = model.predict(
+                features.ts,
+                symbol,
+                self._feature_to_policy_inputs(features),
+            )
+            if signal is None:
+                return 0.0
+            if signal.predicted_regime == "HIGH":
+                return -policy.ml_adjust_max_pct
+            if signal.predicted_regime == "LOW":
+                return policy.ml_adjust_max_pct
+            return 0.0
+        except Exception:
+            logger.warning("GRID_V2_ORDER_SIZE_ML_FALLBACK symbol=%s", symbol, exc_info=True)
+            return 0.0
+
+    def _grid_v2_risk_headroom_ratio(self, symbol: str) -> float:
+        """Estimate remaining headroom ratio from symbol + portfolio caps."""
+        snap = self._last_account_snapshot
+        base = self._risk_base_snapshot
+        if snap is None or base is None or float(base.value_usd) <= 0:
+            return 1.0
+        base_usd = float(base.value_usd)
+        headrooms: list[float] = []
+
+        if self._portfolio_risk_config.symbol_max_notional_pct > 0:
+            sym_limit = base_usd * self._portfolio_risk_config.symbol_max_notional_pct
+            sym_now = (
+                float(abs(self._get_signed_position_qty(symbol)) * self._last_snapshot.mid_price)
+                if self._last_snapshot is not None and self._last_snapshot.symbol == symbol
+                else float(compute_symbol_notional(snap, symbol))
+            )
+            if sym_limit > 0:
+                headrooms.append(max(0.0, min(1.0, (sym_limit - sym_now) / sym_limit)))
+
+        if self._portfolio_risk_config.portfolio_max_gross_notional_pct > 0:
+            gross, _ = compute_portfolio_notionals(snap)
+            limit = base_usd * self._portfolio_risk_config.portfolio_max_gross_notional_pct
+            if limit > 0:
+                headrooms.append(max(0.0, min(1.0, (limit - float(gross)) / limit)))
+
+        if self._portfolio_risk_config.portfolio_max_net_notional_pct > 0:
+            _, net = compute_portfolio_notionals(snap)
+            limit = base_usd * self._portfolio_risk_config.portfolio_max_net_notional_pct
+            if limit > 0:
+                headrooms.append(max(0.0, min(1.0, (limit - float(net)) / limit)))
+
+        return min(headrooms) if headrooms else 1.0
+
+    def _grid_v2_apply_size_reseed(self, snapshot: Snapshot, new_size: Decimal) -> None:
+        """Apply flat-only controlled reseed with a new order size."""
+        bridge = self._grid_v2_bridge
+        if bridge is None:
+            return
+
+        cancel_actions: list[ExecutionAction] = []
+        for cid in sorted(
+            set(bridge.adapter.registry.all_entry_cids) | set(bridge.adapter.registry.all_exit_cids)
+        ):
+            cancel_actions.append(
+                ExecutionAction(
+                    action_type=ActionType.CANCEL,
+                    symbol=self._grid_v2_symbol,
+                    order_id=cid,
+                    reason="grid_v2_ORDER_SIZE_RESEED_CANCEL",
+                )
+            )
+
+        self._grid_v2_order_size_effective = new_size
+        bridge_fresh = self._create_grid_v2_bridge(order_size_override=new_size)
+        seed = list(bridge_fresh.startup_fresh(snapshot.mid_price, snapshot.ts))
+        self._grid_v2_bridge = bridge_fresh
+        self._grid_v2_started = True
+        self._grid_v2_seed_actions = cancel_actions + seed
+        self._grid_v2_awaiting_sync = True
+        self._grid_v2_pending_seed_cids = frozenset(
+            a.order_id for a in seed if a.action_type == ActionType.PLACE and a.order_id
+        )
+        self._grid_v2_pending_cancels.clear()
+        self._grid_v2_pending_place_cids.clear()
+        logger.warning(
+            "GRID_V2_ORDER_SIZE_RESEED_APPLIED symbol=%s old=%s new=%s cancel=%d seed=%d",
+            self._grid_v2_symbol,
+            bridge._config.order_size,
+            new_size,
+            len(cancel_actions),
+            len(seed),
+        )
+
+    def _maybe_update_grid_v2_order_size(self, snapshot: Snapshot) -> None:  # noqa: PLR0911
+        """Flat-only automatic order-size update and reseed."""
+        policy = self._grid_v2_order_size_policy
+        if not policy.enabled or not self._grid_v2_enabled:
+            return
+        if snapshot.symbol != self._grid_v2_symbol:
+            return
+        bridge = self._grid_v2_bridge
+        if bridge is None or not self._grid_v2_started or not bridge.reconstruction_ok:
+            return
+        if self._grid_v2_awaiting_sync or self._grid_v2_seed_actions:
+            return
+
+        pos_qty = self._get_signed_position_qty(snapshot.symbol)
+        has_open_lots = bool(bridge.state_machine and bridge.state_machine.snapshot.open_lots)
+        if policy.flat_only and (pos_qty != 0 or has_open_lots):
+            return
+
+        if snapshot.ts - self._grid_v2_order_size_last_update_ts < int(
+            policy.update_cooldown_s * 1000
+        ):
+            return
+        if self._symbol_risk_manager.get_state(snapshot.symbol) != SymbolRiskState.NORMAL:
+            logger.info(
+                "GRID_V2_ORDER_SIZE_UPDATE_SKIPPED symbol=%s reason=symbol_risk_state",
+                snapshot.symbol,
+            )
+            return
+
+        step_pct = float(bridge._config.grid_step_pct)
+        step_bps = step_pct * 10000.0
+        natr_bps = (
+            float(self._last_feature_snapshot.natr_bps)
+            if self._last_feature_snapshot is not None
+            and self._last_feature_snapshot.symbol == snapshot.symbol
+            else None
+        )
+        ml_adjust_pct = self._grid_v2_order_size_ml_adjust_pct(snapshot.symbol)
+        current_size = float(bridge._config.order_size)
+        decision = compute_target_order_size(
+            current_size=current_size,
+            config=policy,
+            inputs=OrderSizeInputs(
+                natr_bps=natr_bps,
+                step_bps=step_bps,
+                risk_headroom_ratio=self._grid_v2_risk_headroom_ratio(snapshot.symbol),
+                ml_adjust_pct=ml_adjust_pct,
+            ),
+        )
+        self._grid_v2_order_size_last_update_ts = snapshot.ts
+        if not decision.changed:
+            logger.info(
+                "GRID_V2_ORDER_SIZE_UPDATE_SKIPPED symbol=%s reason=%s delta=%.2f "
+                "current=%.6f target=%.6f",
+                snapshot.symbol,
+                decision.reason,
+                decision.delta_pct,
+                current_size,
+                decision.target_size,
+            )
+            return
+
+        self._grid_v2_apply_size_reseed(snapshot, Decimal(str(decision.target_size)))
 
     def _grid_v2_try_startup(self, snapshot: Snapshot) -> None:  # noqa: PLR0912, PLR0915
         """Attempt grid_v2 bridge startup on first tick with account data.
@@ -2261,6 +2597,8 @@ class LiveEngineV0:
         # PR4 (doc-27): Grid V2 startup + fill processing + cancel-ack routing
         if self._grid_v2_enabled and snapshot.symbol == self._grid_v2_symbol:
             self._grid_v2_try_startup(snapshot)
+            # Flat-only automatic sizing: may trigger controlled reseed.
+            self._maybe_update_grid_v2_order_size(snapshot)
             # Skip fill/cancel-ack detection while awaiting first account sync after
             # fresh start: seed CIDs aren't on exchange yet, so registry-vs-exchange
             # diff would be all false positives. Flag cleared by _tick_account_sync().
@@ -4096,7 +4434,7 @@ class LiveEngineV0:
 
         # Evaluate all tracked symbols (including those with zero position)
         # to allow de-escalation when position closes
-        tracked = set(pos_by_sym.keys()) | set(self._symbol_risk_manager._states.keys())
+        tracked = set(pos_by_sym.keys()) | set(self._symbol_risk_manager.tracked_symbols())
         if cfg.applies_to_grid_v2_only and self._grid_v2_symbol:
             tracked.add(self._grid_v2_symbol)
 
@@ -4114,6 +4452,23 @@ class LiveEngineV0:
                 self._symbol_unload.activate(sym)
             if decision.deescalation_reason and decision.state != SymbolRiskState.EXIT_ONLY:
                 self._symbol_unload.clear(sym)
+
+            # DD ladder via portfolio risk config: activate unload automatically
+            # when symbol drawdown reaches unload/forced-flat thresholds.
+            if self._risk_base_enabled:
+                dd_decision = evaluate_risk_gate(
+                    risk_base=self._risk_base_snapshot,
+                    snapshot=acct,
+                    config=self._portfolio_risk_config,
+                    symbol=sym,
+                )
+                if dd_decision.reason in (
+                    RiskGateReason.SYMBOL_DD_UNLOAD,
+                    RiskGateReason.SYMBOL_DD_FORCED_FLAT,
+                    RiskGateReason.PORTFOLIO_DD_FORCE_REDUCE,
+                    RiskGateReason.PORTFOLIO_DD_KILL_SWITCH,
+                ):
+                    self._symbol_unload.activate(sym)
 
         # Try unload steps for active symbols
         if self._symbol_unload.config.enabled:
