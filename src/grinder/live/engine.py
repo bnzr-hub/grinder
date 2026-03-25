@@ -95,6 +95,11 @@ from grinder.risk.drawdown_guard_v1 import DrawdownGuardV1
 from grinder.risk.drawdown_guard_v1 import OrderIntent as RiskIntent
 from grinder.risk.emergency_exit import EmergencyExitExecutor
 from grinder.risk.emergency_exit_metrics import get_emergency_exit_metrics
+from grinder.risk.portfolio_risk import (
+    PortfolioRiskConfig,
+    RiskGateReason,
+    evaluate_risk_gate,
+)
 from grinder.risk.risk_base import (
     BalanceData,
     RiskBaseConfig,
@@ -209,6 +214,24 @@ class BlockReason(Enum):
     SELECTOR_BLOCKED = "SELECTOR_BLOCKED"
     SYMBOL_RISK_CAPPED = "SYMBOL_RISK_CAPPED"
     SYMBOL_RISK_EXIT_ONLY = "SYMBOL_RISK_EXIT_ONLY"
+    # PR-2 (ADR-092): Risk base enforcement
+    RISK_BASE_UNAVAILABLE = "RISK_BASE_UNAVAILABLE"
+    RISK_BASE_STALE = "RISK_BASE_STALE"
+    RISK_BASE_BELOW_MIN = "RISK_BASE_BELOW_MIN"
+    RISK_SYMBOL_CAP = "RISK_SYMBOL_CAP"
+    RISK_PORTFOLIO_GROSS_CAP = "RISK_PORTFOLIO_GROSS_CAP"
+    RISK_PORTFOLIO_NET_CAP = "RISK_PORTFOLIO_NET_CAP"
+
+
+# PR-2 (ADR-092): Map RiskGateReason → BlockReason for risk base enforcement gate.
+_RISK_GATE_TO_BLOCK: dict[RiskGateReason | None, BlockReason] = {
+    RiskGateReason.RISK_BASE_UNAVAILABLE: BlockReason.RISK_BASE_UNAVAILABLE,
+    RiskGateReason.RISK_BASE_STALE: BlockReason.RISK_BASE_STALE,
+    RiskGateReason.RISK_BASE_BELOW_MIN: BlockReason.RISK_BASE_BELOW_MIN,
+    RiskGateReason.SYMBOL_CAP_EXCEEDED: BlockReason.RISK_SYMBOL_CAP,
+    RiskGateReason.PORTFOLIO_GROSS_CAP_EXCEEDED: BlockReason.RISK_PORTFOLIO_GROSS_CAP,
+    RiskGateReason.PORTFOLIO_NET_CAP_EXCEEDED: BlockReason.RISK_PORTFOLIO_NET_CAP,
+}
 
 
 class LiveActionStatus(Enum):
@@ -635,13 +658,29 @@ class LiveEngineV0:
         )
         self._risk_base_enabled = _rb_enabled
         self._risk_base_snapshot: RiskBaseSnapshot | None = None
+        # PR-2 (ADR-092): Portfolio risk enforcement config
+        self._portfolio_risk_config = PortfolioRiskConfig(
+            symbol_max_notional_pct=float(
+                os.environ.get("GRINDER_SYMBOL_RISK_MAX_NOTIONAL_PCT", "0")
+            ),
+            portfolio_max_gross_notional_pct=float(
+                os.environ.get("GRINDER_PORTFOLIO_RISK_MAX_GROSS_NOTIONAL_PCT", "0")
+            ),
+            portfolio_max_net_notional_pct=float(
+                os.environ.get("GRINDER_PORTFOLIO_RISK_MAX_NET_NOTIONAL_PCT", "0")
+            ),
+        )
         if _rb_enabled:
             logger.info(
-                "RISK_BASE_ENABLED mode=%s min_usd=%.2f stale_ttl=%ds hard_age=%ds",
+                "RISK_BASE_ENABLED mode=%s min_usd=%.2f stale_ttl=%ds hard_age=%ds "
+                "sym_pct=%.4f gross_pct=%.4f net_pct=%.4f",
                 self._risk_base_config.mode.value,
                 self._risk_base_config.min_usd,
                 self._risk_base_config.stale_ttl_s,
                 self._risk_base_config.max_age_hard_s,
+                self._portfolio_risk_config.symbol_max_notional_pct,
+                self._portfolio_risk_config.portfolio_max_gross_notional_pct,
+                self._portfolio_risk_config.portfolio_max_net_notional_pct,
             )
 
         # PR-ROLL-1b: log enforcement status at startup
@@ -4241,6 +4280,36 @@ class LiveEngineV0:
                 block_reason=BlockReason.MAX_POSITION_EXCEEDED,
                 intent=intent,
             )
+
+        # Gate 5.5: Risk base enforcement (PR-2, ADR-092)
+        # Blocks INCREASE_RISK when risk base unavailable/stale/below_min,
+        # or when symbol/portfolio notional caps are breached.
+        # REDUCE_RISK/CANCEL never blocked (intent already checked above).
+        if self._risk_base_enabled and intent == RiskIntent.INCREASE_RISK:
+            _rb_decision = evaluate_risk_gate(
+                risk_base=self._risk_base_snapshot,
+                snapshot=self._last_account_snapshot,
+                config=self._portfolio_risk_config,
+                symbol=action.symbol or "",
+            )
+            if not _rb_decision.allowed:
+                _rb_block = _RISK_GATE_TO_BLOCK.get(
+                    _rb_decision.reason, BlockReason.RISK_BASE_UNAVAILABLE
+                )
+                get_risk_base_metrics().record_gate_block(_rb_block.value)
+                logger.warning(
+                    "Action blocked: %s (%s) symbol=%s action=%s",
+                    _rb_block.value,
+                    _rb_decision.detail,
+                    action.symbol,
+                    action.action_type.value,
+                )
+                return LiveAction(
+                    action=action,
+                    status=LiveActionStatus.BLOCKED,
+                    block_reason=_rb_block,
+                    intent=intent,
+                )
 
         # Gate 6: DrawdownGuardV1 (if configured)
         if self._drawdown_guard is not None:
