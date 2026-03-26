@@ -3922,8 +3922,12 @@ class LiveEngineV0:
                 logger.info("Account sync evidence written to %s", evidence_dir)
 
         # PR-1 (ADR-092): Update risk base snapshot from exchange balance
+        # Use wall-clock as freshness marker: we just fetched the data now.
+        # Exchange ts (result.snapshot.ts) can be stale if Binance caches the
+        # account snapshot, causing age_s to grow indefinitely and triggering
+        # false stale blocks.
         if self._risk_base_enabled and result.snapshot is not None:
-            self._update_risk_base(asof_ts_ms=result.snapshot.ts)
+            self._update_risk_base(asof_ts_ms=int(time.time() * 1000))
 
         # ADR-096: Sync-driven reconciler
         if (
