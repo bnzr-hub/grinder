@@ -26,6 +26,7 @@ See ADR-036 for design decisions.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from decimal import Decimal
@@ -66,6 +67,7 @@ from grinder.live.cycle_layer import LiveCycleConfig, LiveCycleLayerV1
 from grinder.live.engine import (
     _BINANCE_ERROR_RE,
     _CONVERGENCE_TIMEOUT_MS,
+    _GRID_V2_DRIFT_RECONSTRUCT_COOLDOWN_GENS,
     _GRID_V2_ESCALATION_LOG_INTERVAL,
     _GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS,
     _GRID_V2_PENDING_CANCEL_STALE_GENS,
@@ -7125,3 +7127,198 @@ class TestSyncReconcilerPrimary:
         assert bridge_after is not None
         assert bridge_after.state_machine is not None
         assert bridge_after.state_machine.mode != BranchMode.FLAT
+
+
+class TestDriftReconstructCooldown:
+    """Tests for drift reconstruction cooldown after SM FLAT from fill."""
+
+    @staticmethod
+    def _make_engine() -> LiveEngineV0:
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+        port = NoOpExchangePort()
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        return LiveEngineV0(paper, port, config)
+
+    def test_flat_since_gen_tracked_on_fill_flat(self) -> None:
+        """When SM goes FLAT after fills, flat_since_gen is recorded."""
+        engine = self._make_engine()
+        engine._account_sync_generation = 5
+
+        # Simulate: bridge SM is FLAT (all lots closed)
+        mock_bridge = MagicMock()
+        mock_sm = MagicMock()
+        mock_sm.mode = BranchMode.FLAT
+        mock_bridge.state_machine = mock_sm
+        mock_bridge.reconstruction_ok = True
+        mock_bridge.adapter.parse_cid.return_value = None
+        engine._grid_v2_bridge = mock_bridge
+        engine._grid_v2_enabled = True
+        engine._grid_v2_started = True
+        engine._grid_v2_symbol = "BTCUSDT"
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=1000, source="test"
+        )
+
+        # Track flat transition (called after fill processing in tick path)
+        engine._grid_v2_track_flat_transition()
+
+        assert engine._grid_v2_flat_since_gen == 5
+
+    def test_flat_since_gen_cleared_on_branch(self) -> None:
+        """When SM is in branch mode, flat_since_gen is cleared."""
+        engine = self._make_engine()
+        engine._grid_v2_flat_since_gen = 5  # previously FLAT
+        engine._account_sync_generation = 7
+
+        mock_bridge = MagicMock()
+        mock_sm = MagicMock()
+        mock_sm.mode = BranchMode.LONG_BRANCH  # not FLAT
+        mock_bridge.state_machine = mock_sm
+        mock_bridge.reconstruction_ok = True
+        mock_bridge.adapter.parse_cid.return_value = None
+        engine._grid_v2_bridge = mock_bridge
+        engine._grid_v2_enabled = True
+        engine._grid_v2_started = True
+        engine._grid_v2_symbol = "BTCUSDT"
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=1000, source="test"
+        )
+
+        engine._grid_v2_track_flat_transition()
+
+        assert engine._grid_v2_flat_since_gen == -1
+
+    def test_drift_reconstruct_deferred_during_cooldown(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Drift reconstruction is deferred when SM just became FLAT from fill."""
+        engine = self._make_engine()
+        engine._grid_v2_enabled = True
+        engine._grid_v2_started = True
+        engine._grid_v2_symbol = "BTCUSDT"
+
+        mock_bridge = MagicMock()
+        mock_sm = MagicMock()
+        mock_sm.mode = BranchMode.FLAT
+        mock_bridge.state_machine = mock_sm
+        mock_bridge.reconstruction_ok = True
+        engine._grid_v2_bridge = mock_bridge
+
+        # SM just went FLAT at gen 5, current gen 6 (within cooldown)
+        engine._grid_v2_flat_since_gen = 5
+        engine._account_sync_generation = 5 + _GRID_V2_DRIFT_RECONSTRUCT_COOLDOWN_GENS - 1
+
+        # Mock position non-zero
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(
+                PositionSnap(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    qty=Decimal("150"),
+                    entry_price=Decimal("50000"),
+                    mark_price=Decimal("50000"),
+                    unrealized_pnl=Decimal("0"),
+                    leverage=1,
+                    ts=1000,
+                ),
+            ),
+            open_orders=(),
+            ts=1000,
+            source="test",
+        )
+
+        # Bridge should NOT be replaced
+        bridge_before = engine._grid_v2_bridge
+        snap = AccountSnapshot(
+            positions=(
+                PositionSnap(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    qty=Decimal("150"),
+                    entry_price=Decimal("50000"),
+                    mark_price=Decimal("50000"),
+                    unrealized_pnl=Decimal("0"),
+                    leverage=1,
+                    ts=1000,
+                ),
+            ),
+            open_orders=(),
+            ts=1000,
+            source="test",
+        )
+        with caplog.at_level(logging.INFO, logger="grinder.live.engine"):
+            engine._grid_v2_sync_reconstruct_on_position_drift(snap)
+
+        assert engine._grid_v2_bridge is bridge_before  # NOT replaced
+        deferred = [r for r in caplog.records if "DRIFT_RECONSTRUCT_DEFERRED" in r.message]
+        assert len(deferred) == 1
+
+    def test_drift_reconstruct_proceeds_after_cooldown(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """After cooldown expires, drift reconstruction proceeds (not deferred)."""
+        engine = self._make_engine()
+        engine._grid_v2_enabled = True
+        engine._grid_v2_started = True
+        engine._grid_v2_symbol = "BTCUSDT"
+
+        mock_bridge = MagicMock()
+        mock_sm = MagicMock()
+        mock_sm.mode = BranchMode.FLAT
+        mock_bridge.state_machine = mock_sm
+        mock_bridge.reconstruction_ok = True
+        engine._grid_v2_bridge = mock_bridge
+
+        # SM went FLAT at gen 5, current gen 8 (past cooldown of 3)
+        engine._grid_v2_flat_since_gen = 5
+        engine._account_sync_generation = 5 + _GRID_V2_DRIFT_RECONSTRUCT_COOLDOWN_GENS
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(
+                PositionSnap(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    qty=Decimal("150"),
+                    entry_price=Decimal("50000"),
+                    mark_price=Decimal("50000"),
+                    unrealized_pnl=Decimal("0"),
+                    leverage=1,
+                    ts=1000,
+                ),
+            ),
+            open_orders=(),
+            ts=1000,
+            source="test",
+        )
+
+        engine._last_snapshot = MagicMock()
+        engine._last_snapshot.symbol = "BTCUSDT"
+        engine._last_snapshot.mid_price = Decimal("50000")
+
+        snap = AccountSnapshot(
+            positions=(
+                PositionSnap(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    qty=Decimal("150"),
+                    entry_price=Decimal("50000"),
+                    mark_price=Decimal("50000"),
+                    unrealized_pnl=Decimal("0"),
+                    leverage=1,
+                    ts=1000,
+                ),
+            ),
+            open_orders=(),
+            ts=1000,
+            source="test",
+        )
+        with (
+            caplog.at_level(logging.INFO, logger="grinder.live.engine"),
+            contextlib.suppress(TypeError, ValueError, AttributeError),
+        ):
+            engine._grid_v2_sync_reconstruct_on_position_drift(snap)
+
+        # Key assertion: no "DEFERRED" log — cooldown expired, method proceeded
+        deferred_logs = [r for r in caplog.records if "DRIFT_RECONSTRUCT_DEFERRED" in r.message]
+        assert len(deferred_logs) == 0

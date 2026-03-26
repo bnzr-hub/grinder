@@ -163,6 +163,9 @@ _GRID_V2_PENDING_CANCEL_STALE_MS = 15_000  # 15s: pending cancel considered stal
 _GRID_V2_PENDING_CANCEL_STALE_GENS = 2  # 2 sync generations: pending cancel stale (dual bound)
 _GRID_V2_PENDING_PLACE_STALE_GENS = 4  # 4 sync generations: pending place considered stale
 _GRID_V2_ESCALATION_LOG_INTERVAL = 10  # log escalation every Nth defer (anti-spam)
+_GRID_V2_DRIFT_RECONSTRUCT_COOLDOWN_GENS = (
+    3  # wait 3 sync cycles after FLAT before drift reconstruct
+)
 # Anti-churn guard defaults (env-overridable)
 _GRID_V2_REPAIR_MAX_DISTANCE_STEPS = 5.0  # max distance from mid in grid steps
 _GRID_V2_REPAIR_MAX_ACTIONS_PER_CYCLE = 5  # max PLACE actions per repair cycle
@@ -800,6 +803,8 @@ class LiveEngineV0:
         self._grid_v2_integrity_mismatch_streak = 0
         self._grid_v2_integrity_mismatch_last_ts = 0
         self._grid_v2_integrity_repair_cooldown_until_ts = 0
+        # Track when SM last became FLAT from a fill (gen-based cooldown for drift detection)
+        self._grid_v2_flat_since_gen: int = -1  # -1 = never / not from fill
         self._grid_v2_integrity_convergence_defer_count = 0
         self._grid_v2_repair_max_distance_steps = float(
             os.environ.get(
@@ -1520,7 +1525,7 @@ class LiveEngineV0:
                 cids.add(o.order_id)
         return cids
 
-    def _grid_v2_sync_reconstruct_on_position_drift(self, snapshot: AccountSnapshot) -> None:
+    def _grid_v2_sync_reconstruct_on_position_drift(self, snapshot: AccountSnapshot) -> None:  # noqa: PLR0912
         """Fast-path recovery for sync drift: position is non-flat while SM is FLAT.
 
         This addresses rapid-fill races where exchange position updates first, but
@@ -1542,6 +1547,23 @@ class LiveEngineV0:
         pos_qty = self._get_signed_position_qty(self._grid_v2_symbol)
         if pos_qty == 0:
             return
+
+        # Cooldown: if SM just became FLAT from fill processing, wait N sync cycles
+        # before reconstructing. Fills may still be in-flight; natural SM transition
+        # to branch will happen via fill-diff detection without reconstruction.
+        if self._grid_v2_flat_since_gen >= 0:
+            gens_since_flat = self._account_sync_generation - self._grid_v2_flat_since_gen
+            if gens_since_flat < _GRID_V2_DRIFT_RECONSTRUCT_COOLDOWN_GENS:
+                logger.info(
+                    "GRID_V2_DRIFT_RECONSTRUCT_DEFERRED symbol=%s pos_qty=%s "
+                    "flat_since_gen=%d current_gen=%d cooldown_remaining=%d",
+                    self._grid_v2_symbol,
+                    pos_qty,
+                    self._grid_v2_flat_since_gen,
+                    self._account_sync_generation,
+                    _GRID_V2_DRIFT_RECONSTRUCT_COOLDOWN_GENS - gens_since_flat,
+                )
+                return
 
         g_orders: list[tuple[str, OrderSide, Decimal, Decimal]] = []
         for o in snapshot.open_orders:
@@ -1923,6 +1945,21 @@ class LiveEngineV0:
             actions.extend(result.execution_actions)
 
         return actions
+
+    def _grid_v2_track_flat_transition(self) -> None:
+        """Track SM FLAT transition for drift-reconstruct cooldown.
+
+        If SM just became FLAT (all lots closed), record current sync gen
+        so drift detection waits before reconstructing.
+        """
+        bridge = self._grid_v2_bridge
+        if bridge is None or bridge.state_machine is None:
+            return
+        if bridge.state_machine.mode == BranchMode.FLAT:
+            if self._grid_v2_flat_since_gen < 0:
+                self._grid_v2_flat_since_gen = self._account_sync_generation
+        else:
+            self._grid_v2_flat_since_gen = -1
 
     def _grid_v2_integrity_repair(  # noqa: PLR0911, PLR0912, PLR0915
         self,
@@ -2875,6 +2912,8 @@ class LiveEngineV0:
                     snapshot.symbol,
                     snapshot.ts,
                 )
+                # Track SM FLAT transition for drift-reconstruct cooldown
+                self._grid_v2_track_flat_transition()
                 # Same-tick dedup: extract PLACE_ENTRY slots from fill path
                 # to prevent integrity repair from duplicating them.
                 planned_slots = self._extract_planned_entry_slots(grid_v2_fill_actions)
