@@ -606,9 +606,11 @@ class GridV2StateMachine:
         return self._commit(new_snapshot, tuple(actions))
 
     def _occupied_prices(self) -> set[Decimal]:
-        """Collect all prices occupied by open lot exits/entries + current entry window.
+        """Collect all prices occupied by open lot exits + current entry window.
 
         Used to prevent price collisions when generating new entry/exit levels.
+        Note: open lot entry_price is NOT included — it's too aggressive and
+        blocks valid rolling entries. Adapter registry dedup is the safety net.
         """
         snap = self._snapshot
         occupied: set[Decimal] = set()
@@ -616,9 +618,6 @@ class GridV2StateMachine:
         for eo in snap.exit_orders:
             if eo.status == ExitOrderStatus.OPEN:
                 occupied.add(eo.price)
-        # Entry prices of all OPEN lots (prevents cross-cycle duplicates)
-        for lot in snap.open_lots:
-            occupied.add(lot.entry_price)
         # Current entry window prices (both sides)
         for p in snap.entry_window.buy_entry_prices:
             occupied.add(p)
