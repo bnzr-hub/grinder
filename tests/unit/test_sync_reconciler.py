@@ -62,6 +62,7 @@ def _make_bridge(
 
     bridge.adapter.parse_cid = _parse
     bridge.adapter.registry.cid_for_exit = lambda eid: f"exit_{eid}"
+    bridge.adapter.registry.cid_for_entry = lambda _side, _price: None  # no existing CIDs
     # Make isinstance check work
     bridge.__class__ = type("GridV2Bridge", (), {})
     return bridge
@@ -280,3 +281,32 @@ class TestReplayDeterminism:
             default=-1,
         )
         assert last_cancel_idx < first_place_idx
+
+
+class TestDuplicateEntrySkip:
+    """P0 fix: reconciler skips PLACE when adapter registry already has CID for slot."""
+
+    def test_skip_place_when_registry_has_cid(self) -> None:
+        bridge = _make_bridge(
+            buy_prices=(Decimal("49000"),),
+        )
+        # Registry already has a CID for BUY@49000
+        bridge.adapter.registry.cid_for_entry = (
+            lambda _side, price: "existing_cid" if price == Decimal("49000") else None
+        )
+        snap = _make_snapshot()  # no orders on exchange → "missing" BUY@49000
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        # Should skip PLACE — registry already owns this slot
+        place_actions = [a for a in r.actions if a.action_type == ActionType.PLACE]
+        assert len(place_actions) == 0
+
+    def test_place_when_registry_empty(self) -> None:
+        bridge = _make_bridge(
+            buy_prices=(Decimal("49000"),),
+        )
+        # Registry has no CID for this slot
+        bridge.adapter.registry.cid_for_entry = lambda _side, _price: None
+        snap = _make_snapshot()
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        place_actions = [a for a in r.actions if a.action_type == ActionType.PLACE]
+        assert len(place_actions) == 1
