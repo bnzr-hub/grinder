@@ -1554,6 +1554,13 @@ class LiveEngineV0:
         if pos_qty == 0:
             return
 
+        # Don't reconstruct if grid_v2 orders are present on exchange.
+        # Grid is alive — fill path will handle state transitions naturally
+        # without destroying rolling history.
+        grid_v2_cids = self._grid_v2_exchange_cids(self._grid_v2_symbol)
+        if grid_v2_cids:
+            return
+
         # Cooldown: if SM just became FLAT from fill processing, wait N sync cycles
         # before reconstructing. Fills may still be in-flight; natural SM transition
         # to branch will happen via fill-diff detection without reconstruction.
