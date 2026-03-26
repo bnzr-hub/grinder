@@ -158,6 +158,7 @@ _CONVERGENCE_TIMEOUT_MS = 30_000  # 30s safety valve for inflight latch
 _GRID_V2_INTEGRITY_MISMATCH_STREAK = 2
 _GRID_V2_INTEGRITY_REPAIR_COOLDOWN_MS = 5_000
 _GRID_V2_INTEGRITY_MISMATCH_WINDOW_MS = 30_000
+_GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS = 6  # after 6 defers, repair proceeds anyway
 # Anti-churn guard defaults (env-overridable)
 _GRID_V2_REPAIR_MAX_DISTANCE_STEPS = 5.0  # max distance from mid in grid steps
 _GRID_V2_REPAIR_MAX_ACTIONS_PER_CYCLE = 5  # max PLACE actions per repair cycle
@@ -795,6 +796,7 @@ class LiveEngineV0:
         self._grid_v2_integrity_mismatch_streak = 0
         self._grid_v2_integrity_mismatch_last_ts = 0
         self._grid_v2_integrity_repair_cooldown_until_ts = 0
+        self._grid_v2_integrity_convergence_defer_count = 0
         self._grid_v2_repair_max_distance_steps = float(
             os.environ.get(
                 "GRINDER_GRID_V2_REPAIR_MAX_DISTANCE_STEPS", str(_GRID_V2_REPAIR_MAX_DISTANCE_STEPS)
@@ -1707,22 +1709,34 @@ class LiveEngineV0:
             self._grid_v2_integrity_mismatch_streak = 0
             return []
 
-        # Don't attempt repair while orders are still converging.
-        if (
+        # Don't attempt repair while orders are still converging —
+        # UNLESS convergence has been pending for too many consecutive ticks.
+        convergence_pending = (
             self._grid_v2_awaiting_sync
             or self._grid_v2_pending_cancels
             or self._grid_v2_pending_place_cids
-        ):
-            # Keep mismatch streak across short convergence windows so repeated
-            # mismatch cannot be permanently stuck at 1/2 under volatile fills.
+        )
+        if convergence_pending:
+            self._grid_v2_integrity_convergence_defer_count += 1
             if (
-                self._grid_v2_integrity_mismatch_last_ts > 0
-                and snapshot.ts - self._grid_v2_integrity_mismatch_last_ts
-                > _GRID_V2_INTEGRITY_MISMATCH_WINDOW_MS
+                self._grid_v2_integrity_convergence_defer_count
+                < _GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS
             ):
-                self._grid_v2_integrity_mismatch_streak = 0
-                self._grid_v2_integrity_mismatch_last_ts = 0
-            return []
+                # Preserve streak during convergence — do NOT reset on window expiry
+                # while still pending, to avoid stuck-at-1 scenario.
+                return []
+            # Bounded escalation: convergence stuck too long, proceed with repair.
+            logger.warning(
+                "GRID_V2_INTEGRITY_CONVERGENCE_ESCALATION symbol=%s defers=%d "
+                "awaiting_sync=%s pending_cancels=%d pending_places=%d",
+                snapshot.symbol,
+                self._grid_v2_integrity_convergence_defer_count,
+                self._grid_v2_awaiting_sync,
+                len(self._grid_v2_pending_cancels),
+                len(self._grid_v2_pending_place_cids),
+            )
+        else:
+            self._grid_v2_integrity_convergence_defer_count = 0
 
         sm = bridge.state_machine
 
@@ -1823,7 +1837,10 @@ class LiveEngineV0:
             self._grid_v2_integrity_mismatch_last_ts = 0
             return []
 
-        if (
+        # If convergence just escalated, the time gap is from deferral, not absence
+        # of mismatch. Treat as continuation to avoid stuck-at-1 streak.
+        escalated = convergence_pending
+        if not escalated and (
             self._grid_v2_integrity_mismatch_last_ts == 0
             or snapshot.ts - self._grid_v2_integrity_mismatch_last_ts
             > _GRID_V2_INTEGRITY_MISMATCH_WINDOW_MS

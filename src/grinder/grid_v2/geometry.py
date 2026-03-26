@@ -81,9 +81,34 @@ def match_entries_with_tolerance(
     truly_missing = expected_keys - matched
     truly_extra = set(actual_entries.keys()) - actual_used
 
-    # Geometry mismatches: orders in truly_extra that are close to a truly_missing
-    # expected key but outside epsilon. These need cancel+place correction.
-    # (Orders within epsilon were already silently matched above.)
-    # For v1: truly_extra/truly_missing are handled by structural repair.
-    # geometry_mismatches is empty — all fuzzy matches are accepted as-is.
+    # Geometry mismatches: actual orders on same side as a missing expected key,
+    # outside epsilon tolerance. These need cancel+replace correction.
+    # We pair each truly_extra with the nearest truly_missing on the same side.
+    # Paired entries are removed from truly_missing/truly_extra (they become
+    # geometry corrections, not structural add/remove).
+    geo_paired_missing: set[tuple[str, Decimal]] = set()
+    geo_paired_extra: set[tuple[str, Decimal]] = set()
+    for extra_key in sorted(truly_extra):
+        extra_side, extra_price = extra_key
+        best_miss: tuple[str, Decimal] | None = None
+        best_dist = Decimal("Infinity")
+        for miss_key in truly_missing - geo_paired_missing:
+            miss_side, miss_price = miss_key
+            if miss_side != extra_side:
+                continue
+            dist = abs(extra_price - miss_price)
+            if dist < best_dist:
+                best_dist = dist
+                best_miss = miss_key
+        if best_miss is not None:
+            _miss_side, miss_price = best_miss
+            cid = actual_entries[extra_key]
+            geometry_mismatches.append((extra_side, miss_price, extra_price, cid))
+            geo_paired_missing.add(best_miss)
+            geo_paired_extra.add(extra_key)
+
+    # Remove paired keys from structural sets — they are geometry corrections
+    truly_missing -= geo_paired_missing
+    truly_extra -= geo_paired_extra
+
     return matched, truly_missing, truly_extra, geometry_mismatches

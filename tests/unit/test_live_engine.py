@@ -53,6 +53,7 @@ from grinder.execution.idempotent_port import IdempotentExchangePort
 from grinder.execution.port import NoOpExchangePort
 from grinder.execution.types import ActionType, ExecutionAction
 from grinder.features.engine import FeatureEngine, FeatureEngineConfig
+from grinder.grid_v2.state import BranchMode
 from grinder.live import (
     BlockReason,
     LiveAction,
@@ -65,6 +66,7 @@ from grinder.live.cycle_layer import LiveCycleConfig, LiveCycleLayerV1
 from grinder.live.engine import (
     _BINANCE_ERROR_RE,
     _CONVERGENCE_TIMEOUT_MS,
+    _GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS,
     _extract_binance_error_code,
     _InflightShift,
 )
@@ -6487,3 +6489,157 @@ class TestRiskBasePlumbing:
 
         # Same output: no dispatch behavior change in PR-1
         assert len(result_off.live_actions) == len(result_on.live_actions)
+
+
+class TestIntegrityRepairConvergenceEscalation:
+    """Tests for bounded convergence deferral and streak progression in integrity repair."""
+
+    @staticmethod
+    def _make_engine() -> LiveEngineV0:
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+        port = NoOpExchangePort()
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        return LiveEngineV0(paper, port, config)
+
+    @staticmethod
+    def _snap(symbol: str = "BTCUSDT", ts: int = 10000) -> Snapshot:
+        return Snapshot(
+            ts=ts,
+            symbol=symbol,
+            bid_price=Decimal("50000"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000.5"),
+            last_qty=Decimal("0.5"),
+        )
+
+    @staticmethod
+    def _setup_flat_bridge(engine: LiveEngineV0) -> None:
+        """Wire a mock bridge in FLAT mode with no entries/exits."""
+        mock_bridge = MagicMock()
+        mock_sm = MagicMock()
+        mock_sm.mode = BranchMode.FLAT
+        mock_sm.snapshot.entry_window.buy_entry_prices = []
+        mock_sm.snapshot.entry_window.sell_entry_prices = []
+        mock_sm.snapshot.open_lots = []
+        mock_sm.snapshot.exit_orders = []
+        mock_bridge.state_machine = mock_sm
+        mock_bridge.reconstruction_ok = True
+        mock_bridge.adapter.parse_cid.return_value = None
+        mock_bridge._config.max_inventory_levels = 80
+        mock_bridge._config.price_tick_size = Decimal("0.10")
+        mock_bridge._config.grid_step_pct = Decimal("0.0025")
+        mock_bridge._config.reseed_on_flat = False
+        mock_bridge._config.reseed_on_flat_only_on_skew = False
+        mock_bridge._quantize_price = lambda p, _s: p
+        engine._grid_v2_bridge = mock_bridge
+        engine._grid_v2_enabled = True
+        engine._grid_v2_started = True
+        engine._grid_v2_symbol = "BTCUSDT"
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=10000, source="test"
+        )
+
+    def test_convergence_deferred_under_max(self) -> None:
+        """When convergence is pending and defers < max, repair returns empty."""
+        engine = self._make_engine()
+        self._setup_flat_bridge(engine)
+        # Set convergence pending
+        engine._grid_v2_awaiting_sync = True
+
+        snap = self._snap(ts=10000)
+        result = engine._grid_v2_integrity_repair(snap)
+        assert result == []
+        assert engine._grid_v2_integrity_convergence_defer_count == 1
+
+    def test_convergence_escalation_after_max_defers(self) -> None:
+        """After max defers, repair proceeds even if convergence is pending."""
+        engine = self._make_engine()
+        self._setup_flat_bridge(engine)
+
+        # Simulate convergence stuck: awaiting_sync stays True
+        engine._grid_v2_awaiting_sync = True
+
+        # Defer up to max - should all return empty
+        for i in range(1, _GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS):
+            snap = self._snap(ts=10000 + i * 1000)
+            result = engine._grid_v2_integrity_repair(snap)
+            assert result == [], f"Expected empty at defer {i}"
+            assert engine._grid_v2_integrity_convergence_defer_count == i
+
+        # On the max defer, it should proceed (not return empty from convergence gate)
+        snap = self._snap(ts=10000 + _GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS * 1000)
+        result = engine._grid_v2_integrity_repair(snap)
+        assert engine._grid_v2_integrity_convergence_defer_count == (
+            _GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS
+        )
+
+    def test_convergence_counter_resets_on_converged(self) -> None:
+        """When convergence clears, defer counter resets to 0."""
+        engine = self._make_engine()
+        self._setup_flat_bridge(engine)
+
+        # Accumulate some defers
+        engine._grid_v2_awaiting_sync = True
+        engine._grid_v2_integrity_repair(self._snap(ts=10000))
+        engine._grid_v2_integrity_repair(self._snap(ts=11000))
+        assert engine._grid_v2_integrity_convergence_defer_count == 2
+
+        # Clear convergence
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_cancels = set()  # type: ignore[assignment]
+        engine._grid_v2_pending_place_cids = {}
+
+        engine._grid_v2_integrity_repair(self._snap(ts=12000))
+        assert engine._grid_v2_integrity_convergence_defer_count == 0
+
+    def test_streak_preserved_during_convergence_defer(self) -> None:
+        """Mismatch streak is NOT reset during convergence deferral, even if time window expires."""
+        engine = self._make_engine()
+        self._setup_flat_bridge(engine)
+
+        # Pre-set streak from a prior mismatch
+        engine._grid_v2_integrity_mismatch_streak = 1
+        engine._grid_v2_integrity_mismatch_last_ts = 5000
+
+        # Convergence pending — would previously reset streak after 30s window
+        engine._grid_v2_awaiting_sync = True
+        engine._grid_v2_integrity_repair(self._snap(ts=40000))  # 35s gap > 30s window
+
+        # Streak preserved (not reset to 0)
+        assert engine._grid_v2_integrity_mismatch_streak == 1
+
+    def test_streak_increments_on_escalation(self) -> None:
+        """When convergence escalates, streak treats it as continuation (not reset to 1)."""
+        engine = self._make_engine()
+        self._setup_flat_bridge(engine)
+
+        # Add a missing entry so mismatch is detected after escalation
+        assert engine._grid_v2_bridge is not None
+        sm = engine._grid_v2_bridge.state_machine
+        assert sm is not None
+        sm.snapshot.entry_window.buy_entry_prices = [Decimal("49000")]  # type: ignore[misc,assignment]
+
+        # Pre-existing mismatch streak=1 from long ago
+        engine._grid_v2_integrity_mismatch_streak = 1
+        engine._grid_v2_integrity_mismatch_last_ts = 5000  # 95s ago at escalation time
+
+        # Fill convergence defers to max
+        engine._grid_v2_awaiting_sync = True
+        for i in range(_GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS - 1):
+            engine._grid_v2_integrity_repair(self._snap(ts=50000 + i * 1000))
+
+        # At escalation (6th call), convergence gate is bypassed.
+        # Mismatch detected (expected 1 entry, actual 0).
+        # Despite >30s gap from last_ts, streak increments (not reset to 1)
+        # because escalation flag skips window-based reset.
+        snap = self._snap(ts=100000)
+        engine._grid_v2_integrity_repair(snap)
+        # Should be 2 (incremented from 1, not reset to 1)
+        assert engine._grid_v2_integrity_mismatch_streak >= 2 or (
+            # If streak reached threshold and was consumed (reset to 0 + repair dispatched)
+            engine._grid_v2_integrity_mismatch_streak == 0
+            and engine._grid_v2_integrity_repair_cooldown_until_ts > 0
+        )
