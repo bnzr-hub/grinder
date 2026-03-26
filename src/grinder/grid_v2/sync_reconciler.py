@@ -75,33 +75,12 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     if sm is None:
         return _empty_result(0)
 
-    # --- Compute desired state from ideal geometry (not SM window) ---
-    # SM window may have gaps from collision guard skips. Reconciler uses
-    # pure geometry: uniform steps from reference price.
-    from grinder.grid_v2.state import _grid_step_price  # noqa: PLC0415
-
-    ref_price = sm.snapshot.entry_window.reference_price
-    step = _grid_step_price(
-        ref_price,
-        bridge._config.grid_step_pct,
-        bridge._config.price_tick_size,
-    )
-    levels = bridge._config.entry_levels_per_side
-
-    # Collect exit prices to avoid placing entries on occupied exit slots
-    exit_prices: set[Decimal] = set()
-    for eo in sm.snapshot.exit_orders:
-        if eo.status == ExitOrderStatus.OPEN:
-            exit_prices.add(eo.price)
-
+    # --- Compute desired entries from SM window (SM owns entry lifecycle) ---
     desired_entry_keys: set[tuple[OrderSide, Decimal]] = set()
-    for i in range(1, levels + 1):
-        buy_price = bridge._quantize_price(ref_price - step * i, OrderSide.BUY)
-        sell_price = bridge._quantize_price(ref_price + step * i, OrderSide.SELL)
-        if buy_price not in exit_prices:
-            desired_entry_keys.add((OrderSide.BUY, buy_price))
-        if sell_price not in exit_prices:
-            desired_entry_keys.add((OrderSide.SELL, sell_price))
+    for p in sm.snapshot.entry_window.buy_entry_prices:
+        desired_entry_keys.add((OrderSide.BUY, bridge._quantize_price(p, OrderSide.BUY)))
+    for p in sm.snapshot.entry_window.sell_entry_prices:
+        desired_entry_keys.add((OrderSide.SELL, bridge._quantize_price(p, OrderSide.SELL)))
 
     # Inventory cap: when full, don't desire new entries
     inventory_full = (
@@ -110,6 +89,21 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     )
     if inventory_full:
         desired_entry_keys = set()
+
+    # --- Step 2: Gap detection supplement ---
+    # SM window may have gaps from collision guard skips. Detect gaps in
+    # actual exchange orders and add missing levels as additional desired.
+    from grinder.grid_v2.state import _grid_step_price  # noqa: PLC0415
+
+    step = _grid_step_price(
+        sm.snapshot.entry_window.reference_price,
+        bridge._config.grid_step_pct,
+        bridge._config.price_tick_size,
+    )
+    exit_prices: set[Decimal] = set()
+    for eo in sm.snapshot.exit_orders:
+        if eo.status == ExitOrderStatus.OPEN:
+            exit_prices.add(eo.price)
 
     desired_exit_cids: set[str] = set()
     for eo in sm.snapshot.exit_orders:
@@ -136,6 +130,27 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
             actual_entry_by_key[(side, o.price)] = o.order_id
         elif parsed.kind.value == "EXIT":
             actual_exit_cids.add(o.order_id)
+
+    # --- Gap detection: find missing levels between actual exchange entries ---
+    # For each side, sort actual prices, check for gaps > 1.5 * step.
+    # If gap found and the missing price isn't an exit → add to desired.
+    actual_entry_keys_pre = set(actual_entry_by_key.keys())
+    for side in (OrderSide.BUY, OrderSide.SELL):
+        side_prices = sorted(
+            [p for s, p in actual_entry_keys_pre if s == side],
+            reverse=(side == OrderSide.BUY),
+        )
+        for i in range(len(side_prices) - 1):
+            gap = abs(side_prices[i] - side_prices[i + 1])
+            if gap > step + step // 2:  # 1.5 * step
+                # Missing level(s) in gap — fill with step-aligned prices
+                if side == OrderSide.BUY:
+                    fill_price = side_prices[i] - step
+                else:
+                    fill_price = side_prices[i] + step
+                fill_price = bridge._quantize_price(fill_price, side)
+                if fill_price not in exit_prices:
+                    desired_entry_keys.add((side, fill_price))
 
     # --- Compute diff ---
     actual_entry_keys = set(actual_entry_by_key.keys())
