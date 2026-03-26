@@ -160,6 +160,7 @@ _GRID_V2_INTEGRITY_REPAIR_COOLDOWN_MS = 5_000
 _GRID_V2_INTEGRITY_MISMATCH_WINDOW_MS = 30_000
 _GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS = 6  # after 6 defers, repair proceeds anyway
 _GRID_V2_PENDING_CANCEL_STALE_MS = 15_000  # 15s: pending cancel considered stale for convergence
+_GRID_V2_PENDING_CANCEL_STALE_GENS = 2  # 2 sync generations: pending cancel stale (dual bound)
 _GRID_V2_PENDING_PLACE_STALE_GENS = 4  # 4 sync generations: pending place considered stale
 _GRID_V2_ESCALATION_LOG_INTERVAL = 10  # log escalation every Nth defer (anti-spam)
 # Anti-churn guard defaults (env-overridable)
@@ -790,7 +791,7 @@ class LiveEngineV0:
         self._grid_v2_bridge: GridV2Bridge | None = None
         self._grid_v2_started = False
         self._grid_v2_seed_actions: list[ExecutionAction] = []
-        self._grid_v2_pending_cancels: dict[str, int] = {}  # cid → ts_ms
+        self._grid_v2_pending_cancels: dict[str, tuple[int, int]] = {}  # cid → (ts_ms, sync_gen)
         self._grid_v2_awaiting_sync = False  # PR6: skip fill detection until seed CIDs visible
         self._grid_v2_pending_seed_cids: frozenset[str] = frozenset()  # PR6: CIDs to confirm
         # cid → sync_gen at dispatch. Released after visibility OR 2 sync cycles grace.
@@ -1503,7 +1504,10 @@ class LiveEngineV0:
             if a.action_type == ActionType.CANCEL and a.order_id:
                 bridge = self._grid_v2_bridge
                 if bridge is not None and bridge.adapter.is_ours(a.order_id):
-                    self._grid_v2_pending_cancels[a.order_id] = ts
+                    self._grid_v2_pending_cancels[a.order_id] = (
+                        ts,
+                        self._account_sync_generation,
+                    )
 
     def _grid_v2_clean_failed_place(self, cid: str) -> None:
         """Remove a FAILED/BLOCKED/SKIPPED PLACE CID from registry and pending."""
@@ -1592,6 +1596,7 @@ class LiveEngineV0:
         """Force-resolve pending cancels that exceed stale threshold.
 
         Called during convergence escalation to unblock repair.
+        Uses dual bound: time-based OR sync-generation-based staleness.
         Re-checks exchange visibility: if CID is gone, confirm cancel ack.
         If CID is still present but stale, remove from pending blocker set
         (it will be re-detected on next cancel dispatch if still needed).
@@ -1600,19 +1605,27 @@ class LiveEngineV0:
         if bridge is None or not bridge.reconstruction_ok:
             return 0
         current_cids = self._grid_v2_exchange_cids(symbol)
+        current_gen = self._account_sync_generation
         resolved = 0
-        for cid, dispatch_ts in list(self._grid_v2_pending_cancels.items()):
+        for cid, (dispatch_ts, dispatch_gen) in list(self._grid_v2_pending_cancels.items()):
             age_ms = now_ts - dispatch_ts
-            if age_ms < _GRID_V2_PENDING_CANCEL_STALE_MS:
+            gen_delta = current_gen - dispatch_gen
+            is_stale = (
+                age_ms >= _GRID_V2_PENDING_CANCEL_STALE_MS
+                or gen_delta >= _GRID_V2_PENDING_CANCEL_STALE_GENS
+            )
+            if not is_stale:
                 continue
             if cid not in current_cids:
                 # Gone from exchange — confirm cancel ack
                 bridge.on_cancel_ack(cid)
                 del self._grid_v2_pending_cancels[cid]
                 logger.info(
-                    "GRID_V2_STALE_PENDING_CANCEL_RESOLVED cid=%s age_ms=%d action=cancel_ack",
+                    "GRID_V2_STALE_PENDING_CANCEL_RESOLVED cid=%s age_ms=%d "
+                    "gen_delta=%d action=cancel_ack",
                     cid,
                     age_ms,
+                    gen_delta,
                 )
             else:
                 # Still on exchange but stale — remove from convergence blocker.
@@ -1621,9 +1634,11 @@ class LiveEngineV0:
                 del self._grid_v2_pending_cancels[cid]
                 logger.warning(
                     "GRID_V2_STALE_PENDING_CANCEL_DROPPED cid=%s age_ms=%d "
-                    "action=drop_from_pending reason=still_on_exchange_but_stale",
+                    "gen_delta=%d action=drop_from_pending "
+                    "reason=still_on_exchange_but_stale",
                     cid,
                     age_ms,
+                    gen_delta,
                 )
             resolved += 1
         return resolved
