@@ -7123,10 +7123,13 @@ class TestSyncReconcilerPrimary:
 
         engine._tick_account_sync()
 
+        # With grid_v2 orders on exchange, drift reconstruction is SKIPPED.
+        # Fill path will handle the fill naturally without destroying rolling state.
         bridge_after = engine._grid_v2_bridge
         assert bridge_after is not None
+        assert bridge_after is bridge  # NOT replaced — same bridge object
         assert bridge_after.state_machine is not None
-        assert bridge_after.state_machine.mode != BranchMode.FLAT
+        assert bridge_after.state_machine.mode == BranchMode.FLAT  # still FLAT, fill path will fix
 
 
 class TestDriftReconstructCooldown:
