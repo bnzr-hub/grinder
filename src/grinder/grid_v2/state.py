@@ -453,6 +453,23 @@ class GridV2StateMachine:
             lot_side, exit_side = LotSide.SHORT, OrderSide.BUY
             exit_price = event.price * (Decimal(1) - cfg.grid_step_pct)
 
+        # B2: Exit price collision guard — shift by ±1 tick if occupied
+        existing_exit_prices = {
+            eo.price for eo in snap.exit_orders if eo.status == ExitOrderStatus.OPEN
+        }
+        if exit_price in existing_exit_prices and cfg.price_tick_size > 0:
+            # Shift exit away from entry (SELL exit → +1 tick, BUY exit → -1 tick)
+            if exit_side == OrderSide.SELL:
+                exit_price = exit_price + cfg.price_tick_size
+            else:
+                exit_price = exit_price - cfg.price_tick_size
+            # Second collision check: if still occupied, shift one more tick
+            if exit_price in existing_exit_prices:
+                if exit_side == OrderSide.SELL:
+                    exit_price = exit_price + cfg.price_tick_size
+                else:
+                    exit_price = exit_price - cfg.price_tick_size
+
         lot = InventoryLot(
             lot_id=f"lot-{event.order_id}",
             side=lot_side,
@@ -589,7 +606,7 @@ class GridV2StateMachine:
         return self._commit(new_snapshot, tuple(actions))
 
     def _occupied_prices(self) -> set[Decimal]:
-        """Collect all prices occupied by open lot exits + current entry window.
+        """Collect all prices occupied by open lot exits/entries + current entry window.
 
         Used to prevent price collisions when generating new entry/exit levels.
         """
@@ -599,6 +616,9 @@ class GridV2StateMachine:
         for eo in snap.exit_orders:
             if eo.status == ExitOrderStatus.OPEN:
                 occupied.add(eo.price)
+        # Entry prices of all OPEN lots (prevents cross-cycle duplicates)
+        for lot in snap.open_lots:
+            occupied.add(lot.entry_price)
         # Current entry window prices (both sides)
         for p in snap.entry_window.buy_entry_prices:
             occupied.add(p)
@@ -626,12 +646,17 @@ class GridV2StateMachine:
         # Remove the filled price — it's no longer occupied by an entry
         occupied.discard(event.price)
 
+        # B3-alt: max distance from reference for new entries (prevents cascading drift)
+        # Allow up to 2x levels from reference: original window spans levels on each side,
+        # rolling can shift up to levels more, so 2x is the natural bound.
+        step_price = _grid_step_price(
+            window.reference_price, cfg.grid_step_pct, cfg.price_tick_size
+        )
+        max_distance = step_price * (cfg.entry_levels_per_side * 2)
+
         if event.side == OrderSide.BUY:
             remaining = tuple(p for p in window.buy_entry_prices if p != event.price)
             farthest = remaining[-1] if remaining else event.price
-            step_price = _grid_step_price(
-                window.reference_price, cfg.grid_step_pct, cfg.price_tick_size
-            )
             new_farthest = farthest - step_price
             if window.sell_entry_prices:
                 trimmed = window.sell_entry_prices[-1]
@@ -646,8 +671,10 @@ class GridV2StateMachine:
                 )
             else:
                 new_sells = ()
-            # Collision guard: skip placement if new_farthest is occupied
-            if new_farthest in occupied:
+            # Collision + distance guard: skip if occupied or too far from reference
+            distance_from_ref = abs(window.reference_price - new_farthest)
+            skip_place = new_farthest in occupied or distance_from_ref > max_distance
+            if skip_place:
                 new_buys = remaining[: cfg.entry_levels_per_side]
             else:
                 new_buys = (*remaining, new_farthest)[: cfg.entry_levels_per_side]
@@ -663,9 +690,6 @@ class GridV2StateMachine:
         else:
             remaining = tuple(p for p in window.sell_entry_prices if p != event.price)
             farthest = remaining[-1] if remaining else event.price
-            step_price = _grid_step_price(
-                window.reference_price, cfg.grid_step_pct, cfg.price_tick_size
-            )
             new_farthest = farthest + step_price
             if window.buy_entry_prices:
                 trimmed = window.buy_entry_prices[-1]
@@ -680,8 +704,10 @@ class GridV2StateMachine:
                 )
             else:
                 new_buys = ()
-            # Collision guard: skip placement if new_farthest is occupied
-            if new_farthest in occupied:
+            # Collision + distance guard: skip if occupied or too far from reference
+            distance_from_ref = abs(new_farthest - window.reference_price)
+            skip_place = new_farthest in occupied or distance_from_ref > max_distance
+            if skip_place:
                 new_sells = remaining[: cfg.entry_levels_per_side]
             else:
                 new_sells = (*remaining, new_farthest)[: cfg.entry_levels_per_side]

@@ -4419,4 +4419,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Context:** Live run showed 2× SELL@0.0600 and 2× SELL@0.0598 — duplicate exit orders at same price. Root cause: rolling window shift and exit restore logic appended new prices without checking for collision with existing open lot exit prices or opposite-side entry prices. Price oscillation (BUY→exit→BUY) at same levels created multiple lots with identical exit prices.
 - **Fix in `_update_window_after_fill()`:** Before emitting `PLACE_ENTRY` for `new_farthest`, check `_occupied_prices()` set (open exit prices + all entry prices). If collision → skip placement, window shorter by 1.
 - **Fix in `_apply_exit_filled()`:** Before every `append(next_price)` in exit restore path (both LONG_BRANCH and SHORT_BRANCH), check `exit_occupied | set(buy_prices) | set(sell_prices)`. If collision → skip restore for that level.
-- **Helper:** `_occupied_prices()` method returns union of open exit order prices + all current entry window prices.
+- **Helper:** `_occupied_prices()` method returns union of open exit order prices + open lot entry prices + all current entry window prices.
+
+### ADR-098: Exit Price Dedup + Distance Clamp (2026-03-26)
+
+- **Status:** Delivered.
+- **Decision:** Three additional collision guards for rolling grid correctness.
+- **B2 — Exit price collision:** In `_execute_entry()`, after computing exit_price, check against existing open exit prices. If collision → shift by ±1 tick (then ±2 if still collides). Prevents duplicate exit orders (e.g., 2× SELL@0.0600).
+- **B1 — Expanded occupied prices:** `_occupied_prices()` now includes `{lot.entry_price for lot in open_lots}`. Prevents cross-cycle entry duplicates where exit restore re-generates a price matching an existing lot's entry.
+- **B3-alt — Distance clamp:** In `_update_window_after_fill()`, new entry must be within `2 × entry_levels_per_side × step_price` from reference_price. Prevents cascading drift from batch fills (4 fills in one tick → 4 sequential shifts → entries far from current price).
