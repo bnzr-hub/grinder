@@ -1615,3 +1615,205 @@ class TestNetOff:
         # After net-off, should be FLAT — no mixed lots
         sides = {lot.side for lot in sm.snapshot.open_lots}
         assert len(sides) <= 1  # only one side or empty
+
+
+# ---------------------------------------------------------------------------
+# Price collision guard tests (rolling window + exit restore)
+# ---------------------------------------------------------------------------
+
+
+def _all_entry_prices(sm: GridV2StateMachine) -> list[Decimal]:
+    """Get all entry prices from both sides."""
+    w = sm.snapshot.entry_window
+    return list(w.buy_entry_prices) + list(w.sell_entry_prices)
+
+
+def _open_exit_prices(sm: GridV2StateMachine) -> set[Decimal]:
+    """Get all exit prices of OPEN exit orders."""
+    return {eo.price for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN}
+
+
+def _assert_no_duplicate_prices(sm: GridV2StateMachine) -> None:
+    """Assert no duplicate prices within buy or sell entry lists."""
+    w = sm.snapshot.entry_window
+    assert len(w.buy_entry_prices) == len(set(w.buy_entry_prices)), (
+        f"Duplicate buy prices: {w.buy_entry_prices}"
+    )
+    assert len(w.sell_entry_prices) == len(set(w.sell_entry_prices)), (
+        f"Duplicate sell prices: {w.sell_entry_prices}"
+    )
+    # No entry price should match an open exit price
+    entry_prices = set(w.buy_entry_prices) | set(w.sell_entry_prices)
+    exit_prices = _open_exit_prices(sm)
+    collision = entry_prices & exit_prices
+    assert not collision, f"Entry/exit price collision: {collision}"
+
+
+class TestRollingWindowCollisionGuard:
+    """Tests A-G: verify no duplicate prices after rolling/restore operations."""
+
+    def test_a_rolling_shift_no_exit_collision(self) -> None:
+        """BUY fill → rolling extends → new entry price != any open exit price."""
+        sm = _sm()
+        buy_price = sm.snapshot.entry_window.buy_entry_prices[0]  # closest BUY
+        result = sm.apply(_entry_filled(side=OrderSide.BUY, price=buy_price))
+        assert not result.rejected
+        _assert_no_duplicate_prices(sm)
+
+    def test_b_rolling_shift_skips_occupied_price(self) -> None:
+        """When new_farthest would collide with exit, entry window is shorter by 1."""
+        # Use tight config where exit price = entry price + step overlaps
+        cfg = _config(step=Decimal("0.01"), levels=3, tick_size=Decimal("0.01"))
+        sm = GridV2StateMachine.create_initial(cfg, Decimal("100"), _BASE_TS)
+
+        # Fill top BUY → creates lot with exit
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        r1 = sm.apply(_entry_filled(side=OrderSide.BUY, price=buy1, order_id="e1"))
+        assert not r1.rejected
+        _assert_no_duplicate_prices(sm)
+
+        # Fill another BUY
+        if sm.snapshot.entry_window.buy_entry_prices:
+            buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
+            r2 = sm.apply(
+                _entry_filled(side=OrderSide.BUY, price=buy2, order_id="e2", ts=_BASE_TS + 2)
+            )
+            assert not r2.rejected
+            _assert_no_duplicate_prices(sm)
+
+    def test_c_exit_restore_no_duplicate_entry(self) -> None:
+        """Exit fill → restore entry → restored price not duplicate in window."""
+        sm = _sm()
+        # Fill BUY → get lot with exit
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(_entry_filled(side=OrderSide.BUY, price=buy1, order_id="e1"))
+
+        # Now close lot via exit fill
+        if sm.snapshot.exit_orders:
+            eo = sm.snapshot.exit_orders[0]
+            lot = sm.snapshot.open_lots[0]
+            sm.apply(
+                ExitFilled(
+                    exit_order_id=eo.exit_order_id,
+                    lot_id=lot.lot_id,
+                    price=eo.price,
+                    qty=eo.qty,
+                    ts=_BASE_TS + 10,
+                )
+            )
+            _assert_no_duplicate_prices(sm)
+
+    def test_d_exit_restore_no_exit_collision(self) -> None:
+        """Exit fill → restore entry → restored price != other open lot exit."""
+        cfg = _config(levels=3)
+        sm = GridV2StateMachine.create_initial(cfg, _REF_PRICE, _BASE_TS)
+
+        # Fill 2 BUYs → 2 lots with exits
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(_entry_filled(side=OrderSide.BUY, price=buy1, order_id="e1"))
+        if sm.snapshot.entry_window.buy_entry_prices:
+            buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
+            sm.apply(_entry_filled(side=OrderSide.BUY, price=buy2, order_id="e2", ts=_BASE_TS + 2))
+
+        # Close first lot
+        if sm.snapshot.exit_orders:
+            eo = next(e for e in sm.snapshot.exit_orders if e.status == ExitOrderStatus.OPEN)
+            lot = next(lt for lt in sm.snapshot.open_lots if lt.lot_id == eo.lot_id)
+            sm.apply(
+                ExitFilled(
+                    exit_order_id=eo.exit_order_id,
+                    lot_id=lot.lot_id,
+                    price=eo.price,
+                    qty=eo.qty,
+                    ts=_BASE_TS + 20,
+                )
+            )
+            _assert_no_duplicate_prices(sm)
+
+    def test_e_oscillation_no_duplicates(self) -> None:
+        """BUY fill → exit fill → BUY fill at same level → zero duplicate prices."""
+        sm = _sm()
+        # Fill closest BUY
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(_entry_filled(side=OrderSide.BUY, price=buy1, order_id="e1"))
+        _assert_no_duplicate_prices(sm)
+
+        # Close via exit
+        eo = sm.snapshot.exit_orders[0]
+        lot = sm.snapshot.open_lots[0]
+        sm.apply(
+            ExitFilled(
+                exit_order_id=eo.exit_order_id,
+                lot_id=lot.lot_id,
+                price=eo.price,
+                qty=eo.qty,
+                ts=_BASE_TS + 10,
+            )
+        )
+        _assert_no_duplicate_prices(sm)
+
+        # Fill another BUY (may be at same price as first if window restored)
+        if sm.snapshot.entry_window.buy_entry_prices:
+            buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
+            sm.apply(_entry_filled(side=OrderSide.BUY, price=buy2, order_id="e3", ts=_BASE_TS + 20))
+            _assert_no_duplicate_prices(sm)
+
+    def test_f_initial_window_no_duplicates(self) -> None:
+        """Initial entry window has no duplicate prices."""
+        sm = _sm()
+        w = sm.snapshot.entry_window
+        all_prices = list(w.buy_entry_prices) + list(w.sell_entry_prices)
+        assert len(all_prices) == len(set(all_prices))
+
+    def test_g_multiple_fills_no_collision(self) -> None:
+        """3 sequential BUY fills → all resulting prices unique."""
+        cfg = _config(levels=5, max_levels=10)
+        sm = GridV2StateMachine.create_initial(cfg, _REF_PRICE, _BASE_TS)
+
+        for i in range(3):
+            if not sm.snapshot.entry_window.buy_entry_prices:
+                break
+            buy = sm.snapshot.entry_window.buy_entry_prices[0]
+            r = sm.apply(
+                _entry_filled(
+                    side=OrderSide.BUY,
+                    price=buy,
+                    order_id=f"e{i}",
+                    ts=_BASE_TS + i + 1,
+                )
+            )
+            assert not r.rejected
+            _assert_no_duplicate_prices(sm)
+
+    def test_oscillation_cycle_5_rounds(self) -> None:
+        """5 full BUY→exit cycles with no price duplicates at any point."""
+        cfg = _config(levels=3, max_levels=10, reseed_on_flat=False)
+        sm = GridV2StateMachine.create_initial(cfg, _REF_PRICE, _BASE_TS)
+
+        ts = _BASE_TS
+        for cycle in range(5):
+            ts += 1
+            if not sm.snapshot.entry_window.buy_entry_prices:
+                break
+            buy = sm.snapshot.entry_window.buy_entry_prices[0]
+            r = sm.apply(_entry_filled(side=OrderSide.BUY, price=buy, order_id=f"e{cycle}", ts=ts))
+            assert not r.rejected, f"Cycle {cycle} entry rejected"
+            _assert_no_duplicate_prices(sm)
+
+            # Close lot via exit
+            ts += 1
+            open_exits = [e for e in sm.snapshot.exit_orders if e.status == ExitOrderStatus.OPEN]
+            if open_exits:
+                eo = open_exits[0]
+                lot = next(lt for lt in sm.snapshot.open_lots if lt.lot_id == eo.lot_id)
+                r2 = sm.apply(
+                    ExitFilled(
+                        exit_order_id=eo.exit_order_id,
+                        lot_id=lot.lot_id,
+                        price=eo.price,
+                        qty=eo.qty,
+                        ts=ts,
+                    )
+                )
+                assert not r2.rejected, f"Cycle {cycle} exit rejected"
+                _assert_no_duplicate_prices(sm)

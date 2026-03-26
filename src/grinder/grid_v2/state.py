@@ -588,6 +588,24 @@ class GridV2StateMachine:
         )
         return self._commit(new_snapshot, tuple(actions))
 
+    def _occupied_prices(self) -> set[Decimal]:
+        """Collect all prices occupied by open lot exits + current entry window.
+
+        Used to prevent price collisions when generating new entry/exit levels.
+        """
+        snap = self._snapshot
+        occupied: set[Decimal] = set()
+        # Exit prices of all OPEN exit orders
+        for eo in snap.exit_orders:
+            if eo.status == ExitOrderStatus.OPEN:
+                occupied.add(eo.price)
+        # Current entry window prices (both sides)
+        for p in snap.entry_window.buy_entry_prices:
+            occupied.add(p)
+        for p in snap.entry_window.sell_entry_prices:
+            occupied.add(p)
+        return occupied
+
     def _update_window_after_fill(
         self, event: EntryFilled
     ) -> tuple[EntryWindow, tuple[ActionIntent, ...]]:
@@ -602,6 +620,11 @@ class GridV2StateMachine:
         window = self._snapshot.entry_window
         cfg = self._config
         actions: list[ActionIntent] = []
+
+        # Collect occupied prices to prevent collisions with exits/entries
+        occupied = self._occupied_prices()
+        # Remove the filled price — it's no longer occupied by an entry
+        occupied.discard(event.price)
 
         if event.side == OrderSide.BUY:
             remaining = tuple(p for p in window.buy_entry_prices if p != event.price)
@@ -623,16 +646,20 @@ class GridV2StateMachine:
                 )
             else:
                 new_sells = ()
-            new_buys = (*remaining, new_farthest)[: cfg.entry_levels_per_side]
-            actions.append(
-                ActionIntent(
-                    kind=ActionIntentKind.PLACE_ENTRY,
-                    side=OrderSide.BUY,
-                    price=new_farthest,
-                    qty=cfg.order_size,
-                    reason="FILL_REPLACEMENT",
+            # Collision guard: skip placement if new_farthest is occupied
+            if new_farthest in occupied:
+                new_buys = remaining[: cfg.entry_levels_per_side]
+            else:
+                new_buys = (*remaining, new_farthest)[: cfg.entry_levels_per_side]
+                actions.append(
+                    ActionIntent(
+                        kind=ActionIntentKind.PLACE_ENTRY,
+                        side=OrderSide.BUY,
+                        price=new_farthest,
+                        qty=cfg.order_size,
+                        reason="FILL_REPLACEMENT",
+                    )
                 )
-            )
         else:
             remaining = tuple(p for p in window.sell_entry_prices if p != event.price)
             farthest = remaining[-1] if remaining else event.price
@@ -653,16 +680,20 @@ class GridV2StateMachine:
                 )
             else:
                 new_buys = ()
-            new_sells = (*remaining, new_farthest)[: cfg.entry_levels_per_side]
-            actions.append(
-                ActionIntent(
-                    kind=ActionIntentKind.PLACE_ENTRY,
-                    side=OrderSide.SELL,
-                    price=new_farthest,
-                    qty=cfg.order_size,
-                    reason="FILL_REPLACEMENT",
+            # Collision guard: skip placement if new_farthest is occupied
+            if new_farthest in occupied:
+                new_sells = remaining[: cfg.entry_levels_per_side]
+            else:
+                new_sells = (*remaining, new_farthest)[: cfg.entry_levels_per_side]
+                actions.append(
+                    ActionIntent(
+                        kind=ActionIntentKind.PLACE_ENTRY,
+                        side=OrderSide.SELL,
+                        price=new_farthest,
+                        qty=cfg.order_size,
+                        reason="FILL_REPLACEMENT",
+                    )
                 )
-            )
 
         new_window = EntryWindow(
             reference_price=window.reference_price,
@@ -734,6 +765,12 @@ class GridV2StateMachine:
                 self._config.grid_step_pct,
                 self._config.price_tick_size,
             )
+            # Collect exit prices of remaining open lots for collision detection
+            exit_occupied: set[Decimal] = set()
+            for eo in new_exits:
+                if eo.status == ExitOrderStatus.OPEN:
+                    exit_occupied.add(eo.price)
+
             if snap.mode == BranchMode.LONG_BRANCH:
                 buy_prices = list(snap.entry_window.buy_entry_prices)
                 sell_prices = list(snap.entry_window.sell_entry_prices)
@@ -743,38 +780,43 @@ class GridV2StateMachine:
                         if sell_prices
                         else snap.entry_window.reference_price + step_delta
                     )
-                    sell_prices.append(next_price)
-                    actions.append(
-                        ActionIntent(
-                            kind=ActionIntentKind.PLACE_ENTRY,
-                            side=OrderSide.SELL,
-                            price=next_price,
-                            qty=self._config.order_size,
-                            reason="EXIT_RESTORE",
+                    _all_occupied = exit_occupied | set(buy_prices) | set(sell_prices)
+                    if next_price not in _all_occupied:
+                        sell_prices.append(next_price)
+                        actions.append(
+                            ActionIntent(
+                                kind=ActionIntentKind.PLACE_ENTRY,
+                                side=OrderSide.SELL,
+                                price=next_price,
+                                qty=self._config.order_size,
+                                reason="EXIT_RESTORE",
+                            )
                         )
-                    )
                 if len(buy_prices) < self._config.entry_levels_per_side:
                     next_price = (
                         buy_prices[0] + step_delta
                         if buy_prices
                         else snap.entry_window.reference_price - step_delta
                     )
-                    buy_prices.append(next_price)
-                    buy_prices.sort(reverse=True)
-                    actions.append(
-                        ActionIntent(
-                            kind=ActionIntentKind.PLACE_ENTRY,
-                            side=OrderSide.BUY,
-                            price=next_price,
-                            qty=self._config.order_size,
-                            reason="EXIT_RESTORE",
+                    _all_occupied = exit_occupied | set(buy_prices) | set(sell_prices)
+                    if next_price not in _all_occupied:
+                        buy_prices.append(next_price)
+                        buy_prices.sort(reverse=True)
+                        actions.append(
+                            ActionIntent(
+                                kind=ActionIntentKind.PLACE_ENTRY,
+                                side=OrderSide.BUY,
+                                price=next_price,
+                                qty=self._config.order_size,
+                                reason="EXIT_RESTORE",
+                            )
                         )
-                    )
                 elif buy_prices:
                     next_price = buy_prices[0] + step_delta
+                    _all_occupied = exit_occupied | set(buy_prices) | set(sell_prices)
                     if (
                         next_price < snap.entry_window.reference_price
-                        and next_price not in buy_prices
+                        and next_price not in _all_occupied
                     ):
                         far_price = buy_prices[-1]
                         buy_prices = buy_prices[:-1]
@@ -813,38 +855,43 @@ class GridV2StateMachine:
                         if buy_prices
                         else snap.entry_window.reference_price - step_delta
                     )
-                    buy_prices.append(next_price)
-                    actions.append(
-                        ActionIntent(
-                            kind=ActionIntentKind.PLACE_ENTRY,
-                            side=OrderSide.BUY,
-                            price=next_price,
-                            qty=self._config.order_size,
-                            reason="EXIT_RESTORE",
+                    _all_occupied = exit_occupied | set(buy_prices) | set(sell_prices)
+                    if next_price not in _all_occupied:
+                        buy_prices.append(next_price)
+                        actions.append(
+                            ActionIntent(
+                                kind=ActionIntentKind.PLACE_ENTRY,
+                                side=OrderSide.BUY,
+                                price=next_price,
+                                qty=self._config.order_size,
+                                reason="EXIT_RESTORE",
+                            )
                         )
-                    )
                 if len(sell_prices) < self._config.entry_levels_per_side:
                     next_price = (
                         sell_prices[0] - step_delta
                         if sell_prices
                         else snap.entry_window.reference_price + step_delta
                     )
-                    sell_prices.append(next_price)
-                    sell_prices.sort()
-                    actions.append(
-                        ActionIntent(
-                            kind=ActionIntentKind.PLACE_ENTRY,
-                            side=OrderSide.SELL,
-                            price=next_price,
-                            qty=self._config.order_size,
-                            reason="EXIT_RESTORE",
+                    _all_occupied = exit_occupied | set(buy_prices) | set(sell_prices)
+                    if next_price not in _all_occupied:
+                        sell_prices.append(next_price)
+                        sell_prices.sort()
+                        actions.append(
+                            ActionIntent(
+                                kind=ActionIntentKind.PLACE_ENTRY,
+                                side=OrderSide.SELL,
+                                price=next_price,
+                                qty=self._config.order_size,
+                                reason="EXIT_RESTORE",
+                            )
                         )
-                    )
                 elif sell_prices:
                     next_price = sell_prices[0] - step_delta
+                    _all_occupied = exit_occupied | set(buy_prices) | set(sell_prices)
                     if (
                         next_price > snap.entry_window.reference_price
-                        and next_price not in sell_prices
+                        and next_price not in _all_occupied
                     ):
                         far_price = sell_prices[-1]
                         sell_prices = sell_prices[:-1]
