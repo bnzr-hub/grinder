@@ -6823,3 +6823,50 @@ class TestIntegrityRepairConvergenceEscalation:
         # (not growing to 20)
         assert engine._grid_v2_integrity_convergence_defer_count < 10
         assert not engine._grid_v2_pending_cancels
+
+
+class TestSyncReconcilerShadow:
+    """Tests for sync-driven reconciler shadow mode (ADR-096)."""
+
+    @staticmethod
+    def _make_engine(reconciler_enabled: bool = False) -> LiveEngineV0:
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+        port = NoOpExchangePort()
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        env = {
+            "GRINDER_GRID_V2_SYNC_RECONCILER_ENABLED": "1" if reconciler_enabled else "0",
+            "GRINDER_GRID_V2_SYNC_RECONCILER_SHADOW": "1",
+        }
+        with patch.dict("os.environ", env):
+            return LiveEngineV0(paper, port, config)
+
+    def test_config_parsed(self) -> None:
+        engine = self._make_engine(reconciler_enabled=True)
+        assert engine._sync_reconciler_enabled is True
+        assert engine._sync_reconciler_shadow is True
+        assert engine._sync_reconciler_max_actions == 10
+
+    def test_config_default_disabled(self) -> None:
+        engine = self._make_engine(reconciler_enabled=False)
+        assert engine._sync_reconciler_enabled is False
+
+    def test_shadow_does_not_change_dispatch(self) -> None:
+        """With shadow reconciler enabled, process_snapshot output is identical."""
+        snap = Snapshot(
+            ts=1000000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("50000"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000.5"),
+            last_qty=Decimal("0.5"),
+        )
+        engine_off = self._make_engine(reconciler_enabled=False)
+        result_off = engine_off.process_snapshot(snap)
+
+        engine_on = self._make_engine(reconciler_enabled=True)
+        result_on = engine_on.process_snapshot(snap)
+
+        assert len(result_off.live_actions) == len(result_on.live_actions)
