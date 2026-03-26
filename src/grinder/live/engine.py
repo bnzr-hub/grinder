@@ -1525,7 +1525,7 @@ class LiveEngineV0:
                 cids.add(o.order_id)
         return cids
 
-    def _grid_v2_sync_reconstruct_on_position_drift(self, snapshot: AccountSnapshot) -> None:  # noqa: PLR0912
+    def _grid_v2_sync_reconstruct_on_position_drift(self, snapshot: AccountSnapshot) -> None:  # noqa: PLR0911, PLR0912
         """Fast-path recovery for sync drift: position is non-flat while SM is FLAT.
 
         This addresses rapid-fill races where exchange position updates first, but
@@ -1542,6 +1542,12 @@ class LiveEngineV0:
             return
         sm = bridge.state_machine
         if sm is None or sm.mode != BranchMode.FLAT:
+            return
+
+        # Don't reconstruct while awaiting seed visibility — seeds are still being
+        # placed on exchange. Early fills during seed placement are expected; fill
+        # detection will handle them once awaiting_sync clears naturally.
+        if self._grid_v2_awaiting_sync:
             return
 
         pos_qty = self._get_signed_position_qty(self._grid_v2_symbol)
