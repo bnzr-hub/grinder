@@ -1148,12 +1148,13 @@ class TestCrossSymbolIsolation:
 class TestReverseKeyCollision:
     """P2: Duplicate reverse keys must be rejected (fail-closed)."""
 
-    def test_duplicate_side_price_entry_raises(self) -> None:
-        """Two different CIDs at same (side, price) → ValueError."""
+    def test_duplicate_side_price_entry_skips(self) -> None:
+        """Two different CIDs at same (side, price) → graceful skip (False)."""
         r = GridV2OrderRegistry()
-        r.register_entry("cid1", OrderSide.BUY, Decimal("49750"))
-        with pytest.raises(ValueError, match="Duplicate entry"):
-            r.register_entry("cid2", OrderSide.BUY, Decimal("49750"))
+        assert r.register_entry("cid1", OrderSide.BUY, Decimal("49750")) is True
+        assert r.register_entry("cid2", OrderSide.BUY, Decimal("49750")) is False
+        # Original CID retained
+        assert r.cid_for_entry(OrderSide.BUY, Decimal("49750")) == "cid1"
 
     def test_duplicate_exit_order_id_raises(self) -> None:
         """Two different CIDs with same exit_order_id → ValueError."""

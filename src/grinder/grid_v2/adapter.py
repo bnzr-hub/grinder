@@ -170,21 +170,20 @@ class GridV2OrderRegistry:
         self._stale_entries: dict[str, EntryRegistration] = {}
         self._stale_exits: dict[str, ExitRegistration] = {}
 
-    def register_entry(self, cid: str, side: OrderSide, price: Decimal) -> None:
-        """Register a new entry order.
+    def register_entry(self, cid: str, side: OrderSide, price: Decimal) -> bool:
+        """Register a new entry order. Returns True on success, False on skip.
 
-        Raises ValueError on duplicate CID or duplicate (side, price).
+        Duplicate CID: raises ValueError (contract violation).
+        Duplicate (side, price): returns False (graceful skip for race safety).
         """
         if cid in self._entries:
             raise ValueError(f"Duplicate entry CID: {cid}")
         if (side, price) in self._entry_by_side_price:
-            raise ValueError(
-                f"Duplicate entry (side={side.value}, price={price}): "
-                f"existing CID={self._entry_by_side_price[(side, price)]}"
-            )
+            return False  # slot occupied by another CID — skip gracefully
         reg = EntryRegistration(cid=cid, side=side, price=price)
         self._entries[cid] = reg
         self._entry_by_side_price[(side, price)] = cid
+        return True
 
     def register_exit(self, cid: str, exit_order_id: str, lot_id: str) -> None:
         """Register a new exit order.
@@ -488,16 +487,17 @@ class GridV2Adapter:
                 if action.side is None or action.price is None or action.qty is None:
                     raise ValueError(f"PLACE_ENTRY missing fields: {action}")
                 cid = self.generate_entry_cid(ts_ms)
-                self._registry.register_entry(cid, action.side, action.price)
-                resolved.append(
-                    ResolvedAction(
-                        cid=cid,
-                        kind=action.kind,
-                        side=action.side,
-                        price=action.price,
-                        qty=action.qty,
+                registered = self._registry.register_entry(cid, action.side, action.price)
+                if registered:
+                    resolved.append(
+                        ResolvedAction(
+                            cid=cid,
+                            kind=action.kind,
+                            side=action.side,
+                            price=action.price,
+                            qty=action.qty,
+                        )
                     )
-                )
 
             elif action.kind == ActionIntentKind.PLACE_EXIT:
                 if (
