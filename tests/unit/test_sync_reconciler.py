@@ -291,8 +291,8 @@ class TestDuplicateEntrySkip:
             buy_prices=(Decimal("49000"),),
         )
         # Registry already has a CID for BUY@49000
-        bridge.adapter.registry.cid_for_entry = (
-            lambda _side, price: "existing_cid" if price == Decimal("49000") else None
+        bridge.adapter.registry.cid_for_entry = lambda _side, price: (
+            "existing_cid" if price == Decimal("49000") else None
         )
         snap = _make_snapshot()  # no orders on exchange → "missing" BUY@49000
         r = reconcile_grid_state(snap, "BTCUSDT", bridge)
