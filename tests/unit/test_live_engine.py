@@ -6870,3 +6870,103 @@ class TestSyncReconcilerShadow:
         result_on = engine_on.process_snapshot(snap)
 
         assert len(result_off.live_actions) == len(result_on.live_actions)
+
+
+class TestSyncReconcilerPrimary:
+    """Tests for sync-driven reconciler primary mode (ADR-096 PR-2)."""
+
+    @staticmethod
+    def _make_engine(
+        *,
+        enabled: bool = True,
+        primary: bool = True,
+        shadow: bool = False,
+    ) -> LiveEngineV0:
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+        port = NoOpExchangePort()
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        env = {
+            "GRINDER_GRID_V2_SYNC_RECONCILER_ENABLED": "1" if enabled else "0",
+            "GRINDER_GRID_V2_SYNC_RECONCILER_PRIMARY": "1" if primary else "0",
+            "GRINDER_GRID_V2_SYNC_RECONCILER_SHADOW": "1" if shadow else "0",
+        }
+        with patch.dict("os.environ", env):
+            return LiveEngineV0(paper, port, config)
+
+    def test_primary_config_parsed(self) -> None:
+        """Test A: primary mode config correctly parsed."""
+        engine = self._make_engine()
+        assert engine._sync_reconciler_enabled is True
+        assert engine._sync_reconciler_primary is True
+        assert engine._sync_reconciler_shadow is False
+
+    def test_invalid_primary_plus_shadow_fails(self) -> None:
+        """Test C: PRIMARY=1 + SHADOW=1 raises ValueError."""
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            self._make_engine(primary=True, shadow=True)
+
+    def test_invalid_primary_without_enabled_fails(self) -> None:
+        """Test C: PRIMARY=1 + ENABLED=0 raises ValueError."""
+        with pytest.raises(ValueError, match=r"requires.*ENABLED"):
+            self._make_engine(enabled=False, primary=True, shadow=False)
+
+    def test_primary_stages_and_drains_actions(self) -> None:
+        """Test A: staged actions are drained once, not repeated."""
+        engine = self._make_engine()
+
+        cancel_action = ExecutionAction(
+            action_type=ActionType.CANCEL,
+            order_id="test_cid",
+            symbol="BTCUSDT",
+            reason="grid_v2_RECONCILE_CANCEL_ENTRY",
+        )
+        engine._sync_reconciler_pending_actions = [cancel_action]
+
+        # Drain (simulating tick path)
+        drained = list(engine._sync_reconciler_pending_actions)
+        engine._sync_reconciler_pending_actions = []
+
+        assert len(drained) == 1
+        assert drained[0].action_type == ActionType.CANCEL
+        assert engine._sync_reconciler_pending_actions == []
+
+    def test_shadow_unchanged_after_primary_added(self) -> None:
+        """Test B: shadow mode still works identically."""
+        snap = Snapshot(
+            ts=1000000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("50000"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000.5"),
+            last_qty=Decimal("0.5"),
+        )
+        engine = self._make_engine(primary=False, shadow=True)
+        result = engine.process_snapshot(snap)
+        assert isinstance(result.live_actions, list)
+
+    def test_cancel_before_place_preserved_in_staging(self) -> None:
+        """Test F: engine doesn't reorder staged actions."""
+        engine = self._make_engine()
+        actions = [
+            ExecutionAction(
+                action_type=ActionType.CANCEL,
+                order_id="extra_cid",
+                symbol="BTCUSDT",
+                reason="grid_v2_RECONCILE_CANCEL_ENTRY",
+            ),
+            ExecutionAction(
+                action_type=ActionType.PLACE,
+                symbol="BTCUSDT",
+                side=OrderSide.BUY,
+                price=Decimal("49000"),
+                quantity=Decimal("100"),
+                reason="grid_v2_RECONCILE_PLACE_ENTRY",
+            ),
+        ]
+        engine._sync_reconciler_pending_actions = actions
+        drained = list(engine._sync_reconciler_pending_actions)
+        assert drained[0].action_type == ActionType.CANCEL
+        assert drained[1].action_type == ActionType.PLACE

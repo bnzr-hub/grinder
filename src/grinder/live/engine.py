@@ -836,9 +836,25 @@ class LiveEngineV0:
         self._sync_reconciler_shadow = parse_bool(
             "GRINDER_GRID_V2_SYNC_RECONCILER_SHADOW", default=True, strict=False
         )
+        self._sync_reconciler_primary = parse_bool(
+            "GRINDER_GRID_V2_SYNC_RECONCILER_PRIMARY", default=False, strict=False
+        )
         self._sync_reconciler_max_actions = int(
             os.environ.get("GRINDER_GRID_V2_RECONCILE_MAX_ACTIONS_PER_SYNC", "10")
         )
+        # Startup validation: fail-closed on invalid combos
+        if self._sync_reconciler_primary and self._sync_reconciler_shadow:
+            raise ValueError(
+                "GRINDER_GRID_V2_SYNC_RECONCILER_PRIMARY=1 and "
+                "GRINDER_GRID_V2_SYNC_RECONCILER_SHADOW=1 are mutually exclusive"
+            )
+        if self._sync_reconciler_primary and not self._sync_reconciler_enabled:
+            raise ValueError(
+                "GRINDER_GRID_V2_SYNC_RECONCILER_PRIMARY=1 requires "
+                "GRINDER_GRID_V2_SYNC_RECONCILER_ENABLED=1"
+            )
+        # Pending actions from reconciler dispatch (for fill-detection exclusion)
+        self._sync_reconciler_pending_actions: list[ExecutionAction] = []
         # Adaptive Step Controller v1 (volatility-aware grid spacing)
         # Must be initialized BEFORE _create_grid_v2_bridge() so effective step
         # is available on cold start, not only on subsequent recreations.
@@ -2739,9 +2755,15 @@ class LiveEngineV0:
                 # Same-tick dedup: extract PLACE_ENTRY slots from fill path
                 # to prevent integrity repair from duplicating them.
                 planned_slots = self._extract_planned_entry_slots(grid_v2_fill_actions)
-                grid_v2_integrity_actions = self._grid_v2_integrity_repair(
-                    snapshot, planned_slots_this_tick=planned_slots
-                )
+                # ADR-096 PR-2: primary reconciler replaces tick watchdog
+                if self._sync_reconciler_primary:
+                    # Drain staged actions from last sync cycle
+                    grid_v2_integrity_actions = list(self._sync_reconciler_pending_actions)
+                    self._sync_reconciler_pending_actions = []
+                else:
+                    grid_v2_integrity_actions = self._grid_v2_integrity_repair(
+                        snapshot, planned_slots_this_tick=planned_slots
+                    )
             else:
                 grid_v2_fill_actions = []
                 grid_v2_integrity_actions = []
@@ -3777,7 +3799,7 @@ class LiveEngineV0:
         if self._risk_base_enabled and result.snapshot is not None:
             self._update_risk_base(asof_ts_ms=result.snapshot.ts)
 
-        # ADR-096: Sync-driven reconciler (shadow mode)
+        # ADR-096: Sync-driven reconciler
         if (
             self._sync_reconciler_enabled
             and result.snapshot is not None
@@ -3794,17 +3816,19 @@ class LiveEngineV0:
                 bridge=self._grid_v2_bridge,
                 max_actions=self._sync_reconciler_max_actions,
             )
-            if (
+            has_diff = bool(
                 recon.missing_entries
                 or recon.extra_entries
                 or recon.missing_exits
                 or recon.extra_exits
-            ):
+            )
+            is_primary = self._sync_reconciler_primary
+            if has_diff:
                 logger.info(
                     "GRID_V2_SYNC_RECONCILER symbol=%s mode=%s "
                     "desired_entries=%d actual_entries=%d missing=%d extra=%d "
                     "desired_exits=%d actual_exits=%d missing_exits=%d extra_exits=%d "
-                    "would_cancel=%d would_place=%d cycle_ms=%d shadow=%s",
+                    "would_cancel=%d would_place=%d cycle_ms=%d primary=%s",
                     self._grid_v2_symbol,
                     self._grid_v2_bridge.state_machine.mode.value
                     if self._grid_v2_bridge.state_machine
@@ -3820,7 +3844,18 @@ class LiveEngineV0:
                     recon.would_cancel,
                     recon.would_place,
                     recon.cycle_ms,
-                    self._sync_reconciler_shadow,
+                    is_primary,
+                )
+            # PRIMARY MODE: stage actions for dispatch on next process_snapshot tick
+            if is_primary and recon.actions:
+                self._sync_reconciler_pending_actions = list(recon.actions)
+                logger.info(
+                    "GRID_V2_SYNC_RECONCILER_DISPATCH_STAGED symbol=%s actions=%d "
+                    "cancel=%d place=%d",
+                    self._grid_v2_symbol,
+                    len(recon.actions),
+                    recon.would_cancel,
+                    recon.would_place,
                 )
 
         # P0-2: correlate recent PLACEs with AccountSync open_orders
