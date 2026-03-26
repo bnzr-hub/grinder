@@ -138,8 +138,9 @@ class TestReconcilerDeterministicDiff:
 
     def test_identical_results_on_repeated_calls(self) -> None:
         """Same inputs → identical output every time."""
-        # ref=100, step=1%, levels=2 → desired BUY@99,98 SELL@101,102
         bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"), Decimal("98.00")),
+            sell_prices=(Decimal("101.00"), Decimal("102.00")),
             ref_price=Decimal("100"),
             step_pct=Decimal("0.01"),
             tick_size=Decimal("0.01"),
@@ -158,9 +159,10 @@ class TestReconcilerDeterministicDiff:
             assert results[i].missing_entries == results[0].missing_entries
 
     def test_no_mismatch_returns_empty(self) -> None:
-        """All geometry levels present on exchange → 0 missing."""
-        # ref=100, step=1%, tick=0.01, levels=2 → BUY@99,98 SELL@101,102
+        """All SM-desired entries present on exchange → 0 missing."""
         bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"), Decimal("98.00")),
+            sell_prices=(Decimal("101.00"), Decimal("102.00")),
             ref_price=Decimal("100"),
             step_pct=Decimal("0.01"),
             tick_size=Decimal("0.01"),
@@ -185,8 +187,9 @@ class TestCancelBeforePlaceOrdering:
 
     def test_cancel_before_place(self) -> None:
         """Extra entry cancelled before missing placed."""
-        # ref=100, levels=1 → desired BUY@99, SELL@101
         bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"),),
+            sell_prices=(Decimal("101.00"),),
             ref_price=Decimal("100"),
             step_pct=Decimal("0.01"),
             tick_size=Decimal("0.01"),
@@ -260,8 +263,9 @@ class TestBudgetCap:
 
     def test_max_actions_limits_output(self) -> None:
         """Budget cap: max_actions=3 limits output to 3."""
-        # ref=100, levels=5 → 10 desired, 0 actual → 10 missing
         bridge = _make_bridge(
+            buy_prices=tuple(Decimal(str(100 - i)) for i in range(1, 6)),
+            sell_prices=tuple(Decimal(str(100 + i)) for i in range(1, 6)),
             ref_price=Decimal("100"),
             step_pct=Decimal("0.01"),
             tick_size=Decimal("0.01"),
@@ -346,8 +350,9 @@ class TestDuplicateEntrySkip:
 
     def test_place_when_registry_empty(self) -> None:
         """Place when registry has no CID for slot."""
-        # ref=100, levels=1 → desired BUY@99, SELL@101
         bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"),),
+            sell_prices=(Decimal("101.00"),),
             ref_price=Decimal("100"),
             step_pct=Decimal("0.01"),
             tick_size=Decimal("0.01"),
