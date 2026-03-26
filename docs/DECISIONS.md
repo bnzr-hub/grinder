@@ -4393,3 +4393,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Escalation log throttle:** `_GRID_V2_ESCALATION_LOG_INTERVAL=10` — log on first escalation + every 10th defer. No per-tick spam.
 - **Convergence re-check:** After stale resolution, convergence status is re-evaluated; if all pending cleared, defer counter resets to 0.
 - **Safety:** Stale cancel resolution does NOT cause false fills: CID dropped from pending-cancels only when stale. If CID is still on exchange, it won't appear in fill detection (`registry - current_cids`). If CID is gone, cancel ack is confirmed normally.
+
+### ADR-095: Pending-Cancel Dual-Bound Staleness (2026-03-26)
+
+- **Status:** Delivered.
+- **Decision:** Pending cancels use dual-bound staleness: time-based OR sync-generation-based. Fixes convergence stall where time-based staleness alone was insufficient.
+- **Context:** Post-PR-457 live smoke showed `stale_cancels_resolved=0` despite extended escalation. Root cause: pending cancels stored only dispatch_ts (market data timestamp). In fast-tick scenarios, `age_ms = snapshot.ts - dispatch_ts` stays small because ticks arrive frequently. Gen-based staleness catches cancels that survived across sync boundaries regardless of tick rate.
+- **Change:** `_grid_v2_pending_cancels` now stores `(ts_ms, sync_gen)` tuples. Resolution triggers on `age_ms >= 15s OR gen_delta >= 2`. New constant: `_GRID_V2_PENDING_CANCEL_STALE_GENS=2`.
+- **Effect:** After 2 account syncs (~10s), any pending cancel becomes stale-eligible for escalation resolution. Combined with time-based 15s fallback for slow-sync scenarios.

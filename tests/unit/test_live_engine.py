@@ -68,6 +68,7 @@ from grinder.live.engine import (
     _CONVERGENCE_TIMEOUT_MS,
     _GRID_V2_ESCALATION_LOG_INTERVAL,
     _GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS,
+    _GRID_V2_PENDING_CANCEL_STALE_GENS,
     _GRID_V2_PENDING_CANCEL_STALE_MS,
     _GRID_V2_PENDING_PLACE_STALE_GENS,
     _extract_binance_error_code,
@@ -6652,10 +6653,10 @@ class TestIntegrityRepairConvergenceEscalation:
         engine = self._make_engine()
         self._setup_flat_bridge(engine)
 
-        # Add a stale pending cancel (dispatched 20s ago)
+        # Add a stale pending cancel (dispatched 20s ago, gen 0)
         now_ts = 30000
         stale_ts = now_ts - _GRID_V2_PENDING_CANCEL_STALE_MS - 1000
-        engine._grid_v2_pending_cancels["stale_cid_1"] = stale_ts
+        engine._grid_v2_pending_cancels["stale_cid_1"] = (stale_ts, 0)
 
         # Mock exchange: CID is gone (cancel succeeded but ack was missed)
         engine._grid_v2_bridge.adapter.is_ours.return_value = True  # type: ignore[union-attr]
@@ -6700,8 +6701,8 @@ class TestIntegrityRepairConvergenceEscalation:
         engine = self._make_engine()
         self._setup_flat_bridge(engine)
 
-        # Non-stale pending cancel (won't be auto-resolved)
-        engine._grid_v2_pending_cancels["fresh_cid"] = 999999999
+        # Non-stale pending cancel (won't be auto-resolved by time or gen)
+        engine._grid_v2_pending_cancels["fresh_cid"] = (999999999, 999999)
 
         # Mock exchange: CID is still present (can't be resolved)
         # The pending cancel stays, escalation continues
@@ -6725,8 +6726,8 @@ class TestIntegrityRepairConvergenceEscalation:
         engine = self._make_engine()
         self._setup_flat_bridge(engine)
 
-        # Add a fresh pending cancel
-        engine._grid_v2_pending_cancels["good_cid"] = 50000
+        # Add a fresh pending cancel (recent ts + current gen)
+        engine._grid_v2_pending_cancels["good_cid"] = (50000, 0)
 
         # Convergence pending due to cancel, defer a few times
         engine._grid_v2_integrity_repair(self._snap(ts=50100))
@@ -6752,7 +6753,7 @@ class TestIntegrityRepairConvergenceEscalation:
         # Add stale pending cancel for a CID that IS still on exchange
         now_ts = 50000
         stale_ts = now_ts - _GRID_V2_PENDING_CANCEL_STALE_MS - 5000
-        engine._grid_v2_pending_cancels["on_exchange_cid"] = stale_ts
+        engine._grid_v2_pending_cancels["on_exchange_cid"] = (stale_ts, 0)
 
         # Mock: CID is still on exchange
         mock_bridge = engine._grid_v2_bridge
@@ -6770,3 +6771,55 @@ class TestIntegrityRepairConvergenceEscalation:
         # would see it as "disappeared" IF it's also absent from exchange.
         # But since it IS on exchange, it won't appear in (registry - current_cids).
         # This is safe — no false fill.
+
+    def test_gen_based_cancel_staleness_unblocks_convergence(self) -> None:
+        """Pending cancel with recent ts but old gen is resolved by gen-based staleness.
+
+        This is the key fix: in fast-tick scenarios, time-based staleness may not
+        trigger (cancel ts is close to current ts), but gen-based staleness catches
+        cancels that survived across multiple sync generations.
+        """
+        engine = self._make_engine()
+        self._setup_flat_bridge(engine)
+
+        # Cancel dispatched at recent ts but old gen (gen=0, current=3)
+        now_ts = 50000
+        engine._account_sync_generation = _GRID_V2_PENDING_CANCEL_STALE_GENS + 1
+        # Time is recent (only 1s ago) — not stale by time
+        engine._grid_v2_pending_cancels["gen_stale_cid"] = (now_ts - 1000, 0)
+
+        # Defer up to max
+        for i in range(_GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS - 1):
+            engine._grid_v2_integrity_repair(self._snap(ts=now_ts + i * 100))
+
+        assert engine._grid_v2_pending_cancels  # still blocking (defers < max)
+
+        # On escalation, gen-based staleness should resolve it
+        engine._grid_v2_integrity_repair(self._snap(ts=now_ts + 1000))
+
+        # Pending cancel resolved via gen-based staleness
+        assert not engine._grid_v2_pending_cancels
+        assert engine._grid_v2_integrity_convergence_defer_count == 0
+
+    def test_convergence_loop_bounded_under_persistent_blocker(self) -> None:
+        """Even with a persistent pending cancel, escalation resolves it deterministically.
+
+        Simulates the live scenario: cancel dispatched, stays in pending across
+        many ticks. Verify defer count doesn't grow unbounded.
+        """
+        engine = self._make_engine()
+        self._setup_flat_bridge(engine)
+
+        # Cancel dispatched at gen=0, advance gen past stale threshold
+        engine._account_sync_generation = 5
+        engine._grid_v2_pending_cancels["persistent_cid"] = (10000, 0)
+
+        # Run many ticks — should resolve on first escalation
+        base_ts = 20000
+        for i in range(20):
+            engine._grid_v2_integrity_repair(self._snap(ts=base_ts + i * 500))
+
+        # After resolution, defer counter should have been reset
+        # (not growing to 20)
+        assert engine._grid_v2_integrity_convergence_defer_count < 10
+        assert not engine._grid_v2_pending_cancels

@@ -1713,7 +1713,7 @@ class TestEngineCancelAckRouting:
         entry_count_before = bridge.adapter.registry.entry_count
 
         # Simulate: we dispatch a CANCEL for this CID
-        engine._grid_v2_pending_cancels[target_cid] = _BASE_TS + 1000
+        engine._grid_v2_pending_cancels[target_cid] = (_BASE_TS + 1000, 0)
 
         # Tick 2: the order is gone from exchange (simulating cancel ack)
         # Provide account snapshot WITHOUT the cancelled CID
@@ -1952,7 +1952,7 @@ class TestEngineImmediateUserDataPath:
         assert entry_reg is not None
 
         # Simulate: cancel dispatched at _BASE_TS, order still on exchange
-        engine._grid_v2_pending_cancels[target_cid] = _BASE_TS
+        engine._grid_v2_pending_cancels[target_cid] = (_BASE_TS, 0)
 
         # Tick 2: 60s later (well past any TTL), order STILL on exchange
         open_order_list = []
@@ -3492,7 +3492,7 @@ class TestEngineCancelUnknownClassification:
 
         cid = sorted(bridge.adapter.registry.all_entry_cids)[0]
         assert bridge.adapter.registry.lookup_entry(cid) is not None
-        engine._grid_v2_pending_cancels[cid] = _BASE_TS + 100
+        engine._grid_v2_pending_cancels[cid] = (_BASE_TS + 100, 0)
         engine._cancel_failed_ids.add(cid)
 
         handled = engine._grid_v2_handle_failed_cancel(cid, -2011)
