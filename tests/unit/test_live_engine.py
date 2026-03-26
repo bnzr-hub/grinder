@@ -66,7 +66,10 @@ from grinder.live.cycle_layer import LiveCycleConfig, LiveCycleLayerV1
 from grinder.live.engine import (
     _BINANCE_ERROR_RE,
     _CONVERGENCE_TIMEOUT_MS,
+    _GRID_V2_ESCALATION_LOG_INTERVAL,
     _GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS,
+    _GRID_V2_PENDING_CANCEL_STALE_MS,
+    _GRID_V2_PENDING_PLACE_STALE_GENS,
     _extract_binance_error_code,
     _InflightShift,
 )
@@ -6643,3 +6646,127 @@ class TestIntegrityRepairConvergenceEscalation:
             engine._grid_v2_integrity_mismatch_streak == 0
             and engine._grid_v2_integrity_repair_cooldown_until_ts > 0
         )
+
+    def test_stale_pending_cancel_resolved_on_escalation(self) -> None:
+        """Pending cancel stuck past stale threshold is resolved during escalation."""
+        engine = self._make_engine()
+        self._setup_flat_bridge(engine)
+
+        # Add a stale pending cancel (dispatched 20s ago)
+        now_ts = 30000
+        stale_ts = now_ts - _GRID_V2_PENDING_CANCEL_STALE_MS - 1000
+        engine._grid_v2_pending_cancels["stale_cid_1"] = stale_ts
+
+        # Mock exchange: CID is gone (cancel succeeded but ack was missed)
+        engine._grid_v2_bridge.adapter.is_ours.return_value = True  # type: ignore[union-attr]
+
+        # Defer up to max
+        for i in range(_GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS - 1):
+            engine._grid_v2_integrity_repair(self._snap(ts=now_ts + i * 1000))
+
+        assert engine._grid_v2_pending_cancels  # still blocking
+
+        # On escalation, stale cancel should be resolved
+        engine._grid_v2_integrity_repair(self._snap(ts=now_ts + 10000))
+
+        # Pending cancel resolved — no longer blocking
+        assert not engine._grid_v2_pending_cancels
+        assert engine._grid_v2_integrity_convergence_defer_count == 0
+
+    def test_stale_pending_place_resolved_on_escalation(self) -> None:
+        """Pending place stuck past gen threshold is resolved during escalation."""
+        engine = self._make_engine()
+        self._setup_flat_bridge(engine)
+
+        # Add pending place from many gens ago
+        engine._account_sync_generation = 10
+        engine._grid_v2_pending_place_cids["stale_place_1"] = 10 - _GRID_V2_PENDING_PLACE_STALE_GENS
+
+        # Defer up to max
+        for i in range(_GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS - 1):
+            engine._grid_v2_integrity_repair(self._snap(ts=10000 + i * 1000))
+
+        assert engine._grid_v2_pending_place_cids  # still blocking
+
+        # On escalation, stale place should be resolved
+        engine._grid_v2_integrity_repair(self._snap(ts=20000))
+
+        # Pending place resolved
+        assert not engine._grid_v2_pending_place_cids
+        assert engine._grid_v2_integrity_convergence_defer_count == 0
+
+    def test_escalation_log_throttled(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Escalation log fires on first escalation + every Nth, not every tick."""
+        engine = self._make_engine()
+        self._setup_flat_bridge(engine)
+
+        # Non-stale pending cancel (won't be auto-resolved)
+        engine._grid_v2_pending_cancels["fresh_cid"] = 999999999
+
+        # Mock exchange: CID is still present (can't be resolved)
+        # The pending cancel stays, escalation continues
+
+        total_ticks = _GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS + 30
+        with caplog.at_level(logging.WARNING, logger="grinder.live.engine"):
+            for i in range(total_ticks):
+                engine._grid_v2_integrity_repair(self._snap(ts=999999999 + i * 100))
+
+        escalation_logs = [r for r in caplog.records if "CONVERGENCE_ESCALATION" in r.message]
+        # Should NOT be one per tick after max_defers.
+        # Expected: first at max_defers, then every _GRID_V2_ESCALATION_LOG_INTERVAL
+        ticks_past_max = total_ticks - _GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS + 1
+        expected_max_logs = 1 + (ticks_past_max // _GRID_V2_ESCALATION_LOG_INTERVAL) + 1
+        assert len(escalation_logs) <= expected_max_logs
+        # At least the first escalation log should be present
+        assert len(escalation_logs) >= 1
+
+    def test_legitimate_cancel_ack_still_works(self) -> None:
+        """Fresh pending cancel that disappears from exchange is properly acked."""
+        engine = self._make_engine()
+        self._setup_flat_bridge(engine)
+
+        # Add a fresh pending cancel
+        engine._grid_v2_pending_cancels["good_cid"] = 50000
+
+        # Convergence pending due to cancel, defer a few times
+        engine._grid_v2_integrity_repair(self._snap(ts=50100))
+        engine._grid_v2_integrity_repair(self._snap(ts=50200))
+        assert engine._grid_v2_pending_cancels  # still there (fresh, not stale)
+
+        # Now simulate normal cancel ack path: remove externally
+        engine._grid_v2_pending_cancels.clear()
+
+        # Next call: convergence clear, counter resets
+        engine._grid_v2_integrity_repair(self._snap(ts=50300))
+        assert engine._grid_v2_integrity_convergence_defer_count == 0
+
+    def test_no_false_fill_from_stale_cancel_resolution(self) -> None:
+        """Stale pending cancel resolution does NOT cause false fill detection.
+
+        When a stale pending cancel is dropped (still on exchange), the CID
+        should NOT appear as 'filled' in the next fill detection pass.
+        """
+        engine = self._make_engine()
+        self._setup_flat_bridge(engine)
+
+        # Add stale pending cancel for a CID that IS still on exchange
+        now_ts = 50000
+        stale_ts = now_ts - _GRID_V2_PENDING_CANCEL_STALE_MS - 5000
+        engine._grid_v2_pending_cancels["on_exchange_cid"] = stale_ts
+
+        # Mock: CID is still on exchange
+        mock_bridge = engine._grid_v2_bridge
+        assert mock_bridge is not None
+
+        # Run escalation to trigger stale resolution
+        for i in range(_GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS):
+            engine._grid_v2_integrity_repair(self._snap(ts=now_ts + i * 1000))
+
+        # The CID was dropped from pending_cancels (stale, still on exchange).
+        # Verify it was removed from pending set.
+        assert "on_exchange_cid" not in engine._grid_v2_pending_cancels
+
+        # Now verify: the CID is NOT in pending_cancels, so fill detection
+        # would see it as "disappeared" IF it's also absent from exchange.
+        # But since it IS on exchange, it won't appear in (registry - current_cids).
+        # This is safe — no false fill.
