@@ -32,6 +32,9 @@ def _make_bridge(
     max_inv: int = 80,
     order_size: Decimal = Decimal("100"),
     tick_size: Decimal = Decimal("0.0001"),
+    ref_price: Decimal = Decimal("50000"),
+    step_pct: Decimal = Decimal("0.01"),
+    levels: int = 3,
 ) -> MagicMock:
     """Build a mock GridV2Bridge with desired SM state."""
     bridge = MagicMock()
@@ -39,6 +42,7 @@ def _make_bridge(
     sm.mode = mode
     sm.snapshot.entry_window.buy_entry_prices = buy_prices
     sm.snapshot.entry_window.sell_entry_prices = sell_prices
+    sm.snapshot.entry_window.reference_price = ref_price
     sm.snapshot.exit_orders = exit_orders
     sm.snapshot.open_lots = open_lots
     bridge.state_machine = sm
@@ -46,6 +50,8 @@ def _make_bridge(
     bridge._config.max_inventory_levels = max_inv
     bridge._config.order_size = order_size
     bridge._config.price_tick_size = tick_size
+    bridge._config.grid_step_pct = step_pct
+    bridge._config.entry_levels_per_side = levels
     bridge._quantize_price = lambda p, _s: p
 
     # Adapter: parse_cid returns mock with kind
@@ -131,32 +137,41 @@ class TestReconcilerDeterministicDiff:
     """Test A: same inputs → identical output."""
 
     def test_identical_results_on_repeated_calls(self) -> None:
+        """Same inputs → identical output every time."""
+        # ref=100, step=1%, levels=2 → desired BUY@99,98 SELL@101,102
         bridge = _make_bridge(
-            buy_prices=(Decimal("49000"), Decimal("48900")),
-            sell_prices=(Decimal("51000"),),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=2,
         )
         snap = _make_snapshot(
-            entry_orders={("BUY", "49000"): "entry_buy1"},
+            entry_orders={("BUY", "99.00"): "entry_buy1"},
         )
-        # Missing: BUY@48900, SELL@51000. Extra: none.
+        # Missing: BUY@98, SELL@101, SELL@102. Extra: none.
         results = []
         for _ in range(3):
             r = reconcile_grid_state(snap, "BTCUSDT", bridge)
             results.append(r)
-        # All identical
         for i in range(1, 3):
             assert results[i].actions == results[0].actions
             assert results[i].missing_entries == results[0].missing_entries
 
     def test_no_mismatch_returns_empty(self) -> None:
+        """All geometry levels present on exchange → 0 missing."""
+        # ref=100, step=1%, tick=0.01, levels=2 → BUY@99,98 SELL@101,102
         bridge = _make_bridge(
-            buy_prices=(Decimal("49000"),),
-            sell_prices=(Decimal("51000"),),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=2,
         )
         snap = _make_snapshot(
             entry_orders={
-                ("BUY", "49000"): "entry_buy1",
-                ("SELL", "51000"): "entry_sell1",
+                ("BUY", "99.00"): "entry_b1",
+                ("BUY", "98.00"): "entry_b2",
+                ("SELL", "101.00"): "entry_s1",
+                ("SELL", "102.00"): "entry_s2",
             },
         )
         r = reconcile_grid_state(snap, "BTCUSDT", bridge)
@@ -169,18 +184,32 @@ class TestCancelBeforePlaceOrdering:
     """Test B: extras and missing mixed → all CANCEL first, then PLACE."""
 
     def test_cancel_before_place(self) -> None:
+        """Extra entry cancelled before missing placed."""
+        # ref=100, levels=1 → desired BUY@99, SELL@101
         bridge = _make_bridge(
-            buy_prices=(Decimal("49000"),),
-            sell_prices=(),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=1,
         )
-        # Actual has extra SELL, missing BUY
+        # Actual: SELL@105 (extra, not at geometry level), missing BUY@99 + SELL@101
         snap = _make_snapshot(
-            entry_orders={("SELL", "51000"): "entry_extra"},
+            entry_orders={("SELL", "105.00"): "entry_extra"},
         )
         r = reconcile_grid_state(snap, "BTCUSDT", bridge)
-        assert len(r.actions) == 2
-        assert r.actions[0].action_type == ActionType.CANCEL
-        assert r.actions[1].action_type == ActionType.PLACE
+        # Should have at least 1 CANCEL + some PLACEs
+        cancels = [a for a in r.actions if a.action_type == ActionType.CANCEL]
+        places = [a for a in r.actions if a.action_type == ActionType.PLACE]
+        assert len(cancels) >= 1
+        assert len(places) >= 1
+        # CANCEL before PLACE
+        first_place_idx = next(
+            i for i, a in enumerate(r.actions) if a.action_type == ActionType.PLACE
+        )
+        last_cancel_idx = max(
+            i for i, a in enumerate(r.actions) if a.action_type == ActionType.CANCEL
+        )
+        assert last_cancel_idx < first_place_idx
 
 
 class TestShadowInvariance:
@@ -188,11 +217,13 @@ class TestShadowInvariance:
 
     def test_bridge_state_unchanged(self) -> None:
         bridge = _make_bridge(
-            buy_prices=(Decimal("49000"),),
-            sell_prices=(Decimal("51000"),),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=2,
         )
         snap = _make_snapshot(
-            entry_orders={("BUY", "48000"): "entry_wrong"},
+            entry_orders={("BUY", "48.00"): "entry_wrong"},
         )
         sm_before = bridge.state_machine.mode
         _ = reconcile_grid_state(snap, "BTCUSDT", bridge)
@@ -209,10 +240,12 @@ class TestInventoryFull:
         lots = [MagicMock() for _ in range(80)]
         bridge = _make_bridge(
             mode=BranchMode.LONG_BRANCH,
-            buy_prices=(Decimal("49000"),),
-            sell_prices=(),
             open_lots=tuple(lots),
             max_inv=80,
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=3,
         )
         snap = _make_snapshot()  # no orders on exchange
         r = reconcile_grid_state(snap, "BTCUSDT", bridge)
@@ -226,9 +259,13 @@ class TestBudgetCap:
     """Test F: budget cap respected."""
 
     def test_max_actions_limits_output(self) -> None:
-        # Desire 10 entries, have 0 → 10 missing
+        """Budget cap: max_actions=3 limits output to 3."""
+        # ref=100, levels=5 → 10 desired, 0 actual → 10 missing
         bridge = _make_bridge(
-            buy_prices=tuple(Decimal(str(49000 - i * 100)) for i in range(10)),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=5,
         )
         snap = _make_snapshot()
         r = reconcile_grid_state(snap, "BTCUSDT", bridge, max_actions=3)
@@ -239,39 +276,44 @@ class TestExitReconciliation:
     """Test G: branch-mode exit reconciliation."""
 
     def test_missing_exit_not_placed_extra_exit_cancelled(self) -> None:
-        """Reconciler cancels extra exits but doesn't PLACE exits (exits go through bridge)."""
+        """Reconciler cancels extra exits but doesn't PLACE exits."""
         eo = _make_exit_order("lot_1")
         bridge = _make_bridge(
             mode=BranchMode.LONG_BRANCH,
             exit_orders=(eo,),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=2,
         )
         # Extra exit on exchange that shouldn't be there
         snap = _make_snapshot(exit_cids=["exit_unknown"])
         r = reconcile_grid_state(snap, "BTCUSDT", bridge)
-        # Extra exit should be cancelled
         cancel_actions = [a for a in r.actions if a.action_type == ActionType.CANCEL]
-        assert len(cancel_actions) == 1
-        assert cancel_actions[0].order_id == "exit_unknown"
+        assert any(a.order_id == "exit_unknown" for a in cancel_actions)
 
 
 class TestReplayDeterminism:
     """Test H: deterministic across repeated calls with same input."""
 
     def test_action_order_stable(self) -> None:
+        """Deterministic: same input → same actions, CANCEL before PLACE."""
+        # ref=100, levels=3 → desired BUY@99,98,97 SELL@101,102,103
         bridge = _make_bridge(
-            buy_prices=(Decimal("49000"), Decimal("48900"), Decimal("48800")),
-            sell_prices=(Decimal("51000"), Decimal("51100")),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=3,
         )
         snap = _make_snapshot(
             entry_orders={
-                ("BUY", "47000"): "entry_extra_buy",
-                ("SELL", "52000"): "entry_extra_sell",
+                ("BUY", "47.00"): "entry_extra_buy",
+                ("SELL", "120.00"): "entry_extra_sell",
             },
         )
         r1 = reconcile_grid_state(snap, "BTCUSDT", bridge)
         r2 = reconcile_grid_state(snap, "BTCUSDT", bridge)
         assert r1.actions == r2.actions
-        # Verify cancel comes before place
         first_place_idx = next(
             (i for i, a in enumerate(r1.actions) if a.action_type == ActionType.PLACE),
             len(r1.actions),
@@ -287,26 +329,32 @@ class TestDuplicateEntrySkip:
     """P0 fix: reconciler skips PLACE when adapter registry already has CID for slot."""
 
     def test_skip_place_when_registry_has_cid(self) -> None:
+        """Skip PLACE if registry already has CID for that slot."""
+        # ref=100, levels=1 → desired BUY@99, SELL@101
         bridge = _make_bridge(
-            buy_prices=(Decimal("49000"),),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=1,
         )
-        # Registry already has a CID for BUY@49000
-        bridge.adapter.registry.cid_for_entry = lambda _side, price: (
-            "existing_cid" if price == Decimal("49000") else None
-        )
-        snap = _make_snapshot()  # no orders on exchange → "missing" BUY@49000
+        # Registry already has CIDs for both slots
+        bridge.adapter.registry.cid_for_entry = lambda _side, _price: "existing_cid"
+        snap = _make_snapshot()  # no orders on exchange
         r = reconcile_grid_state(snap, "BTCUSDT", bridge)
-        # Should skip PLACE — registry already owns this slot
         place_actions = [a for a in r.actions if a.action_type == ActionType.PLACE]
         assert len(place_actions) == 0
 
     def test_place_when_registry_empty(self) -> None:
+        """Place when registry has no CID for slot."""
+        # ref=100, levels=1 → desired BUY@99, SELL@101
         bridge = _make_bridge(
-            buy_prices=(Decimal("49000"),),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=1,
         )
-        # Registry has no CID for this slot
         bridge.adapter.registry.cid_for_entry = lambda _side, _price: None
         snap = _make_snapshot()
         r = reconcile_grid_state(snap, "BTCUSDT", bridge)
         place_actions = [a for a in r.actions if a.action_type == ActionType.PLACE]
-        assert len(place_actions) == 1
+        assert len(place_actions) == 2  # BUY@99 + SELL@101

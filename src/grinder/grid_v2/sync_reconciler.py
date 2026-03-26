@@ -75,14 +75,35 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     if sm is None:
         return _empty_result(0)
 
-    # --- Compute desired state from SM ---
-    desired_entry_keys: set[tuple[OrderSide, Decimal]] = set()
-    for p in sm.snapshot.entry_window.buy_entry_prices:
-        desired_entry_keys.add((OrderSide.BUY, bridge._quantize_price(p, OrderSide.BUY)))
-    for p in sm.snapshot.entry_window.sell_entry_prices:
-        desired_entry_keys.add((OrderSide.SELL, bridge._quantize_price(p, OrderSide.SELL)))
+    # --- Compute desired state from ideal geometry (not SM window) ---
+    # SM window may have gaps from collision guard skips. Reconciler uses
+    # pure geometry: uniform steps from reference price.
+    from grinder.grid_v2.state import _grid_step_price  # noqa: PLC0415
 
-    # Inventory cap: when full, don't desire new entries (match watchdog behavior)
+    ref_price = sm.snapshot.entry_window.reference_price
+    step = _grid_step_price(
+        ref_price,
+        bridge._config.grid_step_pct,
+        bridge._config.price_tick_size,
+    )
+    levels = bridge._config.entry_levels_per_side
+
+    # Collect exit prices to avoid placing entries on occupied exit slots
+    exit_prices: set[Decimal] = set()
+    for eo in sm.snapshot.exit_orders:
+        if eo.status == ExitOrderStatus.OPEN:
+            exit_prices.add(eo.price)
+
+    desired_entry_keys: set[tuple[OrderSide, Decimal]] = set()
+    for i in range(1, levels + 1):
+        buy_price = bridge._quantize_price(ref_price - step * i, OrderSide.BUY)
+        sell_price = bridge._quantize_price(ref_price + step * i, OrderSide.SELL)
+        if buy_price not in exit_prices:
+            desired_entry_keys.add((OrderSide.BUY, buy_price))
+        if sell_price not in exit_prices:
+            desired_entry_keys.add((OrderSide.SELL, sell_price))
+
+    # Inventory cap: when full, don't desire new entries
     inventory_full = (
         sm.mode != BranchMode.FLAT
         and len(sm.snapshot.open_lots) >= bridge._config.max_inventory_levels
