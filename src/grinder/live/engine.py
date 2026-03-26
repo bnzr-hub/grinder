@@ -1520,6 +1520,94 @@ class LiveEngineV0:
                 cids.add(o.order_id)
         return cids
 
+    def _grid_v2_sync_reconstruct_on_position_drift(self, snapshot: AccountSnapshot) -> None:
+        """Fast-path recovery for sync drift: position is non-flat while SM is FLAT.
+
+        This addresses rapid-fill races where exchange position updates first, but
+        fill-diff detection lags and the bridge can remain in FLAT temporarily.
+        Reconstruct from fresh account snapshot and swap bridge only on success.
+        """
+        bridge = self._grid_v2_bridge
+        if (
+            bridge is None
+            or not self._grid_v2_enabled
+            or not self._grid_v2_started
+            or not bridge.reconstruction_ok
+        ):
+            return
+        sm = bridge.state_machine
+        if sm is None or sm.mode != BranchMode.FLAT:
+            return
+
+        pos_qty = self._get_signed_position_qty(self._grid_v2_symbol)
+        if pos_qty == 0:
+            return
+
+        g_orders: list[tuple[str, OrderSide, Decimal, Decimal]] = []
+        for o in snapshot.open_orders:
+            if o.symbol != self._grid_v2_symbol:
+                continue
+            parsed = parse_client_order_id(o.order_id)
+            if parsed is None or parsed.strategy_id != GRID_V2_STRATEGY_ID:
+                continue
+            g_orders.append((o.order_id, OrderSide(o.side), o.price, o.qty))
+
+        ref_price: Decimal | None = None
+        if self._last_snapshot is not None and self._last_snapshot.symbol == self._grid_v2_symbol:
+            ref_price = self._last_snapshot.mid_price
+        elif g_orders:
+            prices = [price for _cid, _side, price, _qty in g_orders]
+            ref_price = (min(prices) + max(prices)) / Decimal(2)
+        if ref_price is None:
+            logger.warning(
+                "GRID_V2_SYNC_POSITION_DRIFT_RECONSTRUCT_SKIPPED "
+                "symbol=%s reason=no_reference_price pos_qty=%s",
+                self._grid_v2_symbol,
+                pos_qty,
+            )
+            return
+
+        rebuilt = GridV2Bridge(bridge._config, self._grid_v2_symbol)
+        ok = rebuilt.startup(g_orders, pos_qty, ref_price, snapshot.ts)
+        if not ok:
+            logger.error(
+                "GRID_V2_SYNC_POSITION_DRIFT_RECONSTRUCT_FAILED symbol=%s reason=%s "
+                "pos_qty=%s open_orders=%d",
+                self._grid_v2_symbol,
+                rebuilt.failed_reason,
+                pos_qty,
+                len(g_orders),
+            )
+            return
+
+        self._grid_v2_bridge = rebuilt
+        self._grid_v2_pending_cancels.clear()
+        self._grid_v2_pending_place_cids.clear()
+        self._sync_reconciler_pending_actions = []
+        self._grid_v2_awaiting_sync = False
+        self._grid_v2_pending_seed_cids = frozenset()
+
+        if rebuilt.f2_protective_recovery:
+            protective = rebuilt.get_f2_protective_exit_actions(snapshot.ts)
+            if protective:
+                self._grid_v2_seed_actions = list(protective)
+                self._grid_v2_awaiting_sync = True
+                self._grid_v2_pending_seed_cids = frozenset(
+                    ea.client_order_id
+                    for ea in protective
+                    if ea.action_type == ActionType.PLACE and ea.client_order_id is not None
+                )
+
+        logger.warning(
+            "GRID_V2_SYNC_POSITION_DRIFT_RECONSTRUCTED symbol=%s old_mode=%s new_mode=%s "
+            "pos_qty=%s open_orders=%d",
+            self._grid_v2_symbol,
+            sm.mode.value,
+            rebuilt.state_machine.mode.value if rebuilt.state_machine is not None else "?",
+            pos_qty,
+            len(g_orders),
+        )
+
     def _grid_v2_register_pending_cancels(
         self,
         actions: list[ExecutionAction],
@@ -3788,6 +3876,9 @@ class LiveEngineV0:
             # ADR-090 follow-up: clear cross-tick cancel dedup set on sync refresh.
             # Snapshot now reflects any successfully dispatched cancels.
             self._cancel_dispatched_pending_sync.clear()
+            # Fast-path convergence guard: if exchange already has non-flat position
+            # while SM is still FLAT, force reconstruction from fresh snapshot.
+            self._grid_v2_sync_reconstruct_on_position_drift(result.snapshot)
 
         # Evidence writing (env-gated, safe-by-default)
         if result.snapshot is not None:
