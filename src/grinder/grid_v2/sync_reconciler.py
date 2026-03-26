@@ -156,9 +156,13 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
 
     # Place missing entries (sorted for determinism)
     # Note: these are raw intents — caller must pass through risk gates.
+    # Skip if adapter registry already has a CID for this slot (avoids duplicate entry fatal).
     for side, price in sorted(missing_entries, key=lambda x: (x[0].value, x[1])):
         if len(actions) >= budget:
             break
+        existing_cid = bridge.adapter.registry.cid_for_entry(side, price)
+        if existing_cid is not None:
+            continue
         actions.append(
             ExecutionAction(
                 action_type=ActionType.PLACE,
