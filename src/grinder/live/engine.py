@@ -829,6 +829,16 @@ class LiveEngineV0:
         self._grid_v2_repair_strict_geometry = parse_bool(
             "GRINDER_GRID_V2_REPAIR_STRICT_GEOMETRY", default=False, strict=False
         )
+        # Sync-driven reconciler (ADR-096)
+        self._sync_reconciler_enabled = parse_bool(
+            "GRINDER_GRID_V2_SYNC_RECONCILER_ENABLED", default=False, strict=False
+        )
+        self._sync_reconciler_shadow = parse_bool(
+            "GRINDER_GRID_V2_SYNC_RECONCILER_SHADOW", default=True, strict=False
+        )
+        self._sync_reconciler_max_actions = int(
+            os.environ.get("GRINDER_GRID_V2_RECONCILE_MAX_ACTIONS_PER_SYNC", "10")
+        )
         # Adaptive Step Controller v1 (volatility-aware grid spacing)
         # Must be initialized BEFORE _create_grid_v2_bridge() so effective step
         # is available on cold start, not only on subsequent recreations.
@@ -3766,6 +3776,52 @@ class LiveEngineV0:
         # PR-1 (ADR-092): Update risk base snapshot from exchange balance
         if self._risk_base_enabled and result.snapshot is not None:
             self._update_risk_base(asof_ts_ms=result.snapshot.ts)
+
+        # ADR-096: Sync-driven reconciler (shadow mode)
+        if (
+            self._sync_reconciler_enabled
+            and result.snapshot is not None
+            and self._grid_v2_bridge is not None
+            and self._grid_v2_bridge.state_machine is not None
+            and self._grid_v2_started
+            and self._grid_v2_bridge.reconstruction_ok
+        ):
+            from grinder.grid_v2.sync_reconciler import reconcile_grid_state  # noqa: PLC0415
+
+            recon = reconcile_grid_state(
+                snapshot=result.snapshot,
+                symbol=self._grid_v2_symbol,
+                bridge=self._grid_v2_bridge,
+                max_actions=self._sync_reconciler_max_actions,
+            )
+            if (
+                recon.missing_entries
+                or recon.extra_entries
+                or recon.missing_exits
+                or recon.extra_exits
+            ):
+                logger.info(
+                    "GRID_V2_SYNC_RECONCILER symbol=%s mode=%s "
+                    "desired_entries=%d actual_entries=%d missing=%d extra=%d "
+                    "desired_exits=%d actual_exits=%d missing_exits=%d extra_exits=%d "
+                    "would_cancel=%d would_place=%d cycle_ms=%d shadow=%s",
+                    self._grid_v2_symbol,
+                    self._grid_v2_bridge.state_machine.mode.value
+                    if self._grid_v2_bridge.state_machine
+                    else "?",
+                    recon.desired_entry_count,
+                    recon.actual_entry_count,
+                    recon.missing_entries,
+                    recon.extra_entries,
+                    recon.desired_exit_count,
+                    recon.actual_exit_count,
+                    recon.missing_exits,
+                    recon.extra_exits,
+                    recon.would_cancel,
+                    recon.would_place,
+                    recon.cycle_ms,
+                    self._sync_reconciler_shadow,
+                )
 
         # P0-2: correlate recent PLACEs with AccountSync open_orders
         if self._debug_open_orders and result.snapshot is not None:

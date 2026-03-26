@@ -4401,3 +4401,13 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Context:** Post-PR-457 live smoke showed `stale_cancels_resolved=0` despite extended escalation. Root cause: pending cancels stored only dispatch_ts (market data timestamp). In fast-tick scenarios, `age_ms = snapshot.ts - dispatch_ts` stays small because ticks arrive frequently. Gen-based staleness catches cancels that survived across sync boundaries regardless of tick rate.
 - **Change:** `_grid_v2_pending_cancels` now stores `(ts_ms, sync_gen)` tuples. Resolution triggers on `age_ms >= 15s OR gen_delta >= 2`. New constant: `_GRID_V2_PENDING_CANCEL_STALE_GENS=2`.
 - **Effect:** After 2 account syncs (~10s), any pending cancel becomes stale-eligible for escalation resolution. Combined with time-based 15s fallback for slow-sync scenarios.
+
+### ADR-096: Sync-Driven Grid Reconciler (2026-03-26)
+
+- **Status:** PR-1 delivered (shadow mode). PR-2 planned (primary switch).
+- **Decision:** Replace tick-level watchdog as primary repair mechanism with sync-driven reconciliation on fresh account snapshots. Watchdog demoted to telemetry/fallback.
+- **Why:** Tick-level watchdog operates on stale exchange state (from last account sync), causing convergence loops (ADR-093/094/095). Sync-driven reconciler operates on fresh snapshot — no stale state, no convergence gates needed.
+- **Architecture:** `src/grinder/grid_v2/sync_reconciler.py` — pure function `reconcile_grid_state()`. Input: fresh AccountSnapshot + SM/bridge state. Output: deterministic action list (CANCEL extras first, PLACE missing). No side effects.
+- **PR-1 scope (shadow):** Reconciler called on each successful `_tick_account_sync()` in shadow mode. Computes diff + logs only, no dispatch. Env: `GRINDER_GRID_V2_SYNC_RECONCILER_ENABLED=0` (default off), `GRINDER_GRID_V2_SYNC_RECONCILER_SHADOW=1` (default shadow when enabled).
+- **PR-2 scope (planned):** Switch to primary dispatch from reconciler. Demote tick watchdog. Configurable sync interval (default 1.5-2s, allow 1s). Budget cap per sync cycle.
+- **Safety:** Fill lifecycle remains event-driven (user-data + bridge), not diff-absence. Reconciler never classifies absence as fill. PLACE intents go through risk gates.
