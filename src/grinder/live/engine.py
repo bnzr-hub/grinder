@@ -2919,8 +2919,22 @@ class LiveEngineV0:
                 planned_slots = self._extract_planned_entry_slots(grid_v2_fill_actions)
                 # ADR-096 PR-2: primary reconciler replaces tick watchdog
                 if self._sync_reconciler_primary:
-                    # Drain staged actions from last sync cycle
-                    grid_v2_integrity_actions = list(self._sync_reconciler_pending_actions)
+                    # Drain staged actions from last sync cycle.
+                    # Filter stale PLACEs: fill path may have registered CIDs
+                    # for these slots between staging and drain.
+                    bridge = self._grid_v2_bridge
+                    drained: list[ExecutionAction] = []
+                    for a in self._sync_reconciler_pending_actions:
+                        if (
+                            a.action_type == ActionType.PLACE
+                            and a.side is not None
+                            and a.price is not None
+                            and bridge is not None
+                            and bridge.adapter.registry.cid_for_entry(a.side, a.price) is not None
+                        ):
+                            continue  # slot already occupied by fill path
+                        drained.append(a)
+                    grid_v2_integrity_actions = drained
                     self._sync_reconciler_pending_actions = []
                 else:
                     grid_v2_integrity_actions = self._grid_v2_integrity_repair(
