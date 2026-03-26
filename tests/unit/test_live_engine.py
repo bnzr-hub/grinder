@@ -6970,3 +6970,106 @@ class TestSyncReconcilerPrimary:
         drained = list(engine._sync_reconciler_pending_actions)
         assert drained[0].action_type == ActionType.CANCEL
         assert drained[1].action_type == ActionType.PLACE
+
+    def test_position_drift_reconstructs_branch_mode(self) -> None:
+        """If exchange position is non-flat while SM is FLAT, sync forces reconstruction."""
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+        port = NoOpExchangePort()
+        syncer = MagicMock()
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        env = {
+            "GRINDER_GRID_V2_ENABLED": "1",
+            "GRINDER_GRID_V2_SYMBOL": "BTCUSDT",
+            "GRINDER_GRID_V2_TICK_SIZE": "0.01",
+            "GRINDER_GRID_V2_SYNC_RECONCILER_ENABLED": "1",
+            "GRINDER_GRID_V2_SYNC_RECONCILER_PRIMARY": "1",
+            "GRINDER_GRID_V2_SYNC_RECONCILER_SHADOW": "0",
+        }
+        with patch.dict("os.environ", env):
+            engine = LiveEngineV0(
+                paper_engine=paper,
+                exchange_port=port,
+                config=config,
+                account_syncer=syncer,
+            )
+
+        # Fresh startup → FLAT mode + seeded entries in registry.
+        startup_snapshot = Snapshot(
+            ts=1000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=1000, source="test"
+        )
+        engine.process_snapshot(startup_snapshot)
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+        assert bridge.state_machine is not None
+        assert bridge.state_machine.mode == BranchMode.FLAT
+
+        # Simulate rapid BUY fill: one BUY entry disappears from open orders,
+        # account position is LONG, but SM still FLAT before sync.
+        remaining_orders: list[OpenOrderSnap] = []
+        removed_one_buy = False
+        for cid in sorted(bridge.adapter.registry.all_entry_cids):
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            assert reg is not None
+            if reg.side == OrderSide.BUY and not removed_one_buy:
+                removed_one_buy = True
+                continue
+            remaining_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=bridge._config.order_size,
+                    filled_qty=Decimal("0"),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=2000,
+                )
+            )
+        assert removed_one_buy is True
+
+        syncer.sync.return_value = MagicMock(
+            error=None,
+            snapshot=AccountSnapshot(
+                positions=(
+                    PositionSnap(
+                        symbol="BTCUSDT",
+                        side="LONG",
+                        qty=bridge._config.order_size,
+                        signed_qty=bridge._config.order_size,
+                        entry_price=Decimal("50000"),
+                        mark_price=Decimal("50000"),
+                        unrealized_pnl=Decimal("0"),
+                        leverage=1,
+                        ts=2000,
+                    ),
+                ),
+                open_orders=tuple(remaining_orders),
+                ts=2000,
+                source="test",
+            ),
+            mismatches=[],
+        )
+
+        engine._tick_account_sync()
+
+        bridge_after = engine._grid_v2_bridge
+        assert bridge_after is not None
+        assert bridge_after.state_machine is not None
+        assert bridge_after.state_machine.mode != BranchMode.FLAT
