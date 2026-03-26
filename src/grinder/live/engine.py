@@ -159,6 +159,9 @@ _GRID_V2_INTEGRITY_MISMATCH_STREAK = 2
 _GRID_V2_INTEGRITY_REPAIR_COOLDOWN_MS = 5_000
 _GRID_V2_INTEGRITY_MISMATCH_WINDOW_MS = 30_000
 _GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS = 6  # after 6 defers, repair proceeds anyway
+_GRID_V2_PENDING_CANCEL_STALE_MS = 15_000  # 15s: pending cancel considered stale for convergence
+_GRID_V2_PENDING_PLACE_STALE_GENS = 4  # 4 sync generations: pending place considered stale
+_GRID_V2_ESCALATION_LOG_INTERVAL = 10  # log escalation every Nth defer (anti-spam)
 # Anti-churn guard defaults (env-overridable)
 _GRID_V2_REPAIR_MAX_DISTANCE_STEPS = 5.0  # max distance from mid in grid steps
 _GRID_V2_REPAIR_MAX_ACTIONS_PER_CYCLE = 5  # max PLACE actions per repair cycle
@@ -1585,6 +1588,69 @@ class LiveEngineV0:
         for cid in confirmed:
             del self._grid_v2_pending_cancels[cid]
 
+    def _grid_v2_resolve_stale_pending_cancels(self, symbol: str, now_ts: int) -> int:
+        """Force-resolve pending cancels that exceed stale threshold.
+
+        Called during convergence escalation to unblock repair.
+        Re-checks exchange visibility: if CID is gone, confirm cancel ack.
+        If CID is still present but stale, remove from pending blocker set
+        (it will be re-detected on next cancel dispatch if still needed).
+        """
+        bridge = self._grid_v2_bridge
+        if bridge is None or not bridge.reconstruction_ok:
+            return 0
+        current_cids = self._grid_v2_exchange_cids(symbol)
+        resolved = 0
+        for cid, dispatch_ts in list(self._grid_v2_pending_cancels.items()):
+            age_ms = now_ts - dispatch_ts
+            if age_ms < _GRID_V2_PENDING_CANCEL_STALE_MS:
+                continue
+            if cid not in current_cids:
+                # Gone from exchange — confirm cancel ack
+                bridge.on_cancel_ack(cid)
+                del self._grid_v2_pending_cancels[cid]
+                logger.info(
+                    "GRID_V2_STALE_PENDING_CANCEL_RESOLVED cid=%s age_ms=%d action=cancel_ack",
+                    cid,
+                    age_ms,
+                )
+            else:
+                # Still on exchange but stale — remove from convergence blocker.
+                # Order is live; repair can proceed around it.
+                # It stays in exchange state and will be handled by normal cancel path.
+                del self._grid_v2_pending_cancels[cid]
+                logger.warning(
+                    "GRID_V2_STALE_PENDING_CANCEL_DROPPED cid=%s age_ms=%d "
+                    "action=drop_from_pending reason=still_on_exchange_but_stale",
+                    cid,
+                    age_ms,
+                )
+            resolved += 1
+        return resolved
+
+    def _grid_v2_resolve_stale_pending_places(self) -> int:
+        """Force-resolve pending places that exceed generation threshold.
+
+        Called during convergence escalation to unblock repair.
+        Uses sync generation bound: if dispatch_gen is too far behind current gen,
+        the CID is removed from pending (either it appeared and was already processed,
+        or it was a failed/dropped place).
+        """
+        gen = self._account_sync_generation
+        resolved = 0
+        for cid, dispatch_gen in list(self._grid_v2_pending_place_cids.items()):
+            if (gen - dispatch_gen) >= _GRID_V2_PENDING_PLACE_STALE_GENS:
+                del self._grid_v2_pending_place_cids[cid]
+                logger.info(
+                    "GRID_V2_STALE_PENDING_PLACE_RESOLVED cid=%s dispatch_gen=%d "
+                    "current_gen=%d action=drop_from_pending",
+                    cid,
+                    dispatch_gen,
+                    gen,
+                )
+                resolved += 1
+        return resolved
+
     def _record_grid_v2_rejected_fill_cleaned(self, symbol: str, source: str, reason: str) -> None:
         """Emit metric for rejected fill cleanup (observability only)."""
         get_live_engine_metrics().record_grid_v2_rejected_fill_cleaned(symbol, source, reason)
@@ -1725,16 +1791,36 @@ class LiveEngineV0:
                 # Preserve streak during convergence — do NOT reset on window expiry
                 # while still pending, to avoid stuck-at-1 scenario.
                 return []
-            # Bounded escalation: convergence stuck too long, proceed with repair.
-            logger.warning(
-                "GRID_V2_INTEGRITY_CONVERGENCE_ESCALATION symbol=%s defers=%d "
-                "awaiting_sync=%s pending_cancels=%d pending_places=%d",
-                snapshot.symbol,
-                self._grid_v2_integrity_convergence_defer_count,
-                self._grid_v2_awaiting_sync,
-                len(self._grid_v2_pending_cancels),
-                len(self._grid_v2_pending_place_cids),
+            # Bounded escalation: force-resolve stale pending state, then proceed.
+            stale_cancels = self._grid_v2_resolve_stale_pending_cancels(
+                snapshot.symbol, snapshot.ts
             )
+            stale_places = self._grid_v2_resolve_stale_pending_places()
+            # Log on first escalation, then every Nth defer (anti-spam)
+            defers = self._grid_v2_integrity_convergence_defer_count
+            if defers == _GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS or (
+                defers % _GRID_V2_ESCALATION_LOG_INTERVAL == 0
+            ):
+                logger.warning(
+                    "GRID_V2_INTEGRITY_CONVERGENCE_ESCALATION symbol=%s defers=%d "
+                    "awaiting_sync=%s pending_cancels=%d pending_places=%d "
+                    "stale_cancels_resolved=%d stale_places_resolved=%d",
+                    snapshot.symbol,
+                    defers,
+                    self._grid_v2_awaiting_sync,
+                    len(self._grid_v2_pending_cancels),
+                    len(self._grid_v2_pending_place_cids),
+                    stale_cancels,
+                    stale_places,
+                )
+            # After resolution, re-check if convergence is now clear
+            convergence_pending = (
+                self._grid_v2_awaiting_sync
+                or self._grid_v2_pending_cancels
+                or self._grid_v2_pending_place_cids
+            )
+            if not convergence_pending:
+                self._grid_v2_integrity_convergence_defer_count = 0
         else:
             self._grid_v2_integrity_convergence_defer_count = 0
 

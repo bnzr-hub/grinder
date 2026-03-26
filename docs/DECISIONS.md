@@ -4382,3 +4382,14 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **P0 — Geometry mismatch detection:** `match_entries_with_tolerance()` now returns non-empty `geometry_mismatches` for same-side extra orders paired with nearest missing expected key (outside epsilon). Paired entries are removed from structural `truly_missing`/`truly_extra` sets, becoming geometry corrections (cancel+replace) instead of structural add/remove. Engine geometry repair path now receives and dispatches these corrections.
 - **P1 — Bounded convergence deferral:** Integrity repair was unconditionally blocked while `awaiting_sync`, `pending_cancels`, or `pending_place_cids` were set. Under fast fills or slow sync, repair could be deferred indefinitely. Fix: `_GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS=6` bounds consecutive deferrals; after 6 deferred ticks, repair proceeds with `GRID_V2_INTEGRITY_CONVERGENCE_ESCALATION` log.
 - **P1 — Streak preservation during convergence:** Previously, mismatch streak was reset to 0 when the 30s window expired during convergence deferral, creating a stuck-at-1 loop. Fix: streak is no longer reset during convergence deferral. On escalation, streak treats the gap as continuation (increment, not reset to 1).
+
+### ADR-094: Convergence-Escalation Loop Fix (2026-03-26)
+
+- **Status:** Delivered.
+- **Decision:** Escalation must force-resolve stale pending state, not just log and proceed.
+- **Context:** Live run showed `defers=289` with `pending_cancels=1, pending_places=2` stuck. ADR-093's bounded escalation proceeded past convergence gate but didn't resolve the underlying pending state, so every subsequent tick re-entered escalation with growing defer count and per-tick log spam.
+- **Stale pending cancel lifecycle:** On escalation, pending cancels older than `_GRID_V2_PENDING_CANCEL_STALE_MS` (15s) are force-resolved: if CID is gone from exchange → confirm cancel ack; if still present → drop from blocker set (order is live, repair can proceed around it). Log codes: `GRID_V2_STALE_PENDING_CANCEL_RESOLVED`, `GRID_V2_STALE_PENDING_CANCEL_DROPPED`.
+- **Stale pending place lifecycle:** On escalation, pending places older than `_GRID_V2_PENDING_PLACE_STALE_GENS` (4 sync generations) are force-removed from blocker set. Log code: `GRID_V2_STALE_PENDING_PLACE_RESOLVED`.
+- **Escalation log throttle:** `_GRID_V2_ESCALATION_LOG_INTERVAL=10` — log on first escalation + every 10th defer. No per-tick spam.
+- **Convergence re-check:** After stale resolution, convergence status is re-evaluated; if all pending cleared, defer counter resets to 0.
+- **Safety:** Stale cancel resolution does NOT cause false fills: CID dropped from pending-cancels only when stale. If CID is still on exchange, it won't appear in fill detection (`registry - current_cids`). If CID is gone, cancel ack is confirmed normally.
