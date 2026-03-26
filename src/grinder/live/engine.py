@@ -34,7 +34,7 @@ import os
 import re
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import ROUND_DOWN, Decimal
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -1622,6 +1622,41 @@ class LiveEngineV0:
                         ts,
                         self._account_sync_generation,
                     )
+
+    def _grid_v2_materialize_reconciler_actions(
+        self, actions: tuple[ExecutionAction, ...], ts: int
+    ) -> list[ExecutionAction]:
+        """Materialize sync-reconciler actions for primary dispatch.
+
+        Reconciler emits pure intents. For PLACE_ENTRY we must attach grid_v2 CID
+        and register it in adapter registry before dispatch; otherwise PLACE falls
+        back to legacy CID scheme (`grinder_d_*`) and breaks grid_v2 ownership.
+        """
+        bridge = self._grid_v2_bridge
+        if bridge is None:
+            return list(actions)
+
+        materialized: list[ExecutionAction] = []
+        for a in actions:
+            if (
+                a.action_type == ActionType.PLACE
+                and a.reason == "grid_v2_RECONCILE_PLACE_ENTRY"
+                and a.side is not None
+                and a.price is not None
+                and a.client_order_id is None
+            ):
+                cid = bridge.adapter.generate_entry_cid(ts)
+                bridge.adapter.registry.register_entry(cid, a.side, a.price)
+                materialized.append(
+                    replace(
+                        a,
+                        client_order_id=cid,
+                        reason="grid_v2_RECONCILE_PLACE_ENTRY",
+                    )
+                )
+                continue
+            materialized.append(a)
+        return materialized
 
     def _grid_v2_clean_failed_place(self, cid: str) -> None:
         """Remove a FAILED/BLOCKED/SKIPPED PLACE CID from registry and pending."""
@@ -3939,12 +3974,14 @@ class LiveEngineV0:
                 )
             # PRIMARY MODE: stage actions for dispatch on next process_snapshot tick
             if is_primary and recon.actions:
-                self._sync_reconciler_pending_actions = list(recon.actions)
+                self._sync_reconciler_pending_actions = (
+                    self._grid_v2_materialize_reconciler_actions(recon.actions, result.snapshot.ts)
+                )
                 logger.info(
                     "GRID_V2_SYNC_RECONCILER_DISPATCH_STAGED symbol=%s actions=%d "
                     "cancel=%d place=%d",
                     self._grid_v2_symbol,
-                    len(recon.actions),
+                    len(self._sync_reconciler_pending_actions),
                     recon.would_cancel,
                     recon.would_place,
                 )
