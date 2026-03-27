@@ -292,11 +292,14 @@ class TestFillLifecycleExit:
         place_actions = [
             ea for ea in exit_result.execution_actions if ea.action_type == ActionType.PLACE
         ]
-        assert len(cancel_actions) == 5
+        # One-sided: entry fill already cancelled all SELL entries, so reseed only
+        # cancels remaining BUY entries (3) and places 6 new (3 BUY + 3 SELL).
+        assert len(cancel_actions) == 3
         assert len(place_actions) == 6
         assert all(ea.reason == "grid_v2_PLACE_ENTRY" for ea in place_actions)
 
-    def test_exit_fill_to_flat_preserve_restores_symmetry_without_recenter(self) -> None:
+    def test_exit_fill_to_flat_preserve_restores_same_side_only(self) -> None:
+        """Preserve mode: exit fill restores BUY entries only (one-sided, was LONG_BRANCH)."""
         b, seed = _fresh_bridge(config=_config(reseed_on_flat=False))
         buy_seed = [s for s in seed if s.side == OrderSide.BUY]
         buy_cid = buy_seed[0].client_order_id
@@ -317,8 +320,9 @@ class TestFillLifecycleExit:
         assert not exit_result.rejected
         assert b.state_machine is not None
         assert b.state_machine.mode == BranchMode.FLAT
+        # One-sided: only BUY entries restored, SELL stays empty.
         assert len(b.state_machine.snapshot.entry_window.buy_entry_prices) == 3
-        assert len(b.state_machine.snapshot.entry_window.sell_entry_prices) == 3
+        assert len(b.state_machine.snapshot.entry_window.sell_entry_prices) == 0
 
         place_actions = [
             ea for ea in exit_result.execution_actions if ea.action_type == ActionType.PLACE
@@ -327,16 +331,16 @@ class TestFillLifecycleExit:
             ea for ea in exit_result.execution_actions if ea.action_type == ActionType.CANCEL
         ]
         assert any(ea.reason == "grid_v2_PLACE_ENTRY" for ea in place_actions)
-        # Preserve mode should not do full recenter fan-out (5 cancels + 6 places).
-        assert len(place_actions) < 6
-        assert len(cancel_actions) < 5
+        # Preserve mode: minimal actions (1 cancel + 1 place for BUY restore shift).
+        assert len(place_actions) == 1
+        assert len(cancel_actions) == 1
 
 
 class TestNetOffBridge:
-    """Bridge-level tests for net-off transition (Variant B)."""
+    """Bridge-level tests: one-sided mode removes opposite entries, making netoff unreachable."""
 
-    def test_netoff_enabled_opposite_fill_not_rejected(self) -> None:
-        """LONG + SELL fill with netoff → not rejected, cancel exit emitted."""
+    def test_one_sided_removes_sell_entries_after_buy_fill(self) -> None:
+        """LONG branch: all SELL entry CIDs removed from registry after BUY fill."""
         cfg = _config()
         cfg_netoff = GridV2Config(
             grid_step_pct=cfg.grid_step_pct,
@@ -364,37 +368,23 @@ class TestNetOffBridge:
         assert bridge.state_machine is not None
         assert bridge.state_machine.snapshot.mode == BranchMode.LONG_BRANCH
 
-        # Fill a SELL entry (opposite) → should net-off, not reject
-        sell_cid = None
-        for cid in bridge.adapter.registry.all_entry_cids:
-            reg = bridge.adapter.registry.lookup_entry(cid)
-            if reg and reg.side == OrderSide.SELL:
-                sell_cid = cid
-                sell_price = reg.price
-                break
-        assert sell_cid is not None
-        r2 = bridge.on_fill(sell_cid, OrderSide.SELL, sell_price, Decimal("0.01"), _BASE_TS + 2)
-        assert not r2.rejected
-        assert bridge.state_machine.snapshot.mode == BranchMode.FLAT  # type: ignore[comparison-overlap]
-        # Should have CANCEL action for paired exit
-        cancel_actions = [a for a in r2.execution_actions if a.action_type == ActionType.CANCEL]
+        # After one-sided cancel, no SELL entry CIDs should remain in the registry.
+        sell_cids = [
+            cid
+            for cid in bridge.adapter.registry.all_entry_cids
+            if (reg := bridge.adapter.registry.lookup_entry(cid)) is not None
+            and reg.side == OrderSide.SELL
+        ]
+        assert len(sell_cids) == 0, "One-sided mode should have removed all SELL entries"
+        # CANCEL_ENTRY actions emitted for opposite side.
+        cancel_actions = [a for a in r1.execution_actions if a.action_type == ActionType.CANCEL]
         assert len(cancel_actions) >= 1
 
-    def test_netoff_disabled_rejects_at_bridge(self) -> None:
-        """Without netoff, opposite fill is BRANCH_INCOMPATIBLE at bridge level."""
+    def test_one_sided_removes_buy_entries_after_sell_fill(self) -> None:
+        """SHORT branch: all BUY entry CIDs removed from registry after SELL fill."""
         bridge = GridV2Bridge(_config(), "BTCUSDT")
         bridge.startup_fresh(Decimal("50000"), _BASE_TS)
 
-        buy_cid = None
-        for cid in bridge.adapter.registry.all_entry_cids:
-            reg = bridge.adapter.registry.lookup_entry(cid)
-            if reg and reg.side == OrderSide.BUY:
-                buy_cid = cid
-                buy_price = reg.price
-                break
-        assert buy_cid is not None
-        bridge.on_fill(buy_cid, OrderSide.BUY, buy_price, Decimal("0.01"), _BASE_TS + 1)
-
         sell_cid = None
         for cid in bridge.adapter.registry.all_entry_cids:
             reg = bridge.adapter.registry.lookup_entry(cid)
@@ -403,9 +393,16 @@ class TestNetOffBridge:
                 sell_price = reg.price
                 break
         assert sell_cid is not None
-        r2 = bridge.on_fill(sell_cid, OrderSide.SELL, sell_price, Decimal("0.01"), _BASE_TS + 2)
-        assert r2.rejected
-        assert r2.reject_reason == "BRANCH_INCOMPATIBLE"
+        bridge.on_fill(sell_cid, OrderSide.SELL, sell_price, Decimal("0.01"), _BASE_TS + 1)
+
+        # After one-sided cancel, no BUY entry CIDs should remain.
+        buy_cids = [
+            cid
+            for cid in bridge.adapter.registry.all_entry_cids
+            if (reg := bridge.adapter.registry.lookup_entry(cid)) is not None
+            and reg.side == OrderSide.BUY
+        ]
+        assert len(buy_cids) == 0, "One-sided mode should have removed all BUY entries"
 
 
 class TestFillRejected:
@@ -2140,13 +2137,14 @@ class TestEngineFillOrdering:
         assert sm_before is not None
         assert sm_before.mode == BranchMode.LONG_BRANCH
 
-        # Pick one exit CID and one SELL-entry CID to disappear in the same tick.
+        # One-sided: after BUY fill, only BUY entry CIDs remain (no SELL entries).
+        # Pick one exit CID and one BUY-entry CID to disappear in the same tick.
         exit_cid = next(iter(bridge.adapter.registry.all_exit_cids))
-        sell_entry_cid = next(
+        buy_entry_cid = next(
             cid
             for cid in sorted(bridge.adapter.registry.all_entry_cids)
             if (reg := bridge.adapter.registry.lookup_entry(cid)) is not None
-            and reg.side == OrderSide.SELL
+            and reg.side == OrderSide.BUY
         )
 
         # Exchange snapshot: both selected CIDs disappeared.
@@ -2154,7 +2152,7 @@ class TestEngineFillOrdering:
         for cid in sorted(
             set(bridge.adapter.registry.all_entry_cids) | set(bridge.adapter.registry.all_exit_cids)
         ):
-            if cid in {exit_cid, sell_entry_cid}:
+            if cid in {exit_cid, buy_entry_cid}:
                 continue
             entry_reg = bridge.adapter.registry.lookup_entry(cid)
             if entry_reg is not None:
@@ -2201,6 +2199,8 @@ class TestEngineFillOrdering:
 
         sm_after = bridge.state_machine
         assert sm_after is not None
+        # Exit processed first → FLAT (reseed). The old BUY entry CID is stale after
+        # reseed (cancelled + new entries placed), so the BUY fill is suppressed.
         assert sm_after.mode == BranchMode.FLAT
         assert any(a.reason == "grid_v2_CANCEL_ENTRY" for a in actions)
 
