@@ -161,7 +161,7 @@ class TestInitialPlacement:
 
 class TestFirstEntryFill:
     def test_buy_creates_long_branch(self) -> None:
-        """T2: BUY fill -> LONG_BRANCH + SELL exit + opposite side trimmed by 1."""
+        """T2: BUY fill -> LONG_BRANCH + SELL exit + all SELL entries cancelled (one-sided)."""
         sm = _sm()
         initial_sells = sm.snapshot.entry_window.sell_entry_prices
         buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
@@ -175,11 +175,22 @@ class TestFirstEntryFill:
         assert snap.open_lots[0].entry_price == buy_price
         assert len(snap.exit_orders) == 1
         assert snap.exit_orders[0].side == OrderSide.SELL
-        # Opposite side keeps nearest levels, far edge is trimmed.
-        assert snap.entry_window.sell_entry_prices == initial_sells[:-1]
+        # One-sided: all SELL entries cancelled on branch entry.
+        assert snap.entry_window.sell_entry_prices == ()
+        # CANCEL_ENTRY actions emitted for opposite side (rolling trim + one-sided cancel).
+        cancel_sell_actions = [
+            a
+            for a in result.actions
+            if a.kind == ActionIntentKind.CANCEL_ENTRY and a.side == OrderSide.SELL
+        ]
+        # 1 ROLLING_TRIM + remaining sells cancelled via ONE_SIDED_CANCEL_OPPOSITE
+        rolling_trims = [a for a in cancel_sell_actions if a.reason == "ROLLING_TRIM"]
+        one_sided = [a for a in cancel_sell_actions if a.reason == "ONE_SIDED_CANCEL_OPPOSITE"]
+        assert len(rolling_trims) == 1
+        assert len(one_sided) == len(initial_sells) - 1  # all except the one trimmed by rolling
 
     def test_sell_creates_short_branch(self) -> None:
-        """T3: SELL fill -> SHORT_BRANCH + BUY exit + opposite side trimmed by 1."""
+        """T3: SELL fill -> SHORT_BRANCH + BUY exit + all BUY entries cancelled (one-sided)."""
         sm = _sm()
         initial_buys = sm.snapshot.entry_window.buy_entry_prices
         sell_price = sm.snapshot.entry_window.sell_entry_prices[0]
@@ -192,21 +203,36 @@ class TestFirstEntryFill:
         assert snap.open_lots[0].side == LotSide.SHORT
         assert len(snap.exit_orders) == 1
         assert snap.exit_orders[0].side == OrderSide.BUY
-        # Opposite side keeps nearest levels, far edge is trimmed.
-        assert snap.entry_window.buy_entry_prices == initial_buys[:-1]
+        # One-sided: all BUY entries cancelled on branch entry.
+        assert snap.entry_window.buy_entry_prices == ()
+        # CANCEL_ENTRY actions emitted for opposite side.
+        cancel_buy_actions = [
+            a
+            for a in result.actions
+            if a.kind == ActionIntentKind.CANCEL_ENTRY and a.side == OrderSide.BUY
+        ]
+        rolling_trims = [a for a in cancel_buy_actions if a.reason == "ROLLING_TRIM"]
+        one_sided = [a for a in cancel_buy_actions if a.reason == "ONE_SIDED_CANCEL_OPPOSITE"]
+        assert len(rolling_trims) == 1
+        assert len(one_sided) == len(initial_buys) - 1
 
     def test_action_order_correct(self) -> None:
-        """Actions: PLACE_EXIT -> CANCEL_ENTRY(s) -> PLACE_ENTRY."""
+        """Actions: PLACE_EXIT -> ROLLING_TRIM -> FILL_REPLACEMENT -> ONE_SIDED_CANCEL."""
         sm = _sm()
         buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
         result = sm.apply(EntryFilled("E1", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1))
 
         kinds = [a.kind for a in result.actions]
-        # PLACE_EXIT first, then CANCEL_ENTRY(s) for opposite side, then PLACE_ENTRY
+        reasons = [a.reason for a in result.actions]
+        # PLACE_EXIT first
         assert kinds[0] == ActionIntentKind.PLACE_EXIT
-        cancel_idx = [i for i, k in enumerate(kinds) if k == ActionIntentKind.CANCEL_ENTRY]
-        place_entry_idx = [i for i, k in enumerate(kinds) if k == ActionIntentKind.PLACE_ENTRY]
-        assert all(ci < pi for ci in cancel_idx for pi in place_entry_idx)
+        # Rolling trim before fill replacement
+        rolling_idx = [i for i, r in enumerate(reasons) if r == "ROLLING_TRIM"]
+        fill_repl_idx = [i for i, r in enumerate(reasons) if r == "FILL_REPLACEMENT"]
+        assert all(ri < fi for ri in rolling_idx for fi in fill_repl_idx)
+        # ONE_SIDED_CANCEL_OPPOSITE actions are present (cancel remaining opposite entries)
+        one_sided_idx = [i for i, r in enumerate(reasons) if r == "ONE_SIDED_CANCEL_OPPOSITE"]
+        assert len(one_sided_idx) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -216,24 +242,23 @@ class TestFirstEntryFill:
 
 class TestBranchContinuation:
     def test_long_continuation(self) -> None:
-        """T4: Second BUY in LONG_BRANCH continues and trims opposite far edge."""
+        """T4: Second BUY in LONG_BRANCH — no opposite entries left to cancel (one-sided)."""
         sm = _sm()
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
-        sells_before = sm.snapshot.entry_window.sell_entry_prices
+        # After first fill, all SELL entries already cancelled (one-sided).
+        assert sm.snapshot.entry_window.sell_entry_prices == ()
         buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
         result = sm.apply(EntryFilled("E2", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 2))
 
         assert not result.rejected
         assert result.snapshot.mode == BranchMode.LONG_BRANCH
         assert len(result.snapshot.open_lots) == 2
-        # One opposite far-edge trim per fill.
+        # No CANCEL_ENTRY: opposite side already empty from first fill.
         cancel_entries = [a for a in result.actions if a.kind == ActionIntentKind.CANCEL_ENTRY]
-        assert len(cancel_entries) == 1
-        assert cancel_entries[0].side == OrderSide.SELL
-        assert cancel_entries[0].reason == "ROLLING_TRIM"
-        assert cancel_entries[0].price == sells_before[-1]
-        assert result.snapshot.entry_window.sell_entry_prices == sells_before[:-1]
+        assert len(cancel_entries) == 0
+        # Still only BUY entries.
+        assert result.snapshot.entry_window.sell_entry_prices == ()
 
     def test_short_continuation(self) -> None:
         """T5: Second SELL in SHORT_BRANCH continues."""
@@ -281,8 +306,8 @@ class TestExitFill:
         assert len(result.snapshot.closed_lots) == 1
         assert result.snapshot.closed_lots[0].lot_id == lot.lot_id
 
-    def test_long_exit_restores_both_sides(self) -> None:
-        """T6: Exit fill in LONG branch restores SELL far edge + BUY near edge."""
+    def test_long_exit_restores_buy_side_only(self) -> None:
+        """T6: Exit fill in LONG branch restores BUY entries only (one-sided)."""
         sm = _sm()
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
@@ -297,12 +322,8 @@ class TestExitFill:
         )
 
         assert not result.rejected
-        assert len(result.actions) == 3
-        sell_action = next(
-            a
-            for a in result.actions
-            if a.kind == ActionIntentKind.PLACE_ENTRY and a.side == OrderSide.SELL
-        )
+        # One-sided: only BUY restore actions (no SELL restore).
+        assert len(result.actions) == 2
         buy_action = next(
             a
             for a in result.actions
@@ -313,25 +334,19 @@ class TestExitFill:
             for a in result.actions
             if a.kind == ActionIntentKind.CANCEL_ENTRY and a.side == OrderSide.BUY
         )
-        assert sell_action.kind == ActionIntentKind.PLACE_ENTRY
-        assert buy_action.kind == ActionIntentKind.PLACE_ENTRY
-        assert sell_action.reason == "EXIT_RESTORE"
         assert buy_action.reason == "EXIT_RESTORE"
-        expected_sells = (
-            *pre_exit_window.sell_entry_prices,
-            pre_exit_window.sell_entry_prices[-1] + pre_exit_window.reference_price * _STEP,
-        )
+        assert buy_cancel.reason == "EXIT_RESTORE_SHIFT"
+        # No SELL entries restored.
+        assert result.snapshot.entry_window.sell_entry_prices == ()
+        assert result.snapshot.mode == BranchMode.LONG_BRANCH
+        # BUY side shifted closer to reference.
         expected_buys = (
             pre_exit_window.buy_entry_prices[0] + pre_exit_window.reference_price * _STEP,
             *pre_exit_window.buy_entry_prices[:-1],
         )
-        assert result.snapshot.mode == BranchMode.LONG_BRANCH
-        assert result.snapshot.entry_window.sell_entry_prices == expected_sells
         assert result.snapshot.entry_window.buy_entry_prices == expected_buys
-        assert sell_action.price == expected_sells[-1]
         assert buy_action.price == expected_buys[0]
         assert buy_cancel.price == pre_exit_window.buy_entry_prices[-1]
-        assert buy_cancel.reason == "EXIT_RESTORE_SHIFT"
         assert len(result.snapshot.open_lots) == 1
 
     def test_short_exit_closes_lot(self) -> None:
@@ -352,8 +367,8 @@ class TestExitFill:
         assert len(result.snapshot.open_lots) == 1
         assert len(result.snapshot.closed_lots) == 1
 
-    def test_short_exit_restores_both_sides(self) -> None:
-        """T7: Exit fill in SHORT branch restores BUY far edge + SELL near edge."""
+    def test_short_exit_restores_sell_side_only(self) -> None:
+        """T7: Exit fill in SHORT branch restores SELL entries only (one-sided)."""
         sm = _sm()
         sell1 = sm.snapshot.entry_window.sell_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.SELL, sell1, _ORDER_SIZE, _BASE_TS + 1))
@@ -367,22 +382,22 @@ class TestExitFill:
         )
 
         assert not result.rejected
-        # At least BUY restore should be present; SELL restore may be skipped
-        # if next_price collides with an occupied price (open lot entry_price).
-        buy_actions = [
+        # One-sided: only SELL restore actions, no BUY restore.
+        sell_actions = [
             a
             for a in result.actions
-            if a.kind == ActionIntentKind.PLACE_ENTRY and a.side == OrderSide.BUY
+            if a.kind == ActionIntentKind.PLACE_ENTRY and a.side == OrderSide.SELL
         ]
-        assert len(buy_actions) >= 1
-        assert buy_actions[0].reason == "EXIT_RESTORE"
+        assert len(sell_actions) >= 1
+        assert sell_actions[0].reason == "EXIT_RESTORE"
         assert result.snapshot.mode == BranchMode.SHORT_BRANCH
-        # BUY restore price should be farthest from reference
-        assert buy_actions[0].price is not None
-        # Verify no duplicate prices in resulting window
+        # No BUY entries restored.
+        assert result.snapshot.entry_window.buy_entry_prices == ()
+        # Verify no duplicate prices in resulting SELL window
         w = result.snapshot.entry_window
-        all_prices = list(w.buy_entry_prices) + list(w.sell_entry_prices)
-        assert len(all_prices) == len(set(all_prices)), f"Duplicate prices: {all_prices}"
+        assert len(w.sell_entry_prices) == len(set(w.sell_entry_prices)), (
+            f"Duplicate sell prices: {w.sell_entry_prices}"
+        )
         assert len(result.snapshot.open_lots) == 1
 
 
@@ -524,8 +539,9 @@ class TestFullUnwind:
         snap = result.snapshot
         assert snap.mode == BranchMode.FLAT
         assert snap.open_lots == ()
+        # One-sided: only BUY side restored (was LONG_BRANCH). SELL stays empty.
         assert len(snap.entry_window.buy_entry_prices) == cfg.entry_levels_per_side
-        assert len(snap.entry_window.sell_entry_prices) == cfg.entry_levels_per_side
+        assert len(snap.entry_window.sell_entry_prices) == 0
         assert any(a.reason == "EXIT_RESTORE" for a in result.actions)
         assert all(a.reason not in {"RECENTER", "RECENTER_REPLACE"} for a in result.actions)
 
@@ -667,32 +683,37 @@ class TestRecenter:
 
 
 class TestMixedInventoryForbidden:
-    def test_buy_in_short_rejected(self) -> None:
+    def test_buy_in_short_impossible(self) -> None:
+        """One-sided: BUY entries absent in SHORT_BRANCH, so opposite fill is impossible."""
         sm = _sm()
         sell1 = sm.snapshot.entry_window.sell_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.SELL, sell1, _ORDER_SIZE, _BASE_TS + 1))
-        # Try BUY in SHORT_BRANCH
-        buy_price = (
-            sm.snapshot.entry_window.buy_entry_prices[0]
-            if sm.snapshot.entry_window.buy_entry_prices
-            else _REF_PRICE * Decimal("0.99")
+        # All BUY entries were cancelled on branch entry.
+        assert sm.snapshot.entry_window.buy_entry_prices == ()
+        # Attempting a BUY at what was a buy price gets PRICE_NOT_IN_ACTIVE_WINDOW.
+        result = sm.apply(
+            EntryFilled(
+                "E2", OrderSide.BUY, _REF_PRICE * Decimal("0.99"), _ORDER_SIZE, _BASE_TS + 2
+            )
         )
-        result = sm.apply(EntryFilled("E2", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 2))
         assert result.rejected
-        assert result.reject_reason == "BRANCH_INCOMPATIBLE"
+        assert result.reject_reason == "PRICE_NOT_IN_ACTIVE_WINDOW"
 
-    def test_sell_in_long_rejected(self) -> None:
+    def test_sell_in_long_impossible(self) -> None:
+        """One-sided: SELL entries absent in LONG_BRANCH, so opposite fill is impossible."""
         sm = _sm()
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
-        sell_price = (
-            sm.snapshot.entry_window.sell_entry_prices[0]
-            if sm.snapshot.entry_window.sell_entry_prices
-            else _REF_PRICE * Decimal("1.01")
+        # All SELL entries were cancelled on branch entry.
+        assert sm.snapshot.entry_window.sell_entry_prices == ()
+        # Attempting a SELL at what was a sell price gets PRICE_NOT_IN_ACTIVE_WINDOW.
+        result = sm.apply(
+            EntryFilled(
+                "E2", OrderSide.SELL, _REF_PRICE * Decimal("1.01"), _ORDER_SIZE, _BASE_TS + 2
+            )
         )
-        result = sm.apply(EntryFilled("E2", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 2))
         assert result.rejected
-        assert result.reject_reason == "BRANCH_INCOMPATIBLE"
+        assert result.reject_reason == "PRICE_NOT_IN_ACTIVE_WINDOW"
 
 
 # ---------------------------------------------------------------------------
@@ -1178,23 +1199,25 @@ class TestEmergencyStop:
 
 class TestOrderingContract:
     def test_action_order_on_entry_fill(self) -> None:
-        """PLACE_EXIT -> CANCEL_ENTRY -> PLACE_ENTRY (no internal mutations)."""
+        """PLACE_EXIT -> ROLLING_TRIM -> FILL_REPLACEMENT -> ONE_SIDED_CANCEL."""
         sm = _sm()
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         result = sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
 
         kinds = [a.kind for a in result.actions]
-        # Find positions
+        reasons = [a.reason for a in result.actions]
+        # PLACE_EXIT first
         pe_idx = kinds.index(ActionIntentKind.PLACE_EXIT)
-        # All CANCEL_ENTRY after PLACE_EXIT
-        for i, k in enumerate(kinds):
-            if k == ActionIntentKind.CANCEL_ENTRY:
-                assert i > pe_idx
-        # All PLACE_ENTRY after CANCEL_ENTRY
-        cancel_indices = [i for i, k in enumerate(kinds) if k == ActionIntentKind.CANCEL_ENTRY]
-        entry_indices = [i for i, k in enumerate(kinds) if k == ActionIntentKind.PLACE_ENTRY]
-        if cancel_indices and entry_indices:
-            assert max(cancel_indices) < min(entry_indices)
+        assert pe_idx == 0
+        # ROLLING_TRIM before FILL_REPLACEMENT
+        rolling_idx = [i for i, r in enumerate(reasons) if r == "ROLLING_TRIM"]
+        fill_repl_idx = [i for i, r in enumerate(reasons) if r == "FILL_REPLACEMENT"]
+        assert all(ri < fi for ri in rolling_idx for fi in fill_repl_idx)
+        # ONE_SIDED_CANCEL_OPPOSITE actions after FILL_REPLACEMENT
+        one_sided_idx = [i for i, r in enumerate(reasons) if r == "ONE_SIDED_CANCEL_OPPOSITE"]
+        assert len(one_sided_idx) >= 1
+        if fill_repl_idx:
+            assert all(oi > max(fill_repl_idx) for oi in one_sided_idx)
 
     def test_lots_chronological(self) -> None:
         sm = _sm()
@@ -1272,7 +1295,12 @@ class TestActionReasons:
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         result = sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
         ce = [a for a in result.actions if a.kind == ActionIntentKind.CANCEL_ENTRY]
-        assert all(a.reason == "ROLLING_TRIM" for a in ce)
+        # One-sided: CANCEL_ENTRY includes both ROLLING_TRIM and ONE_SIDED_CANCEL_OPPOSITE.
+        rolling = [a for a in ce if a.reason == "ROLLING_TRIM"]
+        one_sided = [a for a in ce if a.reason == "ONE_SIDED_CANCEL_OPPOSITE"]
+        assert len(rolling) == 1
+        assert len(one_sided) >= 1
+        assert len(ce) == len(rolling) + len(one_sided)
 
     def test_recenter_reasons(self) -> None:
         sm = _sm()
@@ -1514,87 +1542,89 @@ def _netoff_config() -> GridV2Config:
 
 
 class TestNetOff:
-    """Variant B: opposite-side entry fill closes closest lot (net-off)."""
+    """One-sided grid: opposite entries cancelled, so netoff is unreachable via normal path.
 
-    def test_long_sell_fill_closes_lot(self) -> None:
-        """LONG + SELL entry fill → close LONG lot, no SHORT lot opened."""
+    These tests verify that:
+    1. Opposite entries are absent after branch entry (one-sided).
+    2. Netoff code path still exists but can't be triggered via the normal entry path.
+    3. Attempting an opposite fill at the old price is rejected (PRICE_NOT_IN_ACTIVE_WINDOW).
+    """
+
+    def test_long_branch_has_no_sell_entries(self) -> None:
+        """After BUY fill, SELL entries are empty — netoff is unreachable."""
         sm = GridV2StateMachine.create_initial(_netoff_config(), _REF_PRICE, _BASE_TS)
         buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("e1", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1))
         assert sm.snapshot.mode == BranchMode.LONG_BRANCH
-        assert len(sm.snapshot.open_lots) == 1
+        assert sm.snapshot.entry_window.sell_entry_prices == ()
 
-        sell_price = sm.snapshot.entry_window.sell_entry_prices[0]
-        r = sm.apply(EntryFilled("e2", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 2))
-        assert not r.rejected
-        assert sm.snapshot.mode == BranchMode.FLAT  # type: ignore[comparison-overlap]
-        assert len(sm.snapshot.open_lots) == 0
-        # No SHORT lot should exist
-        assert all(lot.side != LotSide.SHORT for lot in sm.snapshot.open_lots)
-
-    def test_short_buy_fill_closes_lot(self) -> None:
-        """SHORT + BUY entry fill → close SHORT lot."""
+    def test_short_branch_has_no_buy_entries(self) -> None:
+        """After SELL fill, BUY entries are empty — netoff is unreachable."""
         sm = GridV2StateMachine.create_initial(_netoff_config(), _REF_PRICE, _BASE_TS)
         sell_price = sm.snapshot.entry_window.sell_entry_prices[0]
         sm.apply(EntryFilled("e1", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 1))
         assert sm.snapshot.mode == BranchMode.SHORT_BRANCH
+        assert sm.snapshot.entry_window.buy_entry_prices == ()
 
+    def test_opposite_fill_rejected_price_not_in_window(self) -> None:
+        """Opposite fill at old price is rejected (entries were cancelled)."""
+        sm = GridV2StateMachine.create_initial(_netoff_config(), _REF_PRICE, _BASE_TS)
+        initial_sells = sm.snapshot.entry_window.sell_entry_prices
         buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
-        r = sm.apply(EntryFilled("e2", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 2))
-        assert not r.rejected
-        assert sm.snapshot.mode == BranchMode.FLAT  # type: ignore[comparison-overlap]
-        assert len(sm.snapshot.open_lots) == 0
+        sm.apply(EntryFilled("e1", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1))
 
-    def test_partial_netoff_stays_in_branch(self) -> None:
-        """2 LONG lots + 1 SELL fill → 1 LONG lot remains, mode stays LONG_BRANCH."""
+        # Try SELL at what was previously a valid sell price.
+        r = sm.apply(EntryFilled("e2", OrderSide.SELL, initial_sells[0], _ORDER_SIZE, _BASE_TS + 2))
+        assert r.rejected
+        assert r.reject_reason == "PRICE_NOT_IN_ACTIVE_WINDOW"
+
+    def test_netoff_disabled_opposite_fill_rejected(self) -> None:
+        """Without netoff, opposite fill rejected (entries absent, not BRANCH_INCOMPATIBLE)."""
+        sm = GridV2StateMachine.create_initial(_config(), _REF_PRICE, _BASE_TS)
+        initial_sells = sm.snapshot.entry_window.sell_entry_prices
+        buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("e1", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1))
+
+        # SELL entries are gone — rejected before BRANCH_INCOMPATIBLE check.
+        r = sm.apply(EntryFilled("e2", OrderSide.SELL, initial_sells[0], _ORDER_SIZE, _BASE_TS + 2))
+        assert r.rejected
+        assert r.reject_reason == "PRICE_NOT_IN_ACTIVE_WINDOW"
+
+    def test_one_sided_prevents_mixed_inventory(self) -> None:
+        """One-sided mode prevents mixed inventory by removing opposite entries."""
+        sm = GridV2StateMachine.create_initial(_netoff_config(), _REF_PRICE, _BASE_TS)
+        buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("e1", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1))
+
+        # Only LONG lots, no way to create SHORT lots (sell entries absent).
+        assert all(lot.side == LotSide.LONG for lot in sm.snapshot.open_lots)
+        assert sm.snapshot.entry_window.sell_entry_prices == ()
+
+    def test_cancel_entry_actions_emitted_for_opposite_side(self) -> None:
+        """Branch entry emits CANCEL_ENTRY for all opposite-side entries."""
+        sm = GridV2StateMachine.create_initial(_netoff_config(), _REF_PRICE, _BASE_TS)
+        initial_sells = sm.snapshot.entry_window.sell_entry_prices
+        buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
+        r = sm.apply(EntryFilled("e1", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1))
+
+        cancel_sell_actions = [
+            a
+            for a in r.actions
+            if a.kind == ActionIntentKind.CANCEL_ENTRY and a.side == OrderSide.SELL
+        ]
+        # All initial SELL prices are cancelled (1 ROLLING_TRIM + rest ONE_SIDED).
+        cancelled_prices = {a.price for a in cancel_sell_actions}
+        assert cancelled_prices == set(initial_sells)
+
+    def test_two_lots_then_opposite_still_blocked(self) -> None:
+        """2 LONG lots — SELL entries still empty, opposite fill still impossible."""
         sm = GridV2StateMachine.create_initial(_netoff_config(), _REF_PRICE, _BASE_TS)
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("e1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
         buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("e2", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 2))
         assert len(sm.snapshot.open_lots) == 2
-
-        sell_price = sm.snapshot.entry_window.sell_entry_prices[0]
-        r = sm.apply(EntryFilled("e3", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 3))
-        assert not r.rejected
-        assert sm.snapshot.mode == BranchMode.LONG_BRANCH
-        assert len(sm.snapshot.open_lots) == 1
-
-    def test_netoff_cancels_paired_exit(self) -> None:
-        """Net-off emits CANCEL_EXIT for the closed lot's paired exit."""
-        sm = GridV2StateMachine.create_initial(_netoff_config(), _REF_PRICE, _BASE_TS)
-        buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
-        sm.apply(EntryFilled("e1", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1))
-
-        sell_price = sm.snapshot.entry_window.sell_entry_prices[0]
-        r = sm.apply(EntryFilled("e2", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 2))
-        cancel_exit_actions = [a for a in r.actions if a.kind == ActionIntentKind.CANCEL_EXIT]
-        assert len(cancel_exit_actions) == 1
-        assert cancel_exit_actions[0].reason == "NETOFF_CANCEL_PAIRED_EXIT"
-
-    def test_netoff_disabled_rejects_as_branch_incompatible(self) -> None:
-        """With netoff disabled (default), opposite fill is still BRANCH_INCOMPATIBLE."""
-        sm = GridV2StateMachine.create_initial(_config(), _REF_PRICE, _BASE_TS)
-        buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
-        sm.apply(EntryFilled("e1", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1))
-
-        sell_price = sm.snapshot.entry_window.sell_entry_prices[0]
-        r = sm.apply(EntryFilled("e2", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 2))
-        assert r.rejected
-        assert r.reject_reason == "BRANCH_INCOMPATIBLE"
-
-    def test_netoff_mixed_inventory_impossible(self) -> None:
-        """Net-off never creates mixed inventory (LONG + SHORT simultaneously)."""
-        sm = GridV2StateMachine.create_initial(_netoff_config(), _REF_PRICE, _BASE_TS)
-        buy_price = sm.snapshot.entry_window.buy_entry_prices[0]
-        sm.apply(EntryFilled("e1", OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1))
-
-        sell_price = sm.snapshot.entry_window.sell_entry_prices[0]
-        sm.apply(EntryFilled("e2", OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 2))
-
-        # After net-off, should be FLAT — no mixed lots
-        sides = {lot.side for lot in sm.snapshot.open_lots}
-        assert len(sides) <= 1  # only one side or empty
+        assert sm.snapshot.entry_window.sell_entry_prices == ()
 
 
 # ---------------------------------------------------------------------------

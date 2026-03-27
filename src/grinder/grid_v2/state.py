@@ -505,6 +505,47 @@ class GridV2StateMachine:
         actions.extend(rolling_actions)
 
         new_mode = BranchMode.LONG_BRANCH if lot_side == LotSide.LONG else BranchMode.SHORT_BRANCH
+
+        # One-sided grid: cancel all opposite-side entries on branch entry.
+        # Prevents BRANCH_INCOMPATIBLE fills and SM/exchange desync.
+        # Opposite entries re-appear only after full unwind to FLAT.
+        if lot_side == LotSide.LONG:
+            # Cancel all SELL entries
+            for sell_price in new_window.sell_entry_prices:
+                actions.append(
+                    ActionIntent(
+                        kind=ActionIntentKind.CANCEL_ENTRY,
+                        side=OrderSide.SELL,
+                        price=sell_price,
+                        reason="ONE_SIDED_CANCEL_OPPOSITE",
+                    )
+                )
+            new_window = EntryWindow(
+                reference_price=new_window.reference_price,
+                buy_entry_prices=new_window.buy_entry_prices,
+                sell_entry_prices=(),
+                levels_per_side=new_window.levels_per_side,
+                step_pct=new_window.step_pct,
+            )
+        else:
+            # Cancel all BUY entries
+            for buy_price in new_window.buy_entry_prices:
+                actions.append(
+                    ActionIntent(
+                        kind=ActionIntentKind.CANCEL_ENTRY,
+                        side=OrderSide.BUY,
+                        price=buy_price,
+                        reason="ONE_SIDED_CANCEL_OPPOSITE",
+                    )
+                )
+            new_window = EntryWindow(
+                reference_price=new_window.reference_price,
+                buy_entry_prices=(),
+                sell_entry_prices=new_window.sell_entry_prices,
+                levels_per_side=new_window.levels_per_side,
+                step_pct=new_window.step_pct,
+            )
+
         new_snapshot = GridV2Snapshot(
             mode=new_mode,
             entry_window=new_window,
@@ -799,24 +840,8 @@ class GridV2StateMachine:
             if snap.mode == BranchMode.LONG_BRANCH:
                 buy_prices = list(snap.entry_window.buy_entry_prices)
                 sell_prices = list(snap.entry_window.sell_entry_prices)
-                if len(sell_prices) < self._config.entry_levels_per_side:
-                    next_price = (
-                        sell_prices[-1] + step_delta
-                        if sell_prices
-                        else snap.entry_window.reference_price + step_delta
-                    )
-                    _all_occupied = exit_occupied | set(buy_prices) | set(sell_prices)
-                    if next_price not in _all_occupied:
-                        sell_prices.append(next_price)
-                        actions.append(
-                            ActionIntent(
-                                kind=ActionIntentKind.PLACE_ENTRY,
-                                side=OrderSide.SELL,
-                                price=next_price,
-                                qty=self._config.order_size,
-                                reason="EXIT_RESTORE",
-                            )
-                        )
+                # One-sided: do NOT restore SELL entries in LONG_BRANCH.
+                # Opposite side stays empty until FLAT reseed.
                 if len(buy_prices) < self._config.entry_levels_per_side:
                     next_price = (
                         buy_prices[0] + step_delta
@@ -874,24 +899,8 @@ class GridV2StateMachine:
             elif snap.mode == BranchMode.SHORT_BRANCH:
                 buy_prices = list(snap.entry_window.buy_entry_prices)
                 sell_prices = list(snap.entry_window.sell_entry_prices)
-                if len(buy_prices) < self._config.entry_levels_per_side:
-                    next_price = (
-                        buy_prices[-1] - step_delta
-                        if buy_prices
-                        else snap.entry_window.reference_price - step_delta
-                    )
-                    _all_occupied = exit_occupied | set(buy_prices) | set(sell_prices)
-                    if next_price not in _all_occupied:
-                        buy_prices.append(next_price)
-                        actions.append(
-                            ActionIntent(
-                                kind=ActionIntentKind.PLACE_ENTRY,
-                                side=OrderSide.BUY,
-                                price=next_price,
-                                qty=self._config.order_size,
-                                reason="EXIT_RESTORE",
-                            )
-                        )
+                # One-sided: do NOT restore BUY entries in SHORT_BRANCH.
+                # Opposite side stays empty until FLAT reseed.
                 if len(sell_prices) < self._config.entry_levels_per_side:
                     next_price = (
                         sell_prices[0] - step_delta
