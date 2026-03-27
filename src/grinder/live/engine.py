@@ -4004,6 +4004,27 @@ class LiveEngineV0:
             and self._grid_v2_started
             and self._grid_v2_bridge.reconstruction_ok
         ):
+            # Pre-pass: clean stale registry entries that block reconciler PLACE.
+            # A CID in registry but absent from exchange AND not in pending sets
+            # is stale (cancelled/filled without ack). Remove to unblock reseed.
+            exchange_cids = {o.order_id for o in result.snapshot.open_orders}
+            bridge = self._grid_v2_bridge
+            stale_cleaned = 0
+            for cid in list(bridge.adapter.registry.all_entry_cids):
+                if (
+                    cid not in exchange_cids
+                    and cid not in self._grid_v2_pending_place_cids
+                    and cid not in self._grid_v2_pending_cancels
+                ):
+                    bridge.adapter.confirm_cancel_entry(cid)
+                    stale_cleaned += 1
+            if stale_cleaned:
+                logger.info(
+                    "GRID_V2_STALE_REGISTRY_CLEANED symbol=%s entries=%d",
+                    self._grid_v2_symbol,
+                    stale_cleaned,
+                )
+
             from grinder.grid_v2.sync_reconciler import reconcile_grid_state  # noqa: PLC0415
 
             recon = reconcile_grid_state(
