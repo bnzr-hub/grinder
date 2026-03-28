@@ -675,3 +675,24 @@ async def metrics():
 - Review risk limits
 - Update if necessary
 ```
+
+## Grid V2 Sync Reconciler Log Schema (ADR-103)
+
+The `GRID_V2_SYNC_RECONCILER` log emits on every sync cycle with entry/exit diff:
+
+```
+GRID_V2_SYNC_RECONCILER symbol=BTCUSDT mode=FLAT
+  theoretical_entries=4 effective_entries=2 actual_entries=1
+  missing=1 extra=0
+  desired_exits=1 actual_exits=1 missing_exits=0 extra_exits=0
+  would_cancel=0 would_place=1 cycle_ms=2
+  projection=RISK_CONSTRAINED_PARTIAL capacity=2 primary=True
+```
+
+| Field | Meaning |
+|-------|---------|
+| `theoretical_entries` | SM desired entries before risk projection |
+| `effective_entries` | Legal desired entries after projection |
+| `actual_entries` | Entries currently on exchange |
+| `projection` | `UNCONSTRAINED`, `RISK_CONSTRAINED_PARTIAL`, `RISK_CONSTRAINED_ZERO` |
+| `capacity` | Legal entry capacity from risk gate (`None` = unconstrained) |

@@ -4,6 +4,12 @@ Designed to replace tick-level watchdog as primary repair path.
 Input: fresh AccountSnapshot + SM/bridge desired state.
 Output: deterministic action list (CANCEL extras first, then PLACE missing).
 No side effects — caller decides whether to dispatch or shadow-log.
+
+Three-layer model (ADR-103):
+  1. Theoretical desired state: what SM wants absent hard constraints.
+  2. Effective desired state: legal target after risk projection.
+  3. Actual exchange state: what exists on exchange.
+Reconciler diffs actual against effective, not theoretical.
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from grinder.core import OrderSide
@@ -25,10 +32,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class ProjectionMode(Enum):
+    """How desired entries were projected under risk constraints (ADR-103)."""
+
+    UNCONSTRAINED = "UNCONSTRAINED"
+    RISK_CONSTRAINED_PARTIAL = "RISK_CONSTRAINED_PARTIAL"
+    RISK_CONSTRAINED_ZERO = "RISK_CONSTRAINED_ZERO"
+
+
 @dataclass(frozen=True)
 class ReconcileResult:
-    """Output of a single reconciliation pass."""
+    """Output of a single reconciliation pass.
 
+    Fields use the three-layer model:
+    - theoretical_desired_entry_count: what SM wants (before risk projection).
+    - desired_entry_count: effective desired (after risk projection).
+    - actual_entry_count: what is on exchange.
+    - projection_mode: how projection was applied.
+    - legal_entry_capacity: risk cap passed to reconciler (None=unconstrained).
+    """
+
+    theoretical_desired_entry_count: int
     desired_entry_count: int
     actual_entry_count: int
     desired_exit_count: int
@@ -39,6 +63,8 @@ class ReconcileResult:
     extra_exits: int
     actions: tuple[ExecutionAction, ...]
     cycle_ms: int
+    projection_mode: ProjectionMode = ProjectionMode.UNCONSTRAINED
+    legal_entry_capacity: int | None = None
     # Shadow-only fields for observability
     would_cancel: int = 0
     would_place: int = 0
@@ -51,6 +77,35 @@ class ReconcileConfig:
     enabled: bool = False
     shadow: bool = True  # shadow mode: compute + log, don't dispatch
     max_actions_per_sync: int = 10
+
+
+def _project_desired_entries(
+    theoretical_keys: set[tuple[OrderSide, Decimal]],
+    risk_entry_capacity: int | None,
+    reference_price: Decimal,
+) -> tuple[set[tuple[OrderSide, Decimal]], ProjectionMode]:
+    """Project theoretical desired entries to effective desired state.
+
+    Args:
+        theoretical_keys: Full desired entry keys from SM (before risk).
+        risk_entry_capacity: Legal capacity (None=unconstrained, 0=zero, N=partial).
+        reference_price: SM reference price for proximity ranking.
+
+    Returns:
+        (effective_keys, projection_mode)
+    """
+    if risk_entry_capacity is None or risk_entry_capacity >= len(theoretical_keys):
+        return theoretical_keys, ProjectionMode.UNCONSTRAINED
+
+    if risk_entry_capacity <= 0:
+        return set(), ProjectionMode.RISK_CONSTRAINED_ZERO
+
+    # Partial: keep N entries closest to reference price (deterministic)
+    ranked = sorted(
+        theoretical_keys,
+        key=lambda k: abs(k[1] - reference_price),
+    )
+    return set(ranked[:risk_entry_capacity]), ProjectionMode.RISK_CONSTRAINED_PARTIAL
 
 
 def reconcile_grid_state(  # noqa: PLR0912, PLR0915
@@ -68,75 +123,35 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
         symbol: Trading symbol.
         bridge: GridV2Bridge instance (for SM state, adapter, quantize).
         max_actions: Max total actions (cancel + place) per sync cycle.
-        risk_entry_capacity: Legal additional entry capacity (ADR-102).
+        risk_entry_capacity: Legal additional entry capacity (ADR-102/103).
             None = unconstrained (risk base disabled or data unavailable).
-            0 = fully saturated (no new entries allowed).
-            N > 0 = partial ladder (truncate desired to N entries).
+            0 = fully constrained (no new entries allowed).
+            N > 0 = partial capacity (truncate desired to N entries).
 
     Returns:
-        ReconcileResult with deterministic action list.
+        ReconcileResult with deterministic action list and projection metadata.
     """
     t0 = time.monotonic()
     sm = bridge.state_machine
     if sm is None:
         return _empty_result(0)
 
-    # --- Compute desired entries from SM window (SM owns entry lifecycle) ---
-    desired_entry_keys: set[tuple[OrderSide, Decimal]] = set()
+    # --- Layer 1: Theoretical desired state (what SM wants) ---
+    theoretical_entry_keys: set[tuple[OrderSide, Decimal]] = set()
     for p in sm.snapshot.entry_window.buy_entry_prices:
-        desired_entry_keys.add((OrderSide.BUY, bridge._quantize_price(p, OrderSide.BUY)))
+        theoretical_entry_keys.add((OrderSide.BUY, bridge._quantize_price(p, OrderSide.BUY)))
     for p in sm.snapshot.entry_window.sell_entry_prices:
-        desired_entry_keys.add((OrderSide.SELL, bridge._quantize_price(p, OrderSide.SELL)))
+        theoretical_entry_keys.add((OrderSide.SELL, bridge._quantize_price(p, OrderSide.SELL)))
 
-    # Inventory cap: when full, don't desire new entries
+    # Inventory cap: when full, theoretical desired is also 0
     inventory_full = (
         sm.mode != BranchMode.FLAT
         and len(sm.snapshot.open_lots) >= bridge._config.max_inventory_levels
     )
     if inventory_full:
-        desired_entry_keys = set()
+        theoretical_entry_keys = set()
 
-    # ADR-102: Legal target projection.
-    # Project desired entries to legal capacity:
-    # - None → unconstrained (keep full ladder)
-    # - 0 → fully saturated (no entries)
-    # - N > 0 → partial ladder (keep N closest to reference)
-    if risk_entry_capacity is not None and risk_entry_capacity < len(desired_entry_keys):
-        if risk_entry_capacity <= 0:
-            desired_entry_keys = set()
-        else:
-            # Keep N entries closest to reference price (most likely to fill)
-            ref = sm.snapshot.entry_window.reference_price
-            ranked = sorted(
-                desired_entry_keys,
-                key=lambda k: abs(k[1] - ref),
-            )
-            desired_entry_keys = set(ranked[:risk_entry_capacity])
-
-    # --- Step 2: Gap detection supplement ---
-    # SM window may have gaps from collision guard skips. Detect gaps in
-    # actual exchange orders and add missing levels as additional desired.
-    from grinder.grid_v2.state import _grid_step_price  # noqa: PLC0415
-
-    step = _grid_step_price(
-        sm.snapshot.entry_window.reference_price,
-        bridge._config.grid_step_pct,
-        bridge._config.price_tick_size,
-    )
-    exit_prices: set[Decimal] = set()
-    for eo in sm.snapshot.exit_orders:
-        if eo.status == ExitOrderStatus.OPEN:
-            exit_prices.add(eo.price)
-
-    desired_exit_cids: set[str] = set()
-    for eo in sm.snapshot.exit_orders:
-        if eo.status != ExitOrderStatus.OPEN:
-            continue
-        reg_cid = bridge.adapter.registry.cid_for_exit(eo.exit_order_id)
-        if reg_cid is not None:
-            desired_exit_cids.add(reg_cid)
-
-    # --- Compute actual state from fresh snapshot ---
+    # --- Actual exchange state (computed early — needed for gap detection) ---
     actual_entry_by_key: dict[tuple[OrderSide, Decimal], str] = {}
     actual_exit_cids: set[str] = set()
     for o in snapshot.open_orders:
@@ -154,9 +169,19 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
         elif parsed.kind.value == "EXIT":
             actual_exit_cids.add(o.order_id)
 
-    # --- Gap detection: find missing levels between actual exchange entries ---
-    # For each side, sort actual prices, check for gaps > 1.5 * step.
-    # If gap found and the missing price isn't an exit → add to desired.
+    # --- Gap detection supplement (on theoretical, BEFORE projection) ---
+    from grinder.grid_v2.state import _grid_step_price  # noqa: PLC0415
+
+    step = _grid_step_price(
+        sm.snapshot.entry_window.reference_price,
+        bridge._config.grid_step_pct,
+        bridge._config.price_tick_size,
+    )
+    exit_prices: set[Decimal] = set()
+    for eo in sm.snapshot.exit_orders:
+        if eo.status == ExitOrderStatus.OPEN:
+            exit_prices.add(eo.price)
+
     actual_entry_keys_pre = set(actual_entry_by_key.keys())
     for side in (OrderSide.BUY, OrderSide.SELL):
         side_prices = sorted(
@@ -166,19 +191,36 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
         for i in range(len(side_prices) - 1):
             gap = abs(side_prices[i] - side_prices[i + 1])
             if gap > step + step // 2:  # 1.5 * step
-                # Missing level(s) in gap — fill with step-aligned prices
                 if side == OrderSide.BUY:
                     fill_price = side_prices[i] - step
                 else:
                     fill_price = side_prices[i] + step
                 fill_price = bridge._quantize_price(fill_price, side)
                 if fill_price not in exit_prices:
-                    desired_entry_keys.add((side, fill_price))
+                    theoretical_entry_keys.add((side, fill_price))
 
-    # --- Compute diff ---
+    # --- Layer 2: Effective desired state (legal target after projection) ---
+    # Projection runs AFTER gap detection so the combined theoretical set
+    # is projected down to legal capacity. Effective never exceeds capacity.
+    effective_entry_keys, projection_mode = _project_desired_entries(
+        theoretical_entry_keys,
+        risk_entry_capacity,
+        sm.snapshot.entry_window.reference_price,
+    )
+
+    # --- Exit desired state ---
+    desired_exit_cids: set[str] = set()
+    for eo in sm.snapshot.exit_orders:
+        if eo.status != ExitOrderStatus.OPEN:
+            continue
+        reg_cid = bridge.adapter.registry.cid_for_exit(eo.exit_order_id)
+        if reg_cid is not None:
+            desired_exit_cids.add(reg_cid)
+
+    # --- Diff: actual vs effective (NOT vs theoretical) ---
     actual_entry_keys = set(actual_entry_by_key.keys())
-    missing_entries = desired_entry_keys - actual_entry_keys
-    extra_entries = actual_entry_keys - desired_entry_keys
+    missing_entries = effective_entry_keys - actual_entry_keys
+    extra_entries = actual_entry_keys - effective_entry_keys
     missing_exits = desired_exit_cids - actual_exit_cids
     extra_exits = actual_exit_cids - desired_exit_cids
 
@@ -186,7 +228,6 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     actions: list[ExecutionAction] = []
     budget = max_actions
 
-    # Cancel extra entries (sorted for determinism)
     for side, price in sorted(extra_entries, key=lambda x: (x[0].value, x[1])):
         if len(actions) >= budget:
             break
@@ -200,7 +241,6 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
             )
         )
 
-    # Cancel extra exits (sorted for determinism)
     for cid in sorted(extra_exits):
         if len(actions) >= budget:
             break
@@ -213,9 +253,6 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
             )
         )
 
-    # Place missing entries (sorted for determinism)
-    # Note: these are raw intents — caller must pass through risk gates.
-    # Skip if adapter registry already has a CID for this slot (avoids duplicate entry fatal).
     for side, price in sorted(missing_entries, key=lambda x: (x[0].value, x[1])):
         if len(actions) >= budget:
             break
@@ -239,7 +276,8 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     elapsed_ms = int((time.monotonic() - t0) * 1000)
 
     return ReconcileResult(
-        desired_entry_count=len(desired_entry_keys),
+        theoretical_desired_entry_count=len(theoretical_entry_keys),
+        desired_entry_count=len(effective_entry_keys),
         actual_entry_count=len(actual_entry_by_key),
         desired_exit_count=len(desired_exit_cids),
         actual_exit_count=len(actual_exit_cids),
@@ -249,6 +287,8 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
         extra_exits=len(extra_exits),
         actions=tuple(actions),
         cycle_ms=elapsed_ms,
+        projection_mode=projection_mode,
+        legal_entry_capacity=risk_entry_capacity,
         would_cancel=cancel_count,
         would_place=place_count,
     )
@@ -256,6 +296,7 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
 
 def _empty_result(elapsed_ms: int) -> ReconcileResult:
     return ReconcileResult(
+        theoretical_desired_entry_count=0,
         desired_entry_count=0,
         actual_entry_count=0,
         desired_exit_count=0,
