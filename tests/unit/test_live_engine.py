@@ -7325,3 +7325,233 @@ class TestDriftReconstructCooldown:
         # Key assertion: no "DEFERRED" log — cooldown expired, method proceeded
         deferred_logs = [r for r in caplog.records if "DRIFT_RECONSTRUCT_DEFERRED" in r.message]
         assert len(deferred_logs) == 0
+
+
+class TestReduceOnlyBudgetGuard:
+    """Tests for aggregate reduce-only qty budget guard."""
+
+    @staticmethod
+    def _make_engine() -> LiveEngineV0:
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+        port = NoOpExchangePort()
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        return LiveEngineV0(paper, port, config)
+
+    def test_reduce_only_within_budget_allowed(self) -> None:
+        """reduce-only PLACE within position qty → allowed."""
+        engine = self._make_engine()
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(
+                PositionSnap(
+                    symbol="BTCUSDT",
+                    side="SHORT",
+                    qty=Decimal("300"),
+                    entry_price=Decimal("50000"),
+                    mark_price=Decimal("50000"),
+                    unrealized_pnl=Decimal("0"),
+                    leverage=1,
+                    ts=1000,
+                ),
+            ),
+            open_orders=(),  # no existing reduce-only
+            ts=1000,
+            source="test",
+        )
+        action = ExecutionAction(
+            action_type=ActionType.PLACE,
+            symbol="BTCUSDT",
+            side=OrderSide.BUY,
+            price=Decimal("49000"),
+            quantity=Decimal("150"),
+            reduce_only=True,
+            reason="test_exit",
+        )
+        result = engine._process_action(action, 1000)
+        assert result.block_reason != BlockReason.REDUCE_ONLY_BUDGET_EXCEEDED
+
+    def test_reduce_only_exceeds_budget_blocked(self) -> None:
+        """reduce-only PLACE that would exceed position qty → blocked."""
+        engine = self._make_engine()
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(
+                PositionSnap(
+                    symbol="BTCUSDT",
+                    side="SHORT",
+                    qty=Decimal("150"),
+                    entry_price=Decimal("50000"),
+                    mark_price=Decimal("50000"),
+                    unrealized_pnl=Decimal("0"),
+                    leverage=1,
+                    ts=1000,
+                ),
+            ),
+            open_orders=(
+                OpenOrderSnap(
+                    order_id="existing_exit",
+                    symbol="BTCUSDT",
+                    side="BUY",
+                    order_type="LIMIT",
+                    price=Decimal("49000"),
+                    qty=Decimal("150"),
+                    filled_qty=Decimal("0"),
+                    reduce_only=True,
+                    status="NEW",
+                    ts=1000,
+                ),
+            ),
+            ts=1000,
+            source="test",
+        )
+        # existing 150 + new 150 = 300 > position 150
+        action = ExecutionAction(
+            action_type=ActionType.PLACE,
+            symbol="BTCUSDT",
+            side=OrderSide.BUY,
+            price=Decimal("48000"),
+            quantity=Decimal("150"),
+            reduce_only=True,
+            reason="test_exit",
+        )
+        result = engine._process_action(action, 1000)
+        assert result.status == LiveActionStatus.BLOCKED
+        assert result.block_reason == BlockReason.REDUCE_ONLY_BUDGET_EXCEEDED
+
+    def test_batch_exits_accumulated(self) -> None:
+        """Multiple reduce-only exits in same tick: batch accumulator blocks excess."""
+        engine = self._make_engine()
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(
+                PositionSnap(
+                    symbol="BTCUSDT",
+                    side="SHORT",
+                    qty=Decimal("300"),
+                    entry_price=Decimal("50000"),
+                    mark_price=Decimal("50000"),
+                    unrealized_pnl=Decimal("0"),
+                    leverage=1,
+                    ts=1000,
+                ),
+            ),
+            open_orders=(),
+            ts=1000,
+            source="test",
+        )
+        # First exit: 150 of 300 → pass
+        a1 = ExecutionAction(
+            action_type=ActionType.PLACE,
+            symbol="BTCUSDT",
+            side=OrderSide.BUY,
+            price=Decimal("49000"),
+            quantity=Decimal("150"),
+            reduce_only=True,
+            reason="exit_1",
+        )
+        r1 = engine._process_action(a1, 1000)
+        assert r1.block_reason != BlockReason.REDUCE_ONLY_BUDGET_EXCEEDED
+
+        # Second exit: 150 → total 300 = position → pass
+        a2 = ExecutionAction(
+            action_type=ActionType.PLACE,
+            symbol="BTCUSDT",
+            side=OrderSide.BUY,
+            price=Decimal("48000"),
+            quantity=Decimal("150"),
+            reduce_only=True,
+            reason="exit_2",
+        )
+        r2 = engine._process_action(a2, 1000)
+        assert r2.block_reason != BlockReason.REDUCE_ONLY_BUDGET_EXCEEDED
+
+        # Third exit: 150 → total 450 > 300 → blocked
+        a3 = ExecutionAction(
+            action_type=ActionType.PLACE,
+            symbol="BTCUSDT",
+            side=OrderSide.BUY,
+            price=Decimal("47000"),
+            quantity=Decimal("150"),
+            reduce_only=True,
+            reason="exit_3",
+        )
+        r3 = engine._process_action(a3, 1000)
+        assert r3.status == LiveActionStatus.BLOCKED
+        assert r3.block_reason == BlockReason.REDUCE_ONLY_BUDGET_EXCEEDED
+
+    def test_partial_fill_uses_remaining_qty(self) -> None:
+        """Partially filled exits count only remaining qty for budget."""
+        engine = self._make_engine()
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(
+                PositionSnap(
+                    symbol="BTCUSDT",
+                    side="SHORT",
+                    qty=Decimal("300"),
+                    entry_price=Decimal("50000"),
+                    mark_price=Decimal("50000"),
+                    unrealized_pnl=Decimal("0"),
+                    leverage=1,
+                    ts=1000,
+                ),
+            ),
+            open_orders=(
+                OpenOrderSnap(
+                    order_id="partial",
+                    symbol="BTCUSDT",
+                    side="BUY",
+                    order_type="LIMIT",
+                    price=Decimal("49000"),
+                    qty=Decimal("200"),
+                    filled_qty=Decimal("100"),
+                    reduce_only=True,
+                    status="PARTIALLY_FILLED",
+                    ts=1000,
+                ),
+            ),
+            ts=1000,
+            source="test",
+        )
+        # Remaining from partial: 100. Budget: 300 - 100 = 200 available.
+        action = ExecutionAction(
+            action_type=ActionType.PLACE,
+            symbol="BTCUSDT",
+            side=OrderSide.BUY,
+            price=Decimal("48000"),
+            quantity=Decimal("200"),
+            reduce_only=True,
+            reason="exit_new",
+        )
+        r = engine._process_action(action, 1000)
+        assert r.block_reason != BlockReason.REDUCE_ONLY_BUDGET_EXCEEDED
+
+    def test_non_reduce_only_not_affected(self) -> None:
+        """Normal PLACE (not reduce-only) is not affected by budget guard."""
+        engine = self._make_engine()
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(
+                PositionSnap(
+                    symbol="BTCUSDT",
+                    side="SHORT",
+                    qty=Decimal("150"),
+                    entry_price=Decimal("50000"),
+                    mark_price=Decimal("50000"),
+                    unrealized_pnl=Decimal("0"),
+                    leverage=1,
+                    ts=1000,
+                ),
+            ),
+            open_orders=(),
+            ts=1000,
+            source="test",
+        )
+        # SELL on SHORT = same direction (increase risk), not reduce-only
+        action = ExecutionAction(
+            action_type=ActionType.PLACE,
+            symbol="BTCUSDT",
+            side=OrderSide.SELL,
+            price=Decimal("51000"),
+            quantity=Decimal("300"),
+            reduce_only=False,
+            reason="test_entry",
+        )
+        result = engine._process_action(action, 1000)
+        assert result.block_reason != BlockReason.REDUCE_ONLY_BUDGET_EXCEEDED
