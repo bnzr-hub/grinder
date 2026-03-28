@@ -4428,3 +4428,15 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **B2 — Exit price collision:** In `_execute_entry()`, after computing exit_price, check against existing open exit prices. If collision → shift by ±1 tick (then ±2 if still collides). Prevents duplicate exit orders (e.g., 2× SELL@0.0600).
 - **B1 — Expanded occupied prices:** `_occupied_prices()` now includes `{lot.entry_price for lot in open_lots}`. Prevents cross-cycle entry duplicates where exit restore re-generates a price matching an existing lot's entry.
 - **B3-alt — Distance clamp:** In `_update_window_after_fill()`, new entry must be within `2 × entry_levels_per_side × step_price` from reference_price. Prevents cascading drift from batch fills (4 fills in one tick → 4 sequential shifts → entries far from current price).
+
+### ADR-099: Reduce-Only Budget Guard (2026-03-28)
+
+- **Status:** Delivered.
+- **Decision:** Aggregate reduce-only qty guard in `_process_action` (Gate 0). Prevents Binance -2022 when total exit qty exceeds remaining position.
+- **Position source:** Exchange snapshot is SSOT. Provable current-tick lot additions from fill path are added on top (`effective_position = snapshot_qty + batch_new_lots_qty`). Generic SM open_lots are NOT used as override.
+- **Existing exits:** Sourced from exchange snapshot open_orders (partial fills: `qty - filled_qty`).
+- **Within-tick batch:** `_reduce_only_batch_qty` accumulator tracks dispatched exit qty per (symbol, side) within tick. Prevents batch over-dispatch.
+- **Current-tick additions:** `_reduce_only_batch_new_lots_qty` accumulator tracks lot qty added by fill path this tick. Only incremented on provable entry fill → lot creation.
+- **Fail-closed:** Guard blocks if `existing_ro + batch + new > effective_position`. No fail-open path. SM state is not trusted as override.
+- **Accumulators reset:** Both accumulators cleared at start of `process_snapshot()`.
+- **Stale registry cleanup:** Pre-pass before reconciler removes entry CIDs absent from exchange and not in pending sets.
