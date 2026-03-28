@@ -887,6 +887,9 @@ class LiveEngineV0:
         self._reduce_only_batch_qty: dict[tuple[str, str], Decimal] = {}
         # Provable current-tick lot additions from fill path (symbol → qty added)
         self._reduce_only_batch_new_lots_qty: dict[str, Decimal] = {}
+        # ADR-104: (symbol, side) pairs pending reduce-only repair after -2022 reject.
+        # Blocks further reduce-only exits for that direction until sync repairs topology.
+        self._reduce_only_pending_repair: set[tuple[str, str]] = set()
         # Adaptive Step Controller v1 (volatility-aware grid spacing)
         # Must be initialized BEFORE _create_grid_v2_bridge() so effective step
         # is available on cold start, not only on subsequent recreations.
@@ -4058,6 +4061,15 @@ class LiveEngineV0:
         if self._risk_base_enabled and result.snapshot is not None:
             self._update_risk_base(asof_ts_ms=int(time.time() * 1000))
 
+        # ADR-104: Reduce-only budget repair on sync.
+        # Detect and cancel surplus reduce-only exits before reconciler runs.
+        if (
+            result.snapshot is not None
+            and self._grid_v2_bridge is not None
+            and self._grid_v2_started
+        ):
+            self._reduce_only_repair_on_sync(result.snapshot)
+
         # ADR-096: Sync-driven reconciler
         if (
             self._sync_reconciler_enabled
@@ -4581,6 +4593,110 @@ class LiveEngineV0:
             if o.symbol == symbol and o.side == side.value and o.reduce_only:
                 total += o.qty - o.filled_qty
         return total
+
+    def _reduce_only_repair_on_sync(
+        self,
+        snapshot: object,
+    ) -> None:
+        """Detect and cancel surplus reduce-only exits on sync (ADR-104).
+
+        Runs before reconciler to converge illegal exit topology.
+        Cancels smallest surplus exits first to minimize disruption.
+        """
+        from grinder.live.reduce_only_budget import (  # noqa: PLC0415
+            RepairReason,
+            detect_surplus_exits,
+        )
+
+        sym = self._grid_v2_symbol
+        for side in (OrderSide.BUY, OrderSide.SELL):
+            surplus = detect_surplus_exits(snapshot, sym, side)  # type: ignore[arg-type]
+            repair_key = (sym, side.value)
+
+            if not surplus:
+                # No surplus on this side — if previously flagged, verify legal
+                # and clear flag only when topology is confirmed clean.
+                if repair_key in self._reduce_only_pending_repair:
+                    self._reduce_only_pending_repair.discard(repair_key)
+                    logger.info(
+                        "GRID_V2_REDUCE_ONLY_REPAIR_CONVERGED symbol=%s side=%s "
+                        "reason=topology_now_legal",
+                        sym,
+                        side.value,
+                    )
+                continue
+
+            logger.warning(
+                "GRID_V2_REDUCE_ONLY_REPAIR_START symbol=%s side=%s surplus_count=%d reason=%s",
+                sym,
+                side.value,
+                len(surplus),
+                RepairReason.SYNC_OVER_BUDGET.value,
+            )
+            all_ok = True
+            for repair in surplus:
+                cancel_action = ExecutionAction(
+                    action_type=ActionType.CANCEL,
+                    order_id=repair.order_id,
+                    symbol=sym,
+                    reason="GRID_V2_REDUCE_ONLY_REPAIR_CANCEL",
+                )
+                ts = int(time.time() * 1000)
+                result = self._process_action(cancel_action, ts)
+                if result.status == LiveActionStatus.EXECUTED:
+                    logger.info(
+                        "GRID_V2_REDUCE_ONLY_REPAIR_CANCEL symbol=%s order_id=%s remaining_qty=%s",
+                        sym,
+                        repair.order_id,
+                        repair.remaining_qty,
+                    )
+                else:
+                    all_ok = False
+                    logger.warning(
+                        "GRID_V2_REDUCE_ONLY_REPAIR_CANCEL_FAILED symbol=%s order_id=%s status=%s",
+                        sym,
+                        repair.order_id,
+                        result.status.value,
+                    )
+
+            if all_ok:
+                # All cancels succeeded — topology should now be legal.
+                # Clear flag so exits can resume.
+                self._reduce_only_pending_repair.discard(repair_key)
+                logger.info(
+                    "GRID_V2_REDUCE_ONLY_REPAIR_CONVERGED symbol=%s side=%s cancelled=%d",
+                    sym,
+                    side.value,
+                    len(surplus),
+                )
+            else:
+                # Some cancels failed — keep flag set, retry next sync.
+                # Ensure flag is set even if it wasn't before (sync-detected).
+                self._reduce_only_pending_repair.add(repair_key)
+                logger.warning(
+                    "GRID_V2_REDUCE_ONLY_REPAIR_DEFERRED symbol=%s side=%s "
+                    "reason=cancel_failed surplus_remaining=%d",
+                    sym,
+                    side.value,
+                    len(surplus),
+                )
+
+    def _on_reduce_only_reject(self, symbol: str, side: str, error_code: int) -> None:
+        """Handle -2022 ReduceOnly reject from exchange (ADR-104).
+
+        Flags (symbol, side) for repair. Further reduce-only exits for
+        that direction are blocked until sync-time repair clears the flag.
+        """
+        key = (symbol, side)
+        if error_code == -2022 and key not in self._reduce_only_pending_repair:
+            self._reduce_only_pending_repair.add(key)
+            logger.warning(
+                "GRID_V2_REDUCE_ONLY_REPAIR_TRIGGERED symbol=%s side=%s "
+                "reason=EXCHANGE_REJECT_2022 "
+                "action=blocking_further_exits_until_sync_repair",
+                symbol,
+                side,
+            )
 
     def _enforce_reduce_only(
         self,
@@ -5340,8 +5456,29 @@ class LiveEngineV0:
 
         intent = classify_intent(action, pos_sign=pos_sign)
 
-        # Gate 0: Reduce-only budget guard (aggregate qty check)
-        # Includes batch accumulator for multiple exits dispatched in same tick.
+        # Gate 0: Reduce-only budget guard v2 (ADR-104)
+        # Block further reduce-only exits when pending repair (after -2022 reject).
+        # Direction-scoped: only blocks the affected (symbol, side).
+        if (
+            action.action_type == ActionType.PLACE
+            and action.reduce_only
+            and action.symbol
+            and action.side is not None
+            and (action.symbol, action.side.value) in self._reduce_only_pending_repair
+        ):
+            logger.warning(
+                "Action blocked: REDUCE_ONLY_BUDGET_EXCEEDED "
+                "symbol=%s side=%s reason=pending_repair_after_reject",
+                action.symbol,
+                action.side.value,
+            )
+            return LiveAction(
+                action=action,
+                status=LiveActionStatus.BLOCKED,
+                block_reason=BlockReason.REDUCE_ONLY_BUDGET_EXCEEDED,
+                intent=intent,
+            )
+        # Uses reservation model: open_remaining + batch_reserved + new_qty <= position.
         if (
             action.action_type == ActionType.PLACE
             and action.reduce_only
@@ -5349,25 +5486,47 @@ class LiveEngineV0:
             and action.symbol
             and action.side is not None
         ):
-            position_qty = self._get_abs_position_qty(action.symbol)
-            if position_qty is not None:
-                existing_ro_qty = self._get_open_reduce_only_qty(action.symbol, action.side)
+            from grinder.live.reduce_only_budget import (  # noqa: PLC0415
+                BudgetCheckResult,
+                BudgetSnapshot,
+                _closeable_qty_for_side,
+                check_budget,
+            )
+
+            snap = self._last_account_snapshot
+            # Direction-aware: SELL exit → long closeable, BUY exit → short closeable
+            base_closeable = (
+                _closeable_qty_for_side(snap, action.symbol, action.side)
+                if snap is not None
+                else Decimal(0)
+            )
+            # Add provable current-tick lot additions
+            batch_additions = self._reduce_only_batch_new_lots_qty.get(action.symbol, Decimal(0))
+            position_qty = base_closeable + batch_additions
+            if position_qty > 0:
                 batch_key = (action.symbol, action.side.value)
                 batch_qty = self._reduce_only_batch_qty.get(batch_key, Decimal(0))
-                new_qty = action.quantity
-                total = existing_ro_qty + batch_qty + new_qty
-                if total > position_qty:
+                existing_ro = self._get_open_reduce_only_qty(action.symbol, action.side)
+                budget = BudgetSnapshot(
+                    symbol=action.symbol,
+                    side=action.side.value,
+                    position_closeable_qty=position_qty,
+                    open_reduce_only_remaining_qty=existing_ro,
+                    reserved_qty=batch_qty,
+                )
+                result = check_budget(budget, action.quantity)
+                if result == BudgetCheckResult.BLOCKED:
                     logger.warning(
                         "Action blocked: REDUCE_ONLY_BUDGET_EXCEEDED "
-                        "symbol=%s side=%s existing_ro=%s batch=%s new=%s "
-                        "total=%s position=%s",
+                        "symbol=%s side=%s open_ro=%s reserved=%s new=%s "
+                        "position=%s available=%s",
                         action.symbol,
                         action.side.value,
-                        existing_ro_qty,
-                        batch_qty,
-                        new_qty,
-                        total,
-                        position_qty,
+                        budget.open_reduce_only_remaining_qty,
+                        budget.reserved_qty,
+                        action.quantity,
+                        budget.position_closeable_qty,
+                        budget.available,
                     )
                     return LiveAction(
                         action=action,
@@ -5375,8 +5534,8 @@ class LiveEngineV0:
                         block_reason=BlockReason.REDUCE_ONLY_BUDGET_EXCEEDED,
                         intent=intent,
                     )
-                # Passed: accumulate for next action in same tick
-                self._reduce_only_batch_qty[batch_key] = batch_qty + new_qty
+                # Passed: accumulate reservation for next action in same tick
+                self._reduce_only_batch_qty[batch_key] = batch_qty + action.quantity
 
         # Gate 0.5: Live Health Gate — block writes when truth is unsafe
         if not self._is_write_allowed_by_health(action):
@@ -5911,7 +6070,7 @@ class LiveEngineV0:
         self._tp_close_retries.update(to_update)
         return results
 
-    def _execute_action(self, action: ExecutionAction, ts: int, intent: RiskIntent) -> LiveAction:  # noqa: PLR0912
+    def _execute_action(self, action: ExecutionAction, ts: int, intent: RiskIntent) -> LiveAction:  # noqa: PLR0912, PLR0915
         """Execute action on exchange port with retries.
 
         Args:
@@ -6045,6 +6204,11 @@ class LiveEngineV0:
                         delay_ms = self._retry_policy.compute_delay_ms(attempt)
                         time.sleep(delay_ms / 1000.0)
                 else:
+                    # ADR-104: Detect -2022 on reduce-only exits → flag for repair
+                    if action.reduce_only and action.symbol and action.side is not None:
+                        err_code = _extract_binance_error_code(str(e))
+                        if err_code == -2022:
+                            self._on_reduce_only_reject(action.symbol, action.side.value, err_code)
                     return LiveAction(
                         action=action,
                         status=LiveActionStatus.FAILED,

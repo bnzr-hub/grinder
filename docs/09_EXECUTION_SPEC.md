@@ -544,3 +544,12 @@ class OrderRetryPolicy:
 | `fill_rate` | Gauge | Fill rate (filled/placed) |
 | `round_trips_total` | Counter | Total round-trips completed |
 | `round_trip_pnl_bps` | Histogram | Round-trip P&L distribution |
+
+## Reduce-Only Budget Guard v2 (ADR-104)
+
+Gate 0 in `_process_action()` enforces reduce-only exit budget before dispatch:
+- `BudgetSnapshot` computed from exchange truth + same-tick reservations.
+- `check_budget()` returns ALLOWED/BLOCKED/POSITION_UNKNOWN.
+- Batch accumulator tracks same-tick reservations, reset per tick.
+- Sync-time `detect_surplus_exits()` repairs over-budget topology.
+- See `docs/10_RISK_SPEC.md` for detailed accounting model.

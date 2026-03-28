@@ -4487,3 +4487,19 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Key invariant:** When actual matches effective but not theoretical, no actions are generated (no churn). Effective desired count never exceeds `legal_entry_capacity`.
 - **Implementation:** `src/grinder/grid_v2/sync_reconciler.py` (ProjectionMode, _project_desired_entries, updated ReconcileResult), engine logging in `src/grinder/live/engine.py`.
 - **Tests:** 19 adversarial tests in `tests/unit/test_effective_desired_state.py`.
+
+### ADR-104: Reduce-Only Budget Guard v2 (2026-03-28)
+
+- **Status:** Delivered.
+- **Decision:** Full reservation model for reduce-only exits: `open_remaining + reserved + new_qty <= position_closeable_qty`. Sync-time repair detects and cancels surplus exits deterministically.
+- **BudgetSnapshot:** `position_closeable_qty` (exchange truth + provable fills), `open_reduce_only_remaining_qty` (qty - filled_qty for open exits), `reserved_qty` (same-tick batch accumulator). Properties: `available`, `over_budget_qty`, `is_over_budget`.
+- **Gate 0 v2:** Uses `BudgetSnapshot` + `check_budget()`. Returns `ALLOWED`, `BLOCKED`, or `POSITION_UNKNOWN` (fail-closed).
+- **Repair path:** `detect_surplus_exits()` identifies over-budget topology at sync time. Cancels smallest exits first to minimize disruption. `_reduce_only_repair_on_sync()` runs before reconciler each sync cycle.
+- **Logs:** `GRID_V2_REDUCE_ONLY_REPAIR_START`, `GRID_V2_REDUCE_ONLY_REPAIR_CANCEL`, `GRID_V2_REDUCE_ONLY_REPAIR_CONVERGED`, `REDUCE_ONLY_BUDGET_EXCEEDED` (block).
+- **Partial fills:** `remaining_qty = qty - filled_qty` throughout — never uses `origQty`.
+- **Direction-aware:** SELL exit budgets against LONG closeable qty only. BUY exit budgets against SHORT closeable qty only. Handles hedge-mode (LONG/SHORT sides) and one-way mode (BOTH with signed_qty).
+- **-2022 reject path:** On Binance `-2022 ReduceOnly Order is rejected`, `(symbol, side)` is flagged `_reduce_only_pending_repair`. Further reduce-only exits for that direction blocked until sync repairs topology. Opposite side unaffected. No retry storm.
+- **Isolation:** Budget is symbol-scoped and direction-scoped.
+- **Implementation:** `src/grinder/live/reduce_only_budget.py` (new module: BudgetSnapshot, check_budget, detect_surplus_exits, _closeable_qty_for_side), Gate 0 in `engine.py`, sync repair + -2022 hook in `engine.py`.
+- **Convergence:** `CONVERGED` logged only when all repair cancels succeed. If any cancel fails, flag stays set (`DEFERRED`), blocks exits until next sync confirms legal topology. No premature convergence.
+- **Tests:** 31 adversarial tests in `tests/unit/test_reduce_only_budget_v2.py`.
