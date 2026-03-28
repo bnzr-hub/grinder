@@ -863,6 +863,8 @@ class LiveEngineV0:
         self._sync_reconciler_pending_actions: list[ExecutionAction] = []
         # Batch accumulator for reduce-only budget guard (reset per tick)
         self._reduce_only_batch_qty: dict[tuple[str, str], Decimal] = {}
+        # Provable current-tick lot additions from fill path (symbol → qty added)
+        self._reduce_only_batch_new_lots_qty: dict[str, Decimal] = {}
         # Adaptive Step Controller v1 (volatility-aware grid spacing)
         # Must be initialized BEFORE _create_grid_v2_bridge() so effective step
         # is available on cold start, not only on subsequent recreations.
@@ -1930,6 +1932,19 @@ class LiveEngineV0:
                     )
                     continue
                 self._maybe_track_lot_closure(symbol, result)
+                # Provable lot addition: entry fill created a new lot this tick.
+                # Use the qty from the SM transition result (the actual lot created),
+                # not bridge._config.order_size (which may differ if config changed).
+                fill_qty = (
+                    result.transition.snapshot.open_lots[-1].qty
+                    if result.transition
+                    and result.transition.snapshot
+                    and result.transition.snapshot.open_lots
+                    else bridge._config.order_size  # fallback only
+                )
+                self._reduce_only_batch_new_lots_qty[symbol] = (
+                    self._reduce_only_batch_new_lots_qty.get(symbol, Decimal(0)) + fill_qty
+                )
                 actions.extend(result.execution_actions)
                 continue
 
@@ -2542,6 +2557,12 @@ class LiveEngineV0:
 
             self._grid_v2_user_fill_seen.add(oe.client_order_id)
             self._maybe_track_lot_closure(oe.symbol, result)
+            # Provable lot addition from user-data fill path
+            parsed_ud = bridge.adapter.parse_cid(oe.client_order_id)
+            if parsed_ud is not None and parsed_ud.kind.value == "ENTRY" and not result.rejected:
+                self._reduce_only_batch_new_lots_qty[oe.symbol] = (
+                    self._reduce_only_batch_new_lots_qty.get(oe.symbol, Decimal(0)) + qty
+                )
             if result.execution_actions:
                 self._grid_v2_dispatch_immediate_actions(list(result.execution_actions), oe.ts)
             return
@@ -2745,6 +2766,7 @@ class LiveEngineV0:
         """
         # Reset per-tick batch accumulators
         self._reduce_only_batch_qty.clear()
+        self._reduce_only_batch_new_lots_qty.clear()
 
         # Store snapshot for SOR market data (Launch-14 PR2)
         self._last_snapshot = snapshot
@@ -4237,41 +4259,25 @@ class LiveEngineV0:
         return None  # flat or no position
 
     def _get_abs_position_qty(self, symbol: str) -> Decimal | None:
-        """Get absolute position qty, fail-closed: min(snapshot, SM).
+        """Get effective position qty for reduce-only budget guard.
 
-        Snapshot = exchange truth (refreshes every 5s, may be stale).
-        SM open_lots = internal model (updated per-tick, may diverge).
-        Use min() for fail-closed behavior: if either source says less,
-        the budget guard is tighter.
-        SM is fallback only when snapshot is unavailable.
+        Base = exchange snapshot (SSOT, refreshes every ~5s).
+        Addition = provable current-tick lot creations from fill path.
+        Result = snapshot_qty + batch_new_lots_qty (fail-closed).
+
+        Does NOT use generic SM open_lots as override for exchange truth.
         """
-        # Exchange snapshot (primary)
         snap = self._last_account_snapshot
-        snap_qty: Decimal | None = None
+        snap_qty = Decimal(0)
         if snap is not None:
-            total = Decimal(0)
             for p in snap.positions:
                 if p.symbol == symbol:
-                    total += abs(p.qty)
-            snap_qty = total if total > 0 else None
+                    snap_qty += abs(p.qty)
 
-        # SM open lots (secondary / fallback)
-        sm_qty: Decimal | None = None
-        bridge = self._grid_v2_bridge
-        if (
-            bridge is not None
-            and bridge.state_machine is not None
-            and symbol == self._grid_v2_symbol
-        ):
-            total = Decimal(0)
-            for lot in bridge.state_machine.snapshot.open_lots:
-                total += lot.qty
-            sm_qty = total if total > 0 else None
-
-        # Fail-closed: min of available sources
-        if snap_qty is not None and sm_qty is not None:
-            return min(snap_qty, sm_qty)
-        return snap_qty or sm_qty
+        # Add provable current-tick lot additions (fill-derived only)
+        batch_additions = self._reduce_only_batch_new_lots_qty.get(symbol, Decimal(0))
+        effective = snap_qty + batch_additions
+        return effective if effective > 0 else None
 
     def _get_open_reduce_only_qty(self, symbol: str, side: OrderSide | None) -> Decimal:
         """Sum qty of open reduce-only orders actually on exchange.
