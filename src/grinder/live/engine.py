@@ -242,6 +242,7 @@ class BlockReason(Enum):
     RISK_PORTFOLIO_DD_FREEZE = "RISK_PORTFOLIO_DD_FREEZE"
     RISK_PORTFOLIO_DD_FORCE_REDUCE = "RISK_PORTFOLIO_DD_FORCE_REDUCE"
     RISK_PORTFOLIO_DD_KILL_SWITCH = "RISK_PORTFOLIO_DD_KILL_SWITCH"
+    REDUCE_ONLY_BUDGET_EXCEEDED = "REDUCE_ONLY_BUDGET_EXCEEDED"
 
 
 # PR-2 (ADR-092): Map RiskGateReason → BlockReason for risk base enforcement gate.
@@ -860,6 +861,8 @@ class LiveEngineV0:
             )
         # Pending actions from reconciler dispatch (for fill-detection exclusion)
         self._sync_reconciler_pending_actions: list[ExecutionAction] = []
+        # Batch accumulator for reduce-only budget guard (reset per tick)
+        self._reduce_only_batch_qty: dict[tuple[str, str], Decimal] = {}
         # Adaptive Step Controller v1 (volatility-aware grid spacing)
         # Must be initialized BEFORE _create_grid_v2_bridge() so effective step
         # is available on cold start, not only on subsequent recreations.
@@ -2740,6 +2743,9 @@ class LiveEngineV0:
         Returns:
             LiveEngineOutput with paper output and live action results
         """
+        # Reset per-tick batch accumulators
+        self._reduce_only_batch_qty.clear()
+
         # Store snapshot for SOR market data (Launch-14 PR2)
         self._last_snapshot = snapshot
 
@@ -4230,6 +4236,31 @@ class LiveEngineV0:
             return -1
         return None  # flat or no position
 
+    def _get_abs_position_qty(self, symbol: str) -> Decimal | None:
+        """Get absolute position qty for a symbol from last account snapshot."""
+        snap = self._last_account_snapshot
+        if snap is None:
+            return None
+        total = Decimal(0)
+        for p in snap.positions:
+            if p.symbol == symbol:
+                total += abs(p.qty)
+        return total if total > 0 else None
+
+    def _get_open_reduce_only_qty(self, symbol: str, side: OrderSide | None) -> Decimal:
+        """Sum remaining qty of open reduce-only orders for symbol+side.
+
+        Uses qty - filled_qty to account for partial fills.
+        """
+        snap = self._last_account_snapshot
+        if snap is None or side is None:
+            return Decimal(0)
+        total = Decimal(0)
+        for o in snap.open_orders:
+            if o.symbol == symbol and o.side == side.value and o.reduce_only:
+                total += o.qty - o.filled_qty
+        return total
+
     def _enforce_reduce_only(
         self,
         action: ExecutionAction,
@@ -4970,7 +5001,7 @@ class LiveEngineV0:
         else:
             self._symbol_consecutive_losses[symbol] = 0
 
-    def _process_action(self, action: ExecutionAction, ts: int) -> LiveAction:  # noqa: PLR0911, PLR0912
+    def _process_action(self, action: ExecutionAction, ts: int) -> LiveAction:  # noqa: PLR0911, PLR0912, PLR0915
         """Process single action through safety gates and execute.
 
         Args:
@@ -4987,6 +5018,44 @@ class LiveEngineV0:
         self._enforce_reduce_only(action, pos_sign)
 
         intent = classify_intent(action, pos_sign=pos_sign)
+
+        # Gate 0: Reduce-only budget guard (aggregate qty check)
+        # Includes batch accumulator for multiple exits dispatched in same tick.
+        if (
+            action.action_type == ActionType.PLACE
+            and action.reduce_only
+            and action.quantity is not None
+            and action.symbol
+            and action.side is not None
+        ):
+            position_qty = self._get_abs_position_qty(action.symbol)
+            if position_qty is not None:
+                existing_ro_qty = self._get_open_reduce_only_qty(action.symbol, action.side)
+                batch_key = (action.symbol, action.side.value)
+                batch_qty = self._reduce_only_batch_qty.get(batch_key, Decimal(0))
+                new_qty = action.quantity
+                total = existing_ro_qty + batch_qty + new_qty
+                if total > position_qty:
+                    logger.warning(
+                        "Action blocked: REDUCE_ONLY_BUDGET_EXCEEDED "
+                        "symbol=%s side=%s existing_ro=%s batch=%s new=%s "
+                        "total=%s position=%s",
+                        action.symbol,
+                        action.side.value,
+                        existing_ro_qty,
+                        batch_qty,
+                        new_qty,
+                        total,
+                        position_qty,
+                    )
+                    return LiveAction(
+                        action=action,
+                        status=LiveActionStatus.BLOCKED,
+                        block_reason=BlockReason.REDUCE_ONLY_BUDGET_EXCEEDED,
+                        intent=intent,
+                    )
+                # Passed: accumulate for next action in same tick
+                self._reduce_only_batch_qty[batch_key] = batch_qty + new_qty
 
         # Gate 1: Arming check
         if not self._config.armed:
