@@ -4206,7 +4206,70 @@ class LiveEngineV0:
                 or recon.extra_exits
             )
             is_primary = self._sync_reconciler_primary
+
+            # ADR-106: Explicit no-action reason when sync produces zero actions.
+            if not has_diff:
+                from grinder.live.reason_codes import classify_no_action_reason  # noqa: PLC0415
+
+                _no_action = classify_no_action_reason(
+                    recon_has_diff=has_diff,
+                    theoretical_entries=recon.theoretical_desired_entry_count,
+                    effective_entries=recon.desired_entry_count,
+                    actual_entries=recon.actual_entry_count,
+                    is_risk_saturated=self._grid_v2_symbol in self._risk_saturated_symbols,
+                    is_awaiting_sync=getattr(self, "_grid_v2_awaiting_sync", False),
+                    is_started=self._grid_v2_started,
+                    reconstruction_ok=self._grid_v2_bridge.reconstruction_ok
+                    if self._grid_v2_bridge
+                    else False,
+                )
+                if _no_action is not None:
+                    # Throttle: only log non-healthy reasons every time,
+                    # healthy steady-state every 100 syncs
+                    from grinder.live.reason_codes import NoActionReason  # noqa: PLC0415
+
+                    _is_healthy = _no_action == NoActionReason.ACTUAL_MATCHES_EFFECTIVE_TARGET
+                    _ss_key = self._grid_v2_symbol
+                    _ss_count = self._rolling_steady_state_count.get(_ss_key, 0) + 1
+                    self._rolling_steady_state_count[_ss_key] = _ss_count
+                    if not _is_healthy or _ss_count % 100 == 1:
+                        logger.info(
+                            "GRID_V2_NO_ACTION symbol=%s reason=%s "
+                            "theoretical_entries=%d effective_entries=%d "
+                            "actual_entries=%d projection=%s",
+                            self._grid_v2_symbol,
+                            _no_action.value,
+                            recon.theoretical_desired_entry_count,
+                            recon.desired_entry_count,
+                            recon.actual_entry_count,
+                            recon.projection_mode.value,
+                        )
+                    if _is_healthy:
+                        pass  # reset on diff below
+                else:
+                    self._rolling_steady_state_count[self._grid_v2_symbol] = 0
+
+            # ADR-106: Entry suppression reason when projection active
+            if recon.desired_entry_count < recon.theoretical_desired_entry_count:
+                from grinder.live.reason_codes import EntrySuppressionReason  # noqa: PLC0415
+
+                if recon.desired_entry_count == 0:
+                    _entry_reason = EntrySuppressionReason.EFFECTIVE_TARGET_ZERO
+                else:
+                    _entry_reason = EntrySuppressionReason.EFFECTIVE_TARGET_PARTIAL
+                logger.info(
+                    "GRID_V2_ENTRY_SUPPRESSED symbol=%s reason=%s "
+                    "theoretical=%d effective=%d projection=%s capacity=%s",
+                    self._grid_v2_symbol,
+                    _entry_reason.value,
+                    recon.theoretical_desired_entry_count,
+                    recon.desired_entry_count,
+                    recon.projection_mode.value,
+                    recon.legal_entry_capacity,
+                )
+
             if has_diff:
+                self._rolling_steady_state_count[self._grid_v2_symbol] = 0
                 logger.info(
                     "GRID_V2_SYNC_RECONCILER symbol=%s mode=%s "
                     "theoretical_entries=%d effective_entries=%d actual_entries=%d "
@@ -5627,11 +5690,13 @@ class LiveEngineV0:
             and action.side is not None
             and (action.symbol, action.side.value) in self._reduce_only_pending_repair
         ):
+            from grinder.live.reason_codes import ExitSuppressionReason  # noqa: PLC0415
+
             logger.warning(
-                "Action blocked: REDUCE_ONLY_BUDGET_EXCEEDED "
-                "symbol=%s side=%s reason=pending_repair_after_reject",
+                "GRID_V2_EXIT_SUPPRESSED symbol=%s side=%s reason=%s",
                 action.symbol,
                 action.side.value,
+                ExitSuppressionReason.PENDING_REPAIR_AFTER_REJECT.value,
             )
             return LiveAction(
                 action=action,
@@ -5677,12 +5742,17 @@ class LiveEngineV0:
                 )
                 result = check_budget(budget, action.quantity)
                 if result == BudgetCheckResult.BLOCKED:
+                    from grinder.live.reason_codes import (  # noqa: PLC0415
+                        ExitSuppressionReason,
+                    )
+
                     logger.warning(
-                        "Action blocked: REDUCE_ONLY_BUDGET_EXCEEDED "
-                        "symbol=%s side=%s open_ro=%s reserved=%s new=%s "
+                        "GRID_V2_EXIT_SUPPRESSED symbol=%s side=%s reason=%s "
+                        "open_ro=%s reserved=%s new=%s "
                         "position=%s available=%s",
                         action.symbol,
                         action.side.value,
+                        ExitSuppressionReason.REDUCE_ONLY_BUDGET_EXCEEDED.value,
                         budget.open_reduce_only_remaining_qty,
                         budget.reserved_qty,
                         action.quantity,
@@ -5700,11 +5770,14 @@ class LiveEngineV0:
 
         # Gate 0.5: Live Health Gate — block writes when truth is unsafe
         if not self._is_write_allowed_by_health(action):
+            from grinder.live.reason_codes import HealthBlockReason  # noqa: PLC0415
+
+            _health_reason = HealthBlockReason.__members__.get(self._health_mode.value, None)
             logger.warning(
-                "LIVE_WRITE_BLOCKED_UNSAFE_TRUTH mode=%s action=%s symbol=%s",
-                self._health_mode.value,
-                action.action_type.value,
+                "GRID_V2_HEALTH_BLOCK symbol=%s reason=%s action=%s",
                 action.symbol or "?",
+                _health_reason.value if _health_reason else self._health_mode.value,
+                action.action_type.value,
             )
             return LiveAction(
                 action=action,

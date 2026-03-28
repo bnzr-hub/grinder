@@ -718,3 +718,57 @@ GRID_V2_EXIT_TOPOLOGY_REPAIR_CONVERGED symbol=BTCUSDT cancels=1 places=0 deferre
 Additional outcome events:
 - `GRID_V2_EXIT_TOPOLOGY_REPAIR_CONVERGED` — all repair actions succeeded, topology is legal.
 - `GRID_V2_EXIT_TOPOLOGY_REPAIR_INCOMPLETE` — one or more actions failed or deferred; topology not yet converged.
+
+## Reason Codes (ADR-106)
+
+Stable reason codes for every major suppressed/degraded/no-op path.
+
+### GRID_V2_NO_ACTION
+Emitted when sync cycle produces zero repair/reconcile actions.
+```
+GRID_V2_NO_ACTION symbol=BTCUSDT reason=ACTUAL_MATCHES_EFFECTIVE_TARGET
+  theoretical_entries=4 effective_entries=4 actual_entries=4 projection=UNCONSTRAINED
+```
+
+| Reason | Meaning |
+|--------|---------|
+| `ACTUAL_MATCHES_EFFECTIVE_TARGET` | Healthy steady-state: actual == effective |
+| `RISK_SATURATED_TARGET_ZERO` | Risk-saturated: effective=0 while theoretical>0 |
+| `EFFECTIVE_TARGET_PARTIAL_MATCHED` | Partial projection matched: actual == effective < theoretical |
+| `AWAITING_SYNC` | Waiting for first account sync |
+| `NOT_STARTED` | Grid V2 not yet started |
+| `RECONSTRUCTION_PENDING` | SM reconstruction not yet complete |
+
+### GRID_V2_ENTRY_SUPPRESSED
+Emitted when projection reduces desired entries.
+```
+GRID_V2_ENTRY_SUPPRESSED symbol=BTCUSDT reason=EFFECTIVE_TARGET_ZERO
+  theoretical=4 effective=0 projection=RISK_CONSTRAINED_ZERO capacity=0
+```
+
+| Reason | Meaning |
+|--------|---------|
+| `EFFECTIVE_TARGET_ZERO` | All entries suppressed (fully constrained) |
+| `EFFECTIVE_TARGET_PARTIAL` | Some entries suppressed (partial capacity) |
+
+### GRID_V2_EXIT_SUPPRESSED
+Emitted when reduce-only exit is blocked.
+```
+GRID_V2_EXIT_SUPPRESSED symbol=BTCUSDT side=BUY reason=REDUCE_ONLY_BUDGET_EXCEEDED
+GRID_V2_EXIT_SUPPRESSED symbol=BTCUSDT side=BUY reason=PENDING_REPAIR_AFTER_REJECT
+```
+
+### GRID_V2_HEALTH_BLOCK
+Emitted when health gate blocks a write.
+```
+GRID_V2_HEALTH_BLOCK symbol=BTCUSDT reason=STALE_TRUTH action=PLACE
+```
+
+### Reason Families
+| Family | Count | Emitted as | Module |
+|--------|-------|------------|--------|
+| NoActionReason | 6 | `GRID_V2_NO_ACTION reason=` | reason_codes.py |
+| EntrySuppressionReason | 5 | `GRID_V2_ENTRY_SUPPRESSED reason=` | reason_codes.py |
+| ExitSuppressionReason | 4 | `GRID_V2_EXIT_SUPPRESSED reason=` | reason_codes.py |
+| HealthBlockReason | 4 | `GRID_V2_HEALTH_BLOCK reason=` | reason_codes.py |
+| RepairStatusReason | 6 | Stable event names (not `reason=`) | reason_codes.py |
