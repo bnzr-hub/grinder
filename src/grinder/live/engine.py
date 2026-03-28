@@ -243,6 +243,7 @@ class BlockReason(Enum):
     RISK_PORTFOLIO_DD_FORCE_REDUCE = "RISK_PORTFOLIO_DD_FORCE_REDUCE"
     RISK_PORTFOLIO_DD_KILL_SWITCH = "RISK_PORTFOLIO_DD_KILL_SWITCH"
     REDUCE_ONLY_BUDGET_EXCEEDED = "REDUCE_ONLY_BUDGET_EXCEEDED"
+    HEALTH_GATE_UNSAFE = "HEALTH_GATE_UNSAFE"
 
 
 # PR-2 (ADR-092): Map RiskGateReason → BlockReason for risk base enforcement gate.
@@ -632,6 +633,17 @@ class LiveEngineV0:
         # Cleared on AccountSync refresh (snapshot reflects cancel result).
         self._cancel_dispatched_pending_sync: set[str] = set()
         self._account_sync_generation: int = 0
+        # Live Health Gate (PR-1 of production program)
+        from grinder.live.health_gate import (  # noqa: PLC0415
+            LiveHealthConfig,
+            LiveHealthInput,
+            LiveHealthMode,
+        )
+
+        self._health_config = LiveHealthConfig()
+        self._health_input = LiveHealthInput()
+        self._health_mode = LiveHealthMode.HEALTHY
+        self._health_mode_prev = LiveHealthMode.HEALTHY
         # ADR-089: rolling steady-state log throttle (1 per 100 zero-action ticks per symbol)
         self._rolling_steady_state_count: dict[str, int] = {}
         # PR-ROLLING-GRID-V1B: rolling grid mode (doc-26, safe-by-default)
@@ -2768,6 +2780,9 @@ class LiveEngineV0:
         self._reduce_only_batch_qty.clear()
         self._reduce_only_batch_new_lots_qty.clear()
 
+        # Live Health Gate: evaluate truth-source health
+        self._evaluate_and_update_health_mode(snapshot)
+
         # Store snapshot for SOR market data (Launch-14 PR2)
         self._last_snapshot = snapshot
 
@@ -3926,7 +3941,17 @@ class LiveEngineV0:
 
         if result.error is not None:
             logger.warning("Account sync failed: %s", result.error)
+            self._on_sync_failure()
+            # Detect DNS errors for health gate
+            error_str = str(result.error)
+            if "name resolution" in error_str.lower() or "connection error" in error_str.lower():
+                self._on_dns_error()
+            if "-1021" in error_str:
+                self._on_clock_drift_error()
             return
+
+        # Successful sync: update health signals
+        self._on_sync_success()
 
         if result.snapshot is not None and result.mismatches:
             logger.warning(
@@ -4223,6 +4248,82 @@ class LiveEngineV0:
             snap.is_stale_hard,
             snap.is_below_min,
         )
+
+    def _evaluate_and_update_health_mode(self, _snapshot: Snapshot) -> None:
+        """Evaluate truth-source health and update mode. Log transitions."""
+        from grinder.live.health_gate import evaluate_health  # noqa: PLC0415
+
+        # Update health input signals from real connector state
+        now = time.time()
+        # WS liveness from connector stats (not assumed from snapshot arrival)
+        ws_stats = (
+            getattr(self._live_connector, "stats", None)
+            if hasattr(self, "_live_connector")
+            else None
+        )
+        if ws_stats is not None:
+            self._health_input.ws_connected = getattr(ws_stats, "is_connected", True)
+            last_msg = getattr(ws_stats, "last_message_ts", 0)
+            if last_msg > 0:
+                self._health_input.last_ws_message_ts = last_msg / 1000.0  # ms → s
+        else:
+            # No connector reference: use snapshot ts as fallback
+            self._health_input.last_ws_message_ts = now
+
+        result = evaluate_health(self._health_input, self._health_config, now)
+        self._health_mode = result.mode
+
+        # Log mode transitions
+        if self._health_mode != self._health_mode_prev:
+            logger.warning(
+                "LIVE_HEALTH_MODE_CHANGED from=%s to=%s reason=%s "
+                "write_allowed=%s reduce_only_allowed=%s",
+                self._health_mode_prev.value,
+                result.mode.value,
+                result.reason,
+                result.write_allowed,
+                result.reduce_only_allowed,
+            )
+            self._health_mode_prev = self._health_mode
+
+    def _on_sync_success(self) -> None:
+        """Update health input after successful account sync."""
+        self._health_input.last_sync_success_ts = time.time()
+        self._health_input.consecutive_sync_failures = 0
+
+    def _on_sync_failure(self) -> None:
+        """Update health input after failed account sync."""
+        self._health_input.consecutive_sync_failures += 1
+
+    def _on_clock_drift_error(self) -> None:
+        """Update health input after -1021 clock drift error."""
+        self._health_input.last_clock_drift_error_ts = time.time()
+        self._health_input.clock_drift_errors_recent += 1
+
+    def _on_dns_error(self) -> None:
+        """Update health input after DNS/connectivity error."""
+        self._health_input.last_dns_error_ts = time.time()
+        self._health_input.dns_errors_recent += 1
+
+    def _is_write_allowed_by_health(self, action: ExecutionAction) -> bool:
+        """Check if action is allowed under current health mode.
+
+        Returns True if allowed, False if blocked.
+        """
+        from grinder.live.health_gate import evaluate_health  # noqa: PLC0415
+
+        result = evaluate_health(self._health_input, self._health_config)
+
+        # CANCEL always allowed
+        if action.action_type == ActionType.CANCEL:
+            return True
+
+        # Reduce-only allowed in some degraded modes
+        if action.reduce_only and result.reduce_only_allowed:
+            return True
+
+        # Normal writes
+        return result.write_allowed
 
     def _get_position_sign(self, symbol: str) -> int | None:
         """Determine net position direction for a symbol (PR-INV-1).
@@ -5090,6 +5191,21 @@ class LiveEngineV0:
                 # Passed: accumulate for next action in same tick
                 self._reduce_only_batch_qty[batch_key] = batch_qty + new_qty
 
+        # Gate 0.5: Live Health Gate — block writes when truth is unsafe
+        if not self._is_write_allowed_by_health(action):
+            logger.warning(
+                "LIVE_WRITE_BLOCKED_UNSAFE_TRUTH mode=%s action=%s symbol=%s",
+                self._health_mode.value,
+                action.action_type.value,
+                action.symbol or "?",
+            )
+            return LiveAction(
+                action=action,
+                status=LiveActionStatus.BLOCKED,
+                block_reason=BlockReason.HEALTH_GATE_UNSAFE,
+                intent=intent,
+            )
+
         # Gate 1: Arming check
         if not self._config.armed:
             logger.debug("Action blocked: NOT_ARMED (action=%s)", action.action_type.value)
@@ -5718,11 +5834,16 @@ class LiveEngineV0:
                         intent=intent,
                     )
 
-        # All retries exhausted
+        # All retries exhausted — detect health signals from error
+        error_str = str(last_error) if last_error else ""
+        if "-1021" in error_str:
+            self._on_clock_drift_error()
+        if "name resolution" in error_str.lower() or "connection error" in error_str.lower():
+            self._on_dns_error()
         logger.error(
             "Max retries exceeded for %s: %s",
             action.action_type.value,
-            str(last_error),
+            error_str,
         )
         return LiveAction(
             action=action,

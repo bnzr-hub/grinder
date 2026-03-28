@@ -4440,3 +4440,14 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Fail-closed:** Guard blocks if `existing_ro + batch + new > effective_position`. No fail-open path. SM state is not trusted as override.
 - **Accumulators reset:** Both accumulators cleared at start of `process_snapshot()`.
 - **Stale registry cleanup:** Pre-pass before reconciler removes entry CIDs absent from exchange and not in pending sets.
+
+### ADR-100: Live Health Gate (2026-03-28)
+
+- **Status:** Delivered.
+- **Decision:** Introduce first-class health evaluation for truth sources. Engine consults health gate before dispatching writes. Fail-closed on stale truth.
+- **Modes:** HEALTHY → DEGRADED_SYNC → DEGRADED_WS → STALE_TRUTH → PAUSED_UNSAFE.
+- **Signals:** account sync freshness/failures, WS freshness/connectivity, clock drift errors, DNS errors.
+- **Write policy:** HEALTHY/DEGRADED: writes allowed. STALE_TRUTH: only cancel + reduce-only. PAUSED_UNSAFE: only cancel.
+- **Init phase:** Before first successful sync, mode is HEALTHY (health gate not yet activated).
+- **Transitions:** Logged with reason codes (`LIVE_HEALTH_MODE_CHANGED`). Write blocks logged (`LIVE_WRITE_BLOCKED_UNSAFE_TRUTH`).
+- **Implementation:** `src/grinder/live/health_gate.py` (pure evaluator), engine fields + gate in `_process_action`.
