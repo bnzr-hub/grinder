@@ -4248,9 +4248,10 @@ class LiveEngineV0:
         return total if total > 0 else None
 
     def _get_open_reduce_only_qty(self, symbol: str, side: OrderSide | None) -> Decimal:
-        """Sum remaining qty of open reduce-only orders for symbol+side.
+        """Sum qty of open reduce-only orders actually on exchange.
 
-        Uses qty - filled_qty to account for partial fills.
+        Uses account snapshot (what Binance sees) + partial fill accounting.
+        SM exits are what we're TRYING to place — don't count them as existing.
         """
         snap = self._last_account_snapshot
         if snap is None or side is None:
