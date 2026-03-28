@@ -4268,9 +4268,12 @@ class LiveEngineV0:
                 total += lot.qty
             sm_qty = total if total > 0 else None
 
-        # Fail-closed: min of available sources
+        # Use max: SM updates per-tick (current after fills), snapshot lags
+        # by sync interval. max() prevents false blocks on valid exits when
+        # snapshot is stale after rapid fills. Batch accumulator is the
+        # within-tick safety net against over-dispatch.
         if snap_qty is not None and sm_qty is not None:
-            return min(snap_qty, sm_qty)
+            return max(snap_qty, sm_qty)
         return snap_qty or sm_qty
 
     def _get_open_reduce_only_qty(self, symbol: str, side: OrderSide | None) -> Decimal:
