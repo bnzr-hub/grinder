@@ -1471,3 +1471,11 @@ Integrity repair is **role-separated**: ENTRY and EXIT checks are distinct.
 - `GRINDER_GRID_V2_GEOMETRY_REPAIR_ENABLED=1` (default ON)
 - `GRINDER_GRID_V2_GEOMETRY_EPSILON_TICKS=1`
 - `GRINDER_GRID_V2_REPAIR_STRICT_GEOMETRY=0` (default OFF; branch repair only)
+
+**Exit step-spacing (B2, ADR-098):**
+- Paired exits must maintain minimum spacing of `step_price` from all existing open exits.
+- `step_price = _grid_step_price(reference_price, grid_step_pct, price_tick_size)`.
+- On collision or insufficient spacing: shift away by full `step_price` units (SELL → up, BUY → down).
+- Bounded search: `max_inventory_levels + 2` attempts.
+- Fail-closed: if no valid slot found after exhaustion, `PLACE_EXIT` is skipped. Lot is still created; exit placement deferred to reconciler on next sync cycle.
+- Exchange tick quantization applied after spacing resolution in bridge dispatch.

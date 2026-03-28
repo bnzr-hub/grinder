@@ -29,6 +29,7 @@ from grinder.grid_v2.state import (
     LotStatus,
     OperatorCleanup,
     RecenterRequested,
+    _grid_step_price,
 )
 
 # ---------------------------------------------------------------------------
@@ -1827,3 +1828,126 @@ class TestRollingWindowCollisionGuard:
                 )
                 assert not r2.rejected, f"Cycle {cycle} exit rejected"
                 _assert_no_duplicate_prices(sm)
+
+
+# ---------------------------------------------------------------------------
+# Exit step-spacing tests
+# ---------------------------------------------------------------------------
+
+
+def _open_exit_prices_list(sm: GridV2StateMachine) -> list[Decimal]:
+    """Get sorted list of open exit prices."""
+    return sorted(eo.price for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
+
+
+class TestExitStepSpacing:
+    """Verify exits maintain minimum grid-step spacing after collision resolution."""
+
+    @staticmethod
+    def _step_price() -> Decimal:
+        """Canonical step_price for ref=100, step=1%, tick=0.01."""
+        return _grid_step_price(_REF_PRICE, Decimal("0.01"), Decimal("0.01"))
+
+    def test_two_nearby_entries_exits_spaced_by_step(self) -> None:
+        """Two BUY fills at adjacent prices → exits spaced ≥ step_price exactly."""
+        cfg = _config(step=Decimal("0.01"), levels=5, tick_size=Decimal("0.01"))
+        sm = GridV2StateMachine.create_initial(cfg, Decimal("100"), _BASE_TS)
+
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(_entry_filled(side=OrderSide.BUY, price=buy1, order_id="e1"))
+
+        buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(_entry_filled(side=OrderSide.BUY, price=buy2, order_id="e2", ts=_BASE_TS + 2))
+
+        exits = _open_exit_prices_list(sm)
+        assert len(exits) == 2
+        spacing = abs(exits[1] - exits[0])
+        step = self._step_price()
+        assert spacing >= step, f"Exit spacing {spacing} < step {step}"
+
+    def test_three_clustered_lots_all_unique_step_spaced(self) -> None:
+        """Three BUY fills → three exits, all unique, pairwise ≥ step_price."""
+        cfg = _config(step=Decimal("0.01"), levels=5, tick_size=Decimal("0.01"))
+        sm = GridV2StateMachine.create_initial(cfg, Decimal("100"), _BASE_TS)
+
+        for i in range(3):
+            if not sm.snapshot.entry_window.buy_entry_prices:
+                break
+            buy = sm.snapshot.entry_window.buy_entry_prices[0]
+            sm.apply(
+                _entry_filled(side=OrderSide.BUY, price=buy, order_id=f"e{i}", ts=_BASE_TS + i + 1)
+            )
+
+        exits = _open_exit_prices_list(sm)
+        assert len(exits) == 3
+        assert len(set(exits)) == 3, f"Duplicate exits: {exits}"
+        step = self._step_price()
+        for i in range(len(exits) - 1):
+            spacing = abs(exits[i + 1] - exits[i])
+            assert spacing >= step, (
+                f"Pair {exits[i]}-{exits[i + 1]} spacing {spacing} < step {step}"
+            )
+
+    def test_short_branch_buy_exits_step_spaced(self) -> None:
+        """SHORT lots → BUY exits also maintain step spacing."""
+        cfg = _config(step=Decimal("0.01"), levels=5, tick_size=Decimal("0.01"))
+        sm = GridV2StateMachine.create_initial(cfg, Decimal("100"), _BASE_TS)
+
+        for i in range(2):
+            if not sm.snapshot.entry_window.sell_entry_prices:
+                break
+            sell = sm.snapshot.entry_window.sell_entry_prices[0]
+            sm.apply(
+                _entry_filled(
+                    side=OrderSide.SELL, price=sell, order_id=f"e{i}", ts=_BASE_TS + i + 1
+                )
+            )
+
+        exits = _open_exit_prices_list(sm)
+        assert len(exits) == 2
+        step = self._step_price()
+        spacing = abs(exits[1] - exits[0])
+        assert spacing >= step, f"Exit spacing {spacing} < step {step}"
+
+    def test_no_shift_when_base_exit_already_clear(self) -> None:
+        """Single lot: base exit has no collision → no shift needed."""
+        cfg = _config(step=Decimal("0.01"), levels=3, tick_size=Decimal("0.01"))
+        sm = GridV2StateMachine.create_initial(cfg, Decimal("100"), _BASE_TS)
+
+        buy = sm.snapshot.entry_window.buy_entry_prices[0]
+        r = sm.apply(_entry_filled(side=OrderSide.BUY, price=buy, order_id="e1"))
+        assert not r.rejected
+
+        exits = _open_exit_prices_list(sm)
+        assert len(exits) == 1
+        # Base exit = entry * (1 + 0.01) = 99 * 1.01 = 99.99 → no shift
+        expected = buy * (Decimal(1) + Decimal("0.01"))
+        assert exits[0] == expected
+
+    def test_dense_occupied_exits_fail_closed(self) -> None:
+        """When search exhausted (dense occupied ladder), PLACE_EXIT is skipped.
+
+        Lot still created but exit deferred to reconciler.
+        """
+        cfg = _config(step=Decimal("0.01"), levels=5, max_levels=3, tick_size=Decimal("0.01"))
+        sm = GridV2StateMachine.create_initial(cfg, Decimal("100"), _BASE_TS)
+
+        # Fill 3 BUY entries → 3 lots + 3 exits
+        for i in range(3):
+            if not sm.snapshot.entry_window.buy_entry_prices:
+                break
+            buy = sm.snapshot.entry_window.buy_entry_prices[0]
+            r = sm.apply(
+                _entry_filled(side=OrderSide.BUY, price=buy, order_id=f"e{i}", ts=_BASE_TS + i + 1)
+            )
+            assert not r.rejected
+
+        # All exits should be unique and step-spaced (or some skipped if no slot)
+        exits = _open_exit_prices_list(sm)
+        assert len(set(exits)) == len(exits), f"Duplicate exits: {exits}"
+        step = self._step_price()
+        for i in range(len(exits) - 1):
+            spacing = abs(exits[i + 1] - exits[i])
+            assert spacing >= step, (
+                f"Pair {exits[i]}-{exits[i + 1]} spacing {spacing} < step {step}"
+            )

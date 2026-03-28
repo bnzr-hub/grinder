@@ -441,7 +441,7 @@ class GridV2StateMachine:
             return "BRANCH_INCOMPATIBLE"
         return ""
 
-    def _execute_entry(self, event: EntryFilled) -> TransitionResult:
+    def _execute_entry(self, event: EntryFilled) -> TransitionResult:  # noqa: PLR0912
         """Execute a validated entry fill."""
         snap = self._snapshot
         cfg = self._config
@@ -453,22 +453,30 @@ class GridV2StateMachine:
             lot_side, exit_side = LotSide.SHORT, OrderSide.BUY
             exit_price = event.price * (Decimal(1) - cfg.grid_step_pct)
 
-        # B2: Exit price collision guard — shift by ±1 tick if occupied
+        # Exit spacing guard: minimum distance between exits = one grid step.
+        # Shifts by full step_price units (not ticks) to maintain grid geometry.
+        # Bounded search; fail-closed if no valid slot found (skip PLACE_EXIT).
         existing_exit_prices = {
             eo.price for eo in snap.exit_orders if eo.status == ExitOrderStatus.OPEN
         }
-        if exit_price in existing_exit_prices and cfg.price_tick_size > 0:
-            # Shift exit away from entry (SELL exit → +1 tick, BUY exit → -1 tick)
-            if exit_side == OrderSide.SELL:
-                exit_price = exit_price + cfg.price_tick_size
-            else:
-                exit_price = exit_price - cfg.price_tick_size
-            # Second collision check: if still occupied, shift one more tick
-            if exit_price in existing_exit_prices:
+        exit_spacing_valid = True
+        if existing_exit_prices and cfg.price_tick_size > 0:
+            step_price = _grid_step_price(
+                snap.entry_window.reference_price, cfg.grid_step_pct, cfg.price_tick_size
+            )
+            max_attempts = cfg.max_inventory_levels + 2  # bounded by grid capacity
+            for _ in range(max_attempts):
+                too_close = any(abs(exit_price - ep) < step_price for ep in existing_exit_prices)
+                if not too_close:
+                    break
                 if exit_side == OrderSide.SELL:
-                    exit_price = exit_price + cfg.price_tick_size
+                    exit_price = exit_price + step_price
                 else:
-                    exit_price = exit_price - cfg.price_tick_size
+                    exit_price = exit_price - step_price
+            else:
+                # Exhausted search: no valid slot found. Fail-closed: skip PLACE_EXIT.
+                # Lot is still created; exit will be placed by reconciler on next cycle.
+                exit_spacing_valid = False
 
         lot = InventoryLot(
             lot_id=f"lot-{event.order_id}",
@@ -490,16 +498,18 @@ class GridV2StateMachine:
             status=ExitOrderStatus.OPEN,
         )
 
-        actions: list[ActionIntent] = [
-            ActionIntent(
-                kind=ActionIntentKind.PLACE_EXIT,
-                side=exit_side,
-                price=exit_price,
-                qty=event.qty,
-                lot_id=lot.lot_id,
-                reason="PAIRED_EXIT_FOR_LOT",
-            ),
-        ]
+        actions: list[ActionIntent] = []
+        if exit_spacing_valid:
+            actions.append(
+                ActionIntent(
+                    kind=ActionIntentKind.PLACE_EXIT,
+                    side=exit_side,
+                    price=exit_price,
+                    qty=event.qty,
+                    lot_id=lot.lot_id,
+                    reason="PAIRED_EXIT_FOR_LOT",
+                )
+            )
 
         new_window, rolling_actions = self._update_window_after_fill(event)
         actions.extend(rolling_actions)

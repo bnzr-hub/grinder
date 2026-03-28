@@ -4425,7 +4425,7 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 
 - **Status:** Delivered.
 - **Decision:** Three additional collision guards for rolling grid correctness.
-- **B2 — Exit price collision:** In `_execute_entry()`, after computing exit_price, check against existing open exit prices. If collision → shift by ±1 tick (then ±2 if still collides). Prevents duplicate exit orders (e.g., 2× SELL@0.0600).
+- **B2 — Exit step-spacing guard:** In `_execute_entry()`, exits must maintain minimum spacing of `step_price` from all existing open exits. If base exit is too close, shift away by full `step_price` units (not ticks). Bounded search: `max_inventory_levels + 2` attempts. Fail-closed: if no valid slot found after exhaustion, `PLACE_EXIT` is skipped (lot still created; exit deferred to reconciler on next sync cycle). Supersedes prior ±1/2 tick shift.
 - **B1 — Expanded occupied prices:** `_occupied_prices()` now includes `{lot.entry_price for lot in open_lots}`. Prevents cross-cycle entry duplicates where exit restore re-generates a price matching an existing lot's entry.
 - **B3-alt — Distance clamp:** In `_update_window_after_fill()`, new entry must be within `2 × entry_levels_per_side × step_price` from reference_price. Prevents cascading drift from batch fills (4 fills in one tick → 4 sequential shifts → entries far from current price).
 
