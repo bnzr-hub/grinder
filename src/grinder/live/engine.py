@@ -4237,20 +4237,47 @@ class LiveEngineV0:
         return None  # flat or no position
 
     def _get_abs_position_qty(self, symbol: str) -> Decimal | None:
-        """Get absolute position qty for a symbol from last account snapshot."""
+        """Get absolute position qty, fail-closed: min(snapshot, SM).
+
+        Snapshot = exchange truth (refreshes every 5s, may be stale).
+        SM open_lots = internal model (updated per-tick, may diverge).
+        Use min() for fail-closed behavior: if either source says less,
+        the budget guard is tighter.
+        SM is fallback only when snapshot is unavailable.
+        """
+        # Exchange snapshot (primary)
         snap = self._last_account_snapshot
-        if snap is None:
-            return None
-        total = Decimal(0)
-        for p in snap.positions:
-            if p.symbol == symbol:
-                total += abs(p.qty)
-        return total if total > 0 else None
+        snap_qty: Decimal | None = None
+        if snap is not None:
+            total = Decimal(0)
+            for p in snap.positions:
+                if p.symbol == symbol:
+                    total += abs(p.qty)
+            snap_qty = total if total > 0 else None
+
+        # SM open lots (secondary / fallback)
+        sm_qty: Decimal | None = None
+        bridge = self._grid_v2_bridge
+        if (
+            bridge is not None
+            and bridge.state_machine is not None
+            and symbol == self._grid_v2_symbol
+        ):
+            total = Decimal(0)
+            for lot in bridge.state_machine.snapshot.open_lots:
+                total += lot.qty
+            sm_qty = total if total > 0 else None
+
+        # Fail-closed: min of available sources
+        if snap_qty is not None and sm_qty is not None:
+            return min(snap_qty, sm_qty)
+        return snap_qty or sm_qty
 
     def _get_open_reduce_only_qty(self, symbol: str, side: OrderSide | None) -> Decimal:
-        """Sum remaining qty of open reduce-only orders for symbol+side.
+        """Sum qty of open reduce-only orders actually on exchange.
 
-        Uses qty - filled_qty to account for partial fills.
+        Uses account snapshot (what Binance sees) + partial fill accounting.
+        SM exits are what we're TRYING to place — don't count them as existing.
         """
         snap = self._last_account_snapshot
         if snap is None or side is None:
