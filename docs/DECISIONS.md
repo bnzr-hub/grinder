@@ -4451,3 +4451,14 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Init phase:** Before first successful sync, mode is HEALTHY (health gate not yet activated).
 - **Transitions:** Logged with reason codes (`LIVE_HEALTH_MODE_CHANGED`). Write blocks logged (`LIVE_WRITE_BLOCKED_UNSAFE_TRUTH`).
 - **Implementation:** `src/grinder/live/health_gate.py` (pure evaluator), engine fields + gate in `_process_action`.
+
+### ADR-101: Live Preflight / Ceremony Gate (2026-03-28)
+
+- **Status:** Delivered.
+- **Decision:** Armed mainnet runs must pass a deterministic preflight gate before entering the trading loop. Fail-closed: hard failures abort with exit code 2.
+- **Checks:** dns_resolution, exchange_time_sync, ws_bootstrap, account_sync_read, symbol_metadata_read, config_consistency.
+- **Clock drift:** warn at 500ms, fail at 1500ms offset.
+- **Config consistency:** armed+mainnet requires live_trade mode + required acks.
+- **Non-armed/testnet:** preflight skipped (explicit pass).
+- **Read-only:** No trading writes during preflight.
+- **Implementation:** `src/grinder/live/preflight.py`, wired in `scripts/run_trading.py` before engine build.

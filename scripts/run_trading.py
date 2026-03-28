@@ -1705,6 +1705,38 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         print(f"  Fixture: {args.fixture}")
         print("  Network guard: ACTIVE (external connections blocked)")
 
+    # Build read-only syncer for preflight (before engine build)
+    preflight_syncer = None
+    if args.armed and args.mainnet and parse_bool("GRINDER_ACCOUNT_SYNC_ENABLED", default=False):
+        from grinder.account.syncer import AccountSyncer  # noqa: PLC0415
+
+        preflight_syncer = AccountSyncer(port)
+
+    # Live Preflight Gate (PR-2): fail-closed before trading loop
+    from grinder.live.preflight import run_preflight  # noqa: PLC0415
+
+    preflight_report = run_preflight(
+        armed=args.armed,
+        mainnet=args.mainnet,
+        mode_value=mode.value,
+        syncer=preflight_syncer,
+        port=port,
+        symbols=symbols,
+        env_acks={
+            "ALLOW_MAINNET_TRADE": os.environ.get("ALLOW_MAINNET_TRADE") == "1",
+            "GRINDER_REAL_PORT_ACK": os.environ.get("GRINDER_REAL_PORT_ACK")
+            in (
+                "YES_I_REALLY_WANT_MAINNET",
+                "1",
+                "true",
+            ),
+        },
+    )
+    preflight_report.print_report()
+    if not preflight_report.passed:
+        print("LIVE_PREFLIGHT BLOCKED: armed run cannot start. Fix blockers above.")
+        sys.exit(2)
+
     server = run_server(args.metrics_port)
     print(f"  Health endpoint: http://localhost:{args.metrics_port}/healthz")
 
