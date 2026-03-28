@@ -4462,3 +4462,15 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Non-armed/testnet:** preflight skipped (explicit pass).
 - **Read-only:** No trading writes during preflight.
 - **Implementation:** `src/grinder/live/preflight.py`, wired in `scripts/run_trading.py` before engine build.
+
+### ADR-102: Risk-Saturated Mode (2026-03-28)
+
+- **Status:** Delivered.
+- **Decision:** When RISK_SYMBOL_CAP repeatedly blocks entries for a symbol, project the legal entry target down to actual capacity, preventing staging→block→repeat churn.
+- **Mechanism:** Per-symbol consecutive RISK_SYMBOL_CAP block counter. Increments only when symbol-cap blocks actual restore demand (entries missing on exchange relative to SM desired state before risk projection). Passive zero-headroom with a fully satisfied ladder does NOT count. Counter resets on: allowed action, non-cap block, or sync-time headroom. When counter ≥ threshold (default 3, env `GRINDER_RISK_SATURATION_THRESHOLD`), symbol enters saturation.
+- **Legal capacity projection:** `reconcile_grid_state(risk_entry_capacity=N)` where N = `min(symbol_headroom, gross_headroom, net_headroom)` across all active Gate 5.5 caps, each converted via `floor(headroom / per_entry_notional)`. `None` = unconstrained, `0` = fully blocked, `N > 0` = partial ladder (N closest entries to reference kept). Extra entries on exchange still cancelled. Exits unaffected.
+- **Structured reason:** `_compute_risk_legal_entry_capacity()` returns `(capacity, is_symbol_cap_blocked)`. Only `SYMBOL_CAP_EXCEEDED` blocks with actual missing entries on exchange count toward the saturation counter. Other block reasons (stale, portfolio caps, DD) suppress entries but do NOT trigger `RISK_SATURATED` mode. If blocking reason changes from symbol-cap to another reason, saturation flag clears immediately.
+- **Proactive recovery:** Saturation evaluates on every sync (not only on future entry actions). When headroom returns, saturation clears immediately without requiring a new entry attempt. Non-symbol-cap blocks also reset the saturation counter (different failure mode breaks consecutive chain).
+- **Logs:** `GRID_V2_RISK_SATURATED_ENTER` on entry, `GRID_V2_RISK_SATURATED_EXIT` on recovery (with trigger: `sync_headroom_restored` or `headroom_restored`).
+- **Implementation:** `_compute_risk_legal_entry_capacity()` + `_estimate_per_entry_notional()` in engine, proactive evaluation in sync path, `risk_entry_capacity` param in `sync_reconciler.py`.
+- **Tests:** 21 adversarial tests in `tests/unit/test_risk_saturation.py`.

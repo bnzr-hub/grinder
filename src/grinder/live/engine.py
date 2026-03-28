@@ -29,6 +29,7 @@ See: ADR-036 for design decisions
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -644,6 +645,15 @@ class LiveEngineV0:
         self._health_input = LiveHealthInput()
         self._health_mode = LiveHealthMode.HEALTHY
         self._health_mode_prev = LiveHealthMode.HEALTHY
+        # ADR-102: Risk-Saturated Mode — per-symbol tracking
+        # Consecutive RISK_SYMBOL_CAP blocks (reset on allow, non-cap block, or sync headroom)
+        self._risk_cap_consecutive_blocks: dict[str, int] = {}
+        # Threshold: N consecutive cap blocks → enter saturation
+        self._risk_saturation_threshold = int(
+            os.environ.get("GRINDER_RISK_SATURATION_THRESHOLD", "3")
+        )
+        # Currently saturated symbols
+        self._risk_saturated_symbols: set[str] = set()
         # ADR-089: rolling steady-state log throttle (1 per 100 zero-action ticks per symbol)
         self._rolling_steady_state_count: dict[str, int] = {}
         # PR-ROLLING-GRID-V1B: rolling grid mode (doc-26, safe-by-default)
@@ -4080,11 +4090,91 @@ class LiveEngineV0:
 
             from grinder.grid_v2.sync_reconciler import reconcile_grid_state  # noqa: PLC0415
 
+            # ADR-102: Proactive saturation evaluation on sync.
+            # Decouple recovery from future entry actions — evaluate here.
+            _sym = self._grid_v2_symbol
+            _legal_cap, _is_sym_cap = self._compute_risk_legal_entry_capacity(_sym, result.snapshot)
+
+            # Check whether entries are actually missing on exchange (before risk
+            # projection). "Restore demand" = desired entry keys from SM minus
+            # actual entry keys on exchange. If all desired are already present,
+            # zero-headroom is passive — not a "blocked entry."
+            _sm = self._grid_v2_bridge.state_machine
+            _desired_keys: set[tuple[OrderSide, Decimal]] = set()
+            for _p in _sm.snapshot.entry_window.buy_entry_prices:
+                _desired_keys.add(
+                    (OrderSide.BUY, self._grid_v2_bridge._quantize_price(_p, OrderSide.BUY))
+                )
+            for _p in _sm.snapshot.entry_window.sell_entry_prices:
+                _desired_keys.add(
+                    (OrderSide.SELL, self._grid_v2_bridge._quantize_price(_p, OrderSide.SELL))
+                )
+            if (
+                _sm.mode != BranchMode.FLAT
+                and len(_sm.snapshot.open_lots) >= self._grid_v2_bridge._config.max_inventory_levels
+            ):
+                _desired_keys = set()  # inventory full → no desired entries
+
+            _actual_keys: set[tuple[OrderSide, Decimal]] = set()
+            for _o in result.snapshot.open_orders:
+                if _o.symbol != _sym:
+                    continue
+                _parsed = self._grid_v2_bridge.adapter.parse_cid(_o.order_id)
+                if _parsed is not None and _parsed.kind.value == "ENTRY":
+                    with contextlib.suppress(ValueError):
+                        _actual_keys.add((OrderSide(_o.side), _o.price))
+            _has_restore_demand = bool(_desired_keys - _actual_keys)
+
+            if _legal_cap is not None:
+                if _legal_cap == 0 and _is_sym_cap and _has_restore_demand:
+                    # Symbol cap blocked actual entry demand → count toward saturation
+                    prev = self._risk_cap_consecutive_blocks.get(_sym, 0)
+                    self._risk_cap_consecutive_blocks[_sym] = prev + 1
+                    if (
+                        self._risk_cap_consecutive_blocks[_sym] >= self._risk_saturation_threshold
+                        and _sym not in self._risk_saturated_symbols
+                    ):
+                        self._risk_saturated_symbols.add(_sym)
+                        logger.warning(
+                            "GRID_V2_RISK_SATURATED_ENTER symbol=%s "
+                            "consecutive_cap_blocks=%d threshold=%d "
+                            "trigger=sync_proactive",
+                            _sym,
+                            self._risk_cap_consecutive_blocks[_sym],
+                            self._risk_saturation_threshold,
+                        )
+                elif _legal_cap == 0:
+                    # Zero headroom but either non-symbol-cap reason or no restore
+                    # demand. Do NOT count toward saturation.
+                    # Also clear saturation flag if reason changed away from sym cap.
+                    if self._risk_cap_consecutive_blocks.get(_sym, 0) > 0:
+                        self._risk_cap_consecutive_blocks[_sym] = 0
+                    if not _is_sym_cap and _sym in self._risk_saturated_symbols:
+                        self._risk_saturated_symbols.discard(_sym)
+                        logger.info(
+                            "GRID_V2_RISK_SATURATED_EXIT symbol=%s "
+                            "reason=blocking_reason_changed_from_sym_cap",
+                            _sym,
+                        )
+                else:
+                    # Headroom exists — clear saturation proactively
+                    if _sym in self._risk_saturated_symbols:
+                        self._risk_saturated_symbols.discard(_sym)
+                        logger.info(
+                            "GRID_V2_RISK_SATURATED_EXIT symbol=%s "
+                            "reason=sync_headroom_restored legal_cap=%d",
+                            _sym,
+                            _legal_cap,
+                        )
+                    if self._risk_cap_consecutive_blocks.get(_sym, 0) > 0:
+                        self._risk_cap_consecutive_blocks[_sym] = 0
+
             recon = reconcile_grid_state(
                 snapshot=result.snapshot,
                 symbol=self._grid_v2_symbol,
                 bridge=self._grid_v2_bridge,
                 max_actions=self._sync_reconciler_max_actions,
+                risk_entry_capacity=_legal_cap,
             )
             has_diff = bool(
                 recon.missing_entries
@@ -4304,6 +4394,98 @@ class LiveEngineV0:
         """Update health input after DNS/connectivity error."""
         self._health_input.last_dns_error_ts = time.time()
         self._health_input.dns_errors_recent += 1
+
+    def _compute_risk_legal_entry_capacity(
+        self,
+        symbol: str,
+        snapshot: object,
+    ) -> tuple[int | None, bool]:
+        """Compute how many additional entries are legally allowed by risk caps.
+
+        Computes capacity as min across all active Gate 5.5 caps:
+        symbol cap, portfolio gross cap, portfolio net cap.
+
+        Returns:
+            (capacity, is_symbol_cap_blocked) where:
+            - capacity: int >= 0 (0=fully blocked, N=partial), None=unconstrained.
+            - is_symbol_cap_blocked: True only when SYMBOL_CAP is the binding
+              constraint. Used by caller to decide saturation counter increment.
+        """
+        if not self._risk_base_enabled:
+            return None, False
+        if self._risk_base_snapshot is None or snapshot is None:
+            return 0, False  # fail-closed, not symbol-cap-specific
+        from grinder.risk.portfolio_risk import (  # noqa: PLC0415
+            RiskGateReason,
+            compute_portfolio_notionals,
+            compute_symbol_notional,
+            evaluate_risk_gate,
+        )
+
+        # First check if risk gate blocks outright (stale, below min, DD, etc.)
+        decision = evaluate_risk_gate(
+            risk_base=self._risk_base_snapshot,
+            snapshot=snapshot,  # type: ignore[arg-type]
+            config=self._portfolio_risk_config,
+            symbol=symbol,
+        )
+        if not decision.allowed:
+            is_sym_cap = decision.reason == RiskGateReason.SYMBOL_CAP_EXCEEDED
+            return 0, is_sym_cap
+
+        # Gate passed — compute headroom per entry from each active cap
+        base_usd = float(self._risk_base_snapshot.value_usd)
+        per_entry = self._estimate_per_entry_notional()
+        if per_entry is None or per_entry <= 0:
+            return None, False  # can't estimate, unconstrained
+
+        capacities: list[int] = []
+        cfg = self._portfolio_risk_config
+
+        # Symbol cap headroom
+        if cfg.symbol_max_notional_pct > 0:
+            sym_limit = base_usd * cfg.symbol_max_notional_pct
+            sym_notional = float(
+                compute_symbol_notional(snapshot, symbol)  # type: ignore[arg-type]
+            )
+            sym_headroom = sym_limit - sym_notional
+            capacities.append(max(0, int(sym_headroom / per_entry)))
+
+        # Portfolio gross cap headroom
+        if cfg.portfolio_max_gross_notional_pct > 0 or cfg.portfolio_max_net_notional_pct > 0:
+            gross, net = compute_portfolio_notionals(snapshot)  # type: ignore[arg-type]
+            if cfg.portfolio_max_gross_notional_pct > 0:
+                gross_limit = base_usd * cfg.portfolio_max_gross_notional_pct
+                gross_headroom = gross_limit - float(gross)
+                capacities.append(max(0, int(gross_headroom / per_entry)))
+            if cfg.portfolio_max_net_notional_pct > 0:
+                net_limit = base_usd * cfg.portfolio_max_net_notional_pct
+                net_headroom = net_limit - float(net)
+                capacities.append(max(0, int(net_headroom / per_entry)))
+
+        if not capacities:
+            return None, False  # no caps enabled, unconstrained
+
+        min_cap = min(capacities)
+        # is_symbol_cap_blocked: True only when symbol cap is the tightest and = 0
+        is_sym_cap = False
+        if min_cap == 0 and cfg.symbol_max_notional_pct > 0:
+            sym_limit = base_usd * cfg.symbol_max_notional_pct
+            sym_notional = float(
+                compute_symbol_notional(snapshot, symbol)  # type: ignore[arg-type]
+            )
+            is_sym_cap = sym_notional >= sym_limit
+        return min_cap, is_sym_cap
+
+    def _estimate_per_entry_notional(self) -> float | None:
+        """Estimate notional value of a single grid entry order."""
+        if self._grid_v2_bridge is None or self._grid_v2_bridge.state_machine is None:
+            return None
+        order_size = float(self._grid_v2_bridge._config.order_size)
+        ref_price = float(self._grid_v2_bridge.state_machine.snapshot.entry_window.reference_price)
+        if order_size > 0 and ref_price > 0:
+            return order_size * ref_price
+        return None
 
     def _is_write_allowed_by_health(self, action: ExecutionAction) -> bool:
         """Check if action is allowed under current health mode.
@@ -5298,6 +5480,28 @@ class LiveEngineV0:
                     _rb_decision.reason, BlockReason.RISK_BASE_UNAVAILABLE
                 )
                 get_risk_base_metrics().record_gate_block(_rb_block.value)
+                # ADR-102: Track consecutive RISK_SYMBOL_CAP blocks for saturation.
+                # Only consecutive cap blocks count. A non-cap block resets the
+                # counter (different failure mode, not sustained cap pressure).
+                _sym = action.symbol or ""
+                if _rb_block == BlockReason.RISK_SYMBOL_CAP and _sym:
+                    prev = self._risk_cap_consecutive_blocks.get(_sym, 0)
+                    self._risk_cap_consecutive_blocks[_sym] = prev + 1
+                    if (
+                        self._risk_cap_consecutive_blocks[_sym] >= self._risk_saturation_threshold
+                        and _sym not in self._risk_saturated_symbols
+                    ):
+                        self._risk_saturated_symbols.add(_sym)
+                        logger.warning(
+                            "GRID_V2_RISK_SATURATED_ENTER symbol=%s "
+                            "consecutive_cap_blocks=%d threshold=%d",
+                            _sym,
+                            self._risk_cap_consecutive_blocks[_sym],
+                            self._risk_saturation_threshold,
+                        )
+                elif _sym and self._risk_cap_consecutive_blocks.get(_sym, 0) > 0:
+                    # Non-cap block resets consecutive cap counter
+                    self._risk_cap_consecutive_blocks[_sym] = 0
                 logger.warning(
                     "Action blocked: %s (%s) symbol=%s action=%s",
                     _rb_block.value,
@@ -5311,6 +5515,17 @@ class LiveEngineV0:
                     block_reason=_rb_block,
                     intent=intent,
                 )
+            else:
+                # ADR-102: Risk gate allowed — reset cap block counter, exit saturation
+                _sym = action.symbol or ""
+                if _sym and self._risk_cap_consecutive_blocks.get(_sym, 0) > 0:
+                    self._risk_cap_consecutive_blocks[_sym] = 0
+                if _sym and _sym in self._risk_saturated_symbols:
+                    self._risk_saturated_symbols.discard(_sym)
+                    logger.info(
+                        "GRID_V2_RISK_SATURATED_EXIT symbol=%s reason=headroom_restored",
+                        _sym,
+                    )
 
         # Gate 6: DrawdownGuardV1 (if configured)
         if self._drawdown_guard is not None:
