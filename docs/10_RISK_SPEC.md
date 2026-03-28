@@ -521,3 +521,24 @@ When `RISK_SYMBOL_CAP` blocks entry placement repeatedly, the reconciler's proje
 - **Proactive recovery:** Saturation is re-evaluated on every sync cycle. When headroom returns, saturation clears immediately — no new entry action required.
 - **Logs:** `GRID_V2_RISK_SATURATED_ENTER` / `GRID_V2_RISK_SATURATED_EXIT`.
 - **Per-symbol:** Saturation for BTCUSDT does not affect ETHUSDT.
+
+## Effective Desired State Projection (ADR-103)
+
+Three-layer model for reconciler target state under risk constraints:
+
+1. **Theoretical desired state:** What SM/grid window wants absent hard constraints.
+2. **Effective desired state:** Legal target after risk projection (`_project_desired_entries()`).
+3. **Actual exchange state:** What exists on exchange.
+
+The reconciler diffs **actual vs effective**, never actual vs theoretical.
+
+- **ProjectionMode:** `UNCONSTRAINED` (theoretical == effective), `RISK_CONSTRAINED_PARTIAL` (N closest to reference kept), `RISK_CONSTRAINED_ZERO` (no entries allowed).
+- **Partial projection policy:** Keep N entries closest to reference price. Deterministic ordering by `abs(price - reference)`.
+- **ReconcileResult fields:**
+  - `theoretical_desired_entry_count` — SM wants (before projection)
+  - `desired_entry_count` — effective desired (after projection)
+  - `projection_mode` — which ProjectionMode was applied
+  - `legal_entry_capacity` — risk cap value passed to reconciler
+- **Log schema:** `GRID_V2_SYNC_RECONCILER` now includes `theoretical_entries=N effective_entries=M projection=MODE capacity=C`.
+- **Pipeline ordering:** theoretical construction → gap detection supplement → legal projection → diff against actual. Gap detection adds to theoretical BEFORE projection, so effective never exceeds legal capacity.
+- **Key invariant:** When actual matches effective but not theoretical, reconciler produces zero actions (no churn). `desired_entry_count <= legal_entry_capacity` always holds when capacity is set.

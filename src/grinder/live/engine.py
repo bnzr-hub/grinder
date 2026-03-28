@@ -4186,13 +4186,16 @@ class LiveEngineV0:
             if has_diff:
                 logger.info(
                     "GRID_V2_SYNC_RECONCILER symbol=%s mode=%s "
-                    "desired_entries=%d actual_entries=%d missing=%d extra=%d "
+                    "theoretical_entries=%d effective_entries=%d actual_entries=%d "
+                    "missing=%d extra=%d "
                     "desired_exits=%d actual_exits=%d missing_exits=%d extra_exits=%d "
-                    "would_cancel=%d would_place=%d cycle_ms=%d primary=%s",
+                    "would_cancel=%d would_place=%d cycle_ms=%d "
+                    "projection=%s capacity=%s primary=%s",
                     self._grid_v2_symbol,
                     self._grid_v2_bridge.state_machine.mode.value
                     if self._grid_v2_bridge.state_machine
                     else "?",
+                    recon.theoretical_desired_entry_count,
                     recon.desired_entry_count,
                     recon.actual_entry_count,
                     recon.missing_entries,
@@ -4204,6 +4207,8 @@ class LiveEngineV0:
                     recon.would_cancel,
                     recon.would_place,
                     recon.cycle_ms,
+                    recon.projection_mode.value,
+                    recon.legal_entry_capacity,
                     is_primary,
                 )
             # PRIMARY MODE: stage actions for dispatch on next process_snapshot tick

@@ -4474,3 +4474,16 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Logs:** `GRID_V2_RISK_SATURATED_ENTER` on entry, `GRID_V2_RISK_SATURATED_EXIT` on recovery (with trigger: `sync_headroom_restored` or `headroom_restored`).
 - **Implementation:** `_compute_risk_legal_entry_capacity()` + `_estimate_per_entry_notional()` in engine, proactive evaluation in sync path, `risk_entry_capacity` param in `sync_reconciler.py`.
 - **Tests:** 21 adversarial tests in `tests/unit/test_risk_saturation.py`.
+
+### ADR-103: Effective Desired State Projection (2026-03-28)
+
+- **Status:** Delivered.
+- **Decision:** The reconciler must operate on a three-layer model: theoretical desired state (what SM wants), effective desired state (legal target after risk projection), and actual exchange state. Diffs are computed against effective, not theoretical.
+- **ProjectionMode enum:** `UNCONSTRAINED` (theoretical == effective), `RISK_CONSTRAINED_PARTIAL` (N closest entries kept), `RISK_CONSTRAINED_ZERO` (no entries allowed).
+- **Projection function:** `_project_desired_entries()` — deterministic ranking by proximity to reference price. Extracted as standalone, testable pure function.
+- **ReconcileResult fields:** `theoretical_desired_entry_count`, `desired_entry_count` (effective), `projection_mode`, `legal_entry_capacity`. The `desired_entry_count` field now always means effective desired (after projection).
+- **Logging:** `GRID_V2_SYNC_RECONCILER` log now includes `theoretical_entries`, `effective_entries`, `projection`, `capacity` fields.
+- **Pipeline ordering:** theoretical construction → gap detection supplement → legal projection → diff against actual. Gap detection adds to theoretical BEFORE projection, ensuring effective never exceeds legal capacity.
+- **Key invariant:** When actual matches effective but not theoretical, no actions are generated (no churn). Effective desired count never exceeds `legal_entry_capacity`.
+- **Implementation:** `src/grinder/grid_v2/sync_reconciler.py` (ProjectionMode, _project_desired_entries, updated ReconcileResult), engine logging in `src/grinder/live/engine.py`.
+- **Tests:** 19 adversarial tests in `tests/unit/test_effective_desired_state.py`.
