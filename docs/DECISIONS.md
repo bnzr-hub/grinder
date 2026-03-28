@@ -4532,3 +4532,20 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **classify_no_action_reason():** Pure function, deterministic classification from sync state.
 - **Implementation:** `src/grinder/live/reason_codes.py` (new module), engine sync path in `engine.py`.
 - **Tests:** 17 adversarial tests in `tests/unit/test_reason_codes.py` (enum pinning + classifier paths + 3 engine-path observability tests).
+
+### ADR-107: Final Integration + Acceptance (2026-03-28)
+
+- **Status:** Delivered.
+- **Decision:** Prove the 8-PR production stack composes correctly under adversarial multi-layer conditions. Cross-feature integration tests + launch-readiness packet + go/no-go criteria.
+- **Integration matrix:** 10 cross-feature scenarios in `tests/integration/test_live_acceptance_matrix.py`:
+  1. Health gate + preflight interaction (armed path)
+  2. Risk saturation + effective desired projection (no churn)
+  3. Reduce-only budget + exit topology repair
+  4. -2022 reject → repair latch → convergence (real engine path)
+  5. Partial fill → topology recompute → legal budget
+  6. Actual matches effective but not theoretical → zero churn
+  7. Symbol isolation under mixed modes (real engine path)
+  8. Observability contract under integrated failure
+  9-11. Launch readiness command GO/NO-GO contract (3 tests)
+- **Launch readiness:** `scripts/launch_readiness.py` — reproducible command running real preflight checks + config validation. `docs/runbooks/38_GRID_V2_LAUNCH_READINESS.md` — go/no-go checklist, in-run watchpoints, blocker vs warning events, verification success criteria, executable cleanup procedure.
+- **Scope:** This ADR does not introduce new trading logic. It proves the existing stack composes and provides operator guidance for live verification runs.
