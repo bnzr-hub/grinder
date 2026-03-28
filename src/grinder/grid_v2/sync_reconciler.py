@@ -58,6 +58,8 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     symbol: str,
     bridge: Any,  # GridV2Bridge — use Any to avoid circular import
     max_actions: int = 10,
+    *,
+    risk_entry_capacity: int | None = None,
 ) -> ReconcileResult:
     """Compute deterministic repair actions from fresh account snapshot.
 
@@ -66,6 +68,10 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
         symbol: Trading symbol.
         bridge: GridV2Bridge instance (for SM state, adapter, quantize).
         max_actions: Max total actions (cancel + place) per sync cycle.
+        risk_entry_capacity: Legal additional entry capacity (ADR-102).
+            None = unconstrained (risk base disabled or data unavailable).
+            0 = fully saturated (no new entries allowed).
+            N > 0 = partial ladder (truncate desired to N entries).
 
     Returns:
         ReconcileResult with deterministic action list.
@@ -89,6 +95,23 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     )
     if inventory_full:
         desired_entry_keys = set()
+
+    # ADR-102: Legal target projection.
+    # Project desired entries to legal capacity:
+    # - None → unconstrained (keep full ladder)
+    # - 0 → fully saturated (no entries)
+    # - N > 0 → partial ladder (keep N closest to reference)
+    if risk_entry_capacity is not None and risk_entry_capacity < len(desired_entry_keys):
+        if risk_entry_capacity <= 0:
+            desired_entry_keys = set()
+        else:
+            # Keep N entries closest to reference price (most likely to fill)
+            ref = sm.snapshot.entry_window.reference_price
+            ranked = sorted(
+                desired_entry_keys,
+                key=lambda k: abs(k[1] - ref),
+            )
+            desired_entry_keys = set(ranked[:risk_entry_capacity])
 
     # --- Step 2: Gap detection supplement ---
     # SM window may have gaps from collision guard skips. Detect gaps in

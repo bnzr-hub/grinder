@@ -505,3 +505,19 @@ def validate_risk_config(config: RiskLimits) -> list[str]:
 
     return errors
 ```
+
+## Risk-Saturated Mode (ADR-102)
+
+When `RISK_SYMBOL_CAP` blocks entry placement repeatedly, the reconciler's projected target is constrained to legal capacity:
+
+- **Trigger:** ≥ `GRINDER_RISK_SATURATION_THRESHOLD` (default 3) consecutive `RISK_SYMBOL_CAP` blocks per symbol WITH entries actually missing on exchange (desired entry keys from SM minus actual entry keys on exchange, before risk projection). Passive zero-headroom with a fully satisfied ladder does NOT count.
+- **Legal capacity projection:** `risk_entry_capacity = min(sym_cap, gross_cap, net_cap)` where each = `floor(headroom / per_entry_notional)` for active caps.
+  - `None` → unconstrained (risk base disabled, no caps enabled, or can't estimate).
+  - `0` → fully blocked (no new entries allowed).
+  - `N > 0` → partial ladder (N entries closest to reference price kept).
+- **Structured reason:** `_compute_risk_legal_entry_capacity()` returns `(capacity, is_symbol_cap_blocked)`. Only `SYMBOL_CAP_EXCEEDED` with actual missing entries on exchange increments saturation counter. Other block reasons (stale, portfolio caps, DD) suppress entries but do NOT count toward saturation. If blocking reason changes from symbol-cap to another reason, saturation flag clears immediately.
+- **Exits/cancels:** Unaffected. Only new entries are projected down.
+- **Counter resets on:** allowed action at Gate 5.5, non-cap block reason (different failure mode breaks chain, also clears saturation flag), or sync-time headroom detection.
+- **Proactive recovery:** Saturation is re-evaluated on every sync cycle. When headroom returns, saturation clears immediately — no new entry action required.
+- **Logs:** `GRID_V2_RISK_SATURATED_ENTER` / `GRID_V2_RISK_SATURATED_EXIT`.
+- **Per-symbol:** Saturation for BTCUSDT does not affect ETHUSDT.
