@@ -4503,3 +4503,16 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Implementation:** `src/grinder/live/reduce_only_budget.py` (new module: BudgetSnapshot, check_budget, detect_surplus_exits, _closeable_qty_for_side), Gate 0 in `engine.py`, sync repair + -2022 hook in `engine.py`.
 - **Convergence:** `CONVERGED` logged only when all repair cancels succeed. If any cancel fails, flag stays set (`DEFERRED`), blocks exits until next sync confirms legal topology. No premature convergence.
 - **Tests:** 31 adversarial tests in `tests/unit/test_reduce_only_budget_v2.py`.
+
+### ADR-105: Exit Topology Repair (2026-03-28)
+
+- **Status:** Delivered.
+- **Decision:** Introduce deterministic exit topology repair that converges actual exchange exits to the desired legal exit set. Three-layer model: desired legal exits (SM + budget), actual exchange exits, repair diff.
+- **Desired exits:** `compute_desired_exits()` — SM OPEN exit orders constrained by closeable position budget. SM priority ordering preserved.
+- **Repair diff:** `compute_exit_topology_repair()` — computes extra (cancel), missing (place), deferred (not yet registered) actions. Deterministic ordering: cancels by CID, places by exit_order_id.
+- **Deferred:** Exits that need placement but have no registry CID yet are explicitly logged as DEFERRED, not silently dropped.
+- **Integration:** Runs on each sync cycle after budget repair (ADR-104) and before reconciler (ADR-096). Composes with budget guard: repair respects closeable position budget.
+- **Trigger reasons:** `SYNC_DRIFT` (normal sync detects mismatch), `REJECT_RECOVERY` (post -2022 latch). `BUDGET_OVERRUN` and `PARTIAL_FILL_RECOMPUTE` defined in enum for future use but not currently emitted.
+- **Logs:** `GRID_V2_EXIT_TOPOLOGY_REPAIR_START`, `GRID_V2_EXIT_TOPOLOGY_REPAIR_CANCEL`, `GRID_V2_EXIT_TOPOLOGY_REPAIR_PLACE`, `GRID_V2_EXIT_TOPOLOGY_REPAIR_DEFERRED`, `GRID_V2_EXIT_TOPOLOGY_REPAIR_CONVERGED`.
+- **Implementation:** `src/grinder/grid_v2/exit_repair.py` (new module), engine wiring in `_exit_topology_repair_on_sync()`.
+- **Tests:** 16 adversarial tests in `tests/unit/test_exit_topology_repair.py`.

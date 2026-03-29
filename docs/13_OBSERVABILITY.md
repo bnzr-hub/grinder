@@ -696,3 +696,25 @@ GRID_V2_SYNC_RECONCILER symbol=BTCUSDT mode=FLAT
 | `actual_entries` | Entries currently on exchange |
 | `projection` | `UNCONSTRAINED`, `RISK_CONSTRAINED_PARTIAL`, `RISK_CONSTRAINED_ZERO` |
 | `capacity` | Legal entry capacity from risk gate (`None` = unconstrained) |
+
+## Grid V2 Exit Topology Repair Log Schema (ADR-105)
+
+```
+GRID_V2_EXIT_TOPOLOGY_REPAIR_START symbol=BTCUSDT trigger=SYNC_DRIFT
+  desired=3 actual=4 extra=1 missing=0 deferred=0
+GRID_V2_EXIT_TOPOLOGY_REPAIR_CANCEL symbol=BTCUSDT order_id=g-X-4
+GRID_V2_EXIT_TOPOLOGY_REPAIR_CONVERGED symbol=BTCUSDT cancels=1 places=0 deferred=0
+```
+
+| Field | Meaning |
+|-------|---------|
+| `trigger` | `SYNC_DRIFT`, `REJECT_RECOVERY` (emitted); `BUDGET_OVERRUN`, `PARTIAL_FILL_RECOMPUTE` (future) |
+| `desired` | Legal exit count (SM + budget constrained) |
+| `actual` | EXIT CIDs on exchange |
+| `extra` | On exchange but not desired (cancel) |
+| `missing` | Desired but not on exchange (place) |
+| `deferred` | Desired but not yet registered (log only) |
+
+Additional outcome events:
+- `GRID_V2_EXIT_TOPOLOGY_REPAIR_CONVERGED` — all repair actions succeeded, topology is legal.
+- `GRID_V2_EXIT_TOPOLOGY_REPAIR_INCOMPLETE` — one or more actions failed or deferred; topology not yet converged.

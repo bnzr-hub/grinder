@@ -580,3 +580,29 @@ No retry storm: blocked immediately after first reject.
 
 ### Isolation
 Budget is symbol-scoped AND direction-scoped. BTCUSDT SELL budget is independent of ETHUSDT SELL and BTCUSDT BUY.
+
+## Exit Topology Repair (ADR-105)
+
+After budget enforcement (ADR-104), the exit topology repair subsystem converges the actual exchange exit set to the desired legal topology.
+
+### Three-layer model
+1. **Desired legal exits:** SM OPEN exit orders constrained by closeable position budget.
+2. **Actual exchange exits:** Open reduce-only orders with EXIT CIDs.
+3. **Repair diff:** extra (cancel), missing (place if registered), deferred (not yet registered).
+
+### Deterministic ordering
+- Cancels: sorted by CID ascending.
+- Places: sorted by exit_order_id ascending.
+- Deferred: logged explicitly, not silently dropped.
+
+### Trigger reasons
+Currently emitted:
+- `SYNC_DRIFT`: normal sync cycle detects topology mismatch.
+- `REJECT_RECOVERY`: post -2022 latch recovery.
+
+Defined for future use (not currently emitted):
+- `BUDGET_OVERRUN`: topology exceeds closeable budget.
+- `PARTIAL_FILL_RECOMPUTE`: partial fills changed desired topology.
+
+### Convergence
+`is_converged = True` when extra=0, missing=0, deferred=0. Healthy topology produces zero repair actions.
