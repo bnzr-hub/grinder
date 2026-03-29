@@ -4593,3 +4593,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Scope:** Reconciler staging suppression. Complements ADR-110 (SM-level). Does not change reconciler desired-state computation.
 - **Implementation:** `src/grinder/live/engine.py`.
 - **Tests:** 10 adversarial tests in `tests/unit/test_burst_churn_suppression.py` (7 predicate + 3 engine-path).
+
+### ADR-112: Suppress Stale Pre-Fill Reconciler Placements (2026-03-29)
+
+- **Status:** Delivered.
+- **Decision:** When SM mode changes between reconciler staging and tick drain (e.g., FLAT→LONG_BRANCH from a fill), PLACE actions staged under the old mode are dropped. CANCEL actions pass through.
+- **Problem:** Reconciler staged `FLAT missing=1 PLACE` while first fill was arriving. Staged PLACE survived branch transition and polluted post-fill topology.
+- **Fix:** Record `_reconciler_staged_mode` at staging time. At drain time, drop PLACEs if current SM mode differs from staged mode. Log: `GRID_V2_STALE_MODE_PLACE_DROPPED`.
+- **Implementation:** `src/grinder/live/engine.py`.
+- **Tests:** 4 adversarial tests in `tests/unit/test_stale_mode_placement.py`.
