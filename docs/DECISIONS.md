@@ -4563,3 +4563,14 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Key invariant:** Large/unsafe regressions still fail-closed. Only small, repeated cached-snapshot regressions are tolerated after the bounded streak.
 - **Implementation:** `src/grinder/account/syncer.py` (`_ts_regression_streak`, `TS_REGRESSION_TOLERANCE_MS`, `TS_REGRESSION_ACCEPT_AFTER`).
 - **Tests:** 7 adversarial tests in `tests/unit/test_sync_ts_regression.py` including live-incident reproduction.
+
+### ADR-109: Event-Authoritative Truth Layer — Phase 1: Shadow EventLedger (2026-03-29)
+
+- **Status:** Delivered (Phase 1 only — shadow mode, zero behavioral change).
+- **Decision:** Build a local EventLedger that derives open-order state from Binance ORDER_TRADE_UPDATE events. Run in shadow mode alongside existing snapshot-based truth. Compare and report order divergences for observability.
+- **Scope:** Order-only in Phase 1. Position tracking from ACCOUNT_UPDATE deferred to Phase 2 (requires upstream multi-position + positionSide support).
+- **EventLedger:** `src/grinder/account/event_ledger.py` — tracks order lifecycle (NEW→PARTIAL→FILLED/CANCELLED), fills, remaining qty. Idempotent event application. Duplicate/stale event suppression by timestamp.
+- **Shadow comparison:** On each account sync, ledger open-order state is compared against snapshot open orders. Divergences logged as `EVENT_LEDGER_SHADOW_DIVERGENCE`. No authority switch.
+- **Zero behavioral change:** Ledger does not affect reconciler, risk, budget, exit topology, or any live trading decision. It is observability only.
+- **Phase 2 gate:** Authority switch requires at least one full bounded verification run with shadow order divergence below operational threshold. Position authority switch requires multi-position event support first.
+- **Tests:** 13 adversarial tests in `tests/unit/test_event_ledger.py`.

@@ -645,6 +645,10 @@ class LiveEngineV0:
         self._health_input = LiveHealthInput()
         self._health_mode = LiveHealthMode.HEALTHY
         self._health_mode_prev = LiveHealthMode.HEALTHY
+        # ADR-109 Phase 1: EventLedger in shadow mode
+        from grinder.account.event_ledger import EventLedger  # noqa: PLC0415
+
+        self._event_ledger = EventLedger()
         # ADR-102: Risk-Saturated Mode — per-symbol tracking
         # Consecutive RISK_SYMBOL_CAP blocks (reset on allow, non-cap block, or sync headroom)
         self._risk_cap_consecutive_blocks: dict[str, int] = {}
@@ -2531,6 +2535,12 @@ class LiveEngineV0:
         This path is a low-latency supplement to account-sync polling:
         terminal ORDER_TRADE_UPDATE events are applied immediately.
         """
+        # ADR-109 Phase 1: Feed order events to shadow EventLedger.
+        # Order-only in Phase 1. Position tracking deferred to Phase 2.
+        # Zero behavioral change — ledger is observability only.
+        if event.order_event is not None:
+            self._event_ledger.apply_order_event(event.order_event)
+
         if not self._is_grid_v2_active(self._grid_v2_symbol):
             return
         if event.order_event is None:
@@ -3982,6 +3992,19 @@ class LiveEngineV0:
                 self._evaluate_symbol_risk(result.snapshot)
             # PR-L2: Store full snapshot for LiveGridPlannerV1 (open_orders as exchange truth)
             self._last_account_snapshot = result.snapshot
+            # ADR-109 Phase 1: Shadow comparison (observability only)
+            if self._event_ledger.events_applied > 0:
+                shadow = self._event_ledger.compare_with_snapshot(result.snapshot)
+                if not shadow.is_converged:
+                    logger.info(
+                        "EVENT_LEDGER_SHADOW_DIVERGENCE "
+                        "divergences=%d ledger_orders=%d snapshot_orders=%d",
+                        len(shadow.divergences),
+                        shadow.ledger_open_orders,
+                        shadow.snapshot_open_orders,
+                    )
+                    for d in shadow.divergences[:5]:  # cap log volume
+                        logger.info("  %s symbol=%s %s", d.kind.value, d.symbol, d.detail)
             # PR6: clear awaiting-sync flag only when ALL seed CIDs are visible
             # in the account snapshot. If seeds aren't visible yet, keep skipping
             # fill detection to prevent false fills.
