@@ -156,6 +156,36 @@ class EventLedger:
     def get_order(self, client_order_id: str) -> LedgerOrder | None:
         return self._orders.get(client_order_id)
 
+    def hydrate_from_snapshot(self, snapshot: AccountSnapshot) -> int:
+        """Bootstrap ledger from an AccountSnapshot's open orders.
+
+        Populates the ledger with all open orders from the snapshot.
+        Only applies orders not already in the ledger (idempotent).
+        Sets last_event_ts to snapshot.ts so subsequent WS events
+        with ts > snapshot.ts are applied normally.
+
+        Returns the number of orders hydrated.
+        """
+        hydrated = 0
+        for o in snapshot.open_orders:
+            if o.order_id in self._orders:
+                continue  # already known
+            self._orders[o.order_id] = LedgerOrder(
+                order_id=0,  # exchange numeric ID not available in snapshot
+                client_order_id=o.order_id,
+                symbol=o.symbol,
+                side=o.side,
+                status="OPEN" if o.filled_qty == 0 else "PARTIALLY_FILLED",
+                price=o.price,
+                qty=o.qty,
+                executed_qty=o.filled_qty,
+                avg_price=o.price,  # best available from snapshot
+                last_event_ts=snapshot.ts,
+            )
+            hydrated += 1
+        self._last_event_ts = max(self._last_event_ts, snapshot.ts)
+        return hydrated
+
     def reset(self) -> None:
         """Clear all state. Used during bootstrap/recovery."""
         self._orders.clear()

@@ -649,6 +649,7 @@ class LiveEngineV0:
         from grinder.account.event_ledger import EventLedger  # noqa: PLC0415
 
         self._event_ledger = EventLedger()
+        self._event_ledger_bootstrapped = False
         # ADR-102: Risk-Saturated Mode — per-symbol tracking
         # Consecutive RISK_SYMBOL_CAP blocks (reset on allow, non-cap block, or sync headroom)
         self._risk_cap_consecutive_blocks: dict[str, int] = {}
@@ -4027,8 +4028,20 @@ class LiveEngineV0:
                 self._evaluate_symbol_risk(result.snapshot)
             # PR-L2: Store full snapshot for LiveGridPlannerV1 (open_orders as exchange truth)
             self._last_account_snapshot = result.snapshot
+            # ADR-109 PR-C: Bootstrap ledger from first successful sync.
+            # Runs once regardless of whether WS events arrived first.
+            # hydrate_from_snapshot is idempotent — skips already-known orders.
+            if not self._event_ledger_bootstrapped:
+                hydrated = self._event_ledger.hydrate_from_snapshot(result.snapshot)
+                self._event_ledger_bootstrapped = True
+                if hydrated > 0:
+                    logger.info(
+                        "EVENT_LEDGER_BOOTSTRAP_HYDRATED orders=%d snapshot_ts=%d",
+                        hydrated,
+                        result.snapshot.ts,
+                    )
             # ADR-109 Phase 1: Shadow comparison (observability only)
-            if self._event_ledger.events_applied > 0:
+            if self._event_ledger_bootstrapped:
                 shadow = self._event_ledger.compare_with_snapshot(result.snapshot)
                 if not shadow.is_converged:
                     logger.info(
@@ -4038,7 +4051,7 @@ class LiveEngineV0:
                         shadow.ledger_open_orders,
                         shadow.snapshot_open_orders,
                     )
-                    for d in shadow.divergences[:5]:  # cap log volume
+                    for d in shadow.divergences[:5]:
                         logger.info("  %s symbol=%s %s", d.kind.value, d.symbol, d.detail)
             # PR6: clear awaiting-sync flag only when ALL seed CIDs are visible
             # in the account snapshot. If seeds aren't visible yet, keep skipping

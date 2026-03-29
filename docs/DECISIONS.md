@@ -4573,7 +4573,8 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Shadow comparison:** On each account sync, ledger open-order state is compared against snapshot open orders. Divergences logged as `EVENT_LEDGER_SHADOW_DIVERGENCE`. No authority switch.
 - **Zero behavioral change:** Ledger does not affect reconciler, risk, budget, exit topology, or any live trading decision. It is observability only.
 - **Phase 2 gate:** Authority switch requires at least one full bounded verification run with shadow order divergence below operational threshold. Position authority switch requires multi-position event support first.
-- **Tests:** 13 adversarial tests in `tests/unit/test_event_ledger.py`.
+- **Tests:** 20 adversarial tests in `tests/unit/test_event_ledger.py` (13 original + 7 bootstrap hydration).
+- **PR-C Bootstrap hydration:** `hydrate_from_snapshot()` seeds ledger from initial open orders. Eliminates false `ORDER_MISSING_IN_LEDGER` divergence on startup. Idempotent. WS events with newer ts override hydrated state. Log: `EVENT_LEDGER_BOOTSTRAP_HYDRATED`.
 
 ### ADR-110: Suppress Replenish When Inventory Full (2026-03-29)
 
