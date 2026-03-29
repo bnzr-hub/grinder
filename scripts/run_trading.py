@@ -1712,6 +1712,21 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
         preflight_syncer = AccountSyncer(port)
 
+    # Load symbol constraints BEFORE preflight so check_symbol_metadata
+    # can verify the target symbol exists on exchange.
+    preflight_constraints = _load_symbol_constraints()
+    if preflight_constraints:
+        print(f"  Preflight constraints loaded: {len(preflight_constraints)} symbols")
+    else:
+        print("  WARNING: Preflight constraints unavailable (metadata check will fail-closed)")
+
+    # Create a constraint holder for preflight's check_symbol_metadata
+    class _PreflightConstraintHolder:
+        def get_symbol_constraints(self) -> dict[str, SymbolConstraints] | None:
+            return preflight_constraints
+
+    preflight_port = _PreflightConstraintHolder() if preflight_constraints else port
+
     # Live Preflight Gate (PR-2): fail-closed before trading loop
     from grinder.live.preflight import run_preflight  # noqa: PLC0415
 
@@ -1720,7 +1735,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         mainnet=args.mainnet,
         mode_value=mode.value,
         syncer=preflight_syncer,
-        port=port,
+        port=preflight_port,
         symbols=symbols,
         env_acks={
             "ALLOW_MAINNET_TRADE": os.environ.get("ALLOW_MAINNET_TRADE") == "1",
