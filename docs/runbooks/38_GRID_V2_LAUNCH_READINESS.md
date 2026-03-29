@@ -18,6 +18,8 @@ Fix all FAIL items before proceeding.
 # Preflight runs automatically on armed mainnet start.
 # Hard failure = exit code 2, run does not start.
 # Checks: DNS, exchange time sync, WS bootstrap, account sync, symbol metadata, config consistency.
+# Symbol constraints loaded BEFORE preflight (from cache or API).
+# If constraints unavailable, symbol_metadata_read will FAIL (fail-closed).
 ```
 
 **Go:** All 6 checks PASS.
