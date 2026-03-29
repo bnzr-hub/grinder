@@ -4070,6 +4070,17 @@ class LiveEngineV0:
         ):
             self._reduce_only_repair_on_sync(result.snapshot)
 
+        # ADR-105: Exit topology repair on sync.
+        # After budget repair (ADR-104), converge exit set to desired legal topology.
+        if (
+            result.snapshot is not None
+            and self._grid_v2_bridge is not None
+            and self._grid_v2_bridge.state_machine is not None
+            and self._grid_v2_started
+            and self._grid_v2_bridge.reconstruction_ok
+        ):
+            self._exit_topology_repair_on_sync(result.snapshot)
+
         # ADR-096: Sync-driven reconciler
         if (
             self._sync_reconciler_enabled
@@ -4680,6 +4691,156 @@ class LiveEngineV0:
                     side.value,
                     len(surplus),
                 )
+
+    def _exit_topology_repair_on_sync(self, snapshot: object) -> None:  # noqa: PLR0912
+        """Compute and execute exit topology repair (ADR-105).
+
+        Compares desired legal exit topology (from SM + budget) against
+        actual exchange exits. Cancels extras, dispatches missing if legal,
+        logs deferred placements.
+        """
+        from grinder.grid_v2.exit_repair import (  # noqa: PLC0415
+            RepairTrigger,
+            compute_desired_exits,
+            compute_exit_topology_repair,
+        )
+        from grinder.live.reduce_only_budget import (  # noqa: PLC0415
+            _closeable_qty_for_side,
+        )
+
+        sym = self._grid_v2_symbol
+        bridge = self._grid_v2_bridge
+        assert bridge is not None  # guarded by caller
+        sm = bridge.state_machine
+        assert sm is not None  # guarded by caller
+
+        # Compute desired legal exits — per-side budgeting.
+        # Split SM exits by side, budget each against its own closeable qty.
+        from grinder.grid_v2.state import ExitOrderStatus as _EOS  # noqa: PLC0415
+
+        sell_exits = [
+            eo
+            for eo in sm.snapshot.exit_orders
+            if eo.status == _EOS.OPEN and eo.side == OrderSide.SELL
+        ]
+        buy_exits = [
+            eo
+            for eo in sm.snapshot.exit_orders
+            if eo.status == _EOS.OPEN and eo.side == OrderSide.BUY
+        ]
+        sell_budget = (
+            _closeable_qty_for_side(
+                snapshot,  # type: ignore[arg-type]
+                sym,
+                OrderSide.SELL,
+            )
+            if sell_exits
+            else None
+        )
+        buy_budget = (
+            _closeable_qty_for_side(
+                snapshot,  # type: ignore[arg-type]
+                sym,
+                OrderSide.BUY,
+            )
+            if buy_exits
+            else None
+        )
+
+        desired_sell = compute_desired_exits(
+            sell_exits, bridge.adapter.registry.cid_for_exit, sell_budget
+        )
+        desired_buy = compute_desired_exits(
+            buy_exits, bridge.adapter.registry.cid_for_exit, buy_budget
+        )
+        desired = desired_sell + desired_buy
+
+        # Compute actual exit CIDs from exchange
+        actual_exit_cids: set[str] = set()
+        for o in snapshot.open_orders:  # type: ignore[attr-defined]
+            if o.symbol != sym:
+                continue
+            parsed = bridge.adapter.parse_cid(o.order_id)
+            if parsed is not None and parsed.kind.value == "EXIT":
+                actual_exit_cids.add(o.order_id)
+
+        # Determine trigger
+        trigger = RepairTrigger.SYNC_DRIFT
+        if (sym, "BUY") in self._reduce_only_pending_repair or (
+            sym,
+            "SELL",
+        ) in self._reduce_only_pending_repair:
+            trigger = RepairTrigger.REJECT_RECOVERY
+
+        result = compute_exit_topology_repair(desired, actual_exit_cids, trigger)
+
+        if result.is_converged:
+            return  # Nothing to do
+
+        logger.info(
+            "GRID_V2_EXIT_TOPOLOGY_REPAIR_START symbol=%s trigger=%s "
+            "desired=%d actual=%d extra=%d missing=%d deferred=%d",
+            sym,
+            result.trigger.value,
+            result.desired_exit_count,
+            result.actual_exit_count,
+            result.extra_count,
+            result.missing_count,
+            result.deferred_count,
+        )
+
+        all_ok = True
+        for action in result.actions:
+            if action.action_type == "CANCEL" and action.cid:
+                cancel = ExecutionAction(
+                    action_type=ActionType.CANCEL,
+                    order_id=action.cid,
+                    symbol=sym,
+                    reason="GRID_V2_EXIT_TOPOLOGY_REPAIR_CANCEL",
+                )
+                ts = int(time.time() * 1000)
+                r = self._process_action(cancel, ts)
+                if r.status != LiveActionStatus.EXECUTED:
+                    all_ok = False
+            elif action.action_type == "PLACE" and action.cid:
+                place = ExecutionAction(
+                    action_type=ActionType.PLACE,
+                    symbol=sym,
+                    side=action.side,
+                    price=action.price,
+                    quantity=action.qty,
+                    client_order_id=action.cid,
+                    reduce_only=True,
+                    reason="GRID_V2_EXIT_TOPOLOGY_REPAIR_PLACE",
+                )
+                ts = int(time.time() * 1000)
+                r = self._process_action(place, ts)
+                if r.status != LiveActionStatus.EXECUTED:
+                    all_ok = False
+            elif action.action_type == "DEFERRED":
+                all_ok = False  # deferred = not yet converged
+                logger.info(
+                    "GRID_V2_EXIT_TOPOLOGY_REPAIR_DEFERRED symbol=%s "
+                    "exit_order_id=%s lot_id=%s reason=not_yet_registered",
+                    sym,
+                    action.exit_order_id,
+                    action.lot_id,
+                )
+
+        if all_ok:
+            logger.info(
+                "GRID_V2_EXIT_TOPOLOGY_REPAIR_CONVERGED symbol=%s cancels=%d places=%d deferred=%d",
+                sym,
+                result.extra_count,
+                result.missing_count,
+                result.deferred_count,
+            )
+        else:
+            logger.warning(
+                "GRID_V2_EXIT_TOPOLOGY_REPAIR_INCOMPLETE symbol=%s "
+                "reason=action_failed_or_deferred",
+                sym,
+            )
 
     def _on_reduce_only_reject(self, symbol: str, side: str, error_code: int) -> None:
         """Handle -2022 ReduceOnly reject from exchange (ADR-104).
