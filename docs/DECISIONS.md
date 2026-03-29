@@ -4602,3 +4602,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Fix:** Record `_reconciler_staged_mode` at staging time. At drain time, drop PLACEs if current SM mode differs from staged mode. Log: `GRID_V2_STALE_MODE_PLACE_DROPPED`.
 - **Implementation:** `src/grinder/live/engine.py`.
 - **Tests:** 4 adversarial tests in `tests/unit/test_stale_mode_placement.py`.
+
+### ADR-113: Exit Topology Repair Re-Registration (2026-03-29)
+
+- **Status:** Delivered.
+- **Decision:** When exit topology repair encounters a DEFERRED exit (registry entry lost after -2022 cleanup), re-register and place it instead of looping forever.
+- **Problem:** After -2022 reject, `confirm_cancel_exit` removed registry entry. Topology repair saw `registry_cid=None` → DEFERRED → logged but never placed → infinite loop.
+- **Fix:** DEFERRED handler re-registers exit via `generate_exit_cid` + `register_exit`, then dispatches reduce-only PLACE. Log: `GRID_V2_EXIT_TOPOLOGY_REPAIR_REREGISTERED`.
+- **Implementation:** `src/grinder/live/engine.py`.
+- **Tests:** 8 adversarial tests in `tests/unit/test_exit_repair_deadlock.py` (6 classifier + 2 engine-path).

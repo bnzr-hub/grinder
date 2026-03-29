@@ -4848,7 +4848,7 @@ class LiveEngineV0:
                     len(surplus),
                 )
 
-    def _exit_topology_repair_on_sync(self, snapshot: object) -> None:  # noqa: PLR0912
+    def _exit_topology_repair_on_sync(self, snapshot: object) -> None:  # noqa: PLR0912, PLR0915
         """Compute and execute exit topology repair (ADR-105).
 
         Compares desired legal exit topology (from SM + budget) against
@@ -4974,14 +4974,64 @@ class LiveEngineV0:
                 if r.status != LiveActionStatus.EXECUTED:
                     all_ok = False
             elif action.action_type == "DEFERRED":
-                all_ok = False  # deferred = not yet converged
-                logger.info(
-                    "GRID_V2_EXIT_TOPOLOGY_REPAIR_DEFERRED symbol=%s "
-                    "exit_order_id=%s lot_id=%s reason=not_yet_registered",
-                    sym,
-                    action.exit_order_id,
-                    action.lot_id,
-                )
+                # ADR-113: Re-register and place deferred exits instead of
+                # infinite DEFERRED loop. The lot exists in SM but the exit
+                # registry entry was lost (e.g., after -2022 cleanup).
+                if (
+                    action.exit_order_id
+                    and action.lot_id
+                    and action.side
+                    and action.price
+                    and action.qty
+                    and bridge is not None
+                ):
+                    try:
+                        new_cid = bridge.adapter.generate_exit_cid(int(time.time() * 1000))
+                        bridge.adapter.registry.register_exit(
+                            new_cid, action.exit_order_id, action.lot_id
+                        )
+                        place = ExecutionAction(
+                            action_type=ActionType.PLACE,
+                            symbol=sym,
+                            side=action.side,
+                            price=action.price,
+                            quantity=action.qty,
+                            client_order_id=new_cid,
+                            reduce_only=True,
+                            reason="GRID_V2_EXIT_TOPOLOGY_REPAIR_REREGISTER",
+                        )
+                        ts = int(time.time() * 1000)
+                        r = self._process_action(place, ts)
+                        if r.status != LiveActionStatus.EXECUTED:
+                            all_ok = False
+                        logger.info(
+                            "GRID_V2_EXIT_TOPOLOGY_REPAIR_REREGISTERED symbol=%s "
+                            "exit_order_id=%s lot_id=%s new_cid=%s status=%s",
+                            sym,
+                            action.exit_order_id,
+                            action.lot_id,
+                            new_cid,
+                            r.status.value,
+                        )
+                    except Exception:
+                        all_ok = False
+                        logger.warning(
+                            "GRID_V2_EXIT_TOPOLOGY_REPAIR_REREGISTER_FAILED "
+                            "symbol=%s exit_order_id=%s lot_id=%s",
+                            sym,
+                            action.exit_order_id,
+                            action.lot_id,
+                            exc_info=True,
+                        )
+                else:
+                    all_ok = False
+                    logger.info(
+                        "GRID_V2_EXIT_TOPOLOGY_REPAIR_DEFERRED symbol=%s "
+                        "exit_order_id=%s lot_id=%s reason=insufficient_info",
+                        sym,
+                        action.exit_order_id,
+                        action.lot_id,
+                    )
 
         if all_ok:
             logger.info(
