@@ -4612,3 +4612,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Fix:** DEFERRED handler re-registers exit via `generate_exit_cid` + `register_exit`, then dispatches reduce-only PLACE. Log: `GRID_V2_EXIT_TOPOLOGY_REPAIR_REREGISTERED`.
 - **Implementation:** `src/grinder/live/engine.py`.
 - **Tests:** 8 adversarial tests in `tests/unit/test_exit_repair_deadlock.py` (6 classifier + 2 engine-path).
+
+### ADR-114: Quantize Exit-Repair Placements to Exchange Tick Size (2026-03-29)
+
+- **Status:** Delivered.
+- **Decision:** All exit-repair placements (PLACE and DEFERRED re-register) must have prices quantized to the symbol's tick size before dispatch.
+- **Problem:** Repair path used raw SM exit price without tick quantization. Live -4014 reject on repaired exit with price 0.05313250 (tick=0.0001).
+- **Fix:** Call `bridge._quantize_price(price, side)` before creating ExecutionAction in both PLACE and DEFERRED re-register paths.
+- **Implementation:** `src/grinder/live/engine.py`.
+- **Tests:** 3 engine-path tests in `tests/unit/test_exit_repair_tick_quantization.py`.

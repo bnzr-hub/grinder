@@ -4972,11 +4972,17 @@ class LiveEngineV0:
                 if r.status != LiveActionStatus.EXECUTED:
                     all_ok = False
             elif action.action_type == "PLACE" and action.cid:
+                # ADR-114: Quantize repair price to exchange tick size
+                _repair_price = (
+                    bridge._quantize_price(action.price, action.side)
+                    if bridge and action.price
+                    else action.price
+                )
                 place = ExecutionAction(
                     action_type=ActionType.PLACE,
                     symbol=sym,
                     side=action.side,
-                    price=action.price,
+                    price=_repair_price,
                     quantity=action.qty,
                     client_order_id=action.cid,
                     reduce_only=True,
@@ -5003,11 +5009,13 @@ class LiveEngineV0:
                         bridge.adapter.registry.register_exit(
                             new_cid, action.exit_order_id, action.lot_id
                         )
+                        # ADR-114: Quantize re-register price to tick size
+                        _rereg_price = bridge._quantize_price(action.price, action.side)
                         place = ExecutionAction(
                             action_type=ActionType.PLACE,
                             symbol=sym,
                             side=action.side,
-                            price=action.price,
+                            price=_rereg_price,
                             quantity=action.qty,
                             client_order_id=new_cid,
                             reduce_only=True,
