@@ -4516,3 +4516,19 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Logs:** `GRID_V2_EXIT_TOPOLOGY_REPAIR_START`, `GRID_V2_EXIT_TOPOLOGY_REPAIR_CANCEL`, `GRID_V2_EXIT_TOPOLOGY_REPAIR_PLACE`, `GRID_V2_EXIT_TOPOLOGY_REPAIR_DEFERRED`, `GRID_V2_EXIT_TOPOLOGY_REPAIR_CONVERGED`.
 - **Implementation:** `src/grinder/grid_v2/exit_repair.py` (new module), engine wiring in `_exit_topology_repair_on_sync()`.
 - **Tests:** 16 adversarial tests in `tests/unit/test_exit_topology_repair.py`.
+
+### ADR-106: Observability + Reason Codes (2026-03-28)
+
+- **Status:** Delivered.
+- **Decision:** Every major suppressed/degraded/no-op path emits a stable reason code. Operators can explain system state from reason codes without log correlation.
+- **Reason families:**
+  - `NoActionReason` (6 values): `ACTUAL_MATCHES_EFFECTIVE_TARGET`, `RISK_SATURATED_TARGET_ZERO`, `EFFECTIVE_TARGET_PARTIAL_MATCHED`, `AWAITING_SYNC`, `NOT_STARTED`, `RECONSTRUCTION_PENDING`.
+  - `EntrySuppressionReason` (5 values): `RISK_SATURATED`, `EFFECTIVE_TARGET_ZERO`, `EFFECTIVE_TARGET_PARTIAL`, `NO_RESTORE_DEMAND`, `INVENTORY_FULL`.
+  - `ExitSuppressionReason` (4 values): `REDUCE_ONLY_BUDGET_EXCEEDED`, `EXIT_NOT_REGISTERED_DEFERRED`, `PENDING_REPAIR_AFTER_REJECT`, `TOPOLOGY_REPAIR_INCOMPLETE`.
+  - `HealthBlockReason` (4 values): `STALE_TRUTH`, `PAUSED_UNSAFE`, `DEGRADED_WS`, `DEGRADED_SYNC`.
+  - `RepairStatusReason` (6 values): `START`, `CANCEL`, `PLACE`, `DEFERRED`, `CONVERGED`, `INCOMPLETE`. Note: repair lifecycle uses stable event names (`GRID_V2_*_REPAIR_START/CONVERGED/INCOMPLETE`), not `reason=` fields. Enum defined for structured consumers (metrics, dashboards), not currently emitted as `reason=` in logs.
+- **Key log events:** `GRID_V2_NO_ACTION reason=...`, `GRID_V2_ENTRY_SUPPRESSED reason=...`, `GRID_V2_EXIT_SUPPRESSED reason=...`, `GRID_V2_HEALTH_BLOCK reason=...`. Healthy steady-state throttled (1 per 100 syncs). Degraded/blocked reasons logged every occurrence.
+- **Key invariant:** Healthy no-op (`ACTUAL_MATCHES_EFFECTIVE_TARGET`) is distinguishable from degraded no-op (`RISK_SATURATED_TARGET_ZERO`, etc.).
+- **classify_no_action_reason():** Pure function, deterministic classification from sync state.
+- **Implementation:** `src/grinder/live/reason_codes.py` (new module), engine sync path in `engine.py`.
+- **Tests:** 17 adversarial tests in `tests/unit/test_reason_codes.py` (enum pinning + classifier paths + 3 engine-path observability tests).
