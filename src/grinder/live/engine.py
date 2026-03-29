@@ -4336,9 +4336,11 @@ class LiveEngineV0:
                 materialized = self._grid_v2_materialize_reconciler_actions(
                     recon.actions, result.snapshot.ts
                 )
-                # ADR-111: Suppress PLACE_ENTRY only when snapshot is stale
-                # relative to recent fills. If snapshot.ts >= last_fill_ts,
-                # the snapshot has caught up and PLACEs are safe.
+                # ADR-111 (revised): One-shot burst suppression.
+                # Suppress PLACE_ENTRY for ONE reconciler cycle after fills,
+                # then clear _last_fill_ts so the next cycle proceeds normally.
+                # This prevents the obvious stale-one-cycle churn without
+                # starving legitimate restores across many cycles.
                 _snapshot_ts = result.snapshot.ts if result.snapshot else 0
                 _snapshot_stale = self._last_fill_ts > 0 and _snapshot_ts < self._last_fill_ts
                 if _snapshot_stale:
@@ -4350,7 +4352,7 @@ class LiveEngineV0:
                         logger.info(
                             "GRID_V2_BURST_CHURN_SUPPRESSED symbol=%s "
                             "suppressed_places=%d snapshot_ts=%d last_fill_ts=%d "
-                            "reason=SNAPSHOT_STALE_RELATIVE_TO_FILLS",
+                            "reason=ONE_CYCLE_POST_FILL",
                             self._grid_v2_symbol,
                             len(suppressed),
                             _snapshot_ts,
@@ -4359,6 +4361,8 @@ class LiveEngineV0:
                         for sa in suppressed:
                             if sa.client_order_id:
                                 self._grid_v2_clean_failed_place(sa.client_order_id)
+                    # One-shot: clear after suppression so next cycle is not blocked
+                    self._last_fill_ts = 0
                 self._sync_reconciler_pending_actions = materialized
                 if materialized:
                     logger.info(
