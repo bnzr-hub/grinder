@@ -542,3 +542,41 @@ The reconciler diffs **actual vs effective**, never actual vs theoretical.
 - **Log schema:** `GRID_V2_SYNC_RECONCILER` now includes `theoretical_entries=N effective_entries=M projection=MODE capacity=C`.
 - **Pipeline ordering:** theoretical construction → gap detection supplement → legal projection → diff against actual. Gap detection adds to theoretical BEFORE projection, so effective never exceeds legal capacity.
 - **Key invariant:** When actual matches effective but not theoretical, reconciler produces zero actions (no churn). `desired_entry_count <= legal_entry_capacity` always holds when capacity is set.
+
+## Reduce-Only Budget Guard v2 (ADR-104)
+
+End-to-end reduce-only exit budget enforcement with reservation model and repair semantics.
+
+### Core invariant
+`open_reduce_only_remaining_qty + reserved_qty + new_qty <= position_closeable_qty`
+
+### Budget accounting terms
+- **position_closeable_qty:** Direction-aware closeable position. SELL exit → LONG qty only. BUY exit → SHORT qty only. Handles hedge-mode (LONG/SHORT) and one-way mode (BOTH with signed_qty). Includes provable current-tick lot additions.
+- **open_reduce_only_remaining_qty:** `sum(qty - filled_qty)` for open reduce-only exits on exchange. Partial fills shrink this.
+- **reserved_qty:** Same-tick batch accumulator. Resets each tick.
+
+### Gate 0 v2
+At dispatch time, each new reduce-only PLACE is checked via `check_budget()`:
+- `ALLOWED`: total within position → dispatch proceeds, reservation incremented.
+- `BLOCKED`: total exceeds position → action rejected with `REDUCE_ONLY_BUDGET_EXCEEDED`.
+- `POSITION_UNKNOWN`: position qty ≤ 0 → fail-closed.
+
+### Sync-time repair
+On each account sync, `detect_surplus_exits()` checks if `open_remaining > position_closeable_qty`. If over-budget:
+1. Identify surplus exits.
+2. Sort by remaining qty ascending (cancel smallest first).
+3. Cancel until `remaining_total <= position`.
+4. Log: `GRID_V2_REDUCE_ONLY_REPAIR_START`, `GRID_V2_REDUCE_ONLY_REPAIR_CANCEL`, `GRID_V2_REDUCE_ONLY_REPAIR_CONVERGED`.
+
+### -2022 reject repair path
+On Binance `-2022 ReduceOnly Order is rejected`:
+1. `(symbol, side)` flagged in `_reduce_only_pending_repair`. Opposite side unaffected.
+2. Further reduce-only exits for that `(symbol, side)` blocked at Gate 0.
+3. Next sync cycle runs `_reduce_only_repair_on_sync()` — detects and cancels surplus.
+4. `CONVERGED` logged and flag cleared ONLY when all repair cancels succeed.
+5. If any cancel fails: flag stays set (`DEFERRED`), retry on next sync.
+6. If no surplus exists on sync: flag cleared (topology already legal).
+No retry storm: blocked immediately after first reject.
+
+### Isolation
+Budget is symbol-scoped AND direction-scoped. BTCUSDT SELL budget is independent of ETHUSDT SELL and BTCUSDT BUY.
