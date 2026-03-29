@@ -46,7 +46,7 @@ GRINDER_ARTIFACT_DIR=/tmp/evidence bash scripts/fire_drill_account_sync.sh
 | **A** | Clean sync (happy path) | `ok=True`, 0 mismatches, `last_ts` updated, metrics recorded (positions, orders, pending_notional) |
 | **B** | Duplicate key + negative qty | `ok=False`, 2 mismatches (`duplicate_key`, `negative_qty`), mismatch counters incremented |
 | **C** | Orphan order | `ok=False`, 1 mismatch (`orphan_order`), only unknown order flagged, known order NOT flagged |
-| **D** | Timestamp regression | `ok=False`, `ts_regression` detected, `last_ts` NOT updated (regression rejected, stays at previous value) |
+| **D** | Timestamp regression | `ok=False`, `ts_regression` detected, `last_ts` NOT updated (regression rejected, stays at previous value). **ADR-108:** After 3 consecutive bounded regressions (<10s), the 4th is tolerated: `ok=True`, `last_ts` advanced, log `ACCOUNT_SYNC_TS_REGRESSION_TOLERATED`. Large regressions (>10s) always block. |
 | **E** | Metrics contract smoke | All account sync patterns from `REQUIRED_METRICS_PATTERNS` present in `MetricsBuilder` output |
 
 ---
@@ -177,7 +177,7 @@ sum(increase(grinder_account_sync_mismatches_total{rule!="none"}[5m])) > 0
 **Resolution:**
 - `orphan_order`: cancel the orphan order on exchange, or add to tracked set
 - `duplicate_key` / `negative_qty`: file a bug — invariant violation
-- `ts_regression`: usually transient; if persistent, check NTP sync
+- `ts_regression`: usually transient from Binance cached snapshots. **ADR-108:** After 3 consecutive bounded regressions (<10s delta), tolerance kicks in automatically — `ACCOUNT_SYNC_TS_REGRESSION_TOLERATED` log. If regression >10s or persistent after tolerance, check NTP sync or exchange API health.
 
 ---
 

@@ -4549,3 +4549,17 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
   9-11. Launch readiness command GO/NO-GO contract (3 tests)
 - **Launch readiness:** `scripts/launch_readiness.py` — reproducible command running real preflight checks + config validation. `docs/runbooks/38_GRID_V2_LAUNCH_READINESS.md` — go/no-go checklist, in-run watchpoints, blocker vs warning events, verification success criteria, executable cleanup procedure.
 - **Scope:** This ADR does not introduce new trading logic. It proves the existing stack composes and provides operator guidance for live verification runs.
+
+### ADR-108: Bounded Account-Snapshot Timestamp Regression Tolerance (2026-03-29)
+
+- **Status:** Delivered.
+- **Decision:** Tolerate bounded Binance cached-snapshot timestamp regression after a streak threshold, to prevent indefinitely starving the reconciler.
+- **Problem:** Binance can return cached account snapshots with slightly older timestamps after fill events. The syncer's `ts_regression` mismatch detection froze `last_ts` indefinitely, blocking the reconciler from seeing new state (observed: 39 consecutive regressions, ~3.5 minutes starved).
+- **Policy:**
+  - Regression > `TS_REGRESSION_TOLERANCE_MS` (10s): always hard-blocked.
+  - Regression <= tolerance, first 3 consecutive occurrences: flagged as mismatch (last_ts frozen, streak increments).
+  - Regression <= tolerance, 4th+ consecutive occurrence (streak already >= 3): **tolerated** — snapshot accepted, `last_ts` advanced, streak reset. Log: `ACCOUNT_SYNC_TS_REGRESSION_TOLERATED`.
+  - Normal snapshot (no regression): streak reset.
+- **Key invariant:** Large/unsafe regressions still fail-closed. Only small, repeated cached-snapshot regressions are tolerated after the bounded streak.
+- **Implementation:** `src/grinder/account/syncer.py` (`_ts_regression_streak`, `TS_REGRESSION_TOLERANCE_MS`, `TS_REGRESSION_ACCEPT_AFTER`).
+- **Tests:** 7 adversarial tests in `tests/unit/test_sync_ts_regression.py` including live-incident reproduction.

@@ -83,6 +83,13 @@ class AccountSyncer:
         port: ExchangePort to fetch snapshots from.
     """
 
+    # ADR-108: Bounded ts_regression tolerance.
+    # Binance can return cached snapshots with slightly older timestamps.
+    # Small regressions are tolerated after repeated occurrences to prevent
+    # indefinitely starving the reconciler.
+    TS_REGRESSION_TOLERANCE_MS: int = 10_000  # max tolerable regression delta
+    TS_REGRESSION_ACCEPT_AFTER: int = 3  # accept after N consecutive regressions
+
     def __init__(self, port: ExchangePort) -> None:
         """Initialize AccountSyncer.
 
@@ -91,6 +98,7 @@ class AccountSyncer:
         """
         self._port = port
         self._last_ts: int = 0
+        self._ts_regression_streak: int = 0  # consecutive ts_regression count
 
     @property
     def last_ts(self) -> int:
@@ -140,7 +148,7 @@ class AccountSyncer:
 
         return SyncResult(snapshot=snapshot, mismatches=mismatches)
 
-    def _detect_mismatches(
+    def _detect_mismatches(  # noqa: PLR0912
         self,
         snapshot: AccountSnapshot,
         known_order_ids: frozenset[str] | None,
@@ -156,19 +164,53 @@ class AccountSyncer:
         """
         mismatches: list[Mismatch] = []
 
-        # Check ts_regression -- invariant I5
-        # Exception: empty snapshots (ts=0, no positions, no orders) are exempt.
-        # An empty account is a normal transition (orders expired/filled), not
-        # data regression.  Suppressing this avoids infinite mismatch loops when
-        # _last_ts is frozen at the old value.
+        # Check ts_regression -- invariant I5 + ADR-108 bounded tolerance.
+        # Empty snapshots (ts=0) are exempt (normal flat transition).
+        # Small regressions from Binance cached snapshots are tolerated after
+        # TS_REGRESSION_ACCEPT_AFTER consecutive occurrences to prevent
+        # indefinitely starving downstream consumers (reconciler).
         is_empty = len(snapshot.positions) == 0 and len(snapshot.open_orders) == 0
         if self._last_ts > 0 and snapshot.ts < self._last_ts and not is_empty:
-            mismatches.append(
-                Mismatch(
-                    rule="ts_regression",
-                    detail=f"snapshot.ts={snapshot.ts} < last_ts={self._last_ts}",
+            delta_ms = self._last_ts - snapshot.ts
+            if delta_ms > self.TS_REGRESSION_TOLERANCE_MS:
+                # Large regression: always hard-block
+                mismatches.append(
+                    Mismatch(
+                        rule="ts_regression",
+                        detail=f"snapshot.ts={snapshot.ts} < last_ts={self._last_ts} "
+                        f"delta_ms={delta_ms} BLOCKED (exceeds tolerance)",
+                    )
                 )
-            )
+                self._ts_regression_streak += 1
+            elif self._ts_regression_streak < self.TS_REGRESSION_ACCEPT_AFTER:
+                # Small regression, not yet at accept threshold: warn + count
+                mismatches.append(
+                    Mismatch(
+                        rule="ts_regression",
+                        detail=f"snapshot.ts={snapshot.ts} < last_ts={self._last_ts} "
+                        f"delta_ms={delta_ms} streak={self._ts_regression_streak + 1}"
+                        f"/{self.TS_REGRESSION_ACCEPT_AFTER}",
+                    )
+                )
+                self._ts_regression_streak += 1
+            else:
+                # Small regression, streak >= threshold: tolerate + advance last_ts.
+                # This breaks the freeze loop from Binance cached snapshots.
+                logger.warning(
+                    "ACCOUNT_SYNC_TS_REGRESSION_TOLERATED "
+                    "snapshot_ts=%d last_ts=%d delta_ms=%d streak=%d "
+                    "action=accepting_to_unblock_reconciler",
+                    snapshot.ts,
+                    self._last_ts,
+                    delta_ms,
+                    self._ts_regression_streak,
+                )
+                # Do NOT append mismatch — accept the snapshot.
+                # last_ts will be advanced in step 4 below.
+                self._ts_regression_streak = 0  # reset streak
+        else:
+            # No regression or empty snapshot: reset streak
+            self._ts_regression_streak = 0
 
         # Rule: duplicate_key for positions (I6)
         pos_keys: set[tuple[str, str]] = set()
