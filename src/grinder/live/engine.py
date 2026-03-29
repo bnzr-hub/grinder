@@ -1021,10 +1021,10 @@ class LiveEngineV0:
                 self._grid_v2_symbol = os.environ.get("GRINDER_GRID_V2_SYMBOL", "")
             if self._grid_v2_symbol:
                 shadow_config = GridV2Config(
-                    grid_step_pct=Decimal(os.environ.get("GRINDER_GRID_V2_STEP_PCT", "0.0025")),
-                    entry_levels_per_side=int(os.environ.get("GRINDER_GRID_V2_ENTRY_LEVELS", "5")),
+                    grid_step_pct=Decimal(os.environ.get("GRINDER_GRID_V2_STEP_PCT", "0.005")),
+                    entry_levels_per_side=int(os.environ.get("GRINDER_GRID_V2_ENTRY_LEVELS", "3")),
                     order_size=Decimal(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE", "0.001")),
-                    max_inventory_levels=int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "5")),
+                    max_inventory_levels=int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "3")),
                     max_inventory_notional_usd=Decimal(
                         os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL", "1000")
                     ),
@@ -1109,17 +1109,17 @@ class LiveEngineV0:
     def _create_grid_v2_bridge(self, order_size_override: Decimal | None = None) -> GridV2Bridge:
         """Construct GridV2Bridge from env-var config. Fail-closed on bad config."""
         # Use adaptive step if enabled, else env default
-        base_step = os.environ.get("GRINDER_GRID_V2_STEP_PCT", "0.0025")
+        base_step = os.environ.get("GRINDER_GRID_V2_STEP_PCT", "0.005")
         if self._adaptive_step.config.enabled and self._grid_v2_symbol:
             effective = self._adaptive_step.get_effective_step(self._grid_v2_symbol)
             base_step = f"{effective:.8f}"
         config = GridV2Config(
             grid_step_pct=Decimal(base_step),
-            entry_levels_per_side=int(os.environ.get("GRINDER_GRID_V2_ENTRY_LEVELS", "5")),
+            entry_levels_per_side=int(os.environ.get("GRINDER_GRID_V2_ENTRY_LEVELS", "3")),
             order_size=order_size_override
             if order_size_override is not None
             else self._grid_v2_order_size_effective,
-            max_inventory_levels=int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "5")),
+            max_inventory_levels=int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "3")),
             max_inventory_notional_usd=Decimal(
                 os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL", "1000")
             ),

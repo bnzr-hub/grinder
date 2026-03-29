@@ -371,6 +371,18 @@ trigger the I5 monotonic timestamp guard. This prevents false `ts_regression` mi
 when transitioning from non-empty to empty (e.g., all orders filled or expired). The
 syncer resets `last_ts` to 0 on empty snapshots, enabling clean re-entry.
 
+**Bounded ts_regression tolerance (ADR-108):** Binance can return cached account snapshots
+with slightly older timestamps after fill events. To prevent indefinitely starving the
+reconciler, the syncer tolerates small bounded regressions after repeated occurrences:
+
+- Regression > `TS_REGRESSION_TOLERANCE_MS` (10s): always hard-blocked as mismatch.
+- Regression <= tolerance, first 3 consecutive occurrences: flagged as mismatch, `last_ts` frozen.
+- Regression <= tolerance, 4th+ consecutive occurrence: **tolerated** — snapshot accepted, `last_ts` advanced to snapshot.ts, streak reset. Log: `ACCOUNT_SYNC_TS_REGRESSION_TOLERATED`.
+- Normal snapshot (no regression): streak counter reset.
+
+This ensures cached-snapshot behavior does not permanently wedge downstream consumers
+while large/unsafe regressions still fail-closed.
+
 **Alert guard:** `AccountSyncDataStale` only fires when the account has active orders or
 positions (`open_orders_count > 0 or positions_count > 0`). Empty accounts have nothing
 to be "stale" about; sync liveness is covered by `AccountSyncStale`.

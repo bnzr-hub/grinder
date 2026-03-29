@@ -958,11 +958,8 @@ class TestEngineStartupRecenterOnFlat:
         monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT", "0")
         monkeypatch.setenv("GRINDER_GRID_V2_RESEED_ON_FLAT_ONLY_ON_SKEW", "1")
         monkeypatch.setenv("GRINDER_GRID_V2_STEP_PCT", "0.0025")
-        monkeypatch.setenv("GRINDER_GRID_V2_ENTRY_LEVELS", "5")
-        monkeypatch.setenv("GRINDER_GRID_V2_MAX_INV_LEVELS", "5")
 
-        # Use same step + levels as engine so no geometry mismatch
-        old_bridge, _ = _fresh_bridge(config=_config(step=Decimal("0.0025"), levels=5))
+        old_bridge, _ = _fresh_bridge(config=_config(step=Decimal("0.005")))
         existing_orders: list[OpenOrderSnap] = []
         for cid in old_bridge.adapter.registry.all_entry_cids:
             reg = old_bridge.adapter.registry.lookup_entry(cid)
@@ -4281,7 +4278,7 @@ class TestPendingPlaceIntegration:
 
         def flaky_place(*args: object, **kwargs: object) -> str:
             call_count["n"] += 1
-            if call_count["n"] > 10:  # seeds use 10 calls (5 levels × 2 sides)
+            if call_count["n"] > 6:  # seeds use 6 calls
                 raise ConnectorTransientError("timeout")
             return f"ORDER_{call_count['n']}"
 
@@ -4411,7 +4408,7 @@ class TestPreSendClassification:
 
         def place_then_presend_fail(*args: object, **kwargs: object) -> str:
             call_count["n"] += 1
-            if call_count["n"] > 10:  # seeds succeed, then pre-send fail
+            if call_count["n"] > 6:  # seeds succeed, then pre-send fail
                 raise ConnectorNonRetryableError("notional too small", pre_send=True)
             return f"ORDER_{call_count['n']}"
 
@@ -4535,7 +4532,7 @@ class TestPreSendClassification:
 
         def place_then_circuit(*args: object, **kwargs: object) -> str:
             call_count["n"] += 1
-            if call_count["n"] > 10:
+            if call_count["n"] > 6:
                 raise CircuitOpenError("breaker open")
             return f"ORDER_{call_count['n']}"
 
@@ -4645,7 +4642,7 @@ class TestPreSendClassification:
 
         def place_then_exchange_reject(*args: object, **kwargs: object) -> str:
             call_count["n"] += 1
-            if call_count["n"] > 10:
+            if call_count["n"] > 6:
                 raise ConnectorNonRetryableError(
                     "Binance error -4164: min notional", exchange_code=-4164
                 )
@@ -4761,7 +4758,7 @@ class TestPreSendClassification:
 
         def place_then_duplicate(*args: object, **kwargs: object) -> str:
             call_count["n"] += 1
-            if call_count["n"] > 10:
+            if call_count["n"] > 6:
                 raise ConnectorNonRetryableError(
                     "Binance error -2010: New order rejected",
                     exchange_code=-2010,
@@ -4882,7 +4879,7 @@ class TestPreSendClassification:
 
         def place_then_margin(*args: object, **kwargs: object) -> str:
             call_count["n"] += 1
-            if call_count["n"] > 10:  # 5 levels × 2 sides = 10 seed entries
+            if call_count["n"] > 6:
                 raise ConnectorNonRetryableError(
                     "Binance error -2019: Margin is insufficient",
                     exchange_code=-2019,
