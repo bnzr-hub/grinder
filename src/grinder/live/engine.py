@@ -887,6 +887,8 @@ class LiveEngineV0:
             )
         # Pending actions from reconciler dispatch (for fill-detection exclusion)
         self._sync_reconciler_pending_actions: list[ExecutionAction] = []
+        # ADR-112: SM mode at staging time, for stale-mode drain filter
+        self._reconciler_staged_mode: str = ""
         # Batch accumulator for reduce-only budget guard (reset per tick)
         self._reduce_only_batch_qty: dict[tuple[str, str], Decimal] = {}
         # Provable current-tick lot additions from fill path (symbol → qty added)
@@ -3013,6 +3015,16 @@ class LiveEngineV0:
                     # Filter stale PLACEs: fill path may have registered CIDs
                     # for these slots between staging and drain.
                     bridge = self._grid_v2_bridge
+                    # ADR-112: Check if SM mode changed since staging.
+                    # If mode changed (e.g., FLAT→LONG_BRANCH from a fill),
+                    # drop stale PLACEs staged under the old mode.
+                    current_mode = (
+                        bridge.state_machine.mode.value if bridge and bridge.state_machine else ""
+                    )
+                    mode_changed = (
+                        self._reconciler_staged_mode
+                        and current_mode != self._reconciler_staged_mode
+                    )
                     drained: list[ExecutionAction] = []
                     for a in self._sync_reconciler_pending_actions:
                         if (
@@ -3023,6 +3035,18 @@ class LiveEngineV0:
                             and bridge.adapter.registry.cid_for_entry(a.side, a.price) is not None
                         ):
                             continue  # slot already occupied by fill path
+                        if a.action_type == ActionType.PLACE and mode_changed:
+                            logger.info(
+                                "GRID_V2_STALE_MODE_PLACE_DROPPED symbol=%s "
+                                "staged_mode=%s current_mode=%s cid=%s",
+                                self._grid_v2_symbol,
+                                self._reconciler_staged_mode,
+                                current_mode,
+                                a.client_order_id or "?",
+                            )
+                            if a.client_order_id:
+                                self._grid_v2_clean_failed_place(a.client_order_id)
+                            continue  # stale mode PLACE
                         drained.append(a)
                     grid_v2_integrity_actions = drained
                     self._sync_reconciler_pending_actions = []
@@ -4364,6 +4388,12 @@ class LiveEngineV0:
                     # One-shot: clear after suppression so next cycle is not blocked
                     self._last_fill_ts = 0
                 self._sync_reconciler_pending_actions = materialized
+                # ADR-112: Record SM mode at staging for stale-mode drain filter
+                self._reconciler_staged_mode = (
+                    self._grid_v2_bridge.state_machine.mode.value
+                    if self._grid_v2_bridge and self._grid_v2_bridge.state_machine
+                    else ""
+                )
                 if materialized:
                     logger.info(
                         "GRID_V2_SYNC_RECONCILER_DISPATCH_STAGED symbol=%s actions=%d "
