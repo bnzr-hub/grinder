@@ -891,6 +891,11 @@ class LiveEngineV0:
         self._reduce_only_batch_qty: dict[tuple[str, str], Decimal] = {}
         # Provable current-tick lot additions from fill path (symbol → qty added)
         self._reduce_only_batch_new_lots_qty: dict[str, Decimal] = {}
+        # ADR-111: Exchange timestamp of most recent fill (ms).
+        # Both sources (user-data oe.ts, reconstructed snapshot.ts) use
+        # exchange time — same domain as comparison target snapshot.ts.
+        # When snapshot.ts < _last_fill_ts, snapshot is stale → suppress PLACE.
+        self._last_fill_ts: int = 0
         # ADR-104: (symbol, side) pairs pending reduce-only repair after -2022 reject.
         # Blocks further reduce-only exits for that direction until sync repairs topology.
         self._reduce_only_pending_repair: set[tuple[str, str]] = set()
@@ -2591,6 +2596,7 @@ class LiveEngineV0:
                 return
 
             self._grid_v2_user_fill_seen.add(oe.client_order_id)
+            self._last_fill_ts = max(self._last_fill_ts, oe.ts)  # ADR-111
             self._maybe_track_lot_closure(oe.symbol, result)
             # Provable lot addition from user-data fill path
             parsed_ud = bridge.adapter.parse_cid(oe.client_order_id)
@@ -2991,6 +2997,11 @@ class LiveEngineV0:
                     snapshot.symbol,
                     snapshot.ts,
                 )
+                # ADR-111: Track fill timestamp for burst churn suppression.
+                # Use snapshot.ts (exchange time) — same domain as comparison
+                # target in _tick_account_sync. Never use wall-clock here.
+                if grid_v2_fill_actions:
+                    self._last_fill_ts = max(self._last_fill_ts, snapshot.ts)
                 # Track SM FLAT transition for drift-reconstruct cooldown
                 self._grid_v2_track_flat_transition()
                 # Same-tick dedup: extract PLACE_ENTRY slots from fill path
@@ -4322,17 +4333,42 @@ class LiveEngineV0:
                 )
             # PRIMARY MODE: stage actions for dispatch on next process_snapshot tick
             if is_primary and recon.actions:
-                self._sync_reconciler_pending_actions = (
-                    self._grid_v2_materialize_reconciler_actions(recon.actions, result.snapshot.ts)
+                materialized = self._grid_v2_materialize_reconciler_actions(
+                    recon.actions, result.snapshot.ts
                 )
-                logger.info(
-                    "GRID_V2_SYNC_RECONCILER_DISPATCH_STAGED symbol=%s actions=%d "
-                    "cancel=%d place=%d",
-                    self._grid_v2_symbol,
-                    len(self._sync_reconciler_pending_actions),
-                    recon.would_cancel,
-                    recon.would_place,
-                )
+                # ADR-111: Suppress PLACE_ENTRY only when snapshot is stale
+                # relative to recent fills. If snapshot.ts >= last_fill_ts,
+                # the snapshot has caught up and PLACEs are safe.
+                _snapshot_ts = result.snapshot.ts if result.snapshot else 0
+                _snapshot_stale = self._last_fill_ts > 0 and _snapshot_ts < self._last_fill_ts
+                if _snapshot_stale:
+                    suppressed = [a for a in materialized if a.action_type == ActionType.PLACE]
+                    if suppressed:
+                        materialized = [
+                            a for a in materialized if a.action_type != ActionType.PLACE
+                        ]
+                        logger.info(
+                            "GRID_V2_BURST_CHURN_SUPPRESSED symbol=%s "
+                            "suppressed_places=%d snapshot_ts=%d last_fill_ts=%d "
+                            "reason=SNAPSHOT_STALE_RELATIVE_TO_FILLS",
+                            self._grid_v2_symbol,
+                            len(suppressed),
+                            _snapshot_ts,
+                            self._last_fill_ts,
+                        )
+                        for sa in suppressed:
+                            if sa.client_order_id:
+                                self._grid_v2_clean_failed_place(sa.client_order_id)
+                self._sync_reconciler_pending_actions = materialized
+                if materialized:
+                    logger.info(
+                        "GRID_V2_SYNC_RECONCILER_DISPATCH_STAGED symbol=%s actions=%d "
+                        "cancel=%d place=%d",
+                        self._grid_v2_symbol,
+                        len(materialized),
+                        sum(1 for a in materialized if a.action_type == ActionType.CANCEL),
+                        sum(1 for a in materialized if a.action_type == ActionType.PLACE),
+                    )
 
         # P0-2: correlate recent PLACEs with AccountSync open_orders
         if self._debug_open_orders and result.snapshot is not None:
