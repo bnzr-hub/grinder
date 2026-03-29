@@ -4589,7 +4589,7 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Status:** Delivered.
 - **Decision:** When fills have been processed since the last reconciler cycle, suppress PLACE_ENTRY staging. CANCEL actions still allowed.
 - **Problem:** During burst fills, SM state was ahead of exchange snapshot. Reconciler staged entries based on stale snapshot, then cancelled them on the next sync when SM already showed inventory-full.
-- **Fix:** Track `_last_fill_ts` in exchange time only (ms). Both fill paths (user-data `oe.ts`, reconstructed `snapshot.ts`) use exchange timestamps — same domain as the comparison target. Suppress PLACE_ENTRY only when `snapshot.ts < _last_fill_ts`. When snapshot catches up, PLACEs allowed normally. No wall-clock mixing, no starvation.
+- **Fix (revised):** One-shot suppression. Track `_last_fill_ts` in exchange time. Suppress PLACE_ENTRY for ONE reconciler cycle when `snapshot.ts < _last_fill_ts`, then clear `_last_fill_ts = 0`. Next cycle proceeds normally. Previous unbounded policy caused 80x suppression / restore starvation in 900s live run.
 - **Scope:** Reconciler staging suppression. Complements ADR-110 (SM-level). Does not change reconciler desired-state computation.
 - **Implementation:** `src/grinder/live/engine.py`.
-- **Tests:** 8 adversarial tests in `tests/unit/test_burst_churn_suppression.py`.
+- **Tests:** 10 adversarial tests in `tests/unit/test_burst_churn_suppression.py` (7 predicate + 3 engine-path).
