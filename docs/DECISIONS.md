@@ -4583,3 +4583,13 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Fix:** `_inventory_has_room = len(new_open) < max_inventory_levels` guard before all 4 replenish paths in `_apply_exit_filled`.
 - **Implementation:** `src/grinder/grid_v2/state.py`.
 - **Tests:** 2 adversarial tests in `tests/unit/test_grid_v2_state.py`.
+
+### ADR-111: Suppress Reconciler Burst Churn After Rapid Fills (2026-03-29)
+
+- **Status:** Delivered.
+- **Decision:** When fills have been processed since the last reconciler cycle, suppress PLACE_ENTRY staging. CANCEL actions still allowed.
+- **Problem:** During burst fills, SM state was ahead of exchange snapshot. Reconciler staged entries based on stale snapshot, then cancelled them on the next sync when SM already showed inventory-full.
+- **Fix:** Track `_last_fill_ts` in exchange time only (ms). Both fill paths (user-data `oe.ts`, reconstructed `snapshot.ts`) use exchange timestamps — same domain as the comparison target. Suppress PLACE_ENTRY only when `snapshot.ts < _last_fill_ts`. When snapshot catches up, PLACEs allowed normally. No wall-clock mixing, no starvation.
+- **Scope:** Reconciler staging suppression. Complements ADR-110 (SM-level). Does not change reconciler desired-state computation.
+- **Implementation:** `src/grinder/live/engine.py`.
+- **Tests:** 8 adversarial tests in `tests/unit/test_burst_churn_suppression.py`.
