@@ -1951,3 +1951,156 @@ class TestExitStepSpacing:
             assert spacing >= step, (
                 f"Pair {exits[i]}-{exits[i + 1]} spacing {spacing} < step {step}"
             )
+
+
+class TestReplenishSuppressedWhenInventoryFull:
+    """ADR-110: Suppress replenish when inventory is already full."""
+
+    REF = Decimal("50000")
+    STEP = Decimal("0.005")
+    SIZE = Decimal("0.001")
+
+    def test_exit_fill_replenish_when_below_max(self) -> None:
+        """Exit fill with inventory below max and window below levels -> replenish fires.
+
+        Construct a LONG_BRANCH snapshot where buy_entry_prices < levels_per_side
+        and open_lots < max_inventory. This is the scenario where EXIT_RESTORE
+        should create a new entry.
+        """
+        cfg = GridV2Config(
+            grid_step_pct=self.STEP,
+            entry_levels_per_side=3,
+            order_size=self.SIZE,
+            max_inventory_levels=5,
+            max_inventory_notional_usd=Decimal("100000"),
+            reseed_on_flat=True,
+        )
+        step = Decimal("250")
+        # 2 lots, max=5. Window has only 1 buy entry (below levels=3).
+        lots = tuple(
+            InventoryLot(
+                lot_id=f"lot-{i}",
+                side=LotSide.LONG,
+                entry_price=self.REF - step * (i + 1),
+                qty=self.SIZE,
+                opened_at_ts=1000 + i,
+                source_entry_order_id=f"e-{i}",
+                exit_price=self.REF - step * (i + 1) + step,
+                exit_order_id=f"exit-{i}",
+                status=LotStatus.OPEN,
+            )
+            for i in range(2)
+        )
+        exits = tuple(
+            ExitOrder(
+                exit_order_id=f"exit-{i}",
+                lot_id=f"lot-{i}",
+                side=OrderSide.SELL,
+                price=self.REF - step * (i + 1) + step,
+                qty=self.SIZE,
+                status=ExitOrderStatus.OPEN,
+            )
+            for i in range(2)
+        )
+        # Only 1 buy price in window (below levels_per_side=3)
+        window = EntryWindow(
+            reference_price=self.REF,
+            buy_entry_prices=(self.REF - step * 3,),
+            sell_entry_prices=(),
+            levels_per_side=3,
+            step_pct=self.STEP,
+        )
+        snap = GridV2Snapshot(
+            mode=BranchMode.LONG_BRANCH,
+            entry_window=window,
+            open_lots=lots,
+            closed_lots=(),
+            exit_orders=exits,
+            emergency_stopped=False,
+            last_recenter_ts=None,
+        )
+        sm = GridV2StateMachine(cfg, snap)
+        assert len(sm.snapshot.open_lots) == 2
+
+        # Fill exit -> 1 lot remains (below max=5), window has room
+        result = sm.apply(
+            ExitFilled(
+                exit_order_id="exit-0",
+                lot_id="lot-0",
+                price=exits[0].price,
+                qty=self.SIZE,
+                ts=2000,
+            )
+        )
+        assert len(sm.snapshot.open_lots) == 1
+        places = [a for a in result.actions if a.kind == ActionIntentKind.PLACE_ENTRY]
+        assert len(places) == 1, (
+            f"Replenish expected when below max (1 lot, max=5), got {len(places)}"
+        )
+        assert places[0].side == OrderSide.BUY
+        assert places[0].reason == "EXIT_RESTORE"
+
+    def test_exit_fill_no_replenish_when_still_at_max(self) -> None:
+        """Exit fill but remaining lots still >= max -> no PLACE_ENTRY."""
+        cfg = GridV2Config(
+            grid_step_pct=self.STEP,
+            entry_levels_per_side=5,
+            order_size=self.SIZE,
+            max_inventory_levels=2,
+            max_inventory_notional_usd=Decimal("100000"),
+            reseed_on_flat=True,
+        )
+        step = Decimal("250")
+        lots = tuple(
+            InventoryLot(
+                lot_id=f"lot-{i}",
+                side=LotSide.LONG,
+                entry_price=self.REF - step * (i + 1),
+                qty=self.SIZE,
+                opened_at_ts=1000 + i,
+                source_entry_order_id=f"e-{i}",
+                exit_price=self.REF - step * (i + 1) + step,
+                exit_order_id=f"exit-{i}",
+                status=LotStatus.OPEN,
+            )
+            for i in range(3)
+        )
+        exits = tuple(
+            ExitOrder(
+                exit_order_id=f"exit-{i}",
+                lot_id=f"lot-{i}",
+                side=OrderSide.SELL,
+                price=self.REF - step * (i + 1) + step,
+                qty=self.SIZE,
+                status=ExitOrderStatus.OPEN,
+            )
+            for i in range(3)
+        )
+        window = EntryWindow(
+            reference_price=self.REF,
+            buy_entry_prices=(self.REF - step * 4, self.REF - step * 5),
+            sell_entry_prices=(),
+            levels_per_side=5,
+            step_pct=self.STEP,
+        )
+        snap = GridV2Snapshot(
+            mode=BranchMode.LONG_BRANCH,
+            entry_window=window,
+            open_lots=lots,
+            closed_lots=(),
+            exit_orders=exits,
+            emergency_stopped=False,
+            last_recenter_ts=None,
+        )
+        sm = GridV2StateMachine(cfg, snap)
+        assert len(sm.snapshot.open_lots) == 3
+
+        result = sm.apply(
+            ExitFilled(
+                exit_order_id="exit-0", lot_id="lot-0", price=exits[0].price, qty=self.SIZE, ts=2000
+            )
+        )
+        # 2 lots remain == max_inv=2
+        assert len(sm.snapshot.open_lots) == 2
+        places = [a for a in result.actions if a.kind == ActionIntentKind.PLACE_ENTRY]
+        assert len(places) == 0, f"No replenish when at max, got {len(places)}"

@@ -4574,3 +4574,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Zero behavioral change:** Ledger does not affect reconciler, risk, budget, exit topology, or any live trading decision. It is observability only.
 - **Phase 2 gate:** Authority switch requires at least one full bounded verification run with shadow order divergence below operational threshold. Position authority switch requires multi-position event support first.
 - **Tests:** 13 adversarial tests in `tests/unit/test_event_ledger.py`.
+
+### ADR-110: Suppress Replenish When Inventory Full (2026-03-29)
+
+- **Status:** Delivered.
+- **Decision:** Exit-fill replenish path must check remaining inventory against `max_inventory_levels` before creating PLACE_ENTRY. Previously gated only by entry window size, not inventory depth.
+- **Problem:** When an exit filled during inventory-full branch, the SM's `_apply_exit_filled` created an EXIT_RESTORE replenish entry even though remaining lots were still at/above max. This is one contributor to place→cancel churn; the broader reconciler-level burst pattern (theoretical flipping between 0 and N across sync cycles) is a separate issue not addressed here.
+- **Fix:** `_inventory_has_room = len(new_open) < max_inventory_levels` guard before all 4 replenish paths in `_apply_exit_filled`.
+- **Implementation:** `src/grinder/grid_v2/state.py`.
+- **Tests:** 2 adversarial tests in `tests/unit/test_grid_v2_state.py`.
