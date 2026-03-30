@@ -4643,3 +4643,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Invariant:** Ledger trust requires convergence proof from the latest comparison. Divergence immediately revokes trust. Reset clears all state.
 - **Implementation:** `src/grinder/account/event_ledger.py`, `src/grinder/live/engine.py`.
 - **Tests:** 14 regression tests in `tests/unit/test_event_ledger_trusted_read.py`.
+
+### ADR-109 Phase 2 PR-2: Ledger-backed exchange CID visibility (2026-03-30)
+
+- **Decision:** Switch `_grid_v2_exchange_cids()` to prefer EventLedger when trusted, so the backup snapshot-diff fill/cancel detection path benefits from faster WS-driven order disappearance.
+- **Context:** The WS user-data path (`process_user_data_event`) already processes fills event-first via direct `bridge.on_fill()` + immediate dispatch — that existed before this PR. The snapshot diff path (`_grid_v2_process_fills`) is a backup that catches missed fills. This PR improves the backup path's order-visibility source, not the primary fill-transition authority.
+- **Change:** `_grid_v2_exchange_cids()` now prefers `event_ledger.open_orders_for_symbol()` when trusted, falling back to `_last_account_snapshot.open_orders` otherwise.
+- **Observability:** New `EVENT_FIRST_FILL_APPLIED` log line on existing WS fill path for operator visibility.
+- **Implementation:** `src/grinder/live/engine.py`.
+- **Tests:** 7 regression tests in `tests/unit/test_event_first_fill.py`.

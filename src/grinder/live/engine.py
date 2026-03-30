@@ -1553,11 +1553,23 @@ class LiveEngineV0:
         return True
 
     def _grid_v2_exchange_cids(self, symbol: str) -> set[str]:
-        """Get current grid_v2 CIDs on exchange from last account snapshot."""
+        """Get current grid_v2 CIDs on exchange.
+
+        ADR-109 Phase 2 PR-2: prefer EventLedger when trusted for faster
+        fill/cancel detection. Falls back to last account snapshot otherwise.
+        """
+        if self._event_ledger.is_trusted:
+            cids: set[str] = set()
+            for cid in self._event_ledger.open_orders_for_symbol(symbol):
+                parsed = parse_client_order_id(cid)
+                if parsed is not None and parsed.strategy_id == GRID_V2_STRATEGY_ID:
+                    cids.add(cid)
+            return cids
+
         acct = self._last_account_snapshot
         if acct is None:
             return set()
-        cids: set[str] = set()
+        cids = set()
         for o in acct.open_orders:
             if o.symbol != symbol:
                 continue
@@ -2599,6 +2611,14 @@ class LiveEngineV0:
 
             self._grid_v2_user_fill_seen.add(oe.client_order_id)
             self._last_fill_ts = max(self._last_fill_ts, oe.ts)  # ADR-111
+            # ADR-109 Phase 2 PR-2: event-first fill observability
+            logger.info(
+                "EVENT_FIRST_FILL_APPLIED cid=%s symbol=%s source=user_data actions=%d trusted=%s",
+                oe.client_order_id,
+                oe.symbol,
+                len(result.execution_actions),
+                self._event_ledger.is_trusted,
+            )
             self._maybe_track_lot_closure(oe.symbol, result)
             # Provable lot addition from user-data fill path
             parsed_ud = bridge.adapter.parse_cid(oe.client_order_id)
