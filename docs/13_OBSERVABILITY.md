@@ -809,6 +809,19 @@ Emitted when WS user-data path processes a fill event-first (before snapshot).
 EVENT_FIRST_FILL_APPLIED cid=g_g_BTCUSDT_e5_123_0 symbol=BTCUSDT source=user_data actions=7 trusted=True
 ```
 
+### EVENT_LEDGER_ORDER_RECOVERED
+Emitted when a stale ledger-open order is closed by snapshot-backed reconciliation
+(missed WS terminal event). Requires two consecutive snapshot absences.
+```
+EVENT_LEDGER_ORDER_RECOVERED cid=g_g_PIPPINUSDT_e0_123_0 symbol=PIPPINUSDT reason=snapshot_absence_consecutive
+```
+
+### EVENT_LEDGER_RECONCILED
+Emitted after snapshot reconciliation closes stale orders and re-compares.
+```
+EVENT_LEDGER_RECONCILED orders=5 converged=True
+```
+
 ### Operator interpretation
 | Signal | Meaning | Action |
 |--------|---------|--------|
@@ -816,3 +829,6 @@ EVENT_FIRST_FILL_APPLIED cid=g_g_BTCUSDT_e5_123_0 symbol=BTCUSDT source=user_dat
 | `TRUST_RESTORED` | Ledger re-enabled after recovery | Normal operation resumed |
 | `SHADOW_DIVERGENCE` with `trusted=False` | Ledger and snapshot disagree, ledger not trusted | Expected during/after degraded mode |
 | `SHADOW_DIVERGENCE` with `trusted=True` | Should not happen (divergence revokes trust) | Investigate immediately |
+| `ORDER_RECOVERED` | Stale order closed by snapshot absence | Normal recovery; WS terminal event was missed |
+| `RECONCILED converged=True` | Recovery healed all divergences | Trust can now reconverge |
+| `RECONCILED converged=False` | Recovery closed some but not all | Remaining divergences need more cycles or investigation |

@@ -425,8 +425,27 @@ read model for open-order visibility. Authority is bounded:
 - Log signal: `EVENT_LEDGER_TRUST_RESTORED`
 - No silent re-enable without explicit convergence proof
 
+**Snapshot-backed order reconciliation (PR-4):**
+
+When a WS terminal event is missed (e.g., cancel dispatched but WS ack never arrives),
+the ledger keeps the order "open" indefinitely, causing permanent `ORDER_MISSING_IN_SNAPSHOT`
+divergence and preventing trust reconvergence.
+
+Two-cycle conservative reconciliation rule:
+1. `compare_with_snapshot()` tracks which CIDs are missing in the current vs previous cycle
+2. `reconcile_with_snapshot()` closes orders missing in BOTH consecutive comparison cycles
+3. Single-cycle absence does **not** close (prevents false-close from transient visibility gaps)
+4. Reconciled orders are marked with terminal status and logged as `EVENT_LEDGER_ORDER_RECOVERED`
+5. After reconciliation, a re-comparison checks convergence; trust can be restored if converged + HEALTHY
+
+Why single-cycle absence is not enough:
+- Snapshot may be cached/stale (Binance returns slightly old data)
+- Orders just placed may not appear in the first snapshot after dispatch
+- One-cycle gaps are transient and expected; two-cycle absence is strong evidence
+
 **Snapshot role in Phase 2:**
 - Bootstrap source (hydrate ledger on every sync)
 - Audit/drift detection (compare_with_snapshot)
 - Recovery source (authoritative when ledger is not trusted)
+- Reconciliation source (two-cycle absence closes stale ledger orders)
 - Still used by reconciler for actual entry/exit computation
