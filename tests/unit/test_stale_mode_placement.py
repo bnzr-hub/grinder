@@ -158,3 +158,41 @@ class TestEngineDrainPath:
 
         # CANCEL not cleaned — it's not a PLACE
         mock_clean.assert_not_called()
+
+    def test_fill_since_staging_drops_place_same_mode(self) -> None:
+        """Same mode but newer fill watermark -> stale PLACE dropped."""
+        engine, _bridge = self._setup_for_drain("SHORT_BRANCH", "SHORT_BRANCH")
+        engine._sync_reconciler_pending_actions = [_place("g-stale-fill"), _cancel("g-ok")]
+        engine._reconciler_staged_fill_ts = 1000
+        engine._last_fill_ts = 2000
+
+        with (
+            patch.object(engine, "_grid_v2_process_fills", return_value=[]),
+            patch.object(engine, "_grid_v2_process_cancel_acks"),
+            patch.object(engine, "_grid_v2_track_flat_transition"),
+            patch.object(engine, "_extract_planned_entry_slots", return_value=set()),
+            patch.object(engine, "_grid_v2_clean_failed_place") as mock_clean,
+        ):
+            engine.process_snapshot(_snapshot("BTCUSDT"))
+
+        mock_clean.assert_called_once_with("g-stale-fill")
+        assert engine._sync_reconciler_pending_actions == []
+        assert engine._reconciler_staged_fill_ts == 0
+
+    def test_no_fill_since_staging_keeps_place_same_mode(self) -> None:
+        """Same mode and no newer fill watermark -> PLACE kept."""
+        engine, _bridge = self._setup_for_drain("SHORT_BRANCH", "SHORT_BRANCH")
+        engine._sync_reconciler_pending_actions = [_place("g-ok")]
+        engine._reconciler_staged_fill_ts = 2000
+        engine._last_fill_ts = 2000
+
+        with (
+            patch.object(engine, "_grid_v2_process_fills", return_value=[]),
+            patch.object(engine, "_grid_v2_process_cancel_acks"),
+            patch.object(engine, "_grid_v2_track_flat_transition"),
+            patch.object(engine, "_extract_planned_entry_slots", return_value=set()),
+            patch.object(engine, "_grid_v2_clean_failed_place") as mock_clean,
+        ):
+            engine.process_snapshot(_snapshot("BTCUSDT"))
+
+        mock_clean.assert_not_called()

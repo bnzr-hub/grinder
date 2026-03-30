@@ -889,6 +889,9 @@ class LiveEngineV0:
         self._sync_reconciler_pending_actions: list[ExecutionAction] = []
         # ADR-112: SM mode at staging time, for stale-mode drain filter
         self._reconciler_staged_mode: str = ""
+        # Fill watermark at staging time. If a fill lands before drain,
+        # staged PLACE actions were computed on stale pre-fill visibility.
+        self._reconciler_staged_fill_ts: int = 0
         # Batch accumulator for reduce-only budget guard (reset per tick)
         self._reduce_only_batch_qty: dict[tuple[str, str], Decimal] = {}
         # Provable current-tick lot additions from fill path (symbol → qty added)
@@ -3045,6 +3048,7 @@ class LiveEngineV0:
                         self._reconciler_staged_mode
                         and current_mode != self._reconciler_staged_mode
                     )
+                    fill_since_staging = self._last_fill_ts > self._reconciler_staged_fill_ts
                     drained: list[ExecutionAction] = []
                     for a in self._sync_reconciler_pending_actions:
                         if (
@@ -3067,9 +3071,22 @@ class LiveEngineV0:
                             if a.client_order_id:
                                 self._grid_v2_clean_failed_place(a.client_order_id)
                             continue  # stale mode PLACE
+                        if a.action_type == ActionType.PLACE and fill_since_staging:
+                            logger.info(
+                                "GRID_V2_STALE_FILL_PLACE_DROPPED symbol=%s "
+                                "staged_fill_ts=%d current_fill_ts=%d cid=%s",
+                                self._grid_v2_symbol,
+                                self._reconciler_staged_fill_ts,
+                                self._last_fill_ts,
+                                a.client_order_id or "?",
+                            )
+                            if a.client_order_id:
+                                self._grid_v2_clean_failed_place(a.client_order_id)
+                            continue  # stale fill PLACE
                         drained.append(a)
                     grid_v2_integrity_actions = drained
                     self._sync_reconciler_pending_actions = []
+                    self._reconciler_staged_fill_ts = 0
                 else:
                     grid_v2_integrity_actions = self._grid_v2_integrity_repair(
                         snapshot, planned_slots_this_tick=planned_slots
@@ -4456,6 +4473,7 @@ class LiveEngineV0:
                     if self._grid_v2_bridge and self._grid_v2_bridge.state_machine
                     else ""
                 )
+                self._reconciler_staged_fill_ts = self._last_fill_ts
                 if materialized:
                     logger.info(
                         "GRID_V2_SYNC_RECONCILER_DISPATCH_STAGED symbol=%s actions=%d "
