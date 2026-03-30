@@ -645,11 +645,10 @@ class LiveEngineV0:
         self._health_input = LiveHealthInput()
         self._health_mode = LiveHealthMode.HEALTHY
         self._health_mode_prev = LiveHealthMode.HEALTHY
-        # ADR-109 Phase 1: EventLedger in shadow mode
+        # ADR-109 Phase 2: EventLedger as trusted read model (healthy mode)
         from grinder.account.event_ledger import EventLedger  # noqa: PLC0415
 
         self._event_ledger = EventLedger()
-        self._event_ledger_bootstrapped = False
         # ADR-102: Risk-Saturated Mode — per-symbol tracking
         # Consecutive RISK_SYMBOL_CAP blocks (reset on allow, non-cap block, or sync headroom)
         self._risk_cap_consecutive_blocks: dict[str, int] = {}
@@ -4028,36 +4027,47 @@ class LiveEngineV0:
                 self._evaluate_symbol_risk(result.snapshot)
             # PR-L2: Store full snapshot for LiveGridPlannerV1 (open_orders as exchange truth)
             self._last_account_snapshot = result.snapshot
-            # ADR-109 PR-C: Bootstrap ledger from first successful sync.
-            # Runs once regardless of whether WS events arrived first.
-            # hydrate_from_snapshot is idempotent — skips already-known orders.
-            if not self._event_ledger_bootstrapped:
-                hydrated = self._event_ledger.hydrate_from_snapshot(result.snapshot)
-                self._event_ledger_bootstrapped = True
-                if hydrated > 0:
-                    logger.info(
-                        "EVENT_LEDGER_BOOTSTRAP_HYDRATED orders=%d snapshot_ts=%d",
-                        hydrated,
-                        result.snapshot.ts,
-                    )
-            # ADR-109 Phase 1: Shadow comparison (observability only)
-            if self._event_ledger_bootstrapped:
-                shadow = self._event_ledger.compare_with_snapshot(result.snapshot)
-                if not shadow.is_converged:
-                    logger.info(
-                        "EVENT_LEDGER_SHADOW_DIVERGENCE "
-                        "divergences=%d ledger_orders=%d snapshot_orders=%d",
-                        len(shadow.divergences),
-                        shadow.ledger_open_orders,
-                        shadow.snapshot_open_orders,
-                    )
-                    for d in shadow.divergences[:5]:
-                        logger.info("  %s symbol=%s %s", d.kind.value, d.symbol, d.detail)
-            # PR6: clear awaiting-sync flag only when ALL seed CIDs are visible
-            # in the account snapshot. If seeds aren't visible yet, keep skipping
-            # fill detection to prevent false fills.
+            # ADR-109 Phase 2: Hydrate ledger from every sync (idempotent).
+            # Fixes Phase 1 bug: one-shot bootstrap ran on preflight sync
+            # (0 orders), causing permanent divergence for the session.
+            hydrated = self._event_ledger.hydrate_from_snapshot(result.snapshot)
+            if hydrated > 0:
+                logger.info(
+                    "EVENT_LEDGER_HYDRATED orders=%d snapshot_ts=%d bootstrapped=%s trusted=%s",
+                    hydrated,
+                    result.snapshot.ts,
+                    self._event_ledger.bootstrapped,
+                    self._event_ledger.is_trusted,
+                )
+            # ADR-109 Phase 2: Compare and update trust signal.
+            shadow = self._event_ledger.compare_with_snapshot(result.snapshot)
+            if not shadow.is_converged:
+                logger.info(
+                    "EVENT_LEDGER_SHADOW_DIVERGENCE "
+                    "divergences=%d ledger_orders=%d snapshot_orders=%d "
+                    "trusted=%s",
+                    len(shadow.divergences),
+                    shadow.ledger_open_orders,
+                    shadow.snapshot_open_orders,
+                    self._event_ledger.is_trusted,
+                )
+                for d in shadow.divergences[:5]:
+                    logger.info("  %s symbol=%s %s", d.kind.value, d.symbol, d.detail)
+            elif self._event_ledger.is_trusted:
+                logger.debug(
+                    "EVENT_LEDGER_TRUSTED_READ_MODEL ledger_orders=%d snapshot_orders=%d",
+                    shadow.ledger_open_orders,
+                    shadow.snapshot_open_orders,
+                )
+            # PR6: clear awaiting-sync flag only when ALL seed CIDs are visible.
+            # ADR-109 Phase 2: prefer ledger for visibility when trusted,
+            # fall back to snapshot. Ledger may know about orders sooner
+            # via WS events than the REST snapshot (cached/stale).
             if self._grid_v2_awaiting_sync and self._grid_v2_pending_seed_cids:
-                visible_cids = {o.order_id for o in result.snapshot.open_orders}
+                if self._event_ledger.is_trusted:
+                    visible_cids = set(self._event_ledger.open_orders().keys())
+                else:
+                    visible_cids = {o.order_id for o in result.snapshot.open_orders}
                 missing = self._grid_v2_pending_seed_cids - visible_cids
                 if not missing:
                     confirmed_count = len(self._grid_v2_pending_seed_cids)
@@ -4077,8 +4087,12 @@ class LiveEngineV0:
             # Clear pending-place CIDs: visible on exchange OR grace expired.
             # Grace = 2 sync cycles. After grace, CID released for fill detection
             # (handles immediate-fill before first snapshot visibility).
+            # ADR-109 Phase 2: use ledger when trusted for faster visibility.
             if self._grid_v2_pending_place_cids:
-                visible_cids = {o.order_id for o in result.snapshot.open_orders}
+                if self._event_ledger.is_trusted:
+                    visible_cids = set(self._event_ledger.open_orders().keys())
+                else:
+                    visible_cids = {o.order_id for o in result.snapshot.open_orders}
                 gen = self._account_sync_generation + 1  # gen about to be set
                 expired: list[str] = []
                 for cid, dispatch_gen in list(self._grid_v2_pending_place_cids.items()):
@@ -4099,8 +4113,12 @@ class LiveEngineV0:
             # Keep CIDs that are still visible in fresh snapshot (Binance propagation
             # lag — cancel returned -2011 but order still appears in REST).
             # Remove CIDs that are absent from fresh snapshot (order is gone).
+            # ADR-109 Phase 2: use ledger when trusted for faster visibility.
             if self._cancel_failed_ids:
-                live_order_ids = {o.order_id for o in result.snapshot.open_orders}
+                if self._event_ledger.is_trusted:
+                    live_order_ids = set(self._event_ledger.open_orders().keys())
+                else:
+                    live_order_ids = {o.order_id for o in result.snapshot.open_orders}
                 surviving = self._cancel_failed_ids & live_order_ids
                 pruned_count = len(self._cancel_failed_ids) - len(surviving)
                 logger.info(
@@ -4164,7 +4182,11 @@ class LiveEngineV0:
             # Pre-pass: clean stale registry entries that block reconciler PLACE.
             # A CID in registry but absent from exchange AND not in pending sets
             # is stale (cancelled/filled without ack). Remove to unblock reseed.
-            exchange_cids = {o.order_id for o in result.snapshot.open_orders}
+            # ADR-109 Phase 2: use ledger when trusted for faster detection.
+            if self._event_ledger.is_trusted:
+                exchange_cids = set(self._event_ledger.open_orders().keys())
+            else:
+                exchange_cids = {o.order_id for o in result.snapshot.open_orders}
             bridge = self._grid_v2_bridge
             stale_cleaned = 0
             for cid in list(bridge.adapter.registry.all_entry_cids):
