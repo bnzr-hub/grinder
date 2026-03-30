@@ -1849,7 +1849,8 @@ Comprehensive adaptive grid system design:
 - **Phase 2:** Hydration runs every sync (idempotent). `is_trusted` predicate gates authority: requires `bootstrapped + last_comparison_converged`. 4 engine order-visibility paths prefer ledger when trusted, snapshot when not.
 - **PR-2:** `_grid_v2_exchange_cids()` prefers ledger when trusted, improving backup snapshot-diff fill/cancel detection visibility. WS fill path (already event-first) now logs `EVENT_FIRST_FILL_APPLIED`.
 - **PR-3:** Explicit degraded-mode recovery boundary. Health mode non-HEALTHY → trust revoked via `revoke_trust()`. Restoration requires HEALTHY + converged comparison via `restore_trust_after_recovery()`.
-- **Status:** [DONE] PR-1 (trusted read model), PR-2 (ledger-backed CID visibility), PR-3 (degraded recovery boundary). Phase 2 complete.
+- **PR-4:** Snapshot-backed reconciliation of stale ledger orders. Two consecutive absences from snapshot → order closed. Fixes permanent `ORDER_MISSING_IN_SNAPSHOT` divergence from missed WS terminal events.
+- **Status:** [DONE] PR-1 through PR-4. Phase 2 complete with trust reconvergence.
 
 ### Multi-venue
 - **Current:** Binance Futures USDT-M only

@@ -4660,3 +4660,13 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Invariant:** `is_trusted = bootstrapped AND last_convergence_ok AND NOT trust_revoked`. No silent re-enable: requires both HEALTHY mode and converged comparison.
 - **Implementation:** `src/grinder/account/event_ledger.py`, `src/grinder/live/engine.py`.
 - **Tests:** 12 regression tests in `tests/unit/test_degraded_recovery_boundary.py`.
+
+### ADR-109 Phase 2 PR-4: Ledger snapshot reconciliation (2026-03-30)
+
+- **Decision:** Allow EventLedger to close stale open orders when snapshot confirms their absence for two consecutive comparison cycles.
+- **Problem:** Cancelled orders whose terminal WS events were missed stayed "open" in the ledger indefinitely, causing permanent `ORDER_MISSING_IN_SNAPSHOT` divergence and preventing trust reconvergence.
+- **Mechanism:** `compare_with_snapshot()` tracks CIDs missing in current vs previous cycle. `reconcile_with_snapshot()` closes orders in the intersection (missing in BOTH consecutive cycles). Conservative: single-cycle absence does not close.
+- **Log signal:** `EVENT_LEDGER_ORDER_RECOVERED cid=... reason=snapshot_absence_consecutive`
+- **Engine integration:** Called after compare when diverged. Re-compares after reconciliation to check convergence. Logs `EVENT_LEDGER_RECONCILED orders=N converged=True/False`.
+- **Implementation:** `src/grinder/account/event_ledger.py`, `src/grinder/live/engine.py`.
+- **Tests:** 7 regression tests in `tests/unit/test_ledger_snapshot_reconciliation.py`.

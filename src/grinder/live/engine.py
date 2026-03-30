@@ -4090,7 +4090,18 @@ class LiveEngineV0:
                 )
                 for d in shadow.divergences[:5]:
                     logger.info("  %s symbol=%s %s", d.kind.value, d.symbol, d.detail)
-            else:
+                # Reconcile stale ledger-open orders using snapshot as recovery.
+                # Conservative: requires two consecutive absences before closing.
+                reconciled = self._event_ledger.reconcile_with_snapshot()
+                if reconciled > 0:
+                    # Re-compare after reconciliation to check convergence
+                    shadow = self._event_ledger.compare_with_snapshot(result.snapshot)
+                    logger.info(
+                        "EVENT_LEDGER_RECONCILED orders=%d converged=%s",
+                        reconciled,
+                        shadow.is_converged,
+                    )
+            if shadow.is_converged:
                 # Converged. If trust was revoked (degraded mode), attempt restore
                 # only when health is back to HEALTHY.
                 from grinder.live.health_gate import LiveHealthMode  # noqa: PLC0415

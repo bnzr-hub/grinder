@@ -107,6 +107,12 @@ class EventLedger:
         self._bootstrapped: bool = False
         self._last_convergence_ok: bool = False
         self._trust_revoked: bool = False
+        # Two-cycle tracking for conservative reconciliation.
+        # _prev_missing: CIDs missing in the comparison BEFORE the current one.
+        # _curr_missing: CIDs missing in the most recent comparison.
+        # reconcile_with_snapshot closes orders in _prev_missing ∩ _curr_missing.
+        self._prev_missing_in_snapshot: set[str] = set()
+        self._curr_missing_in_snapshot: set[str] = set()
 
     @property
     def last_event_ts(self) -> int:
@@ -259,6 +265,8 @@ class EventLedger:
         self._bootstrapped = False
         self._last_convergence_ok = False
         self._trust_revoked = False
+        self._prev_missing_in_snapshot = set()
+        self._curr_missing_in_snapshot = set()
 
     def compare_with_snapshot(self, snapshot: AccountSnapshot) -> ShadowComparisonResult:
         """Compare ledger order state against an AccountSnapshot.
@@ -296,8 +304,11 @@ class EventLedger:
                 )
 
         # Check for orders open in ledger but missing from snapshot
+        self._prev_missing_in_snapshot = self._curr_missing_in_snapshot
+        current_missing: set[str] = set()
         for cid, lo in ledger_open.items():
             if cid not in snapshot_cids:
+                current_missing.add(cid)
                 divergences.append(
                     Divergence(
                         kind=DivergenceKind.ORDER_MISSING_IN_SNAPSHOT,
@@ -305,6 +316,7 @@ class EventLedger:
                         detail=f"cid={cid} open in ledger but not in snapshot",
                     )
                 )
+        self._curr_missing_in_snapshot = current_missing
 
         result = ShadowComparisonResult(
             divergences=tuple(sorted(divergences, key=lambda d: (d.kind.value, d.symbol))),
@@ -314,3 +326,34 @@ class EventLedger:
         # Update trust signal
         self._last_convergence_ok = result.is_converged
         return result
+
+    def reconcile_with_snapshot(self) -> int:
+        """Reconcile stale ledger-open orders using snapshot as recovery source.
+
+        If a ledger-open order is absent from the snapshot in TWO consecutive
+        comparison cycles, it is marked as recovered-closed. This handles the
+        case where a terminal WS event was missed (e.g., cancel without WS ack).
+
+        Conservative rule: requires two consecutive absences to prevent
+        false-close from transient one-cycle visibility gaps.
+
+        Must be called AFTER compare_with_snapshot (which updates
+        _prev_missing_in_snapshot).
+
+        Returns the number of orders reconciled closed.
+        """
+        # Close orders that were missing in BOTH the previous AND current comparison.
+        consecutive_missing = self._prev_missing_in_snapshot & self._curr_missing_in_snapshot
+        reconciled = 0
+        for cid in consecutive_missing:
+            order = self._orders.get(cid)
+            if order is None or not order.is_open:
+                continue
+            order.status = "CANCELLED"  # recovered terminal state
+            reconciled += 1
+            logger.info(
+                "EVENT_LEDGER_ORDER_RECOVERED cid=%s symbol=%s reason=snapshot_absence_consecutive",
+                cid,
+                order.symbol,
+            )
+        return reconciled
