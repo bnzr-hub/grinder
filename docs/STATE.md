@@ -1839,6 +1839,11 @@ Comprehensive adaptive grid system design:
     - [DONE] **M8-04d:** ACTIVE promotion requires verified dataset artifact (`verify_dataset_for_promotion`, fail-closed guard in `promote_ml_model.py`) (PR #169)
     - [DONE] **M8-04e:** Operator runbook (`docs/runbooks/20_FEATURE_STORE_DATASETS.md`) + golden dataset integration test
 
+### Grid V2 exit-price quantization (ADR-115)
+- **Bug:** SM computed raw fractional exit prices, causing false collision detection in the spacing guard. Multi-level short branch produced anomalous exit prices (observed: x2=0.0525 instead of 0.0529 on PIPPINUSDT).
+- **Fix:** Tick-quantize exit price BEFORE collision guard (side-aware: BUY ROUND_DOWN, SELL ROUND_UP).
+- **Status:** [DONE] Fixed in `state.py`, spec updated (doc-27 section 3.2), 8 regression tests.
+
 ### Multi-venue
 - **Current:** Binance Futures USDT-M only
 - **Planned:** COIN-M, other CEXs (see ROADMAP M9)

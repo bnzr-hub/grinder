@@ -12,7 +12,7 @@ Design constraints:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 from enum import Enum
 
 from grinder.core import OrderSide
@@ -452,6 +452,15 @@ class GridV2StateMachine:
         else:
             lot_side, exit_side = LotSide.SHORT, OrderSide.BUY
             exit_price = event.price * (Decimal(1) - cfg.grid_step_pct)
+
+        # Quantize exit price to tick size BEFORE collision guard.
+        # Without this, fractional remainders cause false collision detection
+        # (e.g. two exits 0.00019950 apart look < step_price 0.0002 in raw form
+        # but are exactly 2 ticks apart when quantized).
+        # Side-aware rounding: BUY exit rounds down, SELL exit rounds up.
+        if cfg.price_tick_size > 0:
+            exit_rounding = ROUND_DOWN if exit_side == OrderSide.BUY else ROUND_UP
+            exit_price = _round_to_tick(exit_price, cfg.price_tick_size, rounding=exit_rounding)
 
         # Exit spacing guard: minimum distance between exits = one grid step.
         # Shifts by full step_price units (not ticks) to maintain grid geometry.
