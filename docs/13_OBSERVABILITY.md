@@ -772,3 +772,47 @@ GRID_V2_HEALTH_BLOCK symbol=BTCUSDT reason=STALE_TRUTH action=PLACE
 | ExitSuppressionReason | 4 | `GRID_V2_EXIT_SUPPRESSED reason=` | reason_codes.py |
 | HealthBlockReason | 4 | `GRID_V2_HEALTH_BLOCK reason=` | reason_codes.py |
 | RepairStatusReason | 6 | Stable event names (not `reason=`) | reason_codes.py |
+
+## EventLedger Trust Lifecycle (ADR-109 Phase 2)
+
+Log signals for EventLedger authority boundary transitions.
+
+### EVENT_LEDGER_TRUST_REVOKED
+Emitted when health mode degrades and ledger trust is revoked.
+```
+EVENT_LEDGER_TRUST_REVOKED reason=health_mode=DEGRADED_WS
+EVENT_LEDGER_TRUST_REVOKED reason=health_mode=STALE_TRUTH
+```
+After this signal, all ledger-preferred order-visibility paths fall back to snapshot.
+
+### EVENT_LEDGER_TRUST_RESTORED
+Emitted when trust is restored after recovery (HEALTHY + converged comparison).
+```
+EVENT_LEDGER_TRUST_RESTORED
+```
+
+### EVENT_LEDGER_HYDRATED
+Emitted when new orders are hydrated from snapshot into the ledger.
+```
+EVENT_LEDGER_HYDRATED orders=10 snapshot_ts=1774835756 bootstrapped=True trusted=True
+```
+
+### EVENT_LEDGER_SHADOW_DIVERGENCE
+Emitted when ledger and snapshot disagree on open-order state.
+```
+EVENT_LEDGER_SHADOW_DIVERGENCE divergences=2 ledger_orders=8 snapshot_orders=10 trusted=False
+```
+
+### EVENT_FIRST_FILL_APPLIED
+Emitted when WS user-data path processes a fill event-first (before snapshot).
+```
+EVENT_FIRST_FILL_APPLIED cid=g_g_BTCUSDT_e5_123_0 symbol=BTCUSDT source=user_data actions=7 trusted=True
+```
+
+### Operator interpretation
+| Signal | Meaning | Action |
+|--------|---------|--------|
+| `TRUST_REVOKED` | Ledger no longer authoritative | Monitor for health recovery |
+| `TRUST_RESTORED` | Ledger re-enabled after recovery | Normal operation resumed |
+| `SHADOW_DIVERGENCE` with `trusted=False` | Ledger and snapshot disagree, ledger not trusted | Expected during/after degraded mode |
+| `SHADOW_DIVERGENCE` with `trusted=True` | Should not happen (divergence revokes trust) | Investigate immediately |

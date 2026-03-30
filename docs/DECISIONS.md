@@ -4652,3 +4652,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Observability:** New `EVENT_FIRST_FILL_APPLIED` log line on existing WS fill path for operator visibility.
 - **Implementation:** `src/grinder/live/engine.py`.
 - **Tests:** 7 regression tests in `tests/unit/test_event_first_fill.py`.
+
+### ADR-109 Phase 2 PR-3: Degraded-mode recovery boundary (2026-03-30)
+
+- **Decision:** Add explicit fail-closed boundary for EventLedger trust. When health mode degrades (DEGRADED_WS, DEGRADED_SYNC, STALE_TRUTH, PAUSED_UNSAFE), ledger trust is immediately revoked. Trust can only be restored after health returns to HEALTHY AND the next sync comparison converges.
+- **Mechanism:** New `_trust_revoked` flag on EventLedger. `revoke_trust(reason)` sets it and logs `EVENT_LEDGER_TRUST_REVOKED`. `restore_trust_after_recovery()` clears it only if bootstrapped + last_convergence_ok. Engine's `_evaluate_and_update_health_mode()` calls `revoke_trust()` on any non-HEALTHY transition. Engine's sync path calls `restore_trust_after_recovery()` only when health is HEALTHY and comparison converged.
+- **Invariant:** `is_trusted = bootstrapped AND last_convergence_ok AND NOT trust_revoked`. No silent re-enable: requires both HEALTHY mode and converged comparison.
+- **Implementation:** `src/grinder/account/event_ledger.py`, `src/grinder/live/engine.py`.
+- **Tests:** 12 regression tests in `tests/unit/test_degraded_recovery_boundary.py`.

@@ -4073,12 +4073,19 @@ class LiveEngineV0:
                 )
                 for d in shadow.divergences[:5]:
                     logger.info("  %s symbol=%s %s", d.kind.value, d.symbol, d.detail)
-            elif self._event_ledger.is_trusted:
-                logger.debug(
-                    "EVENT_LEDGER_TRUSTED_READ_MODEL ledger_orders=%d snapshot_orders=%d",
-                    shadow.ledger_open_orders,
-                    shadow.snapshot_open_orders,
-                )
+            else:
+                # Converged. If trust was revoked (degraded mode), attempt restore
+                # only when health is back to HEALTHY.
+                from grinder.live.health_gate import LiveHealthMode  # noqa: PLC0415
+
+                if self._event_ledger.trust_revoked and self._health_mode == LiveHealthMode.HEALTHY:
+                    self._event_ledger.restore_trust_after_recovery()
+                if self._event_ledger.is_trusted:
+                    logger.debug(
+                        "EVENT_LEDGER_TRUSTED_READ_MODEL ledger_orders=%d snapshot_orders=%d",
+                        shadow.ledger_open_orders,
+                        shadow.snapshot_open_orders,
+                    )
             # PR6: clear awaiting-sync flag only when ALL seed CIDs are visible.
             # ADR-109 Phase 2: prefer ledger for visibility when trusted,
             # fall back to snapshot. Ledger may know about orders sooner
@@ -4580,7 +4587,7 @@ class LiveEngineV0:
 
     def _evaluate_and_update_health_mode(self, _snapshot: Snapshot) -> None:
         """Evaluate truth-source health and update mode. Log transitions."""
-        from grinder.live.health_gate import evaluate_health  # noqa: PLC0415
+        from grinder.live.health_gate import LiveHealthMode, evaluate_health  # noqa: PLC0415
 
         # Update health input signals from real connector state
         now = time.time()
@@ -4613,6 +4620,12 @@ class LiveEngineV0:
                 result.write_allowed,
                 result.reduce_only_allowed,
             )
+            # ADR-109 Phase 2 PR-3: degraded-mode recovery boundary.
+            # Revoke ledger trust on any non-HEALTHY mode transition.
+            # Trust can only be restored after health returns to HEALTHY
+            # AND the next sync comparison converges.
+            if result.mode != LiveHealthMode.HEALTHY:
+                self._event_ledger.revoke_trust(f"health_mode={result.mode.value}")
             self._health_mode_prev = self._health_mode
 
     def _on_sync_success(self) -> None:
