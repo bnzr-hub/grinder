@@ -1844,6 +1844,11 @@ Comprehensive adaptive grid system design:
 - **Fix:** Tick-quantize exit price BEFORE collision guard (side-aware: BUY ROUND_DOWN, SELL ROUND_UP).
 - **Status:** [DONE] Fixed in `state.py`, spec updated (doc-27 section 3.2), 8 regression tests.
 
+### ADR-109 Phase 2: EventLedger trusted read model
+- **Phase 1 bug:** One-shot bootstrap flag fired on preflight sync (0 orders), causing permanent divergence.
+- **Phase 2:** Hydration runs every sync (idempotent). `is_trusted` predicate gates authority: requires `bootstrapped + last_comparison_converged`. 4 engine order-visibility paths prefer ledger when trusted, snapshot when not.
+- **Status:** [DONE] PR-1 (trusted read model) landed. PR-2 (event-first fill transitions) and PR-3 (degraded recovery boundary) pending.
+
 ### Multi-venue
 - **Current:** Binance Futures USDT-M only
 - **Planned:** COIN-M, other CEXs (see ROADMAP M9)

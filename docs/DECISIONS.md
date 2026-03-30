@@ -4633,3 +4633,13 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Spec:** Updated doc-27 section 3.2 with explicit tick-quantization-before-guard rule.
 - **Tests:** 8 regression tests in `tests/unit/test_short_branch_exit_prices.py` (reproduction, tick alignment, spacing, long branch mirror, determinism, mapping stability, negative proof, collision guard).
 - **Live evidence:** Post-PR-503 bounded run PIPPINUSDT 900s, 6 fills: e16@0.0529→x1=0.0527, e17@0.0531→x2=0.0525(anomaly), e18@0.0533→x3=0.0531.
+
+### ADR-109 Phase 2: EventLedger as trusted read model (2026-03-30)
+
+- **Decision:** Promote EventLedger from shadow-only observer to trusted read model for open-order visibility in healthy mode. Snapshot remains bootstrap/audit/recovery source.
+- **Problem (Phase 1 bug):** One-shot bootstrap flag fired on preflight sync (0 orders), causing permanent 10-order divergence for the entire session. Hydration never re-ran.
+- **Fix:** Remove one-shot `_event_ledger_bootstrapped` flag. Hydrate on every sync cycle (idempotent). Add `is_trusted` predicate: True when `bootstrapped AND last_comparison_converged`. Add `open_orders_for_symbol()` for filtered reads.
+- **Authority boundary:** When `is_trusted`, 4 engine order-visibility paths prefer ledger over snapshot: seed-visibility, pending-place CID cleanup, cancel-failed pruning, stale-registry cleaning. When not trusted, existing snapshot fallback applies.
+- **Invariant:** Ledger trust requires convergence proof from the latest comparison. Divergence immediately revokes trust. Reset clears all state.
+- **Implementation:** `src/grinder/account/event_ledger.py`, `src/grinder/live/engine.py`.
+- **Tests:** 14 regression tests in `tests/unit/test_event_ledger_trusted_read.py`.

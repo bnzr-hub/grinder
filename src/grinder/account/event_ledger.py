@@ -1,17 +1,18 @@
-"""Event-authoritative local ledger for orders (ADR-109 Phase 1).
+"""Event-authoritative local ledger for orders (ADR-109).
 
-Shadow mode: builds local order state from Binance ORDER_TRADE_UPDATE
+Phase 1 (shadow): builds local order state from Binance ORDER_TRADE_UPDATE
 events without changing live authority.
 
-Phase 1 is order-only. Position tracking from ACCOUNT_UPDATE requires
-upstream fixes (multi-position, positionSide) and is deferred to Phase 2.
+Phase 2 (trusted read): EventLedger is the primary read model for open-order
+and fill state in healthy mode. Snapshot remains bootstrap/audit/recovery source.
+
+Phase 2 is order-only. Position tracking from ACCOUNT_UPDATE requires
+upstream fixes (multi-position, positionSide) and is deferred to Phase 3.
 
 Three-layer comparison:
 1. EventLedger order state (from WS events)
 2. AccountSnapshot open orders (from REST sync)
 3. Divergence signals when they disagree
-
-Zero behavioral change in Phase 1 — observability only.
 """
 
 from __future__ import annotations
@@ -92,8 +93,8 @@ class EventLedger:
     """Local event-derived order state.
 
     Updated incrementally from Binance ORDER_TRADE_UPDATE events.
-    Phase 1: shadow mode only — no authority over live decisions.
-    Phase 1 is order-only; position tracking deferred to Phase 2.
+    Phase 2: trusted read model in healthy mode — primary source for
+    open-order and fill state. Snapshot is bootstrap/audit/recovery.
 
     Thread safety: NOT thread-safe. Use from single event loop only.
     """
@@ -103,6 +104,8 @@ class EventLedger:
         self._last_event_ts: int = 0
         self._events_applied: int = 0
         self._duplicates_suppressed: int = 0
+        self._bootstrapped: bool = False
+        self._last_convergence_ok: bool = False
 
     @property
     def last_event_ts(self) -> int:
@@ -115,6 +118,21 @@ class EventLedger:
     @property
     def duplicates_suppressed(self) -> int:
         return self._duplicates_suppressed
+
+    @property
+    def bootstrapped(self) -> bool:
+        """True after at least one successful hydration with open orders."""
+        return self._bootstrapped
+
+    @property
+    def is_trusted(self) -> bool:
+        """True when ledger can be used as primary read model.
+
+        Requires:
+        - bootstrapped (hydrated from at least one snapshot with orders)
+        - last comparison converged (no divergence between ledger and snapshot)
+        """
+        return self._bootstrapped and self._last_convergence_ok
 
     def apply_order_event(self, event: FuturesOrderEvent) -> LedgerOrder:
         """Apply an ORDER_TRADE_UPDATE event to the ledger.
@@ -147,22 +165,35 @@ class EventLedger:
         self._orders[cid] = order
         self._last_event_ts = max(self._last_event_ts, event.ts)
         self._events_applied += 1
+        if not self._bootstrapped and order.is_open:
+            self._bootstrapped = True
         return order
 
     def open_orders(self) -> dict[str, LedgerOrder]:
         """Return all currently open orders (non-terminal status)."""
         return {cid: o for cid, o in self._orders.items() if o.is_open}
 
+    def open_orders_for_symbol(self, symbol: str) -> dict[str, LedgerOrder]:
+        """Return open orders filtered by symbol."""
+        return {cid: o for cid, o in self._orders.items() if o.is_open and o.symbol == symbol}
+
     def get_order(self, client_order_id: str) -> LedgerOrder | None:
         return self._orders.get(client_order_id)
 
     def hydrate_from_snapshot(self, snapshot: AccountSnapshot) -> int:
-        """Bootstrap ledger from an AccountSnapshot's open orders.
+        """Bootstrap/refresh ledger from an AccountSnapshot's open orders.
 
         Populates the ledger with all open orders from the snapshot.
         Only applies orders not already in the ledger (idempotent).
         Sets last_event_ts to snapshot.ts so subsequent WS events
         with ts > snapshot.ts are applied normally.
+
+        Called on every sync cycle (not just first). This ensures that
+        orders placed between the first sync and WS event arrival are
+        eventually hydrated.
+
+        Sets _bootstrapped = True once at least one order is present
+        (from hydration or from WS events).
 
         Returns the number of orders hydrated.
         """
@@ -184,6 +215,9 @@ class EventLedger:
             )
             hydrated += 1
         self._last_event_ts = max(self._last_event_ts, snapshot.ts)
+        # Mark bootstrapped once the ledger has any orders
+        if not self._bootstrapped and len(self._orders) > 0:
+            self._bootstrapped = True
         return hydrated
 
     def reset(self) -> None:
@@ -192,12 +226,15 @@ class EventLedger:
         self._last_event_ts = 0
         self._events_applied = 0
         self._duplicates_suppressed = 0
+        self._bootstrapped = False
+        self._last_convergence_ok = False
 
     def compare_with_snapshot(self, snapshot: AccountSnapshot) -> ShadowComparisonResult:
         """Compare ledger order state against an AccountSnapshot.
 
-        Order-only comparison. Position comparison deferred to Phase 2.
-        Returns divergences for observability. Does NOT modify any state.
+        Order-only comparison. Position comparison deferred to Phase 3.
+        Returns divergences for observability.
+        Updates _last_convergence_ok for trust predicate.
         """
         divergences: list[Divergence] = []
 
@@ -238,8 +275,11 @@ class EventLedger:
                     )
                 )
 
-        return ShadowComparisonResult(
+        result = ShadowComparisonResult(
             divergences=tuple(sorted(divergences, key=lambda d: (d.kind.value, d.symbol))),
             ledger_open_orders=len(ledger_open),
             snapshot_open_orders=len(snapshot.open_orders),
         )
+        # Update trust signal
+        self._last_convergence_ok = result.is_converged
+        return result
