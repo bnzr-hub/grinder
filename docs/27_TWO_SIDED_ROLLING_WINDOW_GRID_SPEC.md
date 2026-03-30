@@ -85,10 +85,19 @@ A bounded set of active entry levels:
 * `N_buy` levels below reference
 * `N_sell` levels above reference
 
-When market moves, the window **rolls** (not expands):
+When an entry fills, the window **rolls** (not expands):
 
-* adds a new far level in the direction of movement
-* removes the far level from the opposite side
+* extends a new outer-edge level on the fill side (`farthest + step_price` for SELL,
+  `farthest - step_price` for BUY)
+* trims the farthest level from the opposite side (or does nothing if opposite side is empty)
+* the filled inner price is removed — **never reused**
+* level count stays constant at `entry_levels_per_side`
+
+On one-sided branch entry, all opposite-side entries are cancelled. The window then
+contains only the fill side, rolling outward with each successive fill.
+
+After a full unwind to FLAT with `reseed_on_flat=True`, the window is rebuilt from
+scratch as a fresh symmetric grid — not a continuation of the shifted ladder.
 
 ### 3.4 Inventory lot
 
