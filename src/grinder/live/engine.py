@@ -5045,6 +5045,16 @@ class LiveEngineV0:
                 if r.status != LiveActionStatus.EXECUTED:
                     all_ok = False
             elif action.action_type == "PLACE" and action.cid:
+                # Suppress idempotent re-place when exit is already in-flight
+                # (placed by fill path but not yet visible in snapshot).
+                if action.cid in self._grid_v2_pending_place_cids:
+                    logger.info(
+                        "GRID_V2_EXIT_TOPOLOGY_REPAIR_PLACE_SUPPRESSED "
+                        "symbol=%s cid=%s reason=in_flight",
+                        sym,
+                        action.cid,
+                    )
+                    continue
                 # ADR-114: Quantize repair price to exchange tick size
                 _repair_price = (
                     bridge._quantize_price(action.price, action.side)
