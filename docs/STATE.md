@@ -1848,7 +1848,8 @@ Comprehensive adaptive grid system design:
 - **Phase 1 bug:** One-shot bootstrap flag fired on preflight sync (0 orders), causing permanent divergence.
 - **Phase 2:** Hydration runs every sync (idempotent). `is_trusted` predicate gates authority: requires `bootstrapped + last_comparison_converged`. 4 engine order-visibility paths prefer ledger when trusted, snapshot when not.
 - **PR-2:** `_grid_v2_exchange_cids()` prefers ledger when trusted, improving backup snapshot-diff fill/cancel detection visibility. WS fill path (already event-first) now logs `EVENT_FIRST_FILL_APPLIED`.
-- **Status:** [DONE] PR-1 (trusted read model) and PR-2 (ledger-backed exchange CID visibility) landed. PR-3 (degraded recovery boundary) pending.
+- **PR-3:** Explicit degraded-mode recovery boundary. Health mode non-HEALTHY → trust revoked via `revoke_trust()`. Restoration requires HEALTHY + converged comparison via `restore_trust_after_recovery()`.
+- **Status:** [DONE] PR-1 (trusted read model), PR-2 (ledger-backed CID visibility), PR-3 (degraded recovery boundary). Phase 2 complete.
 
 ### Multi-venue
 - **Current:** Binance Futures USDT-M only

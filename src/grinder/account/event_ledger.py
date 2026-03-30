@@ -106,6 +106,7 @@ class EventLedger:
         self._duplicates_suppressed: int = 0
         self._bootstrapped: bool = False
         self._last_convergence_ok: bool = False
+        self._trust_revoked: bool = False
 
     @property
     def last_event_ts(self) -> int:
@@ -125,14 +126,43 @@ class EventLedger:
         return self._bootstrapped
 
     @property
+    def trust_revoked(self) -> bool:
+        """True when trust was explicitly revoked (degraded mode)."""
+        return self._trust_revoked
+
+    @property
     def is_trusted(self) -> bool:
         """True when ledger can be used as primary read model.
 
         Requires:
         - bootstrapped (hydrated from at least one snapshot with orders)
         - last comparison converged (no divergence between ledger and snapshot)
+        - trust not explicitly revoked by degraded-mode boundary
         """
-        return self._bootstrapped and self._last_convergence_ok
+        return self._bootstrapped and self._last_convergence_ok and not self._trust_revoked
+
+    def revoke_trust(self, reason: str) -> None:
+        """Explicitly revoke trusted-read authority (degraded mode).
+
+        Called when stream continuity is lost or uncertain.
+        Trust can only be restored by restore_trust_after_recovery().
+        """
+        if not self._trust_revoked:
+            self._trust_revoked = True
+            logger.info("EVENT_LEDGER_TRUST_REVOKED reason=%s", reason)
+
+    def restore_trust_after_recovery(self) -> bool:
+        """Attempt to restore trusted-read authority after recovery.
+
+        Only succeeds if the ledger is bootstrapped and the last
+        comparison converged. Returns True if trust was restored.
+        """
+        if not self._bootstrapped or not self._last_convergence_ok:
+            return False
+        if self._trust_revoked:
+            self._trust_revoked = False
+            logger.info("EVENT_LEDGER_TRUST_RESTORED")
+        return True
 
     def apply_order_event(self, event: FuturesOrderEvent) -> LedgerOrder:
         """Apply an ORDER_TRADE_UPDATE event to the ledger.
@@ -228,6 +258,7 @@ class EventLedger:
         self._duplicates_suppressed = 0
         self._bootstrapped = False
         self._last_convergence_ok = False
+        self._trust_revoked = False
 
     def compare_with_snapshot(self, snapshot: AccountSnapshot) -> ShadowComparisonResult:
         """Compare ledger order state against an AccountSnapshot.

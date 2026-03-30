@@ -400,3 +400,33 @@ Sync liveness can also be verified via HTTP request counters:
 curl -s localhost:9092/metrics | grep 'grinder_http_requests_total.*op="get_positions"'
 curl -s localhost:9092/metrics | grep 'grinder_http_requests_total.*op="get_open_orders"'
 ```
+
+### EventLedger trust authority boundary (ADR-109 Phase 2)
+
+EventLedger provides a local event-derived order state from Binance user-data
+stream (ORDER_TRADE_UPDATE events). In healthy mode, it serves as the trusted
+read model for open-order visibility. Authority is bounded:
+
+**Healthy mode (trusted):**
+- `is_trusted = bootstrapped AND last_convergence_ok AND NOT trust_revoked`
+- Engine order-visibility paths prefer ledger over snapshot
+- Fills/cancels detected faster via WS→ledger than REST snapshot polling
+
+**Degraded mode (trust revoked):**
+- Any non-HEALTHY health mode transition (DEGRADED_WS, DEGRADED_SYNC,
+  STALE_TRUTH, PAUSED_UNSAFE) immediately revokes trust
+- All order-visibility paths fall back to snapshot
+- Log signal: `EVENT_LEDGER_TRUST_REVOKED reason=health_mode=<mode>`
+
+**Recovery:**
+- Trust restored only when BOTH conditions met:
+  1. Health mode returns to HEALTHY
+  2. Next sync comparison converges (0 divergences)
+- Log signal: `EVENT_LEDGER_TRUST_RESTORED`
+- No silent re-enable without explicit convergence proof
+
+**Snapshot role in Phase 2:**
+- Bootstrap source (hydrate ledger on every sync)
+- Audit/drift detection (compare_with_snapshot)
+- Recovery source (authoritative when ledger is not trusted)
+- Still used by reconciler for actual entry/exit computation
