@@ -68,6 +68,14 @@ An order that **closes** an already-open lot.
 * for `LONG lot` -> `SELL exit` one step above entry price
 * for `SHORT lot` -> `BUY exit` one step below entry price
 
+Exit price is computed as `entry_price * (1 +/- grid_step_pct)`, then **tick-quantized
+before** the collision guard runs. Side-aware rounding: BUY exit rounds down (ROUND_DOWN),
+SELL exit rounds up (ROUND_UP). This ensures the collision guard operates on exchange-legal
+prices, preventing false collisions from fractional remainders.
+
+If the quantized exit would collide with an existing open exit (distance < step_price),
+the spacing guard shifts it by `step_price` in the exit direction until a free slot is found.
+
 Exit orders are **NOT part of the entry window**. They are owned by the inventory/exit ledger.
 
 ### 3.3 Rolling window

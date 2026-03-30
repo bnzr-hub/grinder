@@ -4621,3 +4621,15 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Fix:** Call `bridge._quantize_price(price, side)` before creating ExecutionAction in both PLACE and DEFERRED re-register paths.
 - **Implementation:** `src/grinder/live/engine.py`.
 - **Tests:** 3 engine-path tests in `tests/unit/test_exit_repair_tick_quantization.py`.
+
+
+### ADR-115: Quantize exit price before collision guard (2026-03-30)
+
+- **Decision:** Exit prices in the SM must be tick-quantized BEFORE the collision spacing guard, not after.
+- **Problem:** Raw fractional exit prices caused false collision detection. With PIPPINUSDT (step_pct=0.0025, tick=0.0001), two exits 0.00019950 apart appeared < step_price 0.0002 in raw form, but are exactly 2 ticks apart when quantized. This caused the guard to shift x2 down by two extra steps (0.0525 instead of 0.0529).
+- **Root cause:** `_execute_entry` computed `exit_price = entry_price * (1 - step_pct)` as a raw Decimal without quantization. The collision guard compared these fractional values.
+- **Fix:** Add `_round_to_tick(exit_price, tick_size, rounding=side_aware)` immediately after the raw computation, before the collision guard loop. BUY exit rounds down, SELL exit rounds up.
+- **Implementation:** `src/grinder/grid_v2/state.py` line 462 (in `_execute_entry`).
+- **Spec:** Updated doc-27 section 3.2 with explicit tick-quantization-before-guard rule.
+- **Tests:** 8 regression tests in `tests/unit/test_short_branch_exit_prices.py` (reproduction, tick alignment, spacing, long branch mirror, determinism, mapping stability, negative proof, collision guard).
+- **Live evidence:** Post-PR-503 bounded run PIPPINUSDT 900s, 6 fills: e16@0.0529→x1=0.0527, e17@0.0531→x2=0.0525(anomaly), e18@0.0533→x3=0.0531.
