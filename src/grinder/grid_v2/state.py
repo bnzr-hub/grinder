@@ -872,6 +872,13 @@ class GridV2StateMachine:
                         else snap.entry_window.reference_price - step_delta
                     )
                     _all_occupied = exit_occupied | set(buy_prices) | set(sell_prices)
+                    # Search outward for a free slot if candidate collides
+                    # with an exit price (common when unwinding from full inventory).
+                    max_search = self._config.max_inventory_levels + 2
+                    for _ in range(max_search):
+                        if next_price not in _all_occupied:
+                            break
+                        next_price = next_price - step_delta  # BUY: search lower
                     if next_price not in _all_occupied:
                         buy_prices.append(next_price)
                         buy_prices.sort(reverse=True)
@@ -931,6 +938,12 @@ class GridV2StateMachine:
                         else snap.entry_window.reference_price + step_delta
                     )
                     _all_occupied = exit_occupied | set(buy_prices) | set(sell_prices)
+                    # Search outward for a free slot if candidate collides
+                    max_search = self._config.max_inventory_levels + 2
+                    for _ in range(max_search):
+                        if next_price not in _all_occupied:
+                            break
+                        next_price = next_price + step_delta  # SELL: search higher
                     if next_price not in _all_occupied:
                         sell_prices.append(next_price)
                         sell_prices.sort()

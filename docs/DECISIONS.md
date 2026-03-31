@@ -4702,3 +4702,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Fix:** Track `_prev_absent_registry_cids` across syncs. Only clean CIDs absent in BOTH previous AND current sync. First-absence CIDs get one grace cycle for fill detection to process them.
 - **Implementation:** `src/grinder/live/engine.py`.
 - **Tests:** 3 tests in `tests/unit/test_stale_registry_fill_race.py`.
+
+### ADR-120: Search outward for free entry slot on exit-restore (2026-03-31)
+
+- **Decision:** When restoring an entry after an exit fill, search outward for a free slot instead of giving up on first collision.
+- **Problem:** After filling all entry levels (max inventory), exit fills should restore entries. But the candidate entry price (reference - step) collided with an existing exit price. The SM tried only one price and silently gave up → `actions=0` → entries never restored during unwind.
+- **Fix:** Bounded outward search (max_inventory_levels + 2 steps) for both LONG_BRANCH (search lower) and SHORT_BRANCH (search higher) in `_apply_exit_filled`.
+- **Implementation:** `src/grinder/grid_v2/state.py`.
+- **Tests:** 4 tests in `tests/unit/test_full_inventory_unwind_restore.py`: first exit restores entry (long + short), full unwind restores progressively, restored price doesn't collide.
