@@ -18,7 +18,7 @@ Exchange port selection:
                                 4. GRINDER_REAL_PORT_ACK=YES_I_REALLY_WANT_MAINNET
                                 5. BINANCE_API_KEY + BINANCE_API_SECRET set
     --max-notional-per-order    Max notional per order in USD (default 100, rehearsal cap)
-    --max-orders-per-run        Max orders per port instance (default 1, canary safety cap).
+    --max-orders-per-run        Max orders per port instance (default 500).
                                 Values >1 require GRINDER_MAX_ORDERS_ACK=YES_I_ACCEPT_MULTI_ORDER.
 
 HA mode (GRINDER_HA_ENABLED=true):
@@ -340,7 +340,7 @@ def build_exchange_port(
     armed: bool,
     symbols: list[str],
     max_notional: Decimal,
-    max_orders_per_run: int = 1,
+    max_orders_per_run: int = 500,
 ) -> ExchangePort:
     """Build exchange port by name.
 
@@ -350,7 +350,7 @@ def build_exchange_port(
         armed: Whether engine is armed.
         symbols: Trading symbols (used as whitelist for futures).
         max_notional: Max notional per order (for futures config).
-        max_orders_per_run: Max orders per port instance (default 1).
+        max_orders_per_run: Max orders per port instance (default 500).
 
     Returns:
         ExchangePort instance.
@@ -1536,8 +1536,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-orders-per-run",
         type=int,
-        default=1,
-        help="Max orders per run (default 1, canary safety cap). "
+        default=500,
+        help="Max orders per run (default 500). "
         "Values >1 require GRINDER_MAX_ORDERS_ACK=YES_I_ACCEPT_MULTI_ORDER.",
     )
     parser.add_argument(

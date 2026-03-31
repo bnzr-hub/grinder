@@ -429,7 +429,7 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
     - `ALLOW_MAINNET_TRADE=1` env var REQUIRED for mainnet
     - `symbol_whitelist` REQUIRED for mainnet (non-empty)
     - `max_notional_per_order` REQUIRED for mainnet
-    - `max_orders_per_run=1` default (single order per run)
+    - `max_orders_per_run=500` default (raised from 1 for production use)
     - `max_open_orders=1` default (single concurrent order)
   - **Injectable HTTP client:**
     - `HttpClient` protocol for HTTP operations
@@ -479,7 +479,7 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
     - `ALLOW_MAINNET_TRADE=1` env var REQUIRED for mainnet
     - `symbol_whitelist` REQUIRED for mainnet (non-empty)
     - `max_notional_per_order` REQUIRED for mainnet
-    - `max_orders_per_run=1` default (single order per run)
+    - `max_orders_per_run=500` default (raised from 1 for production use)
     - `target_leverage=3` default (reduces margin req; safe: far-from-market, cancelled)
   - **Futures-specific features:**
     - `set_leverage()`: Set leverage for symbol (1-125x)

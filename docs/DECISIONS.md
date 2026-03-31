@@ -1539,7 +1539,7 @@
     2. `ALLOW_MAINNET_TRADE=1` env var required (prevents accidental mainnet)
     3. `symbol_whitelist` REQUIRED for mainnet (no wildcard trading)
     4. `max_notional_per_order` REQUIRED for mainnet (caps each order notional)
-    5. `max_orders_per_run=1` default (single order per script run)
+    5. `max_orders_per_run=500` default (raised from 1 for production use; ACK required for >1)
     6. `max_open_orders=1` default (single concurrent order)
     7. `ARMED=1` env var required (same as testnet)
   - **BinanceExchangePort changes:**

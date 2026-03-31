@@ -1044,7 +1044,9 @@ class LiveEngineV0:
                     grid_step_pct=Decimal(os.environ.get("GRINDER_GRID_V2_STEP_PCT", "0.0025")),
                     entry_levels_per_side=int(os.environ.get("GRINDER_GRID_V2_ENTRY_LEVELS", "5")),
                     order_size=Decimal(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE", "0.001")),
-                    max_inventory_levels=int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "5")),
+                    max_inventory_levels=int(
+                        os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "20")
+                    ),
                     max_inventory_notional_usd=Decimal(
                         os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL", "1000")
                     ),
@@ -1139,7 +1141,7 @@ class LiveEngineV0:
             order_size=order_size_override
             if order_size_override is not None
             else self._grid_v2_order_size_effective,
-            max_inventory_levels=int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "5")),
+            max_inventory_levels=int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "20")),
             max_inventory_notional_usd=Decimal(
                 os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL", "1000")
             ),
