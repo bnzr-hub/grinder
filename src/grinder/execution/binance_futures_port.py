@@ -72,6 +72,7 @@ from grinder.net.retry_policy import (
     OP_GET_ORDER_STATUS,
     OP_GET_POSITIONS,
     OP_GET_USER_TRADES,
+    OP_PING_TIME,
     OP_PLACE_ORDER,
 )
 from grinder.reconcile.identity import (
@@ -179,7 +180,7 @@ class BinanceFuturesPortConfig:
     api_key: str = ""
     api_secret: str = ""
     symbol_whitelist: list[str] = field(default_factory=list)
-    recv_window_ms: int = 5000
+    recv_window_ms: int = 10000
     timeout_ms: int = 5000
     dry_run: bool = False
 
@@ -325,6 +326,33 @@ class BinanceFuturesPort:
                 "Reset port or create new instance to place more orders.",
                 pre_send=True,
             )
+
+    def refresh_ts_offset(self) -> int:
+        """Refresh server-time offset from Binance. Returns new offset_ms.
+
+        Called on -1021 to recover from clock drift. Fail-open: if
+        the time endpoint fails, keeps the existing offset.
+        """
+        try:
+            response = self.http_client.request(
+                method="GET",
+                url=f"{self.config.base_url}/fapi/v1/time",
+                headers={},
+                op=OP_PING_TIME,
+            )
+            jd = response.json_data
+            server_ts = jd.get("serverTime", 0) if isinstance(jd, dict) else 0
+            local_ts = int(time.time() * 1000)
+            old = self._ts_offset_ms
+            self._ts_offset_ms = local_ts - server_ts
+            logger.info(
+                "BINANCE_TIME_OFFSET_REFRESHED old_ms=%d new_ms=%d",
+                old,
+                self._ts_offset_ms,
+            )
+        except Exception:
+            logger.warning("BINANCE_TIME_OFFSET_REFRESH_FAILED keeping=%d", self._ts_offset_ms)
+        return self._ts_offset_ms
 
     def _sign_request(self, params: dict[str, Any]) -> dict[str, Any]:
         """Add timestamp and signature to request params."""

@@ -832,3 +832,26 @@ EVENT_LEDGER_RECONCILED orders=5 converged=True
 | `ORDER_RECOVERED` | Stale order closed by snapshot absence | Normal recovery; WS terminal event was missed |
 | `RECONCILED converged=True` | Recovery healed all divergences | Trust can now reconverge |
 | `RECONCILED converged=False` | Recovery closed some but not all | Remaining divergences need more cycles or investigation |
+
+## Timestamp Offset Recovery (ADR-118)
+
+Log signals for server-time offset refresh (clock drift recovery).
+
+### BINANCE_TIME_OFFSET_REFRESHED
+Emitted when offset is successfully refreshed from `/fapi/v1/time`.
+```
+BINANCE_TIME_OFFSET_REFRESHED old_ms=-300 new_ms=-1800
+```
+
+### BINANCE_TIME_OFFSET_REFRESH_FAILED
+Emitted when offset refresh fails (network error, timeout). Fail-open: existing offset kept.
+```
+BINANCE_TIME_OFFSET_REFRESH_FAILED keeping=-300
+```
+
+### Operator interpretation
+| Signal | Meaning | Action |
+|--------|---------|--------|
+| `OFFSET_REFRESHED` with large delta | WSL2/system clock drifted significantly | Normal recovery, no action needed |
+| `OFFSET_REFRESH_FAILED` | Cannot reach Binance time endpoint | Check network; existing offset still used |
+| Repeated `-1021` after refresh | Drift too fast for periodic correction | Investigate system clock source |

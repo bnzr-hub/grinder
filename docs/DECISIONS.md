@@ -4686,3 +4686,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Root cause:** Exit fill follow-up actions included CANCEL_ENTRY for entries whose CIDs were already cleaned from registry. `resolve_actions` raised ValueError on the first missing CANCEL, aborting ALL remaining actions — including PLACE_EXIT for the paired exit. The SM closed the lot, but no exit was placed. Subsequent fills kept creating new lots with exits that hit -2022 because the exchange position was already flat.
 - **Fix:** `resolve_actions_partial` processes each action independently. Missing CANCELs are logged and skipped. PLACE actions (exits, entries) always resolve. Follow-up actions from exit fills are no longer entirely dropped.
 - **Implementation:** `src/grinder/grid_v2/adapter.py` (PartialResolveResult, resolve_actions_partial), `src/grinder/grid_v2/bridge.py` (on_fill Step 4).
+
+### ADR-118: Refresh timestamp offset on -1021 (2026-03-31)
+
+- **Decision:** Add `refresh_ts_offset()` to BinanceFuturesPort. On -1021, engine calls it to update the server-time offset. Also increased default `recvWindow` from 5000 to 10000ms.
+- **Problem:** Timestamp offset was computed once at startup but WSL2 clock drifts continuously. After a few minutes, the offset went stale, causing repeated -1021 errors → STALE_TRUTH → all writes blocked.
+- **Fix:** `refresh_ts_offset()` calls `/fapi/v1/time` and updates `_ts_offset_ms`. Engine calls it in both sync-failure and action-dispatch -1021 paths. Fail-open: if refresh fails, keeps existing offset.
+- **Implementation:** `src/grinder/execution/binance_futures_port.py`, `src/grinder/live/engine.py`.
+- **Tests:** 7 tests in `tests/unit/test_timestamp_drift_recovery.py`.

@@ -1852,6 +1852,11 @@ Comprehensive adaptive grid system design:
 - **PR-4:** Snapshot-backed reconciliation of stale ledger orders. Two consecutive absences from snapshot → order closed. Fixes permanent `ORDER_MISSING_IN_SNAPSHOT` divergence from missed WS terminal events.
 - **Status:** [DONE] PR-1 through PR-4. Phase 2 complete with trust reconvergence.
 
+### Timestamp drift recovery (ADR-118)
+- **Problem:** WSL2 clock drifts continuously; startup offset goes stale → repeated -1021 → STALE_TRUTH.
+- **Fix:** `refresh_ts_offset()` on BinanceFuturesPort, called on every -1021. Default `recvWindow` increased to 10s.
+- **Status:** [DONE]
+
 ### Multi-venue
 - **Current:** Binance Futures USDT-M only
 - **Planned:** COIN-M, other CEXs (see ROADMAP M9)
