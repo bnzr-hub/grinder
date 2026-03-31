@@ -4670,3 +4670,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Engine integration:** Called after compare when diverged. Re-compares after reconciliation to check convergence. Logs `EVENT_LEDGER_RECONCILED orders=N converged=True/False`.
 - **Implementation:** `src/grinder/account/event_ledger.py`, `src/grinder/live/engine.py`.
 - **Tests:** 7 regression tests in `tests/unit/test_ledger_snapshot_reconciliation.py`.
+
+### ADR-116: Fix -2022 latch in wrong exception handler (2026-03-31)
+
+- **Decision:** Move the -2022 reduce-only reject latch from `ConnectorTransientError` handler to `ConnectorNonRetryableError` handler where Binance -2022 errors actually land.
+- **Root cause:** The latch code at line 6697 was inside the `ConnectorTransientError` catch block. But Binance -2022 is a `ConnectorNonRetryableError` caught at line 6633. The latch NEVER fired, so all exits in a rapid batch hit exchange and got rejected.
+- **Evidence:** Post-#512 live run: 10 -2022 rejects with no `REDUCE_ONLY_REPAIR_TRIGGERED` log between them. Latch was dead code.
+- **Fix:** Duplicate the -2022 detection into the `ConnectorNonRetryableError` handler. After first -2022, Gate 0 blocks remaining exits in the same batch.
+- **Implementation:** `src/grinder/live/engine.py` line 6650.
+- **Tests:** 4 regression tests in `tests/unit/test_snapshot_diff_exit_deferral.py`: latch fires on -2022, second exit blocked, batch-of-4 only first hits exchange, opposite direction not latched.

@@ -1983,15 +1983,13 @@ class LiveEngineV0:
                     )
                     continue
                 self._maybe_track_lot_closure(symbol, result)
-                # Provable lot addition: entry fill created a new lot this tick.
-                # Use the qty from the SM transition result (the actual lot created),
-                # not bridge._config.order_size (which may differ if config changed).
+                # Provable lot addition: entry fill created a new lot.
                 fill_qty = (
                     result.transition.snapshot.open_lots[-1].qty
                     if result.transition
                     and result.transition.snapshot
                     and result.transition.snapshot.open_lots
-                    else bridge._config.order_size  # fallback only
+                    else bridge._config.order_size
                 )
                 self._reduce_only_batch_new_lots_qty[symbol] = (
                     self._reduce_only_batch_new_lots_qty.get(symbol, Decimal(0)) + fill_qty
@@ -6636,6 +6634,7 @@ class LiveEngineV0:
                 # Non-retryable: fail immediately
                 error_msg = str(e)
                 _pre_send = getattr(e, "pre_send", False)
+                _exchange_code = getattr(e, "exchange_code", None)
                 logger.error(
                     "Non-retryable error on %s: %s (pre_send=%s)",
                     action.action_type.value,
@@ -6648,6 +6647,13 @@ class LiveEngineV0:
                     logger.warning(
                         "ORDER_BUDGET_LATCH activated — planner suppressed for remaining run"
                     )
+                # ADR-104: Detect -2022 on reduce-only exits → flag for repair.
+                # This MUST be in the NonRetryable handler (not Transient) because
+                # Binance returns -2022 as a non-retryable error.
+                if action.reduce_only and action.symbol and action.side is not None:
+                    err_code = _exchange_code or _extract_binance_error_code(error_msg)
+                    if err_code == -2022:
+                        self._on_reduce_only_reject(action.symbol, action.side.value, err_code)
                 return LiveAction(
                     action=action,
                     status=LiveActionStatus.FAILED,
@@ -6656,7 +6662,7 @@ class LiveEngineV0:
                     attempts=attempt,
                     intent=intent,
                     pre_send=_pre_send,
-                    exchange_code=getattr(e, "exchange_code", None),
+                    exchange_code=_exchange_code,
                 )
             except ConnectorTransientError as e:
                 # Transient: retry with backoff
