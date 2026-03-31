@@ -123,6 +123,8 @@ from grinder.paper.engine import PaperEngine
 from scripts.http_measured_client import RequestsHttpClient, build_measured_client
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from grinder.execution.engine import SymbolConstraints
     from grinder.live.grid_planner import LiveGridPlannerV1
 
@@ -479,11 +481,14 @@ def _build_user_data_connector_or_none(
 
     base_url = USER_DATA_TESTNET_URL if use_testnet else USER_DATA_MAINNET_URL
     symbol_filter = symbols[0] if len(symbols) == 1 else None
+    from grinder.connectors.data_connector import TimeoutConfig  # noqa: PLC0415
+
     ws_cfg = UserDataWsConfig(
         base_url=base_url,
         api_key=api_key,
         use_testnet=use_testnet,
         symbol_filter=symbol_filter,
+        timeout=TimeoutConfig(connect_timeout_ms=10000),
     )
     lk_cfg = ListenKeyConfig(base_url=base_url, api_key=api_key)
     lk_mgr = ListenKeyManager(RequestsHttpClient(port_name="user_data"), lk_cfg)
@@ -1369,12 +1374,59 @@ def build_engine(  # noqa: PLR0912, PLR0915
     )
 
 
+async def run_user_data_loop(
+    make_conn: Callable[[], Any],
+    on_event: Callable[[Any], None],
+    shutdown: asyncio.Event,
+    *,
+    max_retries: int = 5,
+) -> None:
+    """Retry loop for user-data WS: fresh connector per attempt, shutdown-aware.
+
+    Args:
+        make_conn: Factory that creates a fresh connector (with connect/iter_events/close).
+        on_event: Callback for each received event.
+        shutdown: Event to signal graceful stop. Wakes up backoff sleeps immediately.
+        max_retries: Maximum outer restart attempts.
+    """
+    for attempt in range(max_retries):
+        if shutdown.is_set():
+            break
+        conn = make_conn()
+        try:
+            await conn.connect()
+            async for event in conn.iter_events():
+                if shutdown.is_set():
+                    return
+                on_event(event)
+        except Exception as e:
+            if shutdown.is_set():
+                break
+            delay = min(2**attempt * 3, 30)
+            print(
+                f"  User-data loop attempt {attempt + 1}/{max_retries} "
+                f"ended: {e}. Restart in {delay}s"
+            )
+            if attempt < max_retries - 1:
+                # Shutdown-aware sleep: wake immediately on shutdown signal
+                try:
+                    await asyncio.wait_for(shutdown.wait(), timeout=delay)
+                    return  # shutdown fired during backoff
+                except TimeoutError:
+                    pass  # backoff expired, continue retry
+        else:
+            break  # clean exit
+        finally:
+            with contextlib.suppress(Exception):
+                await conn.close()
+
+
 async def trading_loop(
     connector: LiveConnectorV0,
     engine: LiveEngineV0,
     shutdown: asyncio.Event,
     duration_s: int,
-    user_data_connector: FuturesUserDataWsConnector | None = None,
+    user_data_connector_factory: Callable[[], FuturesUserDataWsConnector] | None = None,
 ) -> str:
     """Run the trading loop: connector -> engine.process_snapshot().
 
@@ -1391,23 +1443,16 @@ async def trading_loop(
     """
     global _loop_ready  # noqa: PLW0603
 
-    async def _user_data_loop(user_conn: FuturesUserDataWsConnector) -> None:
-        try:
-            await user_conn.connect()
-            async for event in user_conn.iter_events():
-                if shutdown.is_set():
-                    break
-                engine.process_user_data_event(event)
-        except Exception as e:
-            print(f"  User-data loop warning: {e}")
-        finally:
-            with contextlib.suppress(Exception):
-                await user_conn.close()
-
     user_data_task: asyncio.Task[None] | None = None
     await connector.connect()
-    if user_data_connector is not None:
-        user_data_task = asyncio.create_task(_user_data_loop(user_data_connector))
+    if user_data_connector_factory is not None:
+        user_data_task = asyncio.create_task(
+            run_user_data_loop(
+                make_conn=user_data_connector_factory,
+                on_event=engine.process_user_data_event,
+                shutdown=shutdown,
+            )
+        )
     _loop_ready = True
     print("  /readyz now returning 200 (if HA permits)")
     start = time.time()
@@ -1824,13 +1869,20 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         use_testnet=use_testnet,
         exchange_port=args.exchange_port,
     )
-    user_data_connector = _build_user_data_connector_or_none(
-        symbols=symbols,
-        mode=mode,
-        exchange_port=args.exchange_port,
-        fixture_path=args.fixture,
-        use_testnet=use_testnet,
-    )
+
+    # Factory for user-data connector: creates a fresh instance per retry attempt.
+    # Closed connectors cannot reconnect, so each retry needs a new object.
+    def _make_user_data_connector() -> FuturesUserDataWsConnector | None:
+        return _build_user_data_connector_or_none(
+            symbols=symbols,
+            mode=mode,
+            exchange_port=args.exchange_port,
+            fixture_path=args.fixture,
+            use_testnet=use_testnet,
+        )
+
+    # Probe once to check if user-data is enabled (prints status message)
+    user_data_connector = _make_user_data_connector()
 
     # Async loop with signal handling
     loop = asyncio.new_event_loop()
@@ -1852,7 +1904,11 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 engine,
                 shutdown,
                 args.duration_s,
-                user_data_connector=user_data_connector,
+                user_data_connector_factory=(
+                    _make_user_data_connector  # type: ignore[arg-type]
+                    if user_data_connector is not None
+                    else None
+                ),
             )
         )
     except Exception as exc:
