@@ -855,3 +855,27 @@ BINANCE_TIME_OFFSET_REFRESH_FAILED keeping=-300
 | `OFFSET_REFRESHED` with large delta | WSL2/system clock drifted significantly | Normal recovery, no action needed |
 | `OFFSET_REFRESH_FAILED` | Cannot reach Binance time endpoint | Check network; existing offset still used |
 | Repeated `-1021` after refresh | Drift too fast for periodic correction | Investigate system clock source |
+
+## Trading Loop Cleanup Signals (ADR-121)
+
+### TRADING_PLANNED_CLEANUP_STARTED / COMPLETED
+Normal duration-reached exit. Cleanup runs as planned.
+```
+TRADING_PLANNED_CLEANUP_STARTED stop_reason=duration_reached
+TRADING_PLANNED_CLEANUP_COMPLETED failures=0 stop_reason=duration_reached
+```
+
+### TRADING_ABORT_CLEANUP_STARTED / COMPLETED
+Fatal abort (WS reconnect exhaustion, crash, etc.) after live trading started.
+```
+TRADING_ABORT_CLEANUP_STARTED stop_reason=stream_ended
+TRADING_ABORT_CLEANUP_COMPLETED failures=0 stop_reason=stream_ended
+```
+
+### Operator interpretation
+| Signal | Meaning | Action |
+|--------|---------|--------|
+| `PLANNED_CLEANUP_COMPLETED failures=0` | Normal clean exit | No action |
+| `ABORT_CLEANUP_COMPLETED failures=0` | Fatal exit, but cleanup succeeded | Investigate root cause (WS, network) |
+| `ABORT_CLEANUP_COMPLETED failures>0` | Fatal exit, cleanup partially failed | Check exchange state manually |
+| `Cleanup-on-exit skipped: loop_never_started` | Loop died before trading | No exchange state to clean |

@@ -37,6 +37,7 @@ from scripts.run_trading import (
     evaluate_grid_v2_account_sync_preflight,
     evaluate_launch_guard,
     evaluate_pippin_order_size_lock_preflight,
+    finalize_and_cleanup,
     is_trading_ready,
     reset_trading_state,
     trading_loop,
@@ -173,8 +174,22 @@ class TestCleanupOnExitPolicy:
         assert enabled is False
         assert reason == "fixture_mode"
 
-    def test_cleanup_policy_skips_when_not_duration_timeout(self) -> None:
-        enabled, reason = evaluate_cleanup_on_exit_policy(
+    def test_cleanup_policy_runs_on_fatal_abort(self) -> None:
+        """Fatal abort after live trading → cleanup runs."""
+        enabled, _reason = evaluate_cleanup_on_exit_policy(
+            cleanup_on_exit=True,
+            mode=SafeMode.LIVE_TRADE,
+            exchange_port="futures",
+            armed=True,
+            mainnet=True,
+            fixture_path=None,
+            stop_reason="stream_ended",
+        )
+        assert enabled is True
+
+    def test_cleanup_policy_runs_on_shutdown_requested(self) -> None:
+        """Ctrl+C after live trading → cleanup runs."""
+        enabled, _reason = evaluate_cleanup_on_exit_policy(
             cleanup_on_exit=True,
             mode=SafeMode.LIVE_TRADE,
             exchange_port="futures",
@@ -183,8 +198,109 @@ class TestCleanupOnExitPolicy:
             fixture_path=None,
             stop_reason="shutdown_requested",
         )
+        assert enabled is True
+
+    def test_cleanup_policy_skips_when_loop_never_started(self) -> None:
+        """Loop never started → no cleanup needed."""
+        enabled, reason = evaluate_cleanup_on_exit_policy(
+            cleanup_on_exit=True,
+            mode=SafeMode.LIVE_TRADE,
+            exchange_port="futures",
+            armed=True,
+            mainnet=True,
+            fixture_path=None,
+            stop_reason="not_started",
+        )
         assert enabled is False
-        assert reason == "not_duration_timeout"
+        assert reason == "loop_never_started"
+
+
+class TestFinalizeAndCleanup:
+    """Real invocation path: finalize_and_cleanup runs cleanup_fn on abort."""
+
+    def test_fatal_abort_invokes_cleanup(self) -> None:
+        """stream_ended after live start → cleanup_fn called with symbols."""
+        called_with: list[list[str]] = []
+
+        def fake_cleanup(symbols: list[str]) -> int:
+            called_with.append(symbols)
+            return 0
+
+        result = finalize_and_cleanup(
+            cleanup_on_exit=True,
+            mode=SafeMode.LIVE_TRADE,
+            exchange_port="futures",
+            armed=True,
+            mainnet=True,
+            fixture_path=None,
+            stop_reason="stream_ended",
+            symbols=["BEATUSDT"],
+            cleanup_fn=fake_cleanup,
+        )
+        assert result == 0
+        assert called_with == [["BEATUSDT"]]
+
+    def test_not_started_skips_cleanup(self) -> None:
+        """Loop never started → cleanup_fn NOT called."""
+        called = []
+
+        def fake_cleanup(symbols: list[str]) -> int:
+            called.append(True)
+            return 0
+
+        result = finalize_and_cleanup(
+            cleanup_on_exit=True,
+            mode=SafeMode.LIVE_TRADE,
+            exchange_port="futures",
+            armed=True,
+            mainnet=True,
+            fixture_path=None,
+            stop_reason="not_started",
+            symbols=["BEATUSDT"],
+            cleanup_fn=fake_cleanup,
+        )
+        assert result == 0
+        assert called == []
+
+    def test_cleanup_failure_returns_3(self) -> None:
+        """Cleanup with failures → returns exit code 3."""
+
+        def failing_cleanup(symbols: list[str]) -> int:
+            return 2  # 2 failures
+
+        result = finalize_and_cleanup(
+            cleanup_on_exit=True,
+            mode=SafeMode.LIVE_TRADE,
+            exchange_port="futures",
+            armed=True,
+            mainnet=True,
+            fixture_path=None,
+            stop_reason="stream_ended",
+            symbols=["BEATUSDT"],
+            cleanup_fn=failing_cleanup,
+        )
+        assert result == 3
+
+    def test_planned_stop_invokes_cleanup(self) -> None:
+        """duration_reached → cleanup_fn called (planned path)."""
+        called_with: list[list[str]] = []
+
+        def fake_cleanup(symbols: list[str]) -> int:
+            called_with.append(symbols)
+            return 0
+
+        finalize_and_cleanup(
+            cleanup_on_exit=True,
+            mode=SafeMode.LIVE_TRADE,
+            exchange_port="futures",
+            armed=True,
+            mainnet=True,
+            fixture_path=None,
+            stop_reason="duration_reached",
+            symbols=["BEATUSDT"],
+            cleanup_fn=fake_cleanup,
+        )
+        assert called_with == [["BEATUSDT"]]
 
 
 class TestParserDefaults:
