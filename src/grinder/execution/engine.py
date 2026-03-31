@@ -67,11 +67,13 @@ class SymbolConstraints:
         step_size: Lot size step for qty rounding (e.g., 0.001 for BTC)
         min_qty: Minimum order quantity (e.g., 0.001 for BTC)
         tick_size: Price filter tick size (e.g., 0.10 for BTCUSDT futures)
+        min_notional: Minimum order value in quote asset (e.g., 5 USDT)
     """
 
     step_size: Decimal
     min_qty: Decimal
     tick_size: Decimal = Decimal("0")
+    min_notional: Decimal = Decimal("0")
 
 
 def floor_to_step(qty: Decimal, step_size: Decimal) -> Decimal:

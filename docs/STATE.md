@@ -1762,7 +1762,11 @@ Comprehensive adaptive grid system design:
       - `load_constraints_from_file()` for offline mode
       - `scripts/fetch_exchange_info.py` CLI for ops
       - LOT_SIZE filter parsing for stepSize/minQty
+      - PRICE_FILTER parsing for tickSize
+      - MIN_NOTIONAL / NOTIONAL filter parsing for minNotional (PR-B1, Phase B foundation)
+      - `SymbolConstraints` fields: `step_size`, `min_qty`, `tick_size`, `min_notional`
       - Cache location: `var/cache/exchange_info_futures.json`
+      - Backward compatible: old cache files without min_notional load with default 0
       - See ADR-060
     - **ExecutionEngineConfig (M7-07):** Wiring ConstraintProvider with explicit enablement
       - `ExecutionEngineConfig(constraints_enabled=False)` -- default OFF for safety

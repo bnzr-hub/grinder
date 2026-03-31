@@ -34,6 +34,7 @@ from grinder.execution.constraint_provider import (
     load_constraints_from_file,
     parse_exchange_info,
     parse_lot_size_filter,
+    parse_min_notional_filter,
     parse_price_filter,
 )
 from grinder.execution.engine import ExecutionEngineConfig, SymbolConstraints
@@ -148,6 +149,62 @@ class TestParsePriceFilter:
         assert result is None
 
 
+# --- Tests: parse_min_notional_filter ---
+
+
+class TestParseMinNotionalFilter:
+    """Tests for MIN_NOTIONAL / NOTIONAL filter parsing."""
+
+    def test_parse_min_notional(self) -> None:
+        """MIN_NOTIONAL with notional=5."""
+        filters = [
+            {"filterType": "MIN_NOTIONAL", "notional": "5"},
+        ]
+        result = parse_min_notional_filter(filters)
+        assert result == Decimal("5")
+
+    def test_parse_notional_filter(self) -> None:
+        """NOTIONAL filter (alternate name) with notional=10."""
+        filters = [
+            {"filterType": "NOTIONAL", "notional": "10"},
+        ]
+        result = parse_min_notional_filter(filters)
+        assert result == Decimal("10")
+
+    def test_min_notional_preferred_over_notional(self) -> None:
+        """When both present, MIN_NOTIONAL takes priority."""
+        filters = [
+            {"filterType": "NOTIONAL", "notional": "10"},
+            {"filterType": "MIN_NOTIONAL", "notional": "5"},
+        ]
+        result = parse_min_notional_filter(filters)
+        assert result == Decimal("5")
+
+    def test_parse_min_notional_missing(self) -> None:
+        """No notional filter → None."""
+        filters = [
+            {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+        ]
+        result = parse_min_notional_filter(filters)
+        assert result is None
+
+    def test_parse_min_notional_invalid(self) -> None:
+        """Invalid notional value → None."""
+        filters = [
+            {"filterType": "MIN_NOTIONAL", "notional": "invalid"},
+        ]
+        result = parse_min_notional_filter(filters)
+        assert result is None
+
+    def test_parse_min_notional_missing_key(self) -> None:
+        """MIN_NOTIONAL filter without notional key → None."""
+        filters = [
+            {"filterType": "MIN_NOTIONAL"},
+        ]
+        result = parse_min_notional_filter(filters)
+        assert result is None
+
+
 # --- Tests: parse_exchange_info ---
 
 
@@ -164,13 +221,14 @@ class TestParseExchangeInfo:
         assert "SOLUSDT" in constraints
 
     def test_parse_btc_constraints(self, exchange_info_data: dict[str, Any]) -> None:
-        """Test BTCUSDT constraints parsed correctly (incl. tick_size)."""
+        """Test BTCUSDT constraints parsed correctly (incl. tick_size, min_notional)."""
         constraints = parse_exchange_info(exchange_info_data)
 
         btc = constraints["BTCUSDT"]
         assert btc.step_size == Decimal("0.001")
         assert btc.min_qty == Decimal("0.001")
         assert btc.tick_size == Decimal("0.10")
+        assert btc.min_notional == Decimal("5")
 
     def test_parse_sol_constraints(self, exchange_info_data: dict[str, Any]) -> None:
         """Test SOLUSDT constraints parsed correctly (integer qty)."""
@@ -271,6 +329,81 @@ class TestConstraintProvider:
 
         constraints = provider.get_constraints()
         assert constraints == {}
+
+
+# --- Tests: min_notional backward compatibility and round-trip ---
+
+
+class TestMinNotionalBackwardCompat:
+    """Tests for min_notional backward compatibility and cache round-trip."""
+
+    def test_old_cache_without_min_notional(self, temp_cache_dir: Path) -> None:
+        """Cache file without min_notional loads successfully with default 0."""
+        old_cache = {
+            "symbols": [
+                {
+                    "symbol": "BTCUSDT",
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                    ],
+                }
+            ]
+        }
+        cache_file = temp_cache_dir / "old_cache.json"
+        with cache_file.open("w") as f:
+            json.dump(old_cache, f)
+
+        provider = ConstraintProvider.from_cache(cache_file)
+        constraints = provider.get_constraints()
+
+        assert len(constraints) == 1
+        btc = constraints["BTCUSDT"]
+        assert btc.min_notional == Decimal("0")
+        assert btc.step_size == Decimal("0.001")
+
+    def test_cache_round_trip_preserves_min_notional(self, temp_cache_dir: Path) -> None:
+        """Parse -> cache -> reload preserves min_notional."""
+        # Load original fixture (has MIN_NOTIONAL=5)
+        with FIXTURE_PATH.open() as f:
+            data = json.load(f)
+
+        # Save to cache
+        config = ConstraintProviderConfig(
+            cache_dir=temp_cache_dir,
+            cache_file="round_trip.json",
+            allow_fetch=False,
+        )
+        provider = ConstraintProvider(config=config)
+        provider._save_to_cache(data)
+
+        # Reload from cache
+        reloaded = provider._load_from_cache()
+        assert reloaded is not None
+        assert reloaded["BTCUSDT"].min_notional == Decimal("5")
+        assert reloaded["ETHUSDT"].min_notional == Decimal("5")
+        assert reloaded["SOLUSDT"].min_notional == Decimal("5")
+
+    def test_symbol_constraints_default_min_notional(self) -> None:
+        """SymbolConstraints without min_notional defaults to 0."""
+        sc = SymbolConstraints(step_size=Decimal("0.001"), min_qty=Decimal("0.001"))
+        assert sc.min_notional == Decimal("0")
+
+    def test_parse_exchange_info_no_notional_filter(self) -> None:
+        """Symbol without any notional filter gets min_notional=0."""
+        data = {
+            "symbols": [
+                {
+                    "symbol": "TESTUSDT",
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "stepSize": "0.01", "minQty": "0.01"},
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                    ],
+                }
+            ]
+        }
+        constraints = parse_exchange_info(data)
+        assert constraints["TESTUSDT"].min_notional == Decimal("0")
 
 
 # --- Tests: Integration with ExecutionEngine ---

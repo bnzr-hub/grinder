@@ -4726,3 +4726,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Key definitions:** Autonomous loop (discover → filter → score → activate → trade → rotate), symbol state machine (9 states), tuning solver contract, 8 safety invariants, 4 rollout phases.
 - **Relationship:** Supersedes `36_MULTI_SYMBOL_ELIGIBILITY_ML_INTEGRATION_V1.md` operationally (which remains the source for Phases 1–3b implementation detail).
 - **Current gap:** Grid_v2 is single-symbol per engine. Multi-symbol grid requires either per-symbol engine instances or symbol-scoped bridges (deferred to Phase C/D).
+
+### ADR-123: Extend ConstraintProvider with minNotional (2026-03-31)
+
+- **Decision:** Add `min_notional` field to `SymbolConstraints` and parse `MIN_NOTIONAL` / `NOTIONAL` filters from Binance exchangeInfo.
+- **Phase:** B1 (foundation for tuning solver). No runtime behavior change.
+- **Why:** Future tuning solver needs `min_notional` to compute legal order sizes and declare NO_GO for symbols where minimum notional exceeds budget.
+- **Backward compat:** Default `min_notional = Decimal("0")`. Old cache files without the field load successfully.
+- **Filter priority:** `MIN_NOTIONAL` checked first (more common on futures), then `NOTIONAL` as fallback.

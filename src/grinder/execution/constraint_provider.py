@@ -1,6 +1,6 @@
 """Symbol constraint provider for execution layer (M7-06, ADR-060).
 
-Provides SymbolConstraints (step_size, min_qty) from Binance exchangeInfo.
+Provides SymbolConstraints (step_size, min_qty, tick_size, min_notional) from Binance exchangeInfo.
 
 Sources (in priority order):
 1. Local JSON cache file (var/cache/exchange_info.json)
@@ -9,6 +9,7 @@ Sources (in priority order):
 Design decisions:
 - All values parsed as strings -> Decimal (determinism)
 - LOT_SIZE filter is the SSOT for stepSize/minQty
+- MIN_NOTIONAL or NOTIONAL filter is the SSOT for minNotional
 - Cache file has TTL but can be used indefinitely in offline mode
 - Missing symbol = no constraints applied (pass-through, ADR-059)
 
@@ -114,6 +115,31 @@ def parse_price_filter(filters: list[dict[str, Any]]) -> Decimal | None:
     return None
 
 
+def parse_min_notional_filter(filters: list[dict[str, Any]]) -> Decimal | None:
+    """Parse MIN_NOTIONAL or NOTIONAL filter from symbol filters.
+
+    Binance uses two filter names for the same concept:
+    - ``MIN_NOTIONAL`` with key ``notional``
+    - ``NOTIONAL`` with key ``notional``
+    MIN_NOTIONAL is checked first (more common on futures).
+
+    Args:
+        filters: List of filter dicts from exchangeInfo symbol
+
+    Returns:
+        min_notional as Decimal, or None if neither filter present
+    """
+    for filter_type in ("MIN_NOTIONAL", "NOTIONAL"):
+        for f in filters:
+            if f.get("filterType") == filter_type:
+                try:
+                    return Decimal(str(f["notional"]))
+                except (KeyError, ValueError, InvalidOperation) as e:
+                    logger.warning("Failed to parse %s filter: %s", filter_type, e)
+                    return None
+    return None
+
+
 def parse_exchange_info(data: dict[str, Any]) -> dict[str, SymbolConstraints]:
     """Parse exchangeInfo response into SymbolConstraints dict.
 
@@ -139,6 +165,7 @@ def parse_exchange_info(data: dict[str, Any]) -> dict[str, SymbolConstraints]:
         filters = symbol_info.get("filters", [])
         lot_size = parse_lot_size_filter(filters)
         tick_size = parse_price_filter(filters)
+        min_notional = parse_min_notional_filter(filters)
 
         if lot_size is not None:
             step_size, min_qty = lot_size
@@ -146,13 +173,15 @@ def parse_exchange_info(data: dict[str, Any]) -> dict[str, SymbolConstraints]:
                 step_size=step_size,
                 min_qty=min_qty,
                 tick_size=tick_size or Decimal("0"),
+                min_notional=min_notional or Decimal("0"),
             )
             logger.debug(
-                "Parsed constraints for %s: step_size=%s, min_qty=%s, tick_size=%s",
+                "Parsed constraints for %s: step_size=%s, min_qty=%s, tick_size=%s, min_notional=%s",
                 symbol,
                 step_size,
                 min_qty,
                 tick_size,
+                min_notional,
             )
 
     logger.info("Parsed constraints for %d symbols", len(constraints))
