@@ -216,6 +216,10 @@ disable_error_code = ["type-arg", "union-attr"]
 module = "scripts.train_regime_model"
 disable_error_code = ["import-untyped"]
 
+[[tool.mypy.overrides]]
+module = "tests.unit.test_stale_registry_fill_race"
+disable_error_code = ["union-attr", "attr-defined", "method-assign", "misc"]
+
 # ============================================================================
 # Pytest Configuration
 # ============================================================================
