@@ -424,3 +424,4 @@ All existing signals from `13_OBSERVABILITY.md` remain unchanged: health mode, E
 | [13_OBSERVABILITY.md](13_OBSERVABILITY.md) | Metrics, log signals, operator audit trail |
 | [STATE.md](STATE.md) | Current implementation truth |
 | [POST_LAUNCH_ROADMAP.md](POST_LAUNCH_ROADMAP.md) | P2 backlog items |
+| [38_AUTONOMOUS_MULTI_SYMBOL_IMPLEMENTATION_PLAN.md](38_AUTONOMOUS_MULTI_SYMBOL_IMPLEMENTATION_PLAN.md) | Phased implementation plan (converts this spec into PR chain) |
