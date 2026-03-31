@@ -4679,3 +4679,10 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Fix:** Duplicate the -2022 detection into the `ConnectorNonRetryableError` handler. After first -2022, Gate 0 blocks remaining exits in the same batch.
 - **Implementation:** `src/grinder/live/engine.py` line 6650.
 - **Tests:** 4 regression tests in `tests/unit/test_snapshot_diff_exit_deferral.py`: latch fires on -2022, second exit blocked, batch-of-4 only first hits exchange, opposite direction not latched.
+
+### ADR-117: Partial action resolution for orphan exit fills (2026-03-31)
+
+- **Decision:** Replace all-or-nothing `resolve_actions` with fault-tolerant `resolve_actions_partial` in the fill path. Missing CANCEL CIDs are skipped; PLACE actions still resolve.
+- **Root cause:** Exit fill follow-up actions included CANCEL_ENTRY for entries whose CIDs were already cleaned from registry. `resolve_actions` raised ValueError on the first missing CANCEL, aborting ALL remaining actions — including PLACE_EXIT for the paired exit. The SM closed the lot, but no exit was placed. Subsequent fills kept creating new lots with exits that hit -2022 because the exchange position was already flat.
+- **Fix:** `resolve_actions_partial` processes each action independently. Missing CANCELs are logged and skipped. PLACE actions (exits, entries) always resolve. Follow-up actions from exit fills are no longer entirely dropped.
+- **Implementation:** `src/grinder/grid_v2/adapter.py` (PartialResolveResult, resolve_actions_partial), `src/grinder/grid_v2/bridge.py` (on_fill Step 4).

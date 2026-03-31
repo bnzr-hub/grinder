@@ -390,39 +390,27 @@ class GridV2Bridge:
             self._adapter.confirm_exit_fill(client_order_id)
             self._mark_recent_exit_fill(client_order_id, ts)
 
-        # Step 4: resolve actions
-        # P0 hotfix: resolve_actions may raise ValueError if SM produces
-        # CANCEL_ENTRY/CANCEL_EXIT for an entry that was never placed
-        # (e.g., risk gate blocked the PLACE). The fill itself is valid —
-        # only follow-up actions are unresolvable. Return empty actions.
-        # IMPORTANT: only suppress orphan CID errors; re-raise all others.
-        try:
-            resolved = self._adapter.resolve_actions(result.actions, ts)
-        except ValueError as exc:
-            msg = str(exc)
-            if "No registered entry CID for CANCEL_ENTRY" in msg or (
-                "No registered exit CID for CANCEL_EXIT" in msg
-            ):
-                logger.warning(
-                    "GRID_V2_FILL_RESOLVE_ORPHAN symbol=%s cid=%s reason=%s "
-                    "sm_actions=%d — follow-up actions skipped (no crash)",
-                    self._symbol,
-                    client_order_id,
-                    exc,
-                    len(result.actions),
-                )
-                return FillResult(
-                    translated=translated,
-                    transition=result,
-                    resolved_actions=(),
-                    execution_actions=(),
-                    rejected=False,
-                    reject_reason=None,
-                )
-            raise
+        # Step 4: resolve actions — fault-tolerant for orphan CANCELs.
+        # If a CANCEL_ENTRY/CANCEL_EXIT can't find its CID (entry was
+        # cleaned from registry before fill arrived), skip that CANCEL
+        # but still resolve remaining PLACE actions. This prevents
+        # phantom lots from surviving when follow-up exits/entries
+        # would otherwise be dropped entirely.
+        resolved = self._adapter.resolve_actions_partial(result.actions, ts)
+        if resolved.skipped_count > 0:
+            logger.warning(
+                "GRID_V2_FILL_RESOLVE_PARTIAL symbol=%s cid=%s "
+                "total=%d resolved=%d skipped=%d reasons=%s",
+                self._symbol,
+                client_order_id,
+                len(result.actions),
+                len(resolved.actions),
+                resolved.skipped_count,
+                "; ".join(resolved.skip_reasons),
+            )
 
         # Step 5: convert to ExecutionActions
-        exec_actions = self._to_execution_actions(resolved)
+        exec_actions = self._to_execution_actions(resolved.actions)
 
         logger.info(
             "%s symbol=%s cid=%s actions=%d",
@@ -435,7 +423,7 @@ class GridV2Bridge:
         return FillResult(
             translated=translated,
             transition=result,
-            resolved_actions=resolved,
+            resolved_actions=resolved.actions,
             execution_actions=exec_actions,
             rejected=False,
             reject_reason=None,

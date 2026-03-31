@@ -12,7 +12,7 @@ from grinder.contracts import Snapshot
 from grinder.core import OrderSide, OrderState
 from grinder.execution.futures_events import FuturesOrderEvent, UserDataEvent, UserDataEventType
 from grinder.execution.types import ActionType, ExecutionAction
-from grinder.grid_v2.adapter import GridV2Adapter, GridV2OrderKind
+from grinder.grid_v2.adapter import GridV2Adapter, GridV2OrderKind, PartialResolveResult
 from grinder.grid_v2.bridge import (
     BRIDGE_DISPATCH_BLOCKED,
     GridV2Bridge,
@@ -1337,7 +1337,6 @@ class TestGridV2RecoveryModes:
     def _bad_reconstruct_acct() -> AccountSnapshot:
         """Create account with duplicate grid_v2 entry orders (same side+price = F6 failure)."""
         from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
-        from grinder.grid_v2.adapter import GridV2Adapter  # noqa: PLC0415
 
         adapter = GridV2Adapter(_config(), "BTCUSDT")
         cid1 = adapter.generate_entry_cid(_BASE_TS)
@@ -5778,12 +5777,12 @@ class TestFillResolveOrphanNoFatal:
         buy_price = buy_seed[0].price
         assert buy_cid is not None and buy_price is not None
 
-        # Patch resolve_actions to raise a non-orphan ValueError
+        # Patch resolve_actions_partial to raise a non-orphan ValueError
         def _bad_resolve(*_args: object, **_kwargs: object) -> None:
             raise ValueError("PLACE_ENTRY missing fields: corrupted action")
 
         with (
-            patch.object(b.adapter, "resolve_actions", side_effect=_bad_resolve),
+            patch.object(b.adapter, "resolve_actions_partial", side_effect=_bad_resolve),
             pytest.raises(ValueError, match="PLACE_ENTRY missing fields"),
         ):
             b.on_fill(buy_cid, OrderSide.BUY, buy_price, _ORDER_SIZE, _BASE_TS + 1000)
@@ -5858,3 +5857,172 @@ class TestEngineRiskGateOrphanIntegration:
         # Un-patch: real SM apply for normal fill
         r2 = bridge.on_fill(sell_cid, OrderSide.SELL, sell_price, _ORDER_SIZE, _BASE_TS + 2000)
         assert r2.rejected is False
+
+
+class TestPartialResolveOrphanCancel:
+    """resolve_actions_partial: missing CANCEL skipped, PLACE survives."""
+
+    def test_missing_cancel_entry_skipped_place_exit_survives(self) -> None:
+        """Mixed batch: orphan CANCEL_ENTRY + valid PLACE_EXIT → place resolves."""
+
+        cfg = _config()
+        adapter = GridV2Adapter(cfg, "BTCUSDT")
+
+        # Register an entry so PLACE_EXIT has a valid lot
+        entry_cid = adapter.generate_entry_cid(1000)
+        adapter.registry.register_entry(entry_cid, OrderSide.BUY, Decimal("99"))
+
+        # Confirm as filled so lot exists in SM terms
+        adapter.confirm_entry_fill(entry_cid)
+
+        actions = (
+            # CANCEL_ENTRY for a price that has NO registered CID → orphan
+            ActionIntent(
+                kind=ActionIntentKind.CANCEL_ENTRY,
+                side=OrderSide.SELL,
+                price=Decimal("101"),
+                reason="ONE_SIDED_CANCEL_OPPOSITE",
+            ),
+            # PLACE_EXIT for the lot → should survive
+            ActionIntent(
+                kind=ActionIntentKind.PLACE_EXIT,
+                side=OrderSide.SELL,
+                price=Decimal("100"),
+                qty=Decimal("1"),
+                lot_id=f"lot-{entry_cid}",
+                reason="FILL_REPLACEMENT",
+            ),
+        )
+
+        result = adapter.resolve_actions_partial(actions, ts_ms=2000)
+
+        assert isinstance(result, PartialResolveResult)
+        assert result.skipped_count == 1
+        assert len(result.actions) == 1
+        assert result.actions[0].kind == ActionIntentKind.PLACE_EXIT
+        assert result.actions[0].price == Decimal("100")
+
+    def test_all_cancels_missing_all_places_survive(self) -> None:
+        """Multiple orphan CANCELs + multiple valid PLACEs → all places resolve."""
+
+        cfg = _config()
+        adapter = GridV2Adapter(cfg, "BTCUSDT")
+
+        actions = (
+            ActionIntent(
+                kind=ActionIntentKind.CANCEL_ENTRY,
+                side=OrderSide.SELL,
+                price=Decimal("101"),
+                reason="ONE_SIDED_CANCEL_OPPOSITE",
+            ),
+            ActionIntent(
+                kind=ActionIntentKind.CANCEL_ENTRY,
+                side=OrderSide.SELL,
+                price=Decimal("102"),
+                reason="ONE_SIDED_CANCEL_OPPOSITE",
+            ),
+            ActionIntent(
+                kind=ActionIntentKind.PLACE_ENTRY,
+                side=OrderSide.BUY,
+                price=Decimal("98"),
+                qty=Decimal("1"),
+                reason="FILL_REPLACEMENT",
+            ),
+            ActionIntent(
+                kind=ActionIntentKind.PLACE_ENTRY,
+                side=OrderSide.BUY,
+                price=Decimal("97"),
+                qty=Decimal("1"),
+                reason="FILL_REPLACEMENT",
+            ),
+        )
+
+        result = adapter.resolve_actions_partial(actions, ts_ms=2000)
+
+        assert result.skipped_count == 2
+        assert len(result.actions) == 2
+        assert all(a.kind == ActionIntentKind.PLACE_ENTRY for a in result.actions)
+
+    def test_no_orphans_all_resolve(self) -> None:
+        """When no cancels are orphaned, all actions resolve normally."""
+
+        cfg = _config()
+        adapter = GridV2Adapter(cfg, "BTCUSDT")
+
+        # Register entry at price 101 so CANCEL_ENTRY can find it
+        cid = adapter.generate_entry_cid(1000)
+        adapter.registry.register_entry(cid, OrderSide.SELL, Decimal("101"))
+
+        actions = (
+            ActionIntent(
+                kind=ActionIntentKind.CANCEL_ENTRY,
+                side=OrderSide.SELL,
+                price=Decimal("101"),
+                reason="ONE_SIDED_CANCEL_OPPOSITE",
+            ),
+            ActionIntent(
+                kind=ActionIntentKind.PLACE_ENTRY,
+                side=OrderSide.BUY,
+                price=Decimal("98"),
+                qty=Decimal("1"),
+                reason="FILL_REPLACEMENT",
+            ),
+        )
+
+        result = adapter.resolve_actions_partial(actions, ts_ms=2000)
+
+        assert result.skipped_count == 0
+        assert len(result.actions) == 2
+
+
+class TestBridgeOnFillPartialResolution:
+    """bridge.on_fill returns non-empty execution_actions despite orphan cancel."""
+
+    def test_exit_fill_with_orphan_cancel_still_dispatches_entries(self) -> None:
+        """Exit fill: SM produces CANCEL_ENTRY (orphan) + PLACE_ENTRY → entries dispatch."""
+        b = _bridge()
+        # Startup seeds the grid with entries in registry
+        seeds = list(b.startup_fresh(_REF_PRICE, _BASE_TS))
+        assert len(seeds) > 0
+
+        # Get a BUY entry CID from the seeded grid
+        buy_cids = [
+            cid
+            for cid in b.adapter.registry.all_entry_cids
+            if (reg := b.adapter.registry.lookup_entry(cid)) is not None
+            and reg.side == OrderSide.BUY
+        ]
+        assert len(buy_cids) > 0
+        buy_cid = buy_cids[0]
+        buy_reg = b.adapter.registry.lookup_entry(buy_cid)
+        assert buy_reg is not None
+
+        # Fill the buy entry → creates SELL exit + lot
+        r1 = b.on_fill(buy_cid, OrderSide.BUY, buy_reg.price, _ORDER_SIZE, _BASE_TS + 100)
+        assert not r1.rejected
+        assert len(r1.execution_actions) > 0
+
+        # Now fill the paired exit
+        exit_cids = list(b.adapter.registry.all_exit_cids)
+        assert len(exit_cids) >= 1
+        exit_cid = exit_cids[0]
+
+        # Clean ALL remaining entry CIDs to simulate stale-registry cleaning
+        for entry_cid in list(b.adapter.registry.all_entry_cids):
+            b.adapter.confirm_cancel_entry(entry_cid)
+
+        # Exit fill: SM produces CANCEL_ENTRY (orphan, CIDs gone) + PLACE_ENTRY
+        exit_reg = b.adapter.registry.lookup_exit(exit_cid)
+        assert exit_reg is not None
+        r2 = b.on_fill(
+            exit_cid,
+            OrderSide.SELL,
+            buy_reg.price + Decimal("1"),
+            _ORDER_SIZE,
+            _BASE_TS + 200,
+        )
+
+        # Should NOT be rejected — SM closed the lot
+        assert not r2.rejected
+        # Transition should exist (lot was closed by SM)
+        assert r2.transition is not None

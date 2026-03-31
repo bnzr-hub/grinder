@@ -145,6 +145,15 @@ class ResolvedAction:
 
 
 @dataclass(frozen=True)
+class PartialResolveResult:
+    """Result of fault-tolerant action resolution."""
+
+    actions: tuple[ResolvedAction, ...]
+    skipped_count: int
+    skip_reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ReconciliationResult:
     """Result of comparing expected vs observed state (22.6)."""
 
@@ -559,6 +568,111 @@ class GridV2Adapter:
                 )
 
         return tuple(resolved)
+
+    def resolve_actions_partial(  # noqa: PLR0912
+        self,
+        actions: tuple[ActionIntent, ...],
+        ts_ms: int,
+    ) -> PartialResolveResult:
+        """Resolve actions fault-tolerantly: skip unresolvable CANCELs.
+
+        Like resolve_actions, but missing CANCEL CIDs are skipped instead
+        of raising ValueError. PLACE actions are always resolved. This
+        prevents phantom lots when a CANCEL fails but the paired PLACE
+        should still go through.
+        """
+        resolved: list[ResolvedAction] = []
+        skipped = 0
+        skip_reasons: list[str] = []
+
+        for action in actions:
+            try:
+                if action.kind == ActionIntentKind.PLACE_ENTRY:
+                    if action.side is None or action.price is None or action.qty is None:
+                        raise ValueError(f"PLACE_ENTRY missing fields: {action}")
+                    cid = self.generate_entry_cid(ts_ms)
+                    registered = self._registry.register_entry(cid, action.side, action.price)
+                    if registered:
+                        resolved.append(
+                            ResolvedAction(
+                                cid=cid,
+                                kind=action.kind,
+                                side=action.side,
+                                price=action.price,
+                                qty=action.qty,
+                            )
+                        )
+
+                elif action.kind == ActionIntentKind.PLACE_EXIT:
+                    if (
+                        action.side is None
+                        or action.price is None
+                        or action.qty is None
+                        or action.lot_id is None
+                    ):
+                        raise ValueError(f"PLACE_EXIT missing fields: {action}")
+                    cid = self.generate_exit_cid(ts_ms)
+                    entry_order_id = action.lot_id.removeprefix("lot-")
+                    exit_order_id = f"exit-{entry_order_id}"
+                    self._registry.register_exit(
+                        cid, exit_order_id=exit_order_id, lot_id=action.lot_id
+                    )
+                    resolved.append(
+                        ResolvedAction(
+                            cid=cid,
+                            kind=action.kind,
+                            side=action.side,
+                            price=action.price,
+                            qty=action.qty,
+                        )
+                    )
+
+                elif action.kind == ActionIntentKind.CANCEL_ENTRY:
+                    if action.side is None or action.price is None:
+                        raise ValueError(f"CANCEL_ENTRY missing fields: {action}")
+                    found_cid = self._registry.cid_for_entry(action.side, action.price)
+                    if found_cid is None:
+                        skipped += 1
+                        skip_reasons.append(
+                            f"CANCEL_ENTRY side={action.side.value} price={action.price}: no CID"
+                        )
+                        continue
+                    self._registry.mark_entry_cancel_pending(found_cid)
+                    resolved.append(
+                        ResolvedAction(
+                            cid=found_cid,
+                            kind=action.kind,
+                            side=action.side,
+                            price=action.price,
+                        )
+                    )
+
+                elif action.kind == ActionIntentKind.CANCEL_EXIT:
+                    if action.order_id is None:
+                        raise ValueError(f"CANCEL_EXIT missing order_id: {action}")
+                    found_cid = self._registry.cid_for_exit(action.order_id)
+                    if found_cid is None:
+                        skipped += 1
+                        skip_reasons.append(f"CANCEL_EXIT exit_order_id={action.order_id}: no CID")
+                        continue
+                    self._registry.mark_exit_cancel_pending(found_cid)
+                    resolved.append(
+                        ResolvedAction(
+                            cid=found_cid,
+                            kind=action.kind,
+                            side=action.side or OrderSide.BUY,
+                            price=action.price or Decimal(0),
+                        )
+                    )
+
+            except ValueError:
+                raise  # re-raise non-CID errors (missing fields)
+
+        return PartialResolveResult(
+            actions=tuple(resolved),
+            skipped_count=skipped,
+            skip_reasons=tuple(skip_reasons),
+        )
 
     # --- Explicit confirmation (22.3) ---
 
