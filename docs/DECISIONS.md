@@ -4694,3 +4694,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Fix:** `refresh_ts_offset()` calls `/fapi/v1/time` and updates `_ts_offset_ms`. Engine calls it in both sync-failure and action-dispatch -1021 paths. Fail-open: if refresh fails, keeps existing offset.
 - **Implementation:** `src/grinder/execution/binance_futures_port.py`, `src/grinder/live/engine.py`.
 - **Tests:** 7 tests in `tests/unit/test_timestamp_drift_recovery.py`.
+
+### ADR-119: Two-cycle stale-registry cleaning (2026-03-31)
+
+- **Decision:** Stale-registry cleaning now requires 2 consecutive sync absences before removing a CID, matching the EventLedger reconciliation pattern.
+- **Root cause:** A filled entry disappeared from snapshot. Stale-registry cleaning ran BEFORE fill detection and removed it from registry. Fill detection then couldn't find it → orphan resolution → incomplete follow-up actions → phantom lots → repair loop → chaotic grid behavior.
+- **Fix:** Track `_prev_absent_registry_cids` across syncs. Only clean CIDs absent in BOTH previous AND current sync. First-absence CIDs get one grace cycle for fill detection to process them.
+- **Implementation:** `src/grinder/live/engine.py`.
+- **Tests:** 3 tests in `tests/unit/test_stale_registry_fill_race.py`.

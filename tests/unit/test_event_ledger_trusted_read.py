@@ -455,9 +455,11 @@ class TestEngineStaleRegistryRealPath:
                 projection_mode=MagicMock(value="UNCONSTRAINED"),
                 legal_entry_capacity=None,
             )
+            # Two syncs needed: stale-registry uses 2-consecutive-absence rule
+            engine._tick_account_sync()
             engine._tick_account_sync()
 
-        # g-stale cleaned via trusted ledger (not in ledger's open orders)
+        # g-stale cleaned after 2 consecutive absences
         engine._grid_v2_bridge.adapter.confirm_cancel_entry.assert_called_once_with("g-stale")
 
     def test_untrusted_ledger_cleans_from_snapshot(self) -> None:
@@ -489,7 +491,9 @@ class TestEngineStaleRegistryRealPath:
                 projection_mode=MagicMock(value="UNCONSTRAINED"),
                 legal_entry_capacity=None,
             )
+            # Two syncs: 2-consecutive-absence rule
+            engine._tick_account_sync()
             engine._tick_account_sync()
 
-        # g-stale cleaned (not in exchange visibility from either source)
+        # g-stale cleaned after 2 consecutive absences
         engine._grid_v2_bridge.adapter.confirm_cancel_entry.assert_called_once_with("g-stale")

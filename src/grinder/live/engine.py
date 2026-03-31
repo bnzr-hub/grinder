@@ -826,6 +826,11 @@ class LiveEngineV0:
         self._grid_v2_pending_seed_cids: frozenset[str] = frozenset()  # PR6: CIDs to confirm
         # cid → sync_gen at dispatch. Released after visibility OR 2 sync cycles grace.
         self._grid_v2_pending_place_cids: dict[str, int] = {}
+        # Two-cycle stale-registry tracking: CIDs absent from exchange in
+        # previous sync. Only clean CIDs absent in BOTH consecutive syncs
+        # to avoid racing with fill detection (filled entries disappear
+        # from snapshot but should be processed as fills, not cleaned).
+        self._prev_absent_registry_cids: set[str] = set()
         self._grid_v2_user_fill_seen: set[str] = set()
         self._grid_v2_integrity_mismatch_streak = 0
         self._grid_v2_integrity_mismatch_last_ts = 0
@@ -4243,23 +4248,30 @@ class LiveEngineV0:
             and self._grid_v2_bridge.reconstruction_ok
         ):
             # Pre-pass: clean stale registry entries that block reconciler PLACE.
-            # A CID in registry but absent from exchange AND not in pending sets
-            # is stale (cancelled/filled without ack). Remove to unblock reseed.
-            # ADR-109 Phase 2: use ledger when trusted for faster detection.
+            # Two-cycle rule: only clean CIDs absent from exchange in BOTH
+            # previous AND current sync. This prevents racing with fill
+            # detection — a filled entry disappears from snapshot but must
+            # be processed as a fill before it can be cleaned as stale.
             if self._event_ledger.is_trusted:
                 exchange_cids = set(self._event_ledger.open_orders().keys())
             else:
                 exchange_cids = {o.order_id for o in result.snapshot.open_orders}
             bridge = self._grid_v2_bridge
-            stale_cleaned = 0
+            current_absent: set[str] = set()
             for cid in list(bridge.adapter.registry.all_entry_cids):
                 if (
                     cid not in exchange_cids
                     and cid not in self._grid_v2_pending_place_cids
                     and cid not in self._grid_v2_pending_cancels
                 ):
-                    bridge.adapter.confirm_cancel_entry(cid)
-                    stale_cleaned += 1
+                    current_absent.add(cid)
+            # Only clean CIDs absent in both consecutive syncs
+            stale_candidates = current_absent & self._prev_absent_registry_cids
+            stale_cleaned = 0
+            for cid in stale_candidates:
+                bridge.adapter.confirm_cancel_entry(cid)
+                stale_cleaned += 1
+            self._prev_absent_registry_cids = current_absent
             if stale_cleaned:
                 logger.info(
                     "GRID_V2_STALE_REGISTRY_CLEANED symbol=%s entries=%d",

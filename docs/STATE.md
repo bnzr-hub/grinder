@@ -1857,6 +1857,11 @@ Comprehensive adaptive grid system design:
 - **Fix:** `refresh_ts_offset()` on BinanceFuturesPort, called on every -1021. Default `recvWindow` increased to 10s.
 - **Status:** [DONE]
 
+### Two-cycle stale-registry cleaning (ADR-119)
+- **Problem:** Stale-registry cleaning ran before fill detection. Filled entries were cleaned as "stale" before they could be processed as fills → orphan resolution → phantom lots → chaotic repair loop.
+- **Fix:** Two-consecutive-absence rule: first absence = grace cycle for fill detection. Second consecutive absence = clean as truly stale. Same pattern as EventLedger reconciliation (#511).
+- **Status:** [DONE]
+
 ### Multi-venue
 - **Current:** Binance Futures USDT-M only
 - **Planned:** COIN-M, other CEXs (see ROADMAP M9)
