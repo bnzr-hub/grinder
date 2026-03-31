@@ -170,21 +170,44 @@ Phase D: Autonomous discovery + continuous loop
 
 ### Phase C1: Active rotation with operator universe
 
-**Goal:** System auto-tunes configs for operator-provided symbols and rotates the active set. Grid_v2 still single-symbol per run (or one engine per symbol in multi-process).
+**Goal:** System auto-tunes configs for operator-provided symbols and rotates the active set. Grid_v2 remains single-symbol per engine instance.
+
+**Ownership model (Phase C):**
+
+A new `SymbolOrchestrator` (separate from `LiveEngineV0`) is the sole owner of:
+- **Ranking:** calls tuning cache + ActiveSelector
+- **Active set:** decides which symbols are ACTIVE, GRACEFUL_EXIT_ONLY, COOLDOWN
+- **Deactivation decision:** triggers graceful exit on removal
+- **Per-symbol engine lifecycle:** starts/stops per-symbol engine instances
+
+`LiveEngineV0` remains a single-symbol engine. It does NOT know about rotation, other symbols, or the active set. The orchestrator spawns one engine per active symbol and manages their lifecycle externally.
+
+```
+SymbolOrchestrator (new)
+  ├── RotationController (state machine per symbol)
+  ├── TuningCache (from Phase B)
+  ├── ActiveSelector (existing)
+  └── per-symbol engine instances:
+        ├── LiveEngineV0 for BTCUSDT
+        ├── LiveEngineV0 for ETHUSDT
+        └── ...
+```
 
 **What changes:**
+- New module: `src/grinder/orchestration/` — `SymbolOrchestrator`, `RotationController`
 - ActiveSelector receives only TUNED symbols as input (not raw universe)
 - Rotation controller: owns symbol state machine (doc 37 Section 5)
-- On activation: configure grid_v2 bridge with tuned config
-- On removal (FLAT): release grid resources
-- On removal (non-FLAT): set `graceful_exit_only`, wait for FLAT
+- Orchestrator on activation: spawn engine instance with tuned config
+- Orchestrator on removal (FLAT): stop engine, release resources
+- Orchestrator on removal (non-FLAT): signal engine `graceful_exit_only`, wait for FLAT, then stop
 - Operator still provides `--symbols` universe
 
 **What stays unchanged:**
+- `LiveEngineV0` internals (no rotation logic added to engine.py)
 - Universe source (operator CLI, not auto-discovery)
-- Single-symbol grid_v2 per engine instance (multi-process if multiple symbols needed)
+- Single-symbol grid_v2 per engine instance
 
-**Safety:** Rotation bounded by `MAX_CHANGES_PER_CYCLE`. Hysteresis prevents churn. `graceful_exit_only` protects open inventory.
+**Safety:** Rotation bounded by `MAX_CHANGES_PER_CYCLE`. Hysteresis prevents churn. `graceful_exit_only` protects open inventory. Engine isolation: crash of one symbol engine does not affect others.
 
 ### Phase C2: Safe symbol lifecycle / deactivation orchestration
 
@@ -315,32 +338,39 @@ Phase D: Autonomous discovery + continuous loop
 **Proof bundle:** pytest, ruff, mypy.
 **Must stay unchanged:** No engine changes. No selector changes.
 
-### PR-C1b: Rotation controller wiring + selector integration
+### PR-C1b: Symbol orchestrator + rotation controller wiring
 
-**Title:** `feat(rotation): wire rotation controller into selector cycle`
-**Goal:** ActiveSelector receives only TUNED symbols. Rotation controller manages state transitions.
+**Title:** `feat(orchestration): symbol orchestrator with rotation controller`
+**Goal:** `SymbolOrchestrator` owns active set and per-symbol engine lifecycle. `RotationController` manages state transitions. `LiveEngineV0` is not modified.
 **Files touched:**
-- `src/grinder/rotation/controller.py` (new) — `RotationController` (owns per-symbol state, calls selector + cache)
-- `src/grinder/live/engine.py` — wire rotation controller into selector cycle (feature-flagged)
+- `src/grinder/orchestration/__init__.py` (new)
+- `src/grinder/orchestration/orchestrator.py` (new) — `SymbolOrchestrator` (spawns/stops per-symbol engines, owns active set)
+- `src/grinder/rotation/controller.py` (new) — `RotationController` (per-symbol state, calls selector + cache)
+- `scripts/run_trading.py` — optional `--orchestrator` mode (feature-flagged, default OFF)
+- `tests/unit/test_symbol_orchestrator.py` (new)
 - `tests/unit/test_rotation_controller.py` (new)
 **Dependencies:** PR-C1a, PR-B3b.
 **Tests required:**
+- Orchestrator spawns engine on TUNED → ACTIVE transition
+- Orchestrator stops engine on COOLDOWN transition (after FLAT)
+- Orchestrator signals graceful_exit_only on ACTIVE → GRACEFUL_EXIT_ONLY
 - Controller feeds only TUNED symbols to scorer
 - Symbol transitions through full lifecycle
 - `MAX_CHANGES_PER_CYCLE` enforced
 - `MIN_HOLD_CYCLES` enforced
-- Fail-safe: controller error → retain previous active set
-**Observability:** `SELECTOR_CYCLE_COMPLETED active=N eligible=M scored=L` (extend existing signal).
-**Proof bundle:** pytest, ruff, mypy. Show selector cycle with tuning filter.
-**Must stay unchanged:** Grid_v2 single-symbol behavior. Existing selector metrics.
+- Fail-safe: controller error → retain previous active set, no engine start/stop
+- Engine isolation: one engine failure does not affect orchestrator or other engines
+**Observability:** `SELECTOR_CYCLE_COMPLETED active=N eligible=M scored=L` (extend existing signal). `ORCHESTRATOR_ENGINE_STARTED symbol=X`, `ORCHESTRATOR_ENGINE_STOPPED symbol=X`.
+**Proof bundle:** pytest, ruff, mypy. Show orchestrator cycle with tuning filter + engine lifecycle.
+**Must stay unchanged:** `LiveEngineV0` internals (no rotation logic in engine.py). Grid_v2 single-symbol behavior. Existing selector metrics.
 
 ### PR-C2a: Graceful deactivation sequence
 
-**Title:** `feat(rotation): graceful symbol deactivation with cleanup verification`
-**Goal:** When rotation removes a symbol: entry-block → exit-only → FLAT wait → cleanup verify → COOLDOWN.
+**Title:** `feat(orchestration): graceful symbol deactivation with cleanup verification`
+**Goal:** When orchestrator removes a symbol: signal engine graceful_exit_only → FLAT wait → stop engine → cleanup verify → COOLDOWN.
 **Files touched:**
-- `src/grinder/rotation/deactivation.py` (new) — `DeactivationSequence`
-- `src/grinder/live/engine.py` — deactivation hook on symbol removal
+- `src/grinder/orchestration/deactivation.py` (new) — `DeactivationSequence`
+- `src/grinder/orchestration/orchestrator.py` — deactivation hook on symbol removal
 - `tests/unit/test_deactivation_sequence.py` (new)
 **Dependencies:** PR-C1b.
 **Tests required:**
@@ -475,16 +505,16 @@ Phase D: Autonomous discovery + continuous loop
 ### Fork 1: Multi-symbol execution model
 
 **Options:**
-- **A: Multiple engine instances (one per symbol) behind an orchestrator.**
+- **A: Multiple engine instances (one per symbol) behind a SymbolOrchestrator.**
   - Pros: Clean isolation. Existing engine code unchanged. Crash of one symbol doesn't affect others.
   - Cons: Resource overhead (each engine has full WS + sync + EventLedger stack). Harder portfolio-level coordination.
 - **B: Symbol-scoped bridge dict inside a single engine.**
   - Pros: Shared infrastructure (WS, sync, portfolio risk). Lower resource overhead.
   - Cons: Requires significant engine refactoring. State isolation must be proven. Higher blast radius on bugs.
 
-**Decision point:** Before Phase D (PR-D2). Phase C can operate with Option A (multi-process).
+**Decision for Phase C:** Option A. `SymbolOrchestrator` owns active set and spawns per-symbol `LiveEngineV0` instances. `LiveEngineV0` is not modified for rotation logic.
 
-**Recommendation:** Start with Option A for Phase C (proven isolation, no engine refactoring). Evaluate Option B for Phase D based on resource constraints.
+**Open for Phase D:** Re-evaluate Option B if resource overhead from Option A becomes a constraint at higher K values (e.g., K=10+). Decision point: before PR-D2.
 
 ### Fork 2: Persistence model for symbol state
 
@@ -556,7 +586,11 @@ Phase D: Autonomous discovery + continuous loop
 
 ## 10. Stop-the-line rules
 
-Any of the following triggers an immediate halt to rotation (but NOT to active trading — existing positions are managed normally):
+Two severity tiers with different runtime contracts:
+
+### Tier 1: Rotation halt (orchestrator-level)
+
+Halts rotation decisions. Active symbol engines continue their grid_v2 lifecycle normally. The worst outcome is running the current active set longer than optimal, which is safe.
 
 | # | Trigger | Action |
 |---|---------|--------|
@@ -564,12 +598,19 @@ Any of the following triggers an immediate halt to rotation (but NOT to active t
 | STL-2 | Symbol activated without valid TuningResult | Halt rotation, force GRACEFUL_EXIT_ONLY for invalid symbol |
 | STL-3 | Dirty deactivation detected (orphan orders or position after FLAT declaration) | Halt rotation, alert operator, do NOT auto-remediate |
 | STL-4 | Orphan inventory appears during rotation (position in symbol not in active set or GRACEFUL_EXIT_ONLY) | Halt rotation, alert operator |
-| STL-5 | Any existing grid_v2 safety invariant violated (INV-1 through INV-8 from doc 27) | Halt ALL trading for affected symbol, alert operator |
 | STL-6 | EventLedger trust revoked during rotation | Pause rotation until trust restored (existing degraded-mode behavior) |
 | STL-7 | Portfolio gross exposure exceeds cap during symbol activation | Block activation, defer to next cycle |
 | STL-8 | Tuning solver produces TUNED for a previously-NO_GO symbol with no constraint change | Log warning, investigate (possible price sensitivity) |
 
-**Key principle:** Stop-the-line halts *rotation*, not *existing trading*. A symbol that is ACTIVE continues its grid_v2 lifecycle normally even if rotation is paused. The worst outcome of a rotation halt is running the current active set longer than optimal, which is safe.
+### Tier 2: Symbol emergency halt (engine-level)
+
+Halts ALL trading for the affected symbol. This is a more severe response, justified only when continuing to trade would violate grid_v2 safety invariants. Other symbols are not affected.
+
+| # | Trigger | Action |
+|---|---------|--------|
+| STL-5 | Any existing grid_v2 safety invariant violated (INV-1 through INV-8 from doc 27) for a specific symbol | Halt trading for affected symbol (engine-level kill-switch or graceful_exit_only depending on severity), alert operator. Other symbols and rotation continue. |
+
+**Distinction:** Tier 1 is an orchestrator-level pause — "stop changing the active set." Tier 2 is an engine-level emergency — "this symbol's grid is in an unsafe state, stop placing orders for it." These are independent: a Tier 2 halt on one symbol does not pause rotation for other symbols, and a Tier 1 rotation halt does not stop trading for any symbol.
 
 ---
 
