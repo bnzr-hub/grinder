@@ -4718,3 +4718,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Fix:** Changed `evaluate_cleanup_on_exit_policy` to skip cleanup only when `stop_reason == "not_started"`. All other exits (duration, shutdown, fatal) trigger best-effort cleanup. Cleanup type logged as `PLANNED` or `ABORT`.
 - **Implementation:** `scripts/run_trading.py`.
 - **Tests:** 3 new policy tests in `tests/unit/test_trading_loop.py`: fatal abort runs cleanup, shutdown runs cleanup, not-started skips.
+
+### ADR-122: Autonomous multi-symbol orchestration spec (2026-03-31)
+
+- **Decision:** Create `docs/37_AUTONOMOUS_MULTI_SYMBOL_LIVE_ORCHESTRATION_SPEC.md` as the architectural SSOT for 24/7 multi-symbol operation.
+- **Scope:** Docs + contracts only (Phase A). No implementation changes.
+- **Key definitions:** Autonomous loop (discover → filter → score → activate → trade → rotate), symbol state machine (9 states), tuning solver contract, 8 safety invariants, 4 rollout phases.
+- **Relationship:** Supersedes `36_MULTI_SYMBOL_ELIGIBILITY_ML_INTEGRATION_V1.md` operationally (which remains the source for Phases 1–3b implementation detail).
+- **Current gap:** Grid_v2 is single-symbol per engine. Multi-symbol grid requires either per-symbol engine instances or symbol-scoped bridges (deferred to Phase C/D).

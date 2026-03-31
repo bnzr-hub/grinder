@@ -1866,3 +1866,10 @@ Comprehensive adaptive grid system design:
 - **Current:** Binance Futures USDT-M only
 - **Planned:** COIN-M, other CEXs (see ROADMAP M9)
 - **Status:** [DEFERRED] Post-launch (see ADR-066). Focus on single-venue launch readiness first.
+
+### Autonomous multi-symbol orchestration
+- **Spec:** `docs/37_AUTONOMOUS_MULTI_SYMBOL_LIVE_ORCHESTRATION_SPEC.md`
+- **Phase A (docs):** [DONE] Spec document defines autonomous loop, symbol state machine, tuning contract, safety invariants, rollout phases.
+- **Phase B (shadow tuning):** [NOT STARTED] Universe provider + tuning solver in shadow mode.
+- **Phase C (rotation with operator universe):** [NOT STARTED] Active selector with auto-tuned configs.
+- **Phase D (full autonomous):** [NOT STARTED] Auto-discovery + continuous rotation without `--symbols`.
