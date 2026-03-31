@@ -177,7 +177,8 @@ class TestEngineDrainPath:
 
         mock_clean.assert_called_once_with("g-stale-fill")
         assert engine._sync_reconciler_pending_actions == []
-        assert engine._reconciler_staged_fill_ts == 0
+        # staged_fill_ts is NOT reset to 0 after drain — it keeps the
+        # staging-time value so next drain can correctly detect new fills.
 
     def test_no_fill_since_staging_keeps_place_same_mode(self) -> None:
         """Same mode and no newer fill watermark -> PLACE kept."""
@@ -195,4 +196,93 @@ class TestEngineDrainPath:
         ):
             engine.process_snapshot(_snapshot("BTCUSDT"))
 
+        mock_clean.assert_not_called()
+
+
+class TestBurstSuppressionWatermarkInteraction:
+    """Multi-tick test: burst suppression must not permanently suppress PLACEs."""
+
+    def _setup_active_market(self) -> LiveEngineV0:
+        """Engine with grid_v2, primary reconciler, and a fill already happened."""
+        engine = _make_engine()
+        engine._grid_v2_enabled = True
+        engine._grid_v2_symbol = "BTCUSDT"
+        engine._grid_v2_started = True
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_seed_actions = []
+        engine._sync_reconciler_primary = True
+
+        bridge = MagicMock()
+        bridge.reconstruction_ok = True
+        sm = MagicMock()
+        sm.mode.value = "LONG_BRANCH"
+        sm.snapshot.open_lots = []
+        bridge.state_machine = sm
+        bridge.adapter.registry.cid_for_entry.return_value = None
+        bridge.adapter.is_ours.return_value = True
+        engine._grid_v2_bridge = bridge
+        return engine
+
+    def test_suppression_fires_once_then_place_goes_through(self) -> None:
+        """Fill → burst suppression → next cycle staging → drain does NOT drop."""
+        engine = self._setup_active_market()
+
+        # Tick 1: fill happened, last_fill_ts set
+        engine._last_fill_ts = 5000
+
+        # Stage a PLACE (reconciler found missing entry)
+        engine._sync_reconciler_pending_actions = [_place("g-e0")]
+        engine._reconciler_staged_mode = "LONG_BRANCH"
+        engine._reconciler_staged_fill_ts = 5000  # staged at fill time
+
+        # Tick 2: no new fill, _last_fill_ts still 5000
+        # Drain should NOT drop because staged_fill_ts == _last_fill_ts
+        with (
+            patch.object(engine, "_grid_v2_process_fills", return_value=[]),
+            patch.object(engine, "_grid_v2_process_cancel_acks"),
+            patch.object(engine, "_grid_v2_track_flat_transition"),
+            patch.object(engine, "_extract_planned_entry_slots", return_value=set()),
+            patch.object(engine, "_grid_v2_clean_failed_place") as mock_clean,
+        ):
+            engine.process_snapshot(_snapshot("BTCUSDT"))
+
+        # PLACE should NOT have been dropped (no new fill since staging)
+        mock_clean.assert_not_called()
+
+    def test_staging_after_burst_suppression_records_nonzero_watermark(self) -> None:
+        """After burst suppression fires, staging must record real fill_ts, not 0."""
+        engine = self._setup_active_market()
+
+        # Fill happened
+        engine._last_fill_ts = 5000
+        engine._burst_suppression_fired = False
+
+        # Simulate burst suppression: snapshot_ts < last_fill_ts
+        # After suppression, _last_fill_ts should still be 5000 (NOT zeroed)
+        assert engine._last_fill_ts == 5000
+
+        # Staging should record 5000, not 0
+        engine._reconciler_staged_fill_ts = engine._last_fill_ts
+        assert engine._reconciler_staged_fill_ts == 5000
+
+    def test_same_tick_fill_does_not_permanently_suppress(self) -> None:
+        """Snapshot-diff fill in same tick as drain: only drops if genuinely newer."""
+        engine = self._setup_active_market()
+
+        # Stage with fill_ts = 5000
+        engine._reconciler_staged_fill_ts = 5000
+        engine._last_fill_ts = 5000  # same → no drop
+        engine._reconciler_staged_mode = "LONG_BRANCH"
+        engine._sync_reconciler_pending_actions = [_place("g-e0")]
+
+        with (
+            patch.object(engine, "_grid_v2_process_fills", return_value=[]),
+            patch.object(engine, "_grid_v2_process_cancel_acks"),
+            patch.object(engine, "_grid_v2_track_flat_transition"),
+            patch.object(engine, "_extract_planned_entry_slots", return_value=set()),
+            patch.object(engine, "_grid_v2_clean_failed_place") as mock_clean,
+        ):
+            engine.process_snapshot(_snapshot("BTCUSDT"))
+
+        # Same fill_ts → not dropped
         mock_clean.assert_not_called()

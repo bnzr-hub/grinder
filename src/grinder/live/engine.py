@@ -901,6 +901,7 @@ class LiveEngineV0:
         # exchange time — same domain as comparison target snapshot.ts.
         # When snapshot.ts < _last_fill_ts, snapshot is stale → suppress PLACE.
         self._last_fill_ts: int = 0
+        self._burst_suppression_fired: bool = False
         # ADR-104: (symbol, side) pairs pending reduce-only repair after -2022 reject.
         # Blocks further reduce-only exits for that direction until sync repairs topology.
         self._reduce_only_pending_repair: set[tuple[str, str]] = set()
@@ -2612,6 +2613,7 @@ class LiveEngineV0:
 
             self._grid_v2_user_fill_seen.add(oe.client_order_id)
             self._last_fill_ts = max(self._last_fill_ts, oe.ts)  # ADR-111
+            self._burst_suppression_fired = False  # new fill → allow one suppression
             # ADR-109 Phase 2 PR-2: event-first fill observability
             logger.info(
                 "EVENT_FIRST_FILL_APPLIED cid=%s symbol=%s source=user_data actions=%d trusted=%s",
@@ -3025,6 +3027,7 @@ class LiveEngineV0:
                 # target in _tick_account_sync. Never use wall-clock here.
                 if grid_v2_fill_actions:
                     self._last_fill_ts = max(self._last_fill_ts, snapshot.ts)
+                    self._burst_suppression_fired = False  # new fill → allow one suppression
                 # Track SM FLAT transition for drift-reconstruct cooldown
                 self._grid_v2_track_flat_transition()
                 # Same-tick dedup: extract PLACE_ENTRY slots from fill path
@@ -3084,7 +3087,11 @@ class LiveEngineV0:
                         drained.append(a)
                     grid_v2_integrity_actions = drained
                     self._sync_reconciler_pending_actions = []
-                    self._reconciler_staged_fill_ts = 0
+                    # Do NOT reset staged_fill_ts to 0 here. Staging (line 4488)
+                    # sets it to _last_fill_ts. Resetting to 0 caused every
+                    # subsequent drain to see "fill since staging" when _last_fill_ts
+                    # was updated by a same-tick snapshot-diff fill, permanently
+                    # suppressing all reconciler PLACEs in active markets.
                 else:
                     grid_v2_integrity_actions = self._grid_v2_integrity_repair(
                         snapshot, planned_slots_this_tick=planned_slots
@@ -4452,12 +4459,16 @@ class LiveEngineV0:
                     recon.actions, result.snapshot.ts
                 )
                 # ADR-111 (revised): One-shot burst suppression.
-                # Suppress PLACE_ENTRY for ONE reconciler cycle after fills,
-                # then clear _last_fill_ts so the next cycle proceeds normally.
-                # This prevents the obvious stale-one-cycle churn without
-                # starving legitimate restores across many cycles.
+                # Suppress PLACE_ENTRY for ONE reconciler cycle after fills
+                # when snapshot hasn't caught up (snapshot_ts < last_fill_ts).
+                # Uses a separate flag to prevent re-firing; does NOT zero
+                # _last_fill_ts (which would break the stale-fill watermark).
                 _snapshot_ts = result.snapshot.ts if result.snapshot else 0
-                _snapshot_stale = self._last_fill_ts > 0 and _snapshot_ts < self._last_fill_ts
+                _snapshot_stale = (
+                    self._last_fill_ts > 0
+                    and _snapshot_ts < self._last_fill_ts
+                    and not self._burst_suppression_fired
+                )
                 if _snapshot_stale:
                     suppressed = [a for a in materialized if a.action_type == ActionType.PLACE]
                     if suppressed:
@@ -4476,8 +4487,11 @@ class LiveEngineV0:
                         for sa in suppressed:
                             if sa.client_order_id:
                                 self._grid_v2_clean_failed_place(sa.client_order_id)
-                    # One-shot: clear after suppression so next cycle is not blocked
-                    self._last_fill_ts = 0
+                    # One-shot flag: prevent re-firing until next fill
+                    self._burst_suppression_fired = True
+                elif _snapshot_ts >= self._last_fill_ts:
+                    # Snapshot caught up — reset one-shot flag for next fill
+                    self._burst_suppression_fired = False
                 self._sync_reconciler_pending_actions = materialized
                 # ADR-112: Record SM mode at staging for stale-mode drain filter
                 self._reconciler_staged_mode = (
