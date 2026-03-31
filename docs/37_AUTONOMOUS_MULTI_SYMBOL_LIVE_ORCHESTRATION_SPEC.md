@@ -86,21 +86,23 @@ This document is the **architectural SSOT** for the orchestration layer. It does
 │     - Spread, volume, trade count, OI, blacklist    │
 │     - Output: eligible candidates                   │
 │                                                     │
-│  3. Scoring + Ranking                               │
+│  3. Symbol Tuning (for newly eligible)              │
+│     - Load constraints (tick, step, notional, etc.) │
+│     - Compute legal grid config                     │
+│     - Validate: TUNED or NO_GO                      │
+│     - Already-TUNED symbols skip this step          │
+│                                                     │
+│  4. Scoring + Ranking (among TUNED symbols only)    │
 │     - Top-K v1: range + liquidity - toxicity - trend│
 │     - Optional ML adjustment (bounded)              │
+│     - Input: only symbols in TUNED state            │
 │     - Output: ranked list with scores               │
 │                                                     │
-│  4. Active Set Selection                            │
+│  5. Active Set Selection                            │
 │     - Hysteresis: enter vs stay thresholds          │
 │     - Hold timer: MIN_HOLD_CYCLES before removal    │
 │     - Change budget: MAX_CHANGES_PER_CYCLE          │
 │     - Output: active_set, added, removed, deferred  │
-│                                                     │
-│  5. Symbol Onboarding (for newly added)             │
-│     - Load constraints (tick, step, notional, etc.) │
-│     - Compute legal grid config                     │
-│     - Validate: TUNED or NO_GO                      │
 │                                                     │
 │  6. Live Trading                                    │
 │     - Grid_v2 per active symbol                     │
@@ -114,6 +116,8 @@ This document is the **architectural SSOT** for the orchestration layer. It does
 │     - Release grid resources                        │
 │                                                     │
 │  8. Loop back to Step 1                             │
+│     Note: Steps 3-5 enforce the invariant that      │
+│     only TUNED symbols enter scoring/selection.     │
 │     (cycle interval: SELECTOR_CYCLE_S, default 60s) │
 └─────────────────────────────────────────────────────┘
 ```
@@ -172,32 +176,30 @@ Owns the state machine for symbol lifecycle transitions. Calls selector, tuning 
 
 ```
          DISCOVERED
-             │
-             ▼
-      PREFILTER_BLOCKED ──────────────────┐
-             │ (passes prefilter)          │ (fails prefilter)
-             ▼                             │
-          ELIGIBLE                         │
-             │                             │
-             ▼                             │
-        TUNING_CHECK                       │
-           │    │                          │
-           │    └── NO_GO ─────────────────┤
-           ▼                               │
-          TUNED                            │
-             │                             │
-             ▼ (selected into Top-K)       │
-          ACTIVE                           │
-             │                             │
-             ▼ (dropped from Top-K         │
-                 but position non-flat)    │
-     GRACEFUL_EXIT_ONLY                    │
-             │                             │
-             ▼ (position = FLAT)           │
-         COOLDOWN ─────────────────────────┘
-             │ (cooldown expired)
-             ▼
-          ELIGIBLE (re-enters scoring)
+           │     │
+  (passes) │     │ (fails prefilter)
+           ▼     ▼
+      ELIGIBLE   PREFILTER_BLOCKED ────────┐
+           │          ▲                    │
+           ▼          │ (re-check fails)   │
+      TUNING_CHECK    │                    │
+         │    │       │                    │
+         │    └── NO_GO ───────────────────┤
+         ▼                                 │
+        TUNED                              │
+           │                               │
+           ▼ (selected into Top-K)         │
+        ACTIVE                             │
+           │                               │
+           ▼ (dropped from Top-K           │
+               but position non-flat)      │
+   GRACEFUL_EXIT_ONLY                      │
+           │                               │
+           ▼ (position = FLAT)             │
+       COOLDOWN ───────────────────────────┘
+           │ (cooldown expired)
+           ▼
+        ELIGIBLE (re-enters scoring)
 ```
 
 **State descriptions:**
@@ -388,7 +390,7 @@ All existing signals from `13_OBSERVABILITY.md` remain unchanged: health mode, E
 
 - Universe provider auto-discovers from exchangeInfo
 - No `--symbols` required (operator can still override)
-- Continuous loop: discover → filter → score → activate → trade → rotate
+- Continuous loop: discover → filter → tune → score → activate → trade → rotate
 - Per-symbol grid_v2 bridges (either multi-process or symbol-scoped)
 - **Full 24/7 autonomous operation**
 
