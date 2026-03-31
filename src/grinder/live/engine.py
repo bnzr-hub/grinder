@@ -4041,6 +4041,9 @@ class LiveEngineV0:
                 self._on_dns_error()
             if "-1021" in error_str:
                 self._on_clock_drift_error()
+                # Refresh server-time offset to recover from drift
+                if hasattr(self._exchange_port, "refresh_ts_offset"):
+                    self._exchange_port.refresh_ts_offset()
             return
 
         # Successful sync: update health signals
@@ -6720,6 +6723,8 @@ class LiveEngineV0:
         error_str = str(last_error) if last_error else ""
         if "-1021" in error_str:
             self._on_clock_drift_error()
+            if hasattr(self._exchange_port, "refresh_ts_offset"):
+                self._exchange_port.refresh_ts_offset()
         if "name resolution" in error_str.lower() or "connection error" in error_str.lower():
             self._on_dns_error()
         logger.error(
