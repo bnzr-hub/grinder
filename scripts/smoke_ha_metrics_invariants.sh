@@ -60,6 +60,7 @@ PYTHONUNBUFFERED=1 \
 GRINDER_HA_ENABLED=true \
 GRINDER_REDIS_URL="redis://127.0.0.1:6390/0" \
 python3 -m scripts.run_trading \
+    --max-orders-per-run 1 \
     --symbols BTCUSDT \
     --fixture "$FIXTURE" \
     --duration-s 8 \

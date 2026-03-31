@@ -52,6 +52,7 @@ EOF
 GRINDER_HA_ENABLED=1 \
 GRINDER_REDIS_URL="$DEAD_REDIS" \
 python3 -m scripts.run_trading \
+    --max-orders-per-run 1 \
     --symbols BTCUSDT \
     --fixture "$FIXTURE" \
     --duration-s 10 \

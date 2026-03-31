@@ -59,6 +59,7 @@ def test_fixture_mode_activates_network_guard() -> None:
             # src/ for grinder.*; repo root for scripts.* (run_trading imports scripts.http_measured_client)
             "PYTHONPATH": f"{REPO_ROOT / 'src'}{':' + str(REPO_ROOT)}",
             "GRINDER_TRADING_MODE": "read_only",
+            "GRINDER_MAX_ORDERS_ACK": "YES_I_ACCEPT_MULTI_ORDER",
         },
     )
 

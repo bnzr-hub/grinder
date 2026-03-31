@@ -67,6 +67,7 @@ GRINDER_REAL_PORT_ACK=YES_I_REALLY_WANT_MAINNET \
 BINANCE_API_KEY='smoke_test_fake_key_not_real' \
 BINANCE_API_SECRET='smoke_test_fake_secret_not_real' \
 python3 -m scripts.run_trading \
+    --max-orders-per-run 1 \
     --symbols BTCUSDT \
     --fixture "$FIXTURE" \
     --duration-s 8 \

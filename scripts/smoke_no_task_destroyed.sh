@@ -51,6 +51,7 @@ EOF
 
 # Run trading loop with fixture + duration (synchronous — wait for exit)
 python3 -m scripts.run_trading \
+    --max-orders-per-run 1 \
     --symbols BTCUSDT \
     --fixture "$FIXTURE" \
     --duration-s 4 \
