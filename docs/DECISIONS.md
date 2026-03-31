@@ -4710,3 +4710,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Fix:** Bounded outward search (max_inventory_levels + 2 steps) for both LONG_BRANCH (search lower) and SHORT_BRANCH (search higher) in `_apply_exit_filled`.
 - **Implementation:** `src/grinder/grid_v2/state.py`.
 - **Tests:** 4 tests in `tests/unit/test_full_inventory_unwind_restore.py`: first exit restores entry (long + short), full unwind restores progressively, restored price doesn't collide.
+
+### ADR-121: Fail-safe cleanup on fatal trading-loop abort (2026-03-31)
+
+- **Decision:** Exchange cleanup now runs on ANY post-start exit, not just `duration_reached`. Only `not_started` skips cleanup.
+- **Problem:** WS reconnect exhaustion caused fatal loop exit. Cleanup was restricted to `duration_reached` only, so orders and position were left on exchange after abort.
+- **Fix:** Changed `evaluate_cleanup_on_exit_policy` to skip cleanup only when `stop_reason == "not_started"`. All other exits (duration, shutdown, fatal) trigger best-effort cleanup. Cleanup type logged as `PLANNED` or `ABORT`.
+- **Implementation:** `scripts/run_trading.py`.
+- **Tests:** 3 new policy tests in `tests/unit/test_trading_loop.py`: fatal abort runs cleanup, shutdown runs cleanup, not-started skips.

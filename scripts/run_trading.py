@@ -1634,7 +1634,18 @@ def evaluate_cleanup_on_exit_policy(
     fixture_path: str | None,
     stop_reason: str,
 ) -> tuple[bool, str]:
-    """Decide whether post-run cleanup should execute."""
+    """Decide whether post-run cleanup should execute.
+
+    Cleanup runs on:
+    - normal duration_reached (planned stop)
+    - any fatal abort that happened after live trading started
+      (stream_ended, shutdown_requested, or any non-"not_started" reason)
+
+    Cleanup is skipped only when:
+    - cleanup_on_exit is False
+    - mode/port/armed/mainnet/fixture preconditions fail
+    - loop never started (stop_reason == "not_started")
+    """
     enabled = False
     reason = "disabled"
     if cleanup_on_exit:
@@ -1655,10 +1666,50 @@ def evaluate_cleanup_on_exit_policy(
         elif fixture_path:
             enabled = False
             reason = "fixture_mode"
-        elif stop_reason != "duration_reached":
+        elif stop_reason == "not_started":
             enabled = False
-            reason = "not_duration_timeout"
+            reason = "loop_never_started"
     return (enabled, reason)
+
+
+def finalize_and_cleanup(
+    *,
+    cleanup_on_exit: bool,
+    mode: SafeMode,
+    exchange_port: str,
+    armed: bool,
+    mainnet: bool,
+    fixture_path: str | None,
+    stop_reason: str,
+    symbols: list[str],
+    cleanup_fn: Callable[[list[str]], int] | None = None,
+) -> int:
+    """Evaluate cleanup policy and run cleanup if needed.
+
+    Returns exit code contribution (0 = ok, 3 = cleanup had failures).
+    """
+    should_cleanup, cleanup_reason = evaluate_cleanup_on_exit_policy(
+        cleanup_on_exit=cleanup_on_exit,
+        mode=mode,
+        exchange_port=exchange_port,
+        armed=armed,
+        mainnet=mainnet,
+        fixture_path=fixture_path,
+        stop_reason=stop_reason,
+    )
+    if should_cleanup:
+        cleanup_type = "PLANNED" if stop_reason == "duration_reached" else "ABORT"
+        print(f"TRADING_{cleanup_type}_CLEANUP_STARTED stop_reason={stop_reason}")
+        run_cleanup = cleanup_fn or _run_cleanup_on_exit
+        failures = run_cleanup(symbols)
+        print(
+            f"TRADING_{cleanup_type}_CLEANUP_COMPLETED "
+            f"failures={failures} stop_reason={stop_reason}"
+        )
+        return 3 if failures > 0 else 0
+    if cleanup_on_exit:
+        print(f"  Cleanup-on-exit skipped: {cleanup_reason}")
+    return 0
 
 
 def _run_cleanup_on_exit(
@@ -1918,7 +1969,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.run_until_complete(_drain_pending_tasks())
         loop.close()
-        should_cleanup, cleanup_reason = evaluate_cleanup_on_exit_policy(
+        cleanup_exit = finalize_and_cleanup(
             cleanup_on_exit=args.cleanup_on_exit,
             mode=mode,
             exchange_port=args.exchange_port,
@@ -1926,17 +1977,10 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             mainnet=args.mainnet,
             fixture_path=args.fixture,
             stop_reason=loop_stop_reason,
+            symbols=symbols,
         )
-        if should_cleanup:
-            failures = _run_cleanup_on_exit(symbols)
-            if failures > 0:
-                print(f"  Cleanup-on-exit completed with failures={failures}")
-                if exit_code == 0:
-                    exit_code = 3
-            else:
-                print("  Cleanup-on-exit completed successfully.")
-        elif args.cleanup_on_exit:
-            print(f"  Cleanup-on-exit skipped: {cleanup_reason}")
+        if cleanup_exit > 0 and exit_code == 0:
+            exit_code = cleanup_exit
         if elector is not None:
             print("  Stopping LeaderElector...")
             elector.stop()
