@@ -136,7 +136,7 @@ def parse_min_notional_filter(filters: list[dict[str, Any]]) -> Decimal | None:
                     return Decimal(str(f["notional"]))
                 except (KeyError, ValueError, InvalidOperation) as e:
                     logger.warning("Failed to parse %s filter: %s", filter_type, e)
-                    return None
+                    break  # try next filter type
     return None
 
 

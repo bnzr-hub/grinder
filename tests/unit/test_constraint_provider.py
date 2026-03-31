@@ -204,6 +204,15 @@ class TestParseMinNotionalFilter:
         result = parse_min_notional_filter(filters)
         assert result is None
 
+    def test_malformed_min_notional_falls_back_to_notional(self) -> None:
+        """Malformed MIN_NOTIONAL falls back to valid NOTIONAL."""
+        filters = [
+            {"filterType": "MIN_NOTIONAL", "notional": "invalid"},
+            {"filterType": "NOTIONAL", "notional": "10"},
+        ]
+        result = parse_min_notional_filter(filters)
+        assert result == Decimal("10")
+
 
 # --- Tests: parse_exchange_info ---
 
