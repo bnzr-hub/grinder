@@ -205,8 +205,8 @@ execute_actions(actions: list[RotationAction]) -> ExecutionReport
 ## 5. Desired-vs-actual reconciliation
 
 Each execution cycle compares:
-- **Desired state:** From control-plane (RotationAction intents + current active set)
-- **Actual state:** From EngineRegistry (what engines are actually running)
+- **Desired symbol set:** `set[str]` — symbols that should currently have a live engine. Derived from control-plane active set (the caller resolves RotationAction intents into this set before calling the reconciler).
+- **Actual state:** From EngineRegistry (what engines are actually running and in which state)
 
 **Reconciliation output:**
 - Actions needed to converge (start, stop, signal)
