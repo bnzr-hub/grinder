@@ -201,9 +201,11 @@ class TestNoGoCases:
         assert result.status == TuningStatus.NO_GO
         assert result.reason == NoGoReason.STEP_SIZE_UNAVAILABLE
 
-    def test_position_exceeds_cap(self) -> None:
-        """Worst-case inventory exceeds max_position_usd -> POSITION_EXCEEDS_CAP."""
-        # order_size=4, price=1.26, inv=5 -> 25.20 > cap=20
+    def test_notional_too_low(self) -> None:
+        """Notional floor forces order so large it busts budget -> NOTIONAL_TOO_LOW."""
+        # price=1.26, min_notional=5, step=1 -> min_qty_for_notional=4
+        # worst_case = 4 * 1.26 * 5 = 25.20 > cap=20
+        # Root cause: exchange notional constraint, not risk cap misconfiguration
         constraints = SymbolConstraints(
             step_size=Decimal("1"),
             min_qty=Decimal("1"),
@@ -215,11 +217,13 @@ class TestNoGoCases:
         result = solve("AIOTUSDT", constraints, Decimal("1.26"), config)
 
         assert result.status == TuningStatus.NO_GO
-        assert result.reason == NoGoReason.POSITION_EXCEEDS_CAP
+        assert result.reason == NoGoReason.NOTIONAL_TOO_LOW
 
-    def test_high_notional_btc(self) -> None:
-        """BTC with tiny cap -> POSITION_EXCEEDS_CAP."""
-        # order_size=0.001, price=80000, inv=5 -> 400 > cap=100
+    def test_position_exceeds_cap_without_notional(self) -> None:
+        """min_qty alone busts budget (not notional-driven) -> POSITION_EXCEEDS_CAP."""
+        # min_qty=0.001, price=80000, inv=5 -> 400 > cap=100
+        # min_notional=5: at price=80000, notional_qty=0.001 (same as min_qty)
+        # So NOT notional-driven — plain risk cap exceeded
         config = TuningSolverConfig(max_position_usd=Decimal("100"), max_inventory_levels=5)
 
         result = solve("BTCUSDT", BTC_CONSTRAINTS, Decimal("80000"), config)

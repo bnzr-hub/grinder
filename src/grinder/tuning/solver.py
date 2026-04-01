@@ -131,12 +131,15 @@ def solve(
 
     # --- Compute minimum legal quantity ---
 
+    notional_driven = False
     order_size = constraints.min_qty
 
     if constraints.min_notional > 0:
         raw_qty_for_notional = constraints.min_notional / price
         min_qty_for_notional = ceil_to_step(raw_qty_for_notional, constraints.step_size)
-        order_size = max(order_size, min_qty_for_notional)
+        if min_qty_for_notional > order_size:
+            notional_driven = True
+            order_size = min_qty_for_notional
 
     # Ensure step-aligned (min_qty may already be, but be explicit)
     order_size = ceil_to_step(order_size, constraints.step_size)
@@ -145,7 +148,9 @@ def solve(
 
     worst_case_usd = order_size * price * config.max_inventory_levels
     if worst_case_usd > config.max_position_usd:
-        return _no_go(symbol, NoGoReason.POSITION_EXCEEDS_CAP)
+        # Distinguish root cause: exchange notional floor vs risk cap
+        reason = NoGoReason.NOTIONAL_TOO_LOW if notional_driven else NoGoReason.POSITION_EXCEEDS_CAP
+        return _no_go(symbol, reason)
 
     # --- All checks passed ---
 
