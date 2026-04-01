@@ -399,3 +399,98 @@ class TestRunForever:
 
         assert len(reports) == 2
         assert loop.stopped
+
+
+# --- Tests: Stage 8 execution integration via run_cycle() ---
+
+
+class TestStage8ExecutionDisabled:
+    """With execution deps wired but disabled, run_cycle stays shadow."""
+
+    def test_shadow_when_disabled(self) -> None:
+        from grinder.execution_plane.coordinator import ExecutionCoordinator  # noqa: PLC0415
+        from grinder.execution_plane.operator import OperatorControls  # noqa: PLC0415
+        from grinder.execution_plane.registry import EngineRegistry  # noqa: PLC0415
+
+        cache = TuningCache(ttl_s=300.0)
+        cache.put("BTCUSDT", _tuned("BTCUSDT"))
+
+        loop = _make_loop(cache=cache)
+        loop.execution_coordinator = ExecutionCoordinator()
+        loop.execution_registry = EngineRegistry()
+        loop.execution_operator = OperatorControls()
+        loop.execution_enabled = False
+
+        report = loop.run_cycle()
+        assert report.execution_report is not None
+        assert report.execution_report.execution_enabled is False
+        assert report.execution_report.execution_attempted is False
+
+
+class TestStage8ExecutionEnabledAcked:
+    """With execution enabled + ACK, run_cycle attaches execution report."""
+
+    def test_execution_runs(self) -> None:
+        from grinder.execution_plane.coordinator import ExecutionCoordinator  # noqa: PLC0415
+        from grinder.execution_plane.operator import OperatorControls  # noqa: PLC0415
+        from grinder.execution_plane.registry import EngineRegistry  # noqa: PLC0415
+
+        cache = TuningCache(ttl_s=300.0)
+        cache.put("BTCUSDT", _tuned("BTCUSDT"))
+
+        activated: list[str] = []
+        coord = ExecutionCoordinator(
+            activate_fn=lambda s: activated.append(s) or True,  # type: ignore[func-returns-value]
+        )
+
+        loop = _make_loop(cache=cache, top_k=1, max_changes=1)
+        loop.execution_coordinator = coord
+        loop.execution_registry = EngineRegistry()
+        loop.execution_operator = OperatorControls()
+        loop.execution_enabled = True
+        loop.execution_acknowledged = True
+
+        report = loop.run_cycle()
+        assert report.execution_report is not None
+        assert report.execution_report.execution_enabled is True
+        assert report.execution_report.execution_acknowledged is True
+
+
+class TestStage8SafetyBlock:
+    """Safety block suppresses execution in run_cycle."""
+
+    def test_safety_blocks_in_loop(self) -> None:
+        from grinder.execution_plane.coordinator import ExecutionCoordinator  # noqa: PLC0415
+        from grinder.execution_plane.operator import OperatorControls  # noqa: PLC0415
+        from grinder.execution_plane.registry import EngineRegistry, EngineState  # noqa: PLC0415
+
+        cache = TuningCache(ttl_s=300.0)
+        cache.put("BTCUSDT", _tuned("BTCUSDT"))
+
+        # Create orphan engine to trigger STL-E3
+        reg = EngineRegistry()
+        reg.register("ORPHAN", engine_ref="e")
+        reg.transition("ORPHAN", EngineState.ACTIVE)
+
+        loop = _make_loop(cache=cache)
+        loop.execution_coordinator = ExecutionCoordinator()
+        loop.execution_registry = reg
+        loop.execution_operator = OperatorControls()
+        loop.execution_enabled = True
+        loop.execution_acknowledged = True
+
+        report = loop.run_cycle()
+        assert report.execution_report is not None
+        assert "safety_block" in (report.execution_report.skipped_reason or "")
+
+
+class TestStage8NoExecutionDeps:
+    """Without execution deps, run_cycle has no execution_report."""
+
+    def test_legacy_mode(self) -> None:
+        cache = TuningCache(ttl_s=300.0)
+        cache.put("BTCUSDT", _tuned("BTCUSDT"))
+
+        loop = _make_loop(cache=cache)
+        report = loop.run_cycle()
+        assert report.execution_report is None

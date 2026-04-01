@@ -11,8 +11,9 @@ Continuous loop that wires all orchestration stages per doc 37 Section 3:
   5. Orchestrator reconcile (SymbolOrchestrator → RotationController)
   6. Cycle report
 
-Control-plane: produces action intents and cycle reports. Does not execute
-engine start/stop or exchange writes. Execution is the caller's responsibility.
+Control-plane produces action intents and cycle reports. Optional Stage 8
+runs ExecutionCoordinator when execution_enabled + execution_acknowledged.
+Default: shadow-only (no execution).
 
 Continuous runner: run_forever() loops on configurable cadence with
 injectable clock and sleep. stop() halts gracefully.
@@ -87,6 +88,7 @@ class CycleReport:
     skipped: dict[str, str] = field(default_factory=dict)
     actions: list[RotationAction] = field(default_factory=list)
     error: str | None = None
+    execution_report: Any = None
 
 
 @dataclass
@@ -96,7 +98,9 @@ class AutonomousLoop:
     Wires all stages per doc 37 Section 3:
     UniverseProvider → prefilter → TuningCache → ranker → SymbolOrchestrator
 
-    Produces CycleReport per cycle. Does not execute engine actions.
+    Produces CycleReport per cycle. Optionally executes engine actions
+    via ExecutionCoordinator when execution_enabled + execution_acknowledged.
+    Default: shadow-only (no execution).
 
     Stages are injectable: prefilter_fn and ranker_fn allow callers to plug
     in real market-data prefilter and scoring/ranking without coupling this
@@ -109,12 +113,19 @@ class AutonomousLoop:
     prefilter_fn: Any = field(default=_passthrough)
     ranker_fn: Any = field(default=_passthrough)
 
+    # Optional execution-plane integration (default: shadow-only)
+    execution_coordinator: Any = None  # ExecutionCoordinator | None
+    execution_registry: Any = None  # EngineRegistry | None
+    execution_operator: Any = None  # OperatorControls | None
+    execution_enabled: bool = False
+    execution_acknowledged: bool = False
+
     _cycle: int = 0
     _last_report: CycleReport | None = None
     _stopped: bool = False
     _stop_reason: str | None = None
 
-    def run_cycle(
+    def run_cycle(  # noqa: PLR0915
         self,
         facts: dict[str, SymbolFacts] | None = None,
     ) -> CycleReport:
@@ -229,11 +240,27 @@ class AutonomousLoop:
             actions=list(decision.actions),
         )
 
+        # Stage 8: Optional execution-plane integration
+        exec_report = self._run_execution_phase(decision.admitted, facts)
+        if exec_report is not None:
+            # Attach execution report to cycle report
+            report = CycleReport(
+                cycle=report.cycle,
+                discovered=report.discovered,
+                eligible=report.eligible,
+                tuned=report.tuned,
+                selected=report.selected,
+                admitted=report.admitted,
+                skipped=report.skipped,
+                actions=report.actions,
+                execution_report=exec_report,
+            )
+
         self._last_report = report
 
         logger.info(
             "AUTONOMOUS_LOOP_CYCLE_COMPLETED cycle=%d discovered=%d eligible=%d"
-            " tuned=%d selected=%d admitted=%d skipped=%d actions=%d",
+            " tuned=%d selected=%d admitted=%d skipped=%d actions=%d execution=%s",
             self._cycle,
             len(discovered),
             len(eligible),
@@ -242,9 +269,46 @@ class AutonomousLoop:
             len(decision.admitted),
             len(all_skipped),
             len(decision.actions),
+            "enabled" if exec_report and exec_report.execution_attempted else "shadow",
         )
 
         return report
+
+    def _run_execution_phase(
+        self,
+        admitted: list[str],
+        facts: dict[str, SymbolFacts] | None,  # noqa: ARG002
+    ) -> Any:
+        """Run optional execution-plane phase. Returns ExecutionReport or None."""
+        if self.execution_coordinator is None or self.execution_registry is None:
+            return None
+
+        try:
+            from grinder.execution_plane.reconciler import reconcile  # noqa: PLC0415
+            from grinder.execution_plane.safety import evaluate_safety  # noqa: PLC0415
+
+            desired = set(admitted)
+            reconcile_report = reconcile(desired, self.execution_registry)
+
+            paused = self.execution_operator.paused if self.execution_operator else False
+            safety_result = evaluate_safety(reconcile_report, paused=paused)
+
+            operator = self.execution_operator
+            if operator is None:
+                from grinder.execution_plane.operator import OperatorControls  # noqa: PLC0415
+
+                operator = OperatorControls()
+
+            return self.execution_coordinator.execute(
+                reconcile_report,
+                safety_result,
+                operator,
+                execution_enabled=self.execution_enabled,
+                execution_acknowledged=self.execution_acknowledged,
+            )
+        except Exception as e:
+            logger.warning("AUTONOMOUS_LOOP_EXECUTION_FAILED cycle=%d error=%s", self._cycle, e)
+            return None
 
     def run_forever(
         self,
