@@ -38,6 +38,7 @@ from grinder.risk.emergency_exit_metrics import get_emergency_exit_metrics
 from grinder.risk.risk_base_metrics import get_risk_base_metrics
 from grinder.selection.active_selector import get_active_selector_metrics
 from grinder.selection.shadow_selector import get_selector_metrics
+from grinder.tuning.metrics import get_tuning_metrics
 
 
 @dataclass
@@ -193,6 +194,9 @@ class MetricsBuilder:
 
         # Active selector metrics (doc-36 Phase 2)
         lines.extend(self._build_active_selector_metrics())
+
+        # Tuning metrics (PR-B3b)
+        lines.extend(self._build_tuning_metrics())
 
         return "\n".join(lines)
 
@@ -401,6 +405,10 @@ class MetricsBuilder:
     def _build_active_selector_metrics(self) -> list[str]:
         """Build active selector metrics (doc-36 Phase 2)."""
         return get_active_selector_metrics().to_prometheus_lines()
+
+    def _build_tuning_metrics(self) -> list[str]:
+        """Build tuning metrics (PR-B3b)."""
+        return get_tuning_metrics().to_prometheus_lines()
 
 
 class _BuilderHolder:

@@ -1877,6 +1877,6 @@ Comprehensive adaptive grid system design:
 - **Phase B1 (constraints):** [DONE] `ConstraintProvider` extended with `min_notional` (ADR-123).
 - **Phase B2 (tuning solver):** [DONE] Deterministic `TuningSolver` in `src/grinder/tuning/solver.py` — pure computation, no runtime wiring (ADR-124). Returns `TUNED` (legal order size) or `NO_GO` (with reason code). 24 tests.
 - **Phase B3a (shadow startup):** [DONE] `run_tuning_shadow()` in `src/grinder/tuning/shadow.py` — logs `SYMBOL_TUNED`/`SYMBOL_NO_GO` per symbol on startup. No dispatch change (ADR-125). 13 tests.
-- **Phase B3b (metrics + cache):** [NOT STARTED] Prometheus metrics, TuningCache.
+- **Phase B3b (metrics + cache):** [DONE] `TuningCache` in `src/grinder/tuning/cache.py` (TTL, injectable clock). `TuningMetrics` in `src/grinder/tuning/metrics.py` — `grinder_tuning_result_total{status}`, `grinder_tuning_no_go_total{reason}`, `grinder_tuning_cache_size`, `grinder_tuning_cache_expired_total`. Wired into MetricsBuilder. Startup wrapper populates cache + metrics. Still shadow-only (ADR-126).
 - **Phase C (rotation with operator universe):** [NOT STARTED] Active selector with auto-tuned configs.
 - **Phase D (full autonomous):** [NOT STARTED] Auto-discovery + continuous rotation without `--symbols`.

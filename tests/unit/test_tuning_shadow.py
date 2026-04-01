@@ -326,6 +326,51 @@ class TestRunStartupTuningShadowWrapper:
         assert len(received_prices) == 1
         assert received_prices[0] == {}
 
+    def test_populates_cache(self) -> None:
+        """Wrapper records results into TuningCache."""
+        import scripts.run_trading as rt  # noqa: PLC0415
+
+        from grinder.tuning.cache import get_tuning_cache, reset_tuning_cache  # noqa: PLC0415
+
+        reset_tuning_cache()
+        rt._run_startup_tuning_shadow(["BTCUSDT"], {"BTCUSDT": BTC_CONSTRAINTS})
+
+        cache = get_tuning_cache()
+        result = cache.get("BTCUSDT")
+        assert result is not None
+        assert result.symbol == "BTCUSDT"
+        reset_tuning_cache()
+
+    def test_records_metrics(self) -> None:
+        """Wrapper records results into TuningMetrics."""
+        import scripts.run_trading as rt  # noqa: PLC0415
+
+        from grinder.tuning.metrics import get_tuning_metrics, reset_tuning_metrics  # noqa: PLC0415
+
+        reset_tuning_metrics()
+        rt._run_startup_tuning_shadow(["BTCUSDT", "ETHUSDT"], {"BTCUSDT": BTC_CONSTRAINTS})
+
+        m = get_tuning_metrics()
+        total = sum(m.result_total.values())
+        assert total == 2  # both symbols get a result
+        reset_tuning_metrics()
+
+    def test_fail_open_with_cache_metrics(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Cache/metrics errors don't block startup."""
+        import scripts.run_trading as rt  # noqa: PLC0415
+
+        from grinder.tuning.metrics import reset_tuning_metrics  # noqa: PLC0415
+
+        def exploding_cache_put(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("cache broken")
+
+        monkeypatch.setattr("grinder.tuning.cache.TuningCache.put", exploding_cache_put)
+        reset_tuning_metrics()
+
+        # Must not raise
+        rt._run_startup_tuning_shadow(["BTCUSDT"], {"BTCUSDT": BTC_CONSTRAINTS})
+        reset_tuning_metrics()
+
 
 # --- Helper for capturing log output ---
 

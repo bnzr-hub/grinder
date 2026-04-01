@@ -539,8 +539,13 @@ def _run_startup_tuning_shadow(
     SYMBOL_NO_GO reason=PRICE_UNAVAILABLE. This is the correct B3a behavior:
     visibility into constraint readiness without introducing new data acquisition.
 
+    Results are recorded into TuningCache and TuningMetrics (B3b) for
+    downstream observability. Neither affects runtime decisions.
+
     Fail-open: errors are logged but never block startup.
     """
+    from grinder.tuning.cache import get_tuning_cache  # noqa: PLC0415
+    from grinder.tuning.metrics import get_tuning_metrics  # noqa: PLC0415
     from grinder.tuning.shadow import run_tuning_shadow  # noqa: PLC0415
     from grinder.tuning.solver import TuningSolverConfig  # noqa: PLC0415
 
@@ -557,7 +562,16 @@ def _run_startup_tuning_shadow(
 
         # No price source at startup in B3a — pass empty prices.
         # Solver emits PRICE_UNAVAILABLE for each symbol (visible, non-fatal).
-        run_tuning_shadow(symbols, constraints, {}, config)
+        results = run_tuning_shadow(symbols, constraints, {}, config)
+
+        # Record into cache and metrics (B3b — shadow observability only)
+        cache = get_tuning_cache()
+        metrics = get_tuning_metrics()
+        for r in results:
+            cache.put(r.symbol, r)
+            metrics.record_result(r)
+        metrics.cache_size = cache.size
+        metrics.cache_expired_total = cache.expired_total
     except Exception as e:
         logging.getLogger(__name__).warning("TUNING_SHADOW_SKIPPED error=%s", e)
 
@@ -1906,6 +1920,11 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
     # Pre-populate zero-value port order attempt metrics (PR-FUT-1)
     get_port_metrics().initialize_zero_series(args.exchange_port)
+
+    # Pre-populate zero-value tuning metrics for Prometheus visibility (PR-B3b)
+    from grinder.tuning.metrics import get_tuning_metrics  # noqa: PLC0415
+
+    get_tuning_metrics().initialize_zero_series()
 
     # Register readyz callback so /metrics emits grinder_readyz_ready gauge (PR-ALERTS-0)
     set_ready_fn(is_trading_ready)
