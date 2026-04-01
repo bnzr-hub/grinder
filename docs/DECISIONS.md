@@ -4791,5 +4791,13 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Phase:** C2b tooling. Uses existing cleanup-on-exit infrastructure (ADR-121). Does NOT yet prove graceful_exit_only deactivation path — proves shutdown + cleanup path only.
 - **Sequence:** Pre-flight verify → bounded trading → SIGINT (graceful shutdown) → cleanup-on-exit → post-verify with retries.
 - **Success:** `EXCHANGE_STATE_VERIFY status=CLEAN orders=0 position=FLAT` after ceremony.
-- **Status:** Tooling and runbook ready. Live proof pending operator execution. Full deactivation-path proof (with observed fills + graceful_exit signal) deferred to future ceremony iteration.
+- **Status:** PROVEN. Bounded ceremony executed 2026-04-01 on BTCUSDT @ `611d520`: preflight CLEAN → 60s trading → SIGINT → cleanup-on-exit → post-verify CLEAN (orders=0, position=FLAT). Full graceful_exit_only deactivation proof deferred to future iteration.
 - **Runbook:** `docs/runbooks/39_SYMBOL_DEACTIVATION_CEREMONY.md` with exact commands, evidence checklist, failure handling.
+
+### ADR-131: Universe provider for autonomous symbol discovery (2026-04-01)
+
+- **Decision:** Create `src/grinder/orchestration/universe_provider.py` — venue-level symbol discovery from Binance exchangeInfo.
+- **Phase:** D1. Discovery only — no prefilter, no tuning, no ranking, no runtime wiring.
+- **Provider:** `UniverseProvider` class with injectable clock + fetcher. `get_candidates()` fetches if stale (beyond `refresh_s`), retains previous universe on fetch failure (fail-safe). Returns empty list only if no successful fetch has ever occurred.
+- **Filter:** `filter_candidates(exchange_info, config) -> list[str]` — pure function: alphabetically sorted USDT perpetual TRADING symbols not in blacklist. Malformed entries skipped. Duplicates deduplicated.
+- **Scope:** Provider + filter. Does not apply liquidity/volume/spread/OI prefilter. Fetch uses stdlib urllib by default; injectable fetcher for tests.

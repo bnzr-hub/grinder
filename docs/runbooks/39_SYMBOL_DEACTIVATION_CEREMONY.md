@@ -125,3 +125,26 @@ python3 -m scripts.exchange_state cleanup BTCUSDT
 - [ ] Post-verify: `status=CLEAN`
 - [ ] Final result: `DEACTIVATION_CEREMONY_RESULT status=SUCCESS`
 - [ ] Manual `exchange_state verify` confirms clean state
+
+---
+
+## Proof Record: 2026-04-01 (BTCUSDT @ `611d520`)
+
+**Result:** SUCCESS
+
+```
+DEACTIVATION_CEREMONY_PREFLIGHT symbol=BTCUSDT status=CLEAN
+DEACTIVATION_CEREMONY_TRADING_ACTIVE symbol=BTCUSDT
+DEACTIVATION_CEREMONY_WAITING_FOR_DEACTIVATION symbol=BTCUSDT wait_s=60
+DEACTIVATION_CEREMONY_DEACTIVATION_REQUESTED symbol=BTCUSDT
+DEACTIVATION_CEREMONY_TRADING_EXITED symbol=BTCUSDT exit_code=-1
+DEACTIVATION_CEREMONY_VERIFY symbol=BTCUSDT status=CLEAN
+DEACTIVATION_CEREMONY_RESULT status=SUCCESS symbol=BTCUSDT
+```
+
+**Final exchange state:**
+```
+EXCHANGE_STATE_VERIFY symbol=BTCUSDT status=CLEAN orders=0 position=FLAT
+```
+
+**Notes:** Trading exit code -1 is expected (SIGINT). No cleanup retries needed. No anomalies.
