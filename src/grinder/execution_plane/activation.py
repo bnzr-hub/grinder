@@ -40,7 +40,6 @@ class ActivationOutcome(Enum):
     DUPLICATE_ENGINE = "DUPLICATE_ENGINE"
     BUILD_FAILED = "BUILD_FAILED"
     HEALTH_CHECK_FAILED = "HEALTH_CHECK_FAILED"
-    TIMEOUT = "TIMEOUT"
 
 
 @dataclass(frozen=True)
@@ -58,17 +57,6 @@ class ActivationResult:
     outcome: ActivationOutcome
     engine_ref: Any = None
     detail: str = ""
-
-
-@dataclass(frozen=True)
-class ActivationConfig:
-    """Configuration for activation ceremony.
-
-    Attributes:
-        health_check_timeout_s: Max seconds to wait for health check.
-    """
-
-    health_check_timeout_s: float = 60.0
 
 
 # Type aliases for injectable dependencies
@@ -167,7 +155,6 @@ def activate(
     engine_factory: EngineFactoryFn,
     health_check: HealthCheckFn,
     engine_config: Any = None,
-    config: ActivationConfig | None = None,  # noqa: ARG001
 ) -> ActivationResult:
     """Run activation ceremony for one symbol.
 
@@ -180,7 +167,6 @@ def activate(
         engine_factory: Callable(symbol, config) -> engine_ref. Builds engine.
         health_check: Callable(engine_ref) -> bool. True if engine is healthy.
         engine_config: Symbol-specific config passed to factory.
-        config: Ceremony configuration.
 
     Returns:
         ActivationResult with outcome and optional engine reference.
