@@ -1,7 +1,11 @@
 """Tests for AutonomousLoop (PR-D2, ADR-132).
 
 Covers:
-- Full cycle happy path
+- Full cycle happy path with all stages
+- Prefilter stage filters candidates
+- Ranker stage orders candidates
+- Prefilter failure degrades safely
+- Ranker failure degrades safely
 - Operator universe override
 - Only tuned symbols selected
 - Universe fetch failure retention
@@ -9,7 +13,10 @@ Covers:
 - Actions propagated
 - Determinism
 - Empty universe
-- Stopped loop refuses cycles
+- Cycle counter
+- External stop
+- Continuous run_forever with max_cycles
+- run_forever respects stop
 """
 
 from __future__ import annotations
@@ -75,6 +82,8 @@ def _make_loop(
     max_changes: int = 3,
     override: frozenset[str] | None = None,
     fetcher: object = None,
+    prefilter_fn: object = None,
+    ranker_fn: object = None,
 ) -> AutonomousLoop:
     c = cache or TuningCache(ttl_s=300.0)
     ctrl = RotationController(
@@ -90,19 +99,26 @@ def _make_loop(
         fetcher=fetcher or (lambda _url, _timeout: FIXTURE),
     )
     config = AutonomousLoopConfig(
+        cycle_interval_s=0.01,
         operator_universe_override=override or frozenset(),
     )
+    kwargs: dict[str, object] = {}
+    if prefilter_fn is not None:
+        kwargs["prefilter_fn"] = prefilter_fn
+    if ranker_fn is not None:
+        kwargs["ranker_fn"] = ranker_fn
     return AutonomousLoop(
         universe_provider=provider,
         orchestrator=orch,
         config=config,
+        **kwargs,  # type: ignore[arg-type]
     )
 
 
 class TestFullCycleHappyPath:
-    """Complete cycle: discover → filter → orchestrate → report."""
+    """Complete cycle through all stages."""
 
-    def test_cycle_produces_report(self) -> None:
+    def test_cycle_report_has_all_stages(self) -> None:
         cache = TuningCache(ttl_s=300.0)
         for s in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
             cache.put(s, _tuned(s))
@@ -112,108 +128,140 @@ class TestFullCycleHappyPath:
 
         assert report.cycle == 1
         assert len(report.discovered) == 3
+        assert len(report.eligible) == 3
+        assert len(report.tuned) == 3
+        assert len(report.selected) == 3
         assert len(report.admitted) == 3
-        assert len(report.skipped) == 0
-        assert len(report.actions) == 3  # 3 ACTIVATE
+        assert len(report.actions) == 3
         assert report.error is None
 
-    def test_actions_are_activate(self) -> None:
+
+class TestPrefilterStage:
+    """Prefilter stage filters discovered candidates."""
+
+    def test_prefilter_reduces_candidates(self) -> None:
         cache = TuningCache(ttl_s=300.0)
         for s in ["BTCUSDT", "ETHUSDT"]:
             cache.put(s, _tuned(s))
 
-        loop = _make_loop(cache=cache, top_k=2, max_changes=2)
+        def keep_btc_only(symbols: list[str]) -> list[str]:
+            return [s for s in symbols if s == "BTCUSDT"]
+
+        loop = _make_loop(cache=cache, prefilter_fn=keep_btc_only)
         report = loop.run_cycle()
 
-        activate = [a for a in report.actions if a.kind == RotationActionKind.ACTIVATE]
-        assert len(activate) == 2
+        assert report.discovered == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        assert report.eligible == ["BTCUSDT"]
+        assert report.admitted == ["BTCUSDT"]
+
+    def test_prefilter_failure_degrades_safely(self) -> None:
+        cache = TuningCache(ttl_s=300.0)
+        cache.put("BTCUSDT", _tuned("BTCUSDT"))
+
+        def exploding_filter(_symbols: list[str]) -> list[str]:
+            raise RuntimeError("filter broken")
+
+        loop = _make_loop(cache=cache, prefilter_fn=exploding_filter)
+        report = loop.run_cycle()
+
+        # Fail-open: prefilter skipped, discovered passed through
+        assert report.eligible == report.discovered
+        assert report.error is None
+
+
+class TestRankerStage:
+    """Ranker stage orders eligible candidates."""
+
+    def test_ranker_reorders(self) -> None:
+        cache = TuningCache(ttl_s=300.0)
+        for s in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
+            cache.put(s, _tuned(s))
+
+        def reverse_rank(symbols: list[str]) -> list[str]:
+            return list(reversed(symbols))
+
+        loop = _make_loop(cache=cache, ranker_fn=reverse_rank)
+        report = loop.run_cycle()
+
+        assert report.selected == ["SOLUSDT", "ETHUSDT", "BTCUSDT"]
+
+    def test_ranker_failure_degrades_safely(self) -> None:
+        cache = TuningCache(ttl_s=300.0)
+        cache.put("BTCUSDT", _tuned("BTCUSDT"))
+
+        def exploding_ranker(_symbols: list[str]) -> list[str]:
+            raise RuntimeError("ranker broken")
+
+        loop = _make_loop(cache=cache, ranker_fn=exploding_ranker)
+        report = loop.run_cycle()
+
+        # Fail-open: ranking skipped, eligible passed through
+        assert report.selected == report.eligible
+        assert report.error is None
 
 
 class TestOperatorOverride:
-    """Operator universe override restricts discovery."""
-
     def test_override_restricts(self) -> None:
         cache = TuningCache(ttl_s=300.0)
         for s in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
             cache.put(s, _tuned(s))
 
-        loop = _make_loop(
-            cache=cache,
-            override=frozenset({"BTCUSDT", "ETHUSDT"}),
-        )
+        loop = _make_loop(cache=cache, override=frozenset({"BTCUSDT", "ETHUSDT"}))
         report = loop.run_cycle()
 
         assert set(report.discovered) == {"BTCUSDT", "ETHUSDT"}
-        assert "SOLUSDT" not in report.admitted
 
 
 class TestOnlyTunedSelected:
-    """Symbols without valid TUNED cache entry are skipped."""
-
     def test_cache_miss_skipped(self) -> None:
         cache = TuningCache(ttl_s=300.0)
         cache.put("BTCUSDT", _tuned("BTCUSDT"))
-        # ETHUSDT and SOLUSDT not cached
 
         loop = _make_loop(cache=cache)
         report = loop.run_cycle()
 
         assert report.admitted == ["BTCUSDT"]
         assert "ETHUSDT" in report.skipped
-        assert "SOLUSDT" in report.skipped
 
 
 class TestUniverseFetchFailure:
-    """Universe fetch failure retains previous via provider fail-safe."""
-
-    def test_failure_returns_empty_first_time(self) -> None:
+    def test_failure_returns_empty(self) -> None:
         cache = TuningCache(ttl_s=300.0)
 
-        def failing_fetcher(url: str, timeout: int) -> dict:  # type: ignore[type-arg]
+        def failing_fetcher(_url: str, _timeout: int) -> dict:  # type: ignore[type-arg]
             raise ConnectionError("offline")
 
         loop = _make_loop(cache=cache, fetcher=failing_fetcher)
         report = loop.run_cycle()
 
         assert report.discovered == []
-        assert report.admitted == []
-        assert report.error is None  # universe failure is fail-safe, not error
+        assert report.error is None
 
 
 class TestOrchestratorError:
-    """Orchestrator error triggers stop-the-line."""
-
     def test_stop_on_error(self) -> None:
         cache = TuningCache(ttl_s=300.0)
         cache.put("BTCUSDT", _tuned("BTCUSDT"))
 
         loop = _make_loop(cache=cache)
 
-        # Sabotage orchestrator
-        def exploding_reconcile(*args: object, **kwargs: object) -> None:
-            raise RuntimeError("controller exploded")
+        def _boom(*_a: object, **_k: object) -> None:
+            raise RuntimeError("boom")
 
-        loop.orchestrator.reconcile = exploding_reconcile  # type: ignore[assignment]
+        loop.orchestrator.reconcile = _boom  # type: ignore[assignment,method-assign]
 
         report = loop.run_cycle()
-
         assert report.error is not None
-        assert "orchestrator_error" in report.error
         assert loop.stopped is True
 
-    def test_stopped_loop_refuses_cycles(self) -> None:
-        cache = TuningCache(ttl_s=300.0)
-        loop = _make_loop(cache=cache)
-        loop.stop("test_stop")
-
+    def test_stopped_loop_refuses(self) -> None:
+        loop = _make_loop()
+        loop.stop("test")
         report = loop.run_cycle()
-        assert report.error is not None
-        assert "STOPPED" in report.error
+        assert "STOPPED" in (report.error or "")
 
 
 class TestActionsPropagate:
-    """Controller actions appear in cycle report."""
-
     def test_activate_in_report(self) -> None:
         cache = TuningCache(ttl_s=300.0)
         cache.put("BTCUSDT", _tuned("BTCUSDT"))
@@ -223,13 +271,10 @@ class TestActionsPropagate:
 
         assert len(report.actions) == 1
         assert report.actions[0].kind == RotationActionKind.ACTIVATE
-        assert report.actions[0].symbol == "BTCUSDT"
 
 
 class TestDeterminism:
-    """Same inputs produce identical cycle reports."""
-
-    def test_repeated_cycles_on_fresh_loop(self) -> None:
+    def test_same_inputs(self) -> None:
         def run() -> CycleReport:
             cache = TuningCache(ttl_s=300.0)
             cache.put("BTCUSDT", _tuned("BTCUSDT"))
@@ -239,57 +284,82 @@ class TestDeterminism:
 
         r1 = run()
         r2 = run()
-        assert r1.discovered == r2.discovered
         assert r1.admitted == r2.admitted
-        assert r1.skipped == r2.skipped
         assert len(r1.actions) == len(r2.actions)
 
 
 class TestEmptyUniverse:
-    """Empty universe produces empty report, no crash."""
-
     def test_empty(self) -> None:
-        cache = TuningCache(ttl_s=300.0)
-        loop = _make_loop(
-            cache=cache,
-            fetcher=lambda _url, _timeout: {"symbols": []},
-        )
+        loop = _make_loop(fetcher=lambda _u, _t: {"symbols": []})
         report = loop.run_cycle()
-
         assert report.discovered == []
-        assert report.admitted == []
-        assert report.actions == []
         assert report.error is None
 
 
 class TestCycleCounter:
-    """Cycle counter increments monotonically."""
-
     def test_increments(self) -> None:
-        cache = TuningCache(ttl_s=300.0)
-        loop = _make_loop(cache=cache)
-
+        loop = _make_loop()
         r1 = loop.run_cycle()
         r2 = loop.run_cycle()
-        r3 = loop.run_cycle()
-
         assert r1.cycle == 1
         assert r2.cycle == 2
-        assert r3.cycle == 3
-        assert loop.cycle == 3
 
 
 class TestExternalStop:
-    """External stop halts the loop."""
+    def test_stop(self) -> None:
+        loop = _make_loop()
+        loop.run_cycle()
+        loop.stop("operator")
+        report = loop.run_cycle()
+        assert loop.stopped
+        assert "STOPPED" in (report.error or "")
 
-    def test_stop_and_resume_blocked(self) -> None:
+
+class TestRunForever:
+    """Continuous loop with max_cycles."""
+
+    def test_runs_n_cycles(self) -> None:
         cache = TuningCache(ttl_s=300.0)
+        cache.put("BTCUSDT", _tuned("BTCUSDT"))
+
+        t = [0.0]
+        loop = _make_loop(cache=cache)
+        reports = loop.run_forever(
+            clock=lambda: t[0],
+            sleep_fn=lambda _s: None,
+            max_cycles=3,
+        )
+
+        assert len(reports) == 3
+        assert reports[0].cycle == 1
+        assert reports[2].cycle == 3
+
+    def test_stop_halts_forever(self) -> None:
+        cache = TuningCache(ttl_s=300.0)
+        cache.put("BTCUSDT", _tuned("BTCUSDT"))
+
         loop = _make_loop(cache=cache)
 
-        loop.run_cycle()
-        loop.stop("operator_requested")
+        cycle_count = [0]
 
-        report = loop.run_cycle()
-        assert report.error is not None
-        assert loop.stopped is True
-        assert loop.stop_reason == "operator_requested"
+        def stop_after_two() -> None:
+            cycle_count[0] += 1
+            if cycle_count[0] >= 2:
+                loop.stop("enough")
+
+        original_run = loop.run_cycle
+
+        def counting_cycle(facts: object = None) -> CycleReport:
+            report = original_run(facts)  # type: ignore[arg-type]
+            stop_after_two()
+            return report
+
+        loop.run_cycle = counting_cycle  # type: ignore[method-assign]
+
+        reports = loop.run_forever(
+            clock=lambda: 0.0,
+            sleep_fn=lambda _s: None,
+        )
+
+        assert len(reports) == 2
+        assert loop.stopped

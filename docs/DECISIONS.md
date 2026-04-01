@@ -4806,7 +4806,8 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 
 - **Decision:** Create `src/grinder/orchestration/autonomous_loop.py` — continuous control-plane loop that wires UniverseProvider → TuningCache filter → SymbolOrchestrator → CycleReport.
 - **Phase:** D2. Completes the autonomous multi-symbol orchestration plan (doc 38).
-- **Contract:** `AutonomousLoop.run_cycle(facts) -> CycleReport` with `discovered`, `admitted`, `skipped`, `actions`, `error`.
+- **Stages (per doc 37 Section 3):** Universe discovery → hard prefilter (injectable `prefilter_fn`) → scoring/ranking (injectable `ranker_fn`) → TuningCache filter (via orchestrator) → RotationController reconcile → CycleReport.
+- **Contract:** `run_cycle(facts) -> CycleReport` with `discovered`, `eligible`, `tuned`, `selected`, `admitted`, `skipped`, `actions`, `error`. `run_forever(facts_fn, clock, sleep_fn, max_cycles)` for continuous operation.
 - **Control-plane only:** Produces action intents and cycle reports. Does not execute engine start/stop or exchange writes. Execution is the caller's responsibility.
-- **Safety:** Orchestrator errors trigger stop-the-line (configurable). Universe fetch failure degrades via provider fail-safe. Operator override restricts discovered universe.
+- **Safety:** Orchestrator errors trigger stop-the-line (configurable). Prefilter/ranker failures degrade fail-open (skip stage). Universe fetch failure retains previous via provider. Operator override restricts discovered universe.
 - **Scope boundary:** This completes the autonomous orchestration *plan and control-plane*. Runtime execution of action intents against real per-symbol engines is the next workstream beyond this plan.
