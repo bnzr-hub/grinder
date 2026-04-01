@@ -528,6 +528,53 @@ def _load_symbol_constraints() -> dict[str, SymbolConstraints] | None:
     return None
 
 
+def _fetch_startup_prices(symbols: list[str]) -> dict[str, Decimal]:
+    """Fetch current prices for symbols via Binance Futures REST (best-effort).
+
+    Uses stdlib urllib — no dependency on HttpClient or exchange port.
+    Returns empty dict on failure (caller handles gracefully).
+    """
+    prices: dict[str, Decimal] = {}
+    for symbol in symbols:
+        try:
+            url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+                prices[symbol] = Decimal(str(data["price"]))
+        except Exception:
+            pass  # Solver will emit PRICE_UNAVAILABLE for this symbol
+    return prices
+
+
+def _run_startup_tuning_shadow(
+    symbols: list[str],
+    constraints: dict[str, SymbolConstraints] | None,
+) -> None:
+    """Run shadow tuning at startup and log outcomes.
+
+    Shadow-only: no dispatch mutation, no selector change.
+    Fail-open: errors are logged but never block startup.
+    """
+    from grinder.tuning.shadow import run_tuning_shadow  # noqa: PLC0415
+    from grinder.tuning.solver import TuningSolverConfig  # noqa: PLC0415
+
+    try:
+        prices = _fetch_startup_prices(symbols)
+
+        max_pos_usd = Decimal(os.environ.get("GRINDER_MAX_POSITION_USD", "1000"))
+        max_inv = int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "5"))
+
+        config = TuningSolverConfig(
+            max_position_usd=max_pos_usd,
+            max_inventory_levels=max_inv,
+        )
+
+        run_tuning_shadow(symbols, constraints, prices, config)
+    except Exception as e:
+        print(f"  TUNING_SHADOW skipped: {e}")
+
+
 FuturesPreflightStatus = Literal[
     "skipped",
     "passed",
@@ -1847,6 +1894,10 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     if not preflight_report.passed:
         print("LIVE_PREFLIGHT BLOCKED: armed run cannot start. Fix blockers above.")
         sys.exit(2)
+
+    # Shadow tuning: log SYMBOL_TUNED / SYMBOL_NO_GO per symbol (PR-B3a).
+    # Pure startup visibility — no dispatch change, no selector change.
+    _run_startup_tuning_shadow(symbols, preflight_constraints)
 
     server = run_server(args.metrics_port)
     print(f"  Health endpoint: http://localhost:{args.metrics_port}/healthz")

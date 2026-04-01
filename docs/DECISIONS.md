@@ -4743,3 +4743,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **NO_GO reasons:** `NOTIONAL_TOO_LOW`, `POSITION_EXCEEDS_CAP`, `TICK_SIZE_UNAVAILABLE`, `STEP_SIZE_UNAVAILABLE`, `PRICE_UNAVAILABLE`, `BLACKLISTED`.
 - **Rounding:** `ceil_to_step()` for notional-driven quantity (rounds up to ensure min_notional met). `floor_to_step()` (existing) not reused here — min-notional needs upward rounding.
 - **Determinism:** Same inputs always produce same `TuningResult`. All arithmetic is `Decimal`, no floats.
+
+### ADR-125: Shadow tuning at startup (2026-04-01)
+
+- **Decision:** Wire tuning solver into `run_trading.py` startup as shadow-only logging. Every `--symbols` entry produces exactly one `SYMBOL_TUNED` or `SYMBOL_NO_GO` log line.
+- **Phase:** B3a. Shadow visibility only — no dispatch mutation, no selector change, no runtime behavior change.
+- **Implementation:** `src/grinder/tuning/shadow.py` (`run_tuning_shadow()`), called after preflight in `scripts/run_trading.py`.
+- **Fail-open:** Missing price → `SYMBOL_NO_GO reason=PRICE_UNAVAILABLE`. Missing constraints → solver emits appropriate NO_GO from zero sentinel. Entire shadow block wrapped in try/except — never blocks startup.
+- **Signals:** `SYMBOL_TUNED symbol=X order_size=N tick_size=T step_size=S min_notional=M price=P`, `SYMBOL_NO_GO symbol=X reason=R price=P min_notional=M`, `TUNING_SHADOW_COMPLETE symbols=N tuned=M no_go=K`.
