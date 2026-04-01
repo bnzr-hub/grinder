@@ -4791,5 +4791,5 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Phase:** C2b tooling. Uses existing cleanup-on-exit infrastructure (ADR-121). Does NOT yet prove graceful_exit_only deactivation path — proves shutdown + cleanup path only.
 - **Sequence:** Pre-flight verify → bounded trading → SIGINT (graceful shutdown) → cleanup-on-exit → post-verify with retries.
 - **Success:** `EXCHANGE_STATE_VERIFY status=CLEAN orders=0 position=FLAT` after ceremony.
-- **Status:** Tooling and runbook ready. Live proof pending operator execution. Full deactivation-path proof (with observed fills + graceful_exit signal) deferred to future ceremony iteration.
+- **Status:** PROVEN. Bounded ceremony executed 2026-04-01 on BTCUSDT @ `611d520`: preflight CLEAN → 60s trading → SIGINT → cleanup-on-exit → post-verify CLEAN (orders=0, position=FLAT). Full graceful_exit_only deactivation proof deferred to future iteration.
 - **Runbook:** `docs/runbooks/39_SYMBOL_DEACTIVATION_CEREMONY.md` with exact commands, evidence checklist, failure handling.
