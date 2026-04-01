@@ -241,13 +241,15 @@ Each execution cycle compares:
 | Control | Effect |
 |---------|--------|
 | Pause execution | No new activations/deactivations. Running engines continue. |
-| Force deactivate symbol | Immediate deactivation ceremony for specific symbol. |
-| Quarantine symbol | Move engine to QUARANTINED. No trading. |
-| Release quarantine | Operator acknowledges issue resolved. Verify clean state. Return to ABSENT. |
+| Force deactivate symbol | Record pending deactivation intent for specific symbol. Coordinator processes via normal deactivation ceremony path — not an immediate kill. |
+| Quarantine symbol | Block activation and corrective actions for this symbol. |
+| Release quarantine | Remove quarantine block. Does NOT auto-activate or verify clean state — symbol returns to normal eligibility for control-plane decisions. |
 | Resume execution | Re-enable activation/deactivation after pause. |
-| Emergency stop all | Trigger deactivation ceremony for all active engines. |
+| Emergency stop all | Trigger deactivation ceremony for all active engines (deferred — not yet implemented). |
 
 **All operator controls must be auditable:** Log `OPERATOR_CONTROL action=... symbol=... operator=...`.
+
+**Note:** Operator controls record intents and state changes. The ExecutionCoordinator (E6) is responsible for executing deactivation ceremonies when processing force-deactivate intents.
 
 ---
 
