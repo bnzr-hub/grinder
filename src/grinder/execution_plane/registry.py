@@ -146,14 +146,20 @@ class EngineRegistry:
     def deregister(self, symbol: str) -> None:
         """Remove a symbol's engine handle.
 
-        Sets state to ABSENT and clears engine_ref. Safe to call on
-        already-absent symbols (no-op).
+        Only legal from STOPPED, ABSENT, or if symbol was never registered.
+        Raises InvalidEngineTransitionError if engine is in a live state.
+        This prevents bypassing the state machine for active engines.
         """
         handle = self._handles.get(symbol)
-        if handle is not None:
-            handle.state = EngineState.ABSENT
-            handle.engine_ref = None
-            handle.last_transition_at = self._clock()
+        if handle is None:
+            return  # never registered, no-op
+
+        if handle.state not in (EngineState.ABSENT, EngineState.STOPPED):
+            raise InvalidEngineTransitionError(handle.symbol, handle.state, EngineState.ABSENT)
+
+        handle.state = EngineState.ABSENT
+        handle.engine_ref = None
+        handle.last_transition_at = self._clock()
 
     def get(self, symbol: str) -> EngineHandle | None:
         """Get engine handle for a symbol, or None if never registered."""

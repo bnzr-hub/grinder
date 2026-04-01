@@ -141,12 +141,30 @@ class TestRegisterAndGet:
 
 
 class TestDeregister:
-    def test_deregister_sets_absent(self) -> None:
+    def test_deregister_from_stopped(self) -> None:
         reg = EngineRegistry()
         reg.register("BTC")
         reg.transition("BTC", EngineState.ACTIVE)
+        reg.transition("BTC", EngineState.GRACEFUL_EXIT)
+        reg.transition("BTC", EngineState.SHUTTING_DOWN)
+        reg.transition("BTC", EngineState.STOPPED)
         reg.deregister("BTC")
         assert reg.get_state("BTC") == EngineState.ABSENT
+
+    def test_deregister_from_active_rejected(self) -> None:
+        """Cannot bypass state machine from live state."""
+        reg = EngineRegistry()
+        reg.register("BTC")
+        reg.transition("BTC", EngineState.ACTIVE)
+        with pytest.raises(InvalidEngineTransitionError, match=r"ACTIVE.*ABSENT"):
+            reg.deregister("BTC")
+        assert reg.get_state("BTC") == EngineState.ACTIVE
+
+    def test_deregister_from_activating_rejected(self) -> None:
+        reg = EngineRegistry()
+        reg.register("BTC")
+        with pytest.raises(InvalidEngineTransitionError):
+            reg.deregister("BTC")
 
     def test_deregister_unknown_is_noop(self) -> None:
         reg = EngineRegistry()
@@ -160,11 +178,15 @@ class TestDuplicateRegister:
         with pytest.raises(DuplicateEngineError, match="BTC"):
             reg.register("BTC")
 
-    def test_reregister_after_absent(self) -> None:
+    def test_reregister_after_proper_lifecycle(self) -> None:
+        """Re-register allowed after full lifecycle reaches ABSENT."""
         reg = EngineRegistry()
         reg.register("BTC")
         reg.transition("BTC", EngineState.ACTIVE)
-        reg.deregister("BTC")
+        reg.transition("BTC", EngineState.GRACEFUL_EXIT)
+        reg.transition("BTC", EngineState.SHUTTING_DOWN)
+        reg.transition("BTC", EngineState.STOPPED)
+        reg.transition("BTC", EngineState.ABSENT)
         handle = reg.register("BTC")  # allowed after ABSENT
         assert handle.state == EngineState.ACTIVATING
 
