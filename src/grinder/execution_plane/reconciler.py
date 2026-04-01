@@ -178,6 +178,10 @@ def reconcile(
                 )
             )
 
+    # --- Global sort by symbol for deterministic bounding ---
+    actions.sort(key=lambda a: a.symbol)
+    mismatches.sort(key=lambda m: m.symbol)
+
     # --- Bound actions ---
     truncated = len(actions) > cfg.max_actions_per_cycle
     bounded_actions = actions[: cfg.max_actions_per_cycle]

@@ -4851,4 +4851,4 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Phase:** E4. Pure reconciliation, no engine execution.
 - **Mismatches:** MISSING (desired but absent/stopped), ORPHAN (present but not desired), STATE_MISMATCH (desired but in wrong state).
 - **Actions:** ACTIVATE_ENGINE, REQUEST_GRACEFUL_EXIT, FINALIZE_DEACTIVATION, QUARANTINE_ENGINE. All symbolic — caller executes.
-- **Bounded:** `max_actions_per_cycle` caps corrective actions. Deterministic sort by symbol.
+- **Bounded:** `max_actions_per_cycle` caps corrective actions. Global sort by symbol before bounding (not bucket-then-symbol).
