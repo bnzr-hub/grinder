@@ -226,7 +226,7 @@ This phase covers runtime execution of **two** control-plane intents:
 **Goal:** Execute REQUEST_GRACEFUL_EXIT (signal engine, verify no new entries) and FINALIZE_DEACTIVATION (stop engine, cleanup, verify clean).
 **Files touched:**
 - `src/grinder/execution_plane/graceful_exit.py` (new) — signal engine graceful-exit-only mode
-- `src/grinder/execution_plane/deactivation.py` (new) — stop engine, cleanup, verify
+- `src/grinder/execution_plane/engine_deactivation.py` (new) — stop engine, cleanup, verify
 - `tests/unit/test_graceful_exit_signal.py` (new)
 - `tests/unit/test_engine_deactivation.py` (new)
 **Dependencies:** PR-E2.

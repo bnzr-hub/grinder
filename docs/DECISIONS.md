@@ -4841,6 +4841,6 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 
 - **Decision:** Create `graceful_exit.py` (REQUEST_GRACEFUL_EXIT) and `engine_deactivation.py` (FINALIZE_DEACTIVATION) in `src/grinder/execution_plane/`.
 - **Phase:** E3. Covers both runtime removal intents from control-plane.
-- **Graceful exit:** `signal_graceful_exit(symbol, registry, exit_hook)` — injectable hook blocks new entries, transitions ACTIVE → GRACEFUL_EXIT. Idempotent on already GRACEFUL_EXIT. Fail-closed on hook failure.
+- **Graceful exit:** `signal_graceful_exit(symbol, registry, exit_hook)` — injectable hook signals entry blocking, transitions ACTIVE → GRACEFUL_EXIT. Idempotent on already GRACEFUL_EXIT. Fail-closed on hook failure. Note: this is a signal primitive — the hook abstracts the actual dispatch-gate effect. Real dispatch-gate integration (proving `is_selector_dispatch_allowed` blocks entries) is deferred to bounded live proof.
 - **Deactivation:** `deactivate(symbol, registry, facts, stop_engine, cleanup, verify_clean)` — only from GRACEFUL_EXIT, requires finalize gate (flat + no orders). Stop → cleanup → verify → STOPPED or FAILED. All deps injectable.
 - **Signals:** `ENGINE_GRACEFUL_EXIT_STARTED/COMPLETED/FAILED`, `ENGINE_DEACTIVATION_STARTED/COMPLETED/FAILED/BLOCKED`.
