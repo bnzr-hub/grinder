@@ -4767,4 +4767,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **States:** 9 states from doc 37 Section 5: DISCOVERED, PREFILTER_BLOCKED, ELIGIBLE, TUNING_CHECK, NO_GO, TUNED, ACTIVE, GRACEFUL_EXIT_ONLY, COOLDOWN.
 - **Design:** Data-driven transition table (dict, not if/else). Invalid transitions raise `InvalidTransitionError`. Transition history tracked for audit. Re-entry paths: NO_GO→ELIGIBLE, PREFILTER_BLOCKED→ELIGIBLE, COOLDOWN→ELIGIBLE.
 - **Controller:** `RotationController` in `src/grinder/rotation/controller.py` — reconciles desired active set with current symbol states. Owns per-symbol `SymbolLifecycle` instances. Produces `RotationAction` intents (ACTIVATE, REQUEST_GRACEFUL_EXIT, FINALIZE_DEACTIVATION). Enforces `top_k`, `max_changes_per_cycle`, `min_hold_cycles`. Non-flat symbols go through graceful exit path.
-- **Ownership:** Controller produces symbolic intents only. Orchestrator (C1b) will execute them against real engines.
+- **Ownership:** Controller produces symbolic intents only. Orchestrator (C1b) executes them.
+
+### ADR-128: SymbolOrchestrator wiring (2026-04-01)
+
+- **Decision:** Create `src/grinder/orchestration/symbol_orchestrator.py` — top-level owner that wires TuningCache → candidate filtering → RotationController → action intents.
+- **Phase:** C1b. Pure logic, no engine start/stop, no runtime wiring, no exchange I/O.
+- **Contract:** `SymbolOrchestrator.reconcile(candidates, facts) -> OrchestratorDecision` with `admitted`, `skipped` (with `SkipReason`), and `actions`.
+- **Filtering:** Only valid non-expired TUNED cache entries admitted. CACHE_MISS, NOT_TUNED reasons for skipped symbols.
+- **Ownership:** Orchestrator reads TuningCache (does not mutate). Controller owns lifecycle state. Future runtime wiring (C2+) will execute returned action intents against real engines.

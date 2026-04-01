@@ -1879,6 +1879,6 @@ Comprehensive adaptive grid system design:
 - **Phase B3a (shadow startup):** [DONE] `run_tuning_shadow()` in `src/grinder/tuning/shadow.py` — logs `SYMBOL_TUNED`/`SYMBOL_NO_GO` per symbol on startup. No dispatch change (ADR-125). 13 tests.
 - **Phase B3b (metrics + cache):** [DONE] `TuningCache` in `src/grinder/tuning/cache.py` (TTL, injectable clock). `TuningMetrics` in `src/grinder/tuning/metrics.py` — `grinder_tuning_result_total{status}`, `grinder_tuning_no_go_total{reason}`, `grinder_tuning_cache_size`, `grinder_tuning_cache_expired_total`. Wired into MetricsBuilder. Startup wrapper populates cache + metrics. Still shadow-only (ADR-126).
 - **Phase C1a (rotation controller):** [DONE] `SymbolLifecycle` (9 states, data-driven transition table) + `RotationController` (reconcile desired set, bounded changes, min-hold, graceful exit for non-flat, no-churn) in `src/grinder/rotation/`. Pure logic, no engine wiring (ADR-127).
-- **Phase C1b (orchestrator wiring):** [NOT STARTED] SymbolOrchestrator + rotation controller wiring.
+- **Phase C1b (orchestrator wiring):** [DONE] `SymbolOrchestrator` in `src/grinder/orchestration/` — filters candidates through TuningCache, passes ordered TUNED symbols to RotationController, returns decisions with admitted/skipped/actions. Pure logic, no engine start/stop (ADR-128). 12 tests.
 - **Phase C2 (deactivation):** [NOT STARTED] Graceful symbol deactivation with cleanup verification.
 - **Phase D (full autonomous):** [NOT STARTED] Auto-discovery + continuous rotation without `--symbols`.
