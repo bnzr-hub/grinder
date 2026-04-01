@@ -120,14 +120,15 @@ class AutonomousLoop:
     ) -> CycleReport:
         """Run one orchestration cycle through all stages.
 
-        Steps per doc 37 Section 3:
+        Steps per doc 37 Section 3 (order matters):
         1. Check stop-the-line
         2. Universe discovery (fail-safe via provider)
         3. Operator override
         4. Hard prefilter (injectable prefilter_fn)
-        5. Scoring/ranking (injectable ranker_fn)
-        6. Orchestrator reconcile (TuningCache filter + rotation controller)
-        7. Cycle report
+        5. Tuning admission (TuningCache — only TUNED symbols proceed)
+        6. Scoring/ranking among TUNED symbols only (injectable ranker_fn)
+        7. Orchestrator reconcile (rotation controller)
+        8. Cycle report
 
         Args:
             facts: Runtime facts per symbol (is_flat, etc.).
@@ -168,14 +169,32 @@ class AutonomousLoop:
             logger.warning("AUTONOMOUS_LOOP_PREFILTER_FAILED cycle=%d error=%s", self._cycle, e)
             eligible = discovered  # fail-open: skip prefilter
 
-        # Stage 4: Scoring/ranking
+        # Stage 4: Tuning admission (before ranking — doc 37 invariant)
+        # Only TUNED symbols enter ranking. Cache miss / NO_GO / expired = skipped.
+        tuned: list[str] = []
+        tuning_skipped: dict[str, str] = {}
+        cache = self.orchestrator.cache
+        for symbol in eligible:
+            from grinder.tuning.solver import TuningStatus  # noqa: PLC0415
+
+            result = cache.get(symbol)
+            if result is None:
+                tuning_skipped[symbol] = "CACHE_MISS"
+                continue
+            if result.status != TuningStatus.TUNED:
+                tuning_skipped[symbol] = "NOT_TUNED"
+                continue
+            tuned.append(symbol)
+
+        # Stage 5: Scoring/ranking among TUNED symbols only
         try:
-            selected = self.ranker_fn(eligible)
+            selected = self.ranker_fn(tuned)
         except Exception as e:
             logger.warning("AUTONOMOUS_LOOP_RANKING_FAILED cycle=%d error=%s", self._cycle, e)
-            selected = eligible  # fail-open: skip ranking
+            selected = tuned  # fail-open: skip ranking
 
-        # Stage 5: Orchestrator reconcile (TuningCache filter + rotation controller)
+        # Stage 6: Orchestrator reconcile (TuningCache re-check + rotation controller)
+        # Orchestrator will re-validate tuning (defense in depth) and run controller.
         try:
             decision = self.orchestrator.reconcile(selected, facts)
         except Exception as e:
@@ -188,23 +207,25 @@ class AutonomousLoop:
                 cycle=self._cycle,
                 discovered=discovered,
                 eligible=eligible,
+                tuned=tuned,
                 selected=selected,
                 error=error_msg,
             )
             self._last_report = report
             return report
 
-        # Stage 6: Build cycle report
-        skipped_str = {s: r.value for s, r in decision.skipped.items()}
+        # Stage 7: Build cycle report
+        # Merge tuning_skipped with orchestrator skipped (orchestrator may add more)
+        all_skipped = {**tuning_skipped, **{s: r.value for s, r in decision.skipped.items()}}
 
         report = CycleReport(
             cycle=self._cycle,
             discovered=discovered,
             eligible=eligible,
-            tuned=decision.admitted,
+            tuned=tuned,
             selected=selected,
             admitted=decision.admitted,
-            skipped=skipped_str,
+            skipped=all_skipped,
             actions=list(decision.actions),
         )
 
@@ -216,10 +237,10 @@ class AutonomousLoop:
             self._cycle,
             len(discovered),
             len(eligible),
-            len(decision.admitted),
+            len(tuned),
             len(selected),
             len(decision.admitted),
-            len(decision.skipped),
+            len(all_skipped),
             len(decision.actions),
         )
 

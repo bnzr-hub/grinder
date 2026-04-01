@@ -195,8 +195,8 @@ class TestRankerStage:
         loop = _make_loop(cache=cache, ranker_fn=exploding_ranker)
         report = loop.run_cycle()
 
-        # Fail-open: ranking skipped, eligible passed through
-        assert report.selected == report.eligible
+        # Fail-open: ranking skipped, tuned set passed through as selected
+        assert report.selected == report.tuned
         assert report.error is None
 
 
@@ -212,8 +212,43 @@ class TestOperatorOverride:
         assert set(report.discovered) == {"BTCUSDT", "ETHUSDT"}
 
 
-class TestOnlyTunedSelected:
-    def test_cache_miss_skipped(self) -> None:
+class TestTuningBeforeRanking:
+    """Tuning admission happens before ranking — doc 37 invariant."""
+
+    def test_ranker_sees_only_tuned(self) -> None:
+        """Ranker receives only TUNED symbols, not raw eligible set."""
+        cache = TuningCache(ttl_s=300.0)
+        cache.put("BTCUSDT", _tuned("BTCUSDT"))
+        # ETHUSDT and SOLUSDT not cached
+
+        ranked_input: list[list[str]] = []
+
+        def capturing_ranker(symbols: list[str]) -> list[str]:
+            ranked_input.append(list(symbols))
+            return symbols
+
+        loop = _make_loop(cache=cache, ranker_fn=capturing_ranker)
+        loop.run_cycle()
+
+        # Ranker should have received only BTCUSDT (the one TUNED symbol)
+        assert len(ranked_input) == 1
+        assert ranked_input[0] == ["BTCUSDT"]
+
+    def test_tuned_field_is_pre_ranking(self) -> None:
+        """CycleReport.tuned reflects tuning stage, not orchestrator output."""
+        cache = TuningCache(ttl_s=300.0)
+        cache.put("BTCUSDT", _tuned("BTCUSDT"))
+        cache.put("ETHUSDT", _tuned("ETHUSDT"))
+
+        loop = _make_loop(cache=cache, top_k=2, max_changes=2)
+        report = loop.run_cycle()
+
+        # tuned = symbols that passed TuningCache (pre-ranking)
+        assert set(report.tuned) == {"BTCUSDT", "ETHUSDT"}
+        # admitted = post-orchestrator (may equal tuned when all pass)
+        assert set(report.admitted) == {"BTCUSDT", "ETHUSDT"}
+
+    def test_cache_miss_in_skipped(self) -> None:
         cache = TuningCache(ttl_s=300.0)
         cache.put("BTCUSDT", _tuned("BTCUSDT"))
 
@@ -222,6 +257,7 @@ class TestOnlyTunedSelected:
 
         assert report.admitted == ["BTCUSDT"]
         assert "ETHUSDT" in report.skipped
+        assert report.skipped["ETHUSDT"] == "CACHE_MISS"
 
 
 class TestUniverseFetchFailure:
