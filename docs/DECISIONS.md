@@ -4777,10 +4777,10 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Filtering:** Only valid non-expired TUNED cache entries admitted. Skip reasons: `CACHE_MISS` (not cached or expired), `NOT_TUNED` (cached as NO_GO). No separate CACHE_EXPIRED reason — `TuningCache.get()` returns None for both miss and expiry.
 - **Ownership:** Orchestrator reads TuningCache (does not mutate). Controller owns lifecycle state. Future runtime wiring (C2+) will execute returned action intents against real engines.
 
-### ADR-129: Deactivation verification contract (2026-04-01)
+### ADR-129: Deactivation finalize gate (2026-04-01)
 
-- **Decision:** Create `src/grinder/orchestration/deactivation.py` — pure cleanup gate for symbol removal. Finalization requires ALL clean conditions: position flat AND zero open orders.
+- **Decision:** Create `src/grinder/orchestration/deactivation.py` — pure finalize gate for symbol removal. Answers: "given current runtime facts, is it safe to finalize?"
 - **Phase:** C2a. Pure logic, no live cleanup execution, no engine commands, no exchange I/O.
-- **Contract:** `evaluate_deactivation(symbol, facts, stage) -> DeactivationDecision` with `can_finalize`, `block_reason`, `stage`.
+- **Contract:** `can_finalize_deactivation(symbol, facts) -> DeactivationDecision` with `can_finalize` and `block_reason`.
 - **Block reasons:** `POSITION_NOT_FLAT`, `OPEN_ORDERS_REMAIN`, `POSITION_NOT_FLAT_AND_ORDERS_REMAIN`.
-- **Stages:** NONE → REQUESTED → GRACEFUL_EXIT_ONLY → VERIFYING_CLEAN → COMPLETE. Only COMPLETE when all clean conditions pass.
+- **Scope:** Finalize gate only. Stage progression (ACTIVE → GRACEFUL_EXIT_ONLY → COOLDOWN) is owned by RotationController, not this module.
