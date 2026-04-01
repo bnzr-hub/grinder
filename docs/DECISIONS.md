@@ -4860,3 +4860,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **STL-E rules implemented:** STL-E3 (orphan engine), STL-E5 (mismatch threshold). STL-E1/E2/E6 deferred (require runtime health/failure history not yet available).
 - **Operator controls:** pause/resume (global), quarantine/release (per-symbol), force-deactivate (pending intent for coordinator — not immediate kill). All produce `AuditRecord`. Quarantine blocks activation. Release removes quarantine block only — does not auto-activate or verify clean state. Emergency stop all deferred.
 - **Safety evaluator:** `evaluate_safety(report, paused, config) -> SafetyResult` with `execution_allowed`, `triggered_rules`.
+
+### ADR-139: Execution coordinator and loop integration (2026-04-01)
+
+- **Decision:** Create `src/grinder/execution_plane/coordinator.py` — maps corrective actions to injectable ceremony calls with 4-gate safety chain.
+- **Phase:** E6 coordinator. Actual wiring into `AutonomousLoop.run_cycle()` pending. Execution-plane plan completion blocked by E3 live proof gate.
+- **Gate chain:** (1) execution_enabled (default OFF) → (2) operator ACK → (3) safety evaluator → (4) operator pause. All four must pass before any action executes.
+- **Per-action gates:** Quarantined symbols blocked per-action. Unmapped action kinds skipped.
+- **Contract:** `ExecutionCoordinator.execute(report, safety, operator, enabled, acked) -> ExecutionReport` with per-action results, skip reasons, and execution-attempted flag.
+- **Default:** Shadow-only. Execution requires explicit `execution_enabled=True` AND `execution_acknowledged=True`. No silent rollout.
