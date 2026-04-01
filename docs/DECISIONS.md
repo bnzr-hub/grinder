@@ -4793,3 +4793,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Success:** `EXCHANGE_STATE_VERIFY status=CLEAN orders=0 position=FLAT` after ceremony.
 - **Status:** PROVEN. Bounded ceremony executed 2026-04-01 on BTCUSDT @ `611d520`: preflight CLEAN → 60s trading → SIGINT → cleanup-on-exit → post-verify CLEAN (orders=0, position=FLAT). Full graceful_exit_only deactivation proof deferred to future iteration.
 - **Runbook:** `docs/runbooks/39_SYMBOL_DEACTIVATION_CEREMONY.md` with exact commands, evidence checklist, failure handling.
+
+### ADR-131: Universe provider for autonomous symbol discovery (2026-04-01)
+
+- **Decision:** Create `src/grinder/orchestration/universe_provider.py` — venue-level symbol discovery from Binance exchangeInfo.
+- **Phase:** D1. Discovery only — no prefilter, no tuning, no ranking, no runtime wiring.
+- **Contract:** `filter_candidates(exchange_info, config) -> list[str]` returns alphabetically sorted USDT perpetual TRADING symbols not in blacklist.
+- **Filtering:** `quoteAsset == "USDT"`, `contractType == "PERPETUAL"`, `status == "TRADING"`, not in `blacklist`. Malformed entries skipped. Duplicates deduplicated.
+- **Scope:** Pure function. Does not fetch data — caller provides exchangeInfo dict. Does not apply liquidity/volume/spread/OI prefilter.
