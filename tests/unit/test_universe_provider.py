@@ -1,19 +1,16 @@
 """Tests for UniverseProvider (PR-D1, ADR-131).
 
 Covers:
-- Keeps only TRADING symbols
-- Keeps only USDT perpetual
-- Blacklist excluded
-- Deterministic alphabetical order
-- Empty response
-- Malformed entries handled
-- Duplicate symbols deduplicated
-- All filters combined
+- filter_candidates: TRADING-only, USDT-perpetual-only, blacklist,
+  deterministic order, empty, malformed, dedup, combined
+- UniverseProvider: refresh interval, fetch failure retention,
+  fetcher injection, clock injection
 """
 
 from __future__ import annotations
 
 from grinder.orchestration.universe_provider import (
+    UniverseProvider,
     UniverseProviderConfig,
     filter_candidates,
 )
@@ -45,6 +42,9 @@ FIXTURE = {
         _make_symbol("SCAMUSDT"),
     ]
 }
+
+
+# --- Tests: filter_candidates (pure function) ---
 
 
 class TestKeepsTradingOnly:
@@ -102,9 +102,6 @@ class TestEmptyResponse:
     def test_missing_symbols_key(self) -> None:
         assert filter_candidates({}) == []
 
-    def test_empty_dict(self) -> None:
-        assert filter_candidates({}) == []
-
 
 class TestMalformedEntries:
     def test_non_dict_entry(self) -> None:
@@ -135,3 +132,141 @@ class TestAllFiltersCombined:
         config = UniverseProviderConfig(blacklist=frozenset({"SCAMUSDT"}))
         result = filter_candidates(FIXTURE, config)
         assert result == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+
+# --- Tests: UniverseProvider (stateful provider with fetch/refresh/fail-safe) ---
+
+
+def _fake_fetcher(data: dict) -> object:  # type: ignore[type-arg]
+    """Create a fetcher that returns fixed data."""
+
+    def fetch(url: str, timeout: int) -> dict:  # type: ignore[type-arg]
+        return data
+
+    return fetch
+
+
+def _failing_fetcher() -> object:
+    def fetch(url: str, timeout: int) -> dict:  # type: ignore[type-arg]
+        raise ConnectionError("network down")
+
+    return fetch
+
+
+class TestProviderFetch:
+    """Provider fetches and returns candidates."""
+
+    def test_initial_fetch(self) -> None:
+        t = [0.0]
+        provider = UniverseProvider(
+            config=UniverseProviderConfig(refresh_s=60.0),
+            clock=lambda: t[0],
+            fetcher=_fake_fetcher(FIXTURE),
+        )
+        result = provider.get_candidates()
+        assert "BTCUSDT" in result
+        assert "ETHUSDT" in result
+        assert provider.fetch_count == 1
+
+    def test_fetch_produces_sorted_list(self) -> None:
+        provider = UniverseProvider(
+            fetcher=_fake_fetcher(FIXTURE),
+        )
+        result = provider.get_candidates()
+        assert result == sorted(result)
+
+
+class TestProviderRefreshInterval:
+    """Provider skips fetch when cache is fresh."""
+
+    def test_skips_fetch_within_interval(self) -> None:
+        t = [0.0]
+        call_count = [0]
+
+        def counting_fetcher(url: str, timeout: int) -> dict:  # type: ignore[type-arg]
+            call_count[0] += 1
+            return FIXTURE
+
+        provider = UniverseProvider(
+            config=UniverseProviderConfig(refresh_s=60.0),
+            clock=lambda: t[0],
+            fetcher=counting_fetcher,
+        )
+
+        provider.get_candidates()
+        assert call_count[0] == 1
+
+        t[0] = 30.0  # within refresh interval
+        provider.get_candidates()
+        assert call_count[0] == 1  # no second fetch
+
+    def test_refetches_after_interval(self) -> None:
+        t = [0.0]
+        call_count = [0]
+
+        def counting_fetcher(url: str, timeout: int) -> dict:  # type: ignore[type-arg]
+            call_count[0] += 1
+            return FIXTURE
+
+        provider = UniverseProvider(
+            config=UniverseProviderConfig(refresh_s=60.0),
+            clock=lambda: t[0],
+            fetcher=counting_fetcher,
+        )
+
+        provider.get_candidates()
+        assert call_count[0] == 1
+
+        t[0] = 61.0  # past refresh interval
+        provider.get_candidates()
+        assert call_count[0] == 2
+
+
+class TestProviderFetchFailureRetention:
+    """Provider retains previous universe on fetch failure."""
+
+    def test_retains_on_failure(self) -> None:
+        t = [0.0]
+        call_seq = [0]
+
+        def flaky_fetcher(url: str, timeout: int) -> dict:  # type: ignore[type-arg]
+            call_seq[0] += 1
+            if call_seq[0] == 1:
+                return FIXTURE
+            raise ConnectionError("network down")
+
+        provider = UniverseProvider(
+            config=UniverseProviderConfig(refresh_s=10.0),
+            clock=lambda: t[0],
+            fetcher=flaky_fetcher,
+        )
+
+        r1 = provider.get_candidates()
+        assert len(r1) > 0
+        assert provider.fetch_failures == 0
+
+        t[0] = 20.0  # stale, will try fetch → fail
+        r2 = provider.get_candidates()
+        assert r2 == r1  # retained previous
+        assert provider.fetch_failures == 1
+
+    def test_empty_on_first_failure(self) -> None:
+        provider = UniverseProvider(
+            fetcher=_failing_fetcher(),
+        )
+        result = provider.get_candidates()
+        assert result == []
+        assert provider.fetch_failures == 1
+
+
+class TestProviderBlacklist:
+    """Provider applies blacklist from config."""
+
+    def test_blacklist_applied(self) -> None:
+        provider = UniverseProvider(
+            config=UniverseProviderConfig(blacklist=frozenset({"SCAMUSDT"})),
+            fetcher=_fake_fetcher(FIXTURE),
+        )
+        result = provider.get_candidates()
+        assert "SCAMUSDT" not in result
+        assert "BTCUSDT" in result

@@ -4798,6 +4798,6 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 
 - **Decision:** Create `src/grinder/orchestration/universe_provider.py` — venue-level symbol discovery from Binance exchangeInfo.
 - **Phase:** D1. Discovery only — no prefilter, no tuning, no ranking, no runtime wiring.
-- **Contract:** `filter_candidates(exchange_info, config) -> list[str]` returns alphabetically sorted USDT perpetual TRADING symbols not in blacklist.
-- **Filtering:** `quoteAsset == "USDT"`, `contractType == "PERPETUAL"`, `status == "TRADING"`, not in `blacklist`. Malformed entries skipped. Duplicates deduplicated.
-- **Scope:** Pure function. Does not fetch data — caller provides exchangeInfo dict. Does not apply liquidity/volume/spread/OI prefilter.
+- **Provider:** `UniverseProvider` class with injectable clock + fetcher. `get_candidates()` fetches if stale (beyond `refresh_s`), retains previous universe on fetch failure (fail-safe). Returns empty list only if no successful fetch has ever occurred.
+- **Filter:** `filter_candidates(exchange_info, config) -> list[str]` — pure function: alphabetically sorted USDT perpetual TRADING symbols not in blacklist. Malformed entries skipped. Duplicates deduplicated.
+- **Scope:** Provider + filter. Does not apply liquidity/volume/spread/OI prefilter. Fetch uses stdlib urllib by default; injectable fetcher for tests.
