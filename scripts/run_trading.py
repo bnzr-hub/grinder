@@ -562,7 +562,9 @@ def _run_startup_tuning_shadow(
     try:
         prices = _fetch_startup_prices(symbols)
 
-        max_pos_usd = Decimal(os.environ.get("GRINDER_MAX_POSITION_USD", "1000"))
+        # Use env var if set; otherwise high sentinel (consistent with engine's "no cap" semantics)
+        raw_cap = os.environ.get("GRINDER_MAX_POSITION_USD")
+        max_pos_usd = Decimal(raw_cap) if raw_cap else Decimal("999999999")
         max_inv = int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "5"))
 
         config = TuningSolverConfig(

@@ -346,8 +346,8 @@ class TuningResult:
 | `SYMBOL_DISCOVERED count=N` | Universe refresh found N symbols |
 | `SYMBOL_PREFILTER_BLOCKED symbol=X reason=Y` | Symbol failed hard filter |
 | `SYMBOL_ELIGIBLE symbol=X` | Symbol passed prefilter |
-| `SYMBOL_TUNED symbol=X order_size=N tick=T` | Legal config computed |
-| `SYMBOL_NO_GO symbol=X reason=Y` | Cannot trade this symbol |
+| `SYMBOL_TUNED symbol=X order_size=N tick_size=T step_size=S min_notional=M price=P` | Legal config computed |
+| `SYMBOL_NO_GO symbol=X reason=Y price=P min_notional=M` | Cannot trade this symbol |
 | `SYMBOL_ACTIVATED symbol=X` | Added to active set |
 | `SYMBOL_DEACTIVATED symbol=X` | Removed from active set (was flat) |
 | `SYMBOL_GRACEFUL_EXIT_ONLY symbol=X` | Non-flat, blocking new entries |
