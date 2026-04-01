@@ -564,14 +564,14 @@ def _run_startup_tuning_shadow(
         # Solver emits PRICE_UNAVAILABLE for each symbol (visible, non-fatal).
         results = run_tuning_shadow(symbols, constraints, {}, config)
 
-        # Record into cache and metrics (B3b — shadow observability only)
+        # Record into cache and metrics (B3b — shadow observability only).
+        # Cache gauge values (cache_size, expired_total) are synced live
+        # by MetricsBuilder._build_tuning_metrics() on each /metrics scrape.
         cache = get_tuning_cache()
         metrics = get_tuning_metrics()
         for r in results:
             cache.put(r.symbol, r)
             metrics.record_result(r)
-        metrics.cache_size = cache.size
-        metrics.cache_expired_total = cache.expired_total
     except Exception as e:
         logging.getLogger(__name__).warning("TUNING_SHADOW_SKIPPED error=%s", e)
 

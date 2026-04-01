@@ -309,6 +309,7 @@ REQUIRED_METRICS_PATTERNS = [
     "grinder_tuning_result_total{status=",
     "# HELP grinder_tuning_no_go_total",
     "# TYPE grinder_tuning_no_go_total",
+    "grinder_tuning_no_go_total{reason=",
     "# HELP grinder_tuning_cache_size",
     "# TYPE grinder_tuning_cache_size",
     "grinder_tuning_cache_size",

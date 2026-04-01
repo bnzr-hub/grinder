@@ -158,7 +158,7 @@ Phase D: Autonomous discovery + continuous loop
 
 **What changes:**
 - Tuning solver emits log signals: `SYMBOL_TUNED`, `SYMBOL_NO_GO` (per doc 37 Section 10)
-- Prometheus metrics: `grinder_tuning_result_total{symbol, status}`, `grinder_tuning_no_go_total{symbol, reason}`
+- Prometheus metrics: `grinder_tuning_result_total{status}`, `grinder_tuning_no_go_total{reason}`
 - `TuningCache`: in-memory dict of `symbol -> TuningResult` with TTL
 - Selector can optionally filter input to TUNED-only symbols (shadow: log what would change)
 
@@ -315,7 +315,7 @@ SymbolOrchestrator (new)
 - Cache TTL expiry
 - Metrics increment on TUNED / NO_GO
 - Metrics contract: new metric names in SSOT
-**Observability:** `grinder_tuning_result_total{symbol, status}`, `grinder_tuning_no_go_total{symbol, reason}`.
+**Observability:** `grinder_tuning_result_total{status}`, `grinder_tuning_no_go_total{reason}`.
 **Proof bundle:** pytest, ruff, mypy. Show metrics output.
 **Must stay unchanged:** Dispatch loop. Active selector behavior.
 

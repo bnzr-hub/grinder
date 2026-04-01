@@ -75,10 +75,11 @@ class TuningMetrics:
         for status, count in sorted(effective.items()):
             lines.append(f'{METRIC_TUNING_RESULT_TOTAL}{{{LABEL_STATUS}="{status}"}} {count}')
 
-        # NO_GO total counter
+        # NO_GO total counter — always emit PRICE_UNAVAILABLE series for visibility
         lines.append(f"# HELP {METRIC_TUNING_NO_GO_TOTAL} Total NO_GO outcomes by reason")
         lines.append(f"# TYPE {METRIC_TUNING_NO_GO_TOTAL} counter")
-        for reason, count in sorted(self.no_go_total.items()):
+        effective_no_go = {**{"PRICE_UNAVAILABLE": 0}, **self.no_go_total}
+        for reason, count in sorted(effective_no_go.items()):
             lines.append(f'{METRIC_TUNING_NO_GO_TOTAL}{{{LABEL_REASON}="{reason}"}} {count}')
 
         # Cache size gauge
@@ -98,6 +99,9 @@ class TuningMetrics:
         for status in ("TUNED", "NO_GO"):
             if status not in self.result_total:
                 self.result_total[status] = 0
+        # Ensure at least one no_go reason series is emitted for contract validation
+        if "PRICE_UNAVAILABLE" not in self.no_go_total:
+            self.no_go_total["PRICE_UNAVAILABLE"] = 0
 
     def reset(self) -> None:
         """Reset all metrics."""

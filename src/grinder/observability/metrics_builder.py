@@ -38,6 +38,7 @@ from grinder.risk.emergency_exit_metrics import get_emergency_exit_metrics
 from grinder.risk.risk_base_metrics import get_risk_base_metrics
 from grinder.selection.active_selector import get_active_selector_metrics
 from grinder.selection.shadow_selector import get_selector_metrics
+from grinder.tuning.cache import get_tuning_cache
 from grinder.tuning.metrics import get_tuning_metrics
 
 
@@ -407,8 +408,16 @@ class MetricsBuilder:
         return get_active_selector_metrics().to_prometheus_lines()
 
     def _build_tuning_metrics(self) -> list[str]:
-        """Build tuning metrics (PR-B3b)."""
-        return get_tuning_metrics().to_prometheus_lines()
+        """Build tuning metrics (PR-B3b).
+
+        Syncs live cache values into metrics on each scrape so
+        Prometheus sees current cache_size and expired_total.
+        """
+        cache = get_tuning_cache()
+        metrics = get_tuning_metrics()
+        metrics.cache_size = cache.size
+        metrics.cache_expired_total = cache.expired_total
+        return metrics.to_prometheus_lines()
 
 
 class _BuilderHolder:

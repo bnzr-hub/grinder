@@ -73,19 +73,15 @@ class TuningCache:
             self.expired_total = 0
 
 
-# Module-level singleton
-_cache: TuningCache | None = None
+# Module-level singleton (eager init — no race at creation time)
+_cache = TuningCache()
 
 
 def get_tuning_cache() -> TuningCache:
-    """Get or create global tuning cache instance."""
-    global _cache  # noqa: PLW0603
-    if _cache is None:
-        _cache = TuningCache()
+    """Get global tuning cache instance."""
     return _cache
 
 
 def reset_tuning_cache() -> None:
     """Reset global tuning cache (for testing)."""
-    global _cache  # noqa: PLW0603
-    _cache = None
+    _cache.reset()
