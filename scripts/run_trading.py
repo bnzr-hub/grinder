@@ -528,40 +528,23 @@ def _load_symbol_constraints() -> dict[str, SymbolConstraints] | None:
     return None
 
 
-def _fetch_startup_prices(symbols: list[str]) -> dict[str, Decimal]:
-    """Fetch current prices for symbols via Binance Futures REST (best-effort).
-
-    Uses stdlib urllib — no dependency on HttpClient or exchange port.
-    Returns empty dict on failure (caller handles gracefully).
-    """
-    prices: dict[str, Decimal] = {}
-    for symbol in symbols:
-        try:
-            url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read())
-                prices[symbol] = Decimal(str(data["price"]))
-        except Exception:
-            pass  # Solver will emit PRICE_UNAVAILABLE for this symbol
-    return prices
-
-
 def _run_startup_tuning_shadow(
     symbols: list[str],
     constraints: dict[str, SymbolConstraints] | None,
 ) -> None:
     """Run shadow tuning at startup and log outcomes.
 
-    Shadow-only: no dispatch mutation, no selector change.
+    Shadow-only: no dispatch mutation, no selector change, no new network I/O.
+    Prices are not available at this startup stage — every symbol will get
+    SYMBOL_NO_GO reason=PRICE_UNAVAILABLE. This is the correct B3a behavior:
+    visibility into constraint readiness without introducing new data acquisition.
+
     Fail-open: errors are logged but never block startup.
     """
     from grinder.tuning.shadow import run_tuning_shadow  # noqa: PLC0415
     from grinder.tuning.solver import TuningSolverConfig  # noqa: PLC0415
 
     try:
-        prices = _fetch_startup_prices(symbols)
-
         # Use env var if set; otherwise high sentinel (consistent with engine's "no cap" semantics)
         raw_cap = os.environ.get("GRINDER_MAX_POSITION_USD")
         max_pos_usd = Decimal(raw_cap) if raw_cap else Decimal("999999999")
@@ -572,9 +555,11 @@ def _run_startup_tuning_shadow(
             max_inventory_levels=max_inv,
         )
 
-        run_tuning_shadow(symbols, constraints, prices, config)
+        # No price source at startup in B3a — pass empty prices.
+        # Solver emits PRICE_UNAVAILABLE for each symbol (visible, non-fatal).
+        run_tuning_shadow(symbols, constraints, {}, config)
     except Exception as e:
-        print(f"  TUNING_SHADOW skipped: {e}")
+        logging.getLogger(__name__).warning("TUNING_SHADOW_SKIPPED error=%s", e)
 
 
 FuturesPreflightStatus = Literal[

@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import logging
 from decimal import Decimal
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pytest
 
 from grinder.execution.engine import SymbolConstraints
 from grinder.tuning.shadow import run_tuning_shadow
@@ -258,6 +262,69 @@ class TestDeterminism:
         r2 = run_tuning_shadow(symbols, constraints, prices, DEFAULT_CONFIG)
 
         assert r1 == r2
+
+
+# --- Tests: _run_startup_tuning_shadow wrapper (call-site integration) ---
+
+
+class TestRunStartupTuningShadowWrapper:
+    """Tests for the production call-site wrapper in run_trading.py."""
+
+    def test_invokes_shadow_helper(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Wrapper calls run_tuning_shadow and returns normally."""
+        import scripts.run_trading as rt  # noqa: PLC0415
+
+        called_with: list[tuple[list[str], object]] = []
+
+        def fake_shadow(
+            symbols: list[str],
+            constraints: object,
+            prices: object,
+            config: object,
+        ) -> list[object]:
+            called_with.append((symbols, constraints))
+            return []
+
+        monkeypatch.setattr("grinder.tuning.shadow.run_tuning_shadow", fake_shadow)
+
+        rt._run_startup_tuning_shadow(["BTCUSDT"], {"BTCUSDT": BTC_CONSTRAINTS})
+
+        assert len(called_with) == 1
+        assert called_with[0][0] == ["BTCUSDT"]
+
+    def test_fail_open_on_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Exception inside shadow path is swallowed — startup continues."""
+        import scripts.run_trading as rt  # noqa: PLC0415
+
+        def exploding_shadow(*args: object, **kwargs: object) -> list[object]:
+            raise RuntimeError("solver exploded")
+
+        monkeypatch.setattr("grinder.tuning.shadow.run_tuning_shadow", exploding_shadow)
+
+        # Must not raise
+        rt._run_startup_tuning_shadow(["BTCUSDT"], {"BTCUSDT": BTC_CONSTRAINTS})
+
+    def test_passes_empty_prices(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Wrapper passes empty prices dict (no new network I/O in B3a)."""
+        import scripts.run_trading as rt  # noqa: PLC0415
+
+        received_prices: list[dict[str, Decimal]] = []
+
+        def capture_shadow(
+            symbols: list[str],
+            constraints: object,
+            prices: dict[str, Decimal],
+            config: object,
+        ) -> list[object]:
+            received_prices.append(prices)
+            return []
+
+        monkeypatch.setattr("grinder.tuning.shadow.run_tuning_shadow", capture_shadow)
+
+        rt._run_startup_tuning_shadow(["BTCUSDT"], {"BTCUSDT": BTC_CONSTRAINTS})
+
+        assert len(received_prices) == 1
+        assert received_prices[0] == {}
 
 
 # --- Helper for capturing log output ---
