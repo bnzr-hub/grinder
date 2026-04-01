@@ -4819,3 +4819,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Key definitions:** ExecutionCoordinator, EngineRegistry (8 states), ActivationCeremony, DeactivationCeremony, desired-vs-actual reconciliation, 6 STL-E rules, operator controls. 6 phases (E1–E6).
 - **Ownership split:** Control-plane produces action intents. Execution-plane executes them against real per-symbol engines. LiveEngineV0 remains single-symbol, unchanged.
 - **Relationship:** Continues the autonomous multi-symbol workstream. Control-plane (docs 37/38, ADRs 122–132) is complete. Execution-plane is the next layer.
+
+### ADR-134: Engine registry and execution state model (2026-04-01)
+
+- **Decision:** Create `src/grinder/execution_plane/registry.py` — pure data model for per-symbol engine tracking with validated state transitions.
+- **Phase:** E1. Pure data model, no engine start/stop, no exchange I/O.
+- **States:** 8 (ABSENT, ACTIVATING, ACTIVE, GRACEFUL_EXIT, SHUTTING_DOWN, STOPPED, FAILED, QUARANTINED). 10 valid transitions.
+- **Contract:** `EngineRegistry` with register/deregister/transition/get_state/list_present/find_missing/find_orphan. Duplicate registration rejected. Invalid transitions raise `InvalidEngineTransitionError`.
+- **Boundary:** Registry stores state and validates transitions. It does NOT execute actions, decide retries, or own ceremonies.

@@ -91,7 +91,7 @@ Tracks all per-symbol engine instances and their current execution state.
 - Detect orphan engines (running but not in desired set)
 - Detect missing engines (desired but not running)
 
-**Contract:** `get_state(symbol) -> EngineState`, `list_active() -> list[EngineHandle]`
+**Contract:** `get_state(symbol) -> EngineState`, `list_present() -> list[EngineHandle]` (ACTIVATING, ACTIVE, GRACEFUL_EXIT, SHUTTING_DOWN)
 
 ### 3.2 EngineHandle
 
