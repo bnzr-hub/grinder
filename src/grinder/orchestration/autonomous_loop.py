@@ -11,8 +11,9 @@ Continuous loop that wires all orchestration stages per doc 37 Section 3:
   5. Orchestrator reconcile (SymbolOrchestrator → RotationController)
   6. Cycle report
 
-Control-plane: produces action intents and cycle reports. Does not execute
-engine start/stop or exchange writes. Execution is the caller's responsibility.
+Control-plane produces action intents and cycle reports. Optional Stage 8
+runs ExecutionCoordinator when execution_enabled + execution_acknowledged.
+Default: shadow-only (no execution).
 
 Continuous runner: run_forever() loops on configurable cadence with
 injectable clock and sleep. stop() halts gracefully.

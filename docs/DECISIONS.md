@@ -4844,7 +4844,7 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Graceful exit:** `signal_graceful_exit(symbol, registry, exit_hook)` — injectable hook signals entry blocking, transitions ACTIVE → GRACEFUL_EXIT. Idempotent on already GRACEFUL_EXIT. Fail-closed on hook failure. Note: this is a signal primitive — the hook abstracts the actual dispatch-gate effect. Real dispatch-gate integration (proving `is_selector_dispatch_allowed` blocks entries) is deferred to bounded live proof.
 - **Deactivation:** `deactivate(symbol, registry, facts, stop_engine, cleanup, verify_clean)` — only from GRACEFUL_EXIT, requires finalize gate (flat + no orders). Stop → cleanup → verify → STOPPED or FAILED. All deps injectable.
 - **Signals:** `ENGINE_GRACEFUL_EXIT_STARTED/COMPLETED/FAILED`, `ENGINE_DEACTIVATION_STARTED/COMPLETED/FAILED/BLOCKED`.
-- **Live proof:** Bounded ceremony 2026-04-01 on BTCUSDT @ `4057e98`. Preflight CLEAN → 60s trading → SIGINT → cleanup-on-exit → post-verify CLEAN (orders=0, position=FLAT). E3 gate closed.
+- **Live proof:** Pending. SIGINT shutdown/cleanup proof (C2b pattern) is insufficient for E3 gate. E3 requires: graceful-exit signal → no-new-entries evidence → finalize gate → deactivation ceremony → clean exchange state.
 
 ### ADR-137: Desired-vs-actual engine reconciliation (2026-04-01)
 
@@ -4865,7 +4865,7 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 ### ADR-139: Execution coordinator and loop integration (2026-04-01)
 
 - **Decision:** Create `src/grinder/execution_plane/coordinator.py` — maps corrective actions to injectable ceremony calls with 4-gate safety chain.
-- **Phase:** E6. ExecutionCoordinator wired into `AutonomousLoop.run_cycle()` as optional Stage 8. E3 live proof now captured (2026-04-01). Execution-plane plan complete.
+- **Phase:** E6. ExecutionCoordinator wired into `AutonomousLoop.run_cycle()` as optional Stage 8. E3 live proof still pending (requires real graceful-exit evidence).
 - **Gate chain:** (1) execution_enabled (default OFF) → (2) operator ACK → (3) safety evaluator → (4) operator pause. All four must pass before any action executes.
 - **Per-action gates:** Quarantined symbols blocked per-action. Unmapped action kinds skipped.
 - **Contract:** `ExecutionCoordinator.execute(report, safety, operator, enabled, acked) -> ExecutionReport` with per-action results, skip reasons, and execution-attempted flag.
