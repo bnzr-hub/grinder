@@ -4827,3 +4827,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **States:** 8 (ABSENT, ACTIVATING, ACTIVE, GRACEFUL_EXIT, SHUTTING_DOWN, STOPPED, FAILED, QUARANTINED). 10 valid transitions.
 - **Contract:** `EngineRegistry` with register/deregister/transition/get_state/list_present/find_missing/find_orphan. Duplicate registration rejected. Invalid transitions raise `InvalidEngineTransitionError`.
 - **Boundary:** Registry stores state and validates transitions. It does NOT execute actions, decide retries, or own ceremonies.
+
+### ADR-135: Per-symbol engine activation ceremony (2026-04-01)
+
+- **Decision:** Create `src/grinder/execution_plane/activation.py` — safely starts one per-symbol engine with injectable dependencies.
+- **Phase:** E2. First execution-plane PR with real runtime semantics (via injectable stubs for testing).
+- **Sequence:** Duplicate check → clean exchange verify → register ACTIVATING → build engine → health check → ACTIVE or FAILED.
+- **Fail-closed:** Any error (verify, build, health) → FAILED in registry. No retry loops.
+- **Dependencies:** All injectable: verify_clean, engine_factory, health_check. No hidden globals.
+- **Signals:** `ENGINE_ACTIVATION_STARTED`, `ENGINE_ACTIVATION_COMPLETED`, `ENGINE_ACTIVATION_FAILED`.
