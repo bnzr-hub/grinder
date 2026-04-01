@@ -4784,3 +4784,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Contract:** `can_finalize_deactivation(symbol, facts) -> DeactivationDecision` with `can_finalize` and `block_reason`.
 - **Block reasons:** `POSITION_NOT_FLAT`, `OPEN_ORDERS_REMAIN`, `POSITION_NOT_FLAT_AND_ORDERS_REMAIN`.
 - **Scope:** Finalize gate only. Stage progression (ACTIVE → GRACEFUL_EXIT_ONLY → COOLDOWN) is owned by RotationController, not this module.
+
+### ADR-130: Bounded live deactivation ceremony (2026-04-01)
+
+- **Decision:** Create `scripts/deactivation_ceremony.py` — bounded live ceremony that proves symbol deactivation reaches clean exchange state.
+- **Phase:** C2b. Live proof, not pure logic. Uses existing cleanup-on-exit infrastructure.
+- **Sequence:** Pre-flight verify → bounded trading → SIGINT (graceful shutdown) → cleanup-on-exit → post-verify with retries.
+- **Success:** `EXCHANGE_STATE_VERIFY status=CLEAN orders=0 position=FLAT` after ceremony.
+- **Runbook:** `docs/runbooks/39_SYMBOL_DEACTIVATION_CEREMONY.md` with exact commands, evidence checklist, failure handling.
