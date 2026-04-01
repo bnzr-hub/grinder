@@ -4844,3 +4844,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Graceful exit:** `signal_graceful_exit(symbol, registry, exit_hook)` — injectable hook signals entry blocking, transitions ACTIVE → GRACEFUL_EXIT. Idempotent on already GRACEFUL_EXIT. Fail-closed on hook failure. Note: this is a signal primitive — the hook abstracts the actual dispatch-gate effect. Real dispatch-gate integration (proving `is_selector_dispatch_allowed` blocks entries) is deferred to bounded live proof.
 - **Deactivation:** `deactivate(symbol, registry, facts, stop_engine, cleanup, verify_clean)` — only from GRACEFUL_EXIT, requires finalize gate (flat + no orders). Stop → cleanup → verify → STOPPED or FAILED. All deps injectable.
 - **Signals:** `ENGINE_GRACEFUL_EXIT_STARTED/COMPLETED/FAILED`, `ENGINE_DEACTIVATION_STARTED/COMPLETED/FAILED/BLOCKED`.
+
+### ADR-137: Desired-vs-actual engine reconciliation (2026-04-01)
+
+- **Decision:** Create `src/grinder/execution_plane/reconciler.py` — compares desired engine set with EngineRegistry actual state, emits bounded corrective actions.
+- **Phase:** E4. Pure reconciliation, no engine execution.
+- **Mismatches:** MISSING (desired but absent/stopped), ORPHAN (present but not desired), STATE_MISMATCH (desired but in wrong state).
+- **Actions:** ACTIVATE_ENGINE, REQUEST_GRACEFUL_EXIT, FINALIZE_DEACTIVATION, QUARANTINE_ENGINE. All symbolic — caller executes.
+- **Bounded:** `max_actions_per_cycle` caps corrective actions. Deterministic sort by symbol.
