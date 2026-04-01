@@ -1889,7 +1889,7 @@ Comprehensive adaptive grid system design:
 - **Spec:** `docs/39_EXECUTION_PLANE_ARCHITECTURE_SPEC.md`
 - **Plan:** `docs/40_EXECUTION_PLANE_IMPLEMENTATION_PLAN.md`
 - **Phase E1 (engine registry):** [DONE] `EngineState` (8 states), `EngineHandle`, `EngineRegistry` in `src/grinder/execution_plane/registry.py`. Validated transitions, duplicate rejection, missing/orphan detection. Pure data model, no engine operations (ADR-134). 27 tests.
-- **Phase E2 (activation ceremony):** [NOT STARTED] Per-symbol engine startup with health verification.
+- **Phase E2 (activation ceremony):** [DONE] `activate()` in `src/grinder/execution_plane/activation.py` — clean-verify gated, fail-closed. ABSENT → ACTIVATING → ACTIVE/FAILED. Injectable deps (verifier, factory, health check). Live proof pending (ADR-135). 14 tests.
 - **Phase E3 (deactivation ceremony):** [NOT STARTED] Per-symbol engine shutdown with cleanup verification.
 - **Phase E4 (reconciliation):** [NOT STARTED] Desired-vs-actual engine state reconciliation.
 - **Phase E5 (safety controls):** [NOT STARTED] Stop-the-line, quarantine, operator controls.
