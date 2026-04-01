@@ -328,6 +328,7 @@ class TestRunCleanupOnExit:
             capture_output: bool,
             text: bool,
             check: bool,
+            timeout: int | None = None,
         ) -> Any:
             calls.append(cmd)
             assert env["ALLOW_MAINNET_TRADE"] == "1"
@@ -346,7 +347,9 @@ class TestRunCleanupOnExit:
         assert failures == 0
         assert calls == [
             [sys.executable, "-m", "scripts.exchange_state", "cleanup", "BTCUSDT"],
+            [sys.executable, "-m", "scripts.exchange_state", "verify", "BTCUSDT"],
             [sys.executable, "-m", "scripts.exchange_state", "cleanup", "ETHUSDT"],
+            [sys.executable, "-m", "scripts.exchange_state", "verify", "ETHUSDT"],
         ]
 
 
