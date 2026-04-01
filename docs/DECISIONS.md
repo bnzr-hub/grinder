@@ -4759,3 +4759,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Metrics:** `grinder_tuning_result_total{status}`, `grinder_tuning_no_go_total{reason}`, `grinder_tuning_cache_size`, `grinder_tuning_cache_expired_total`. No `symbol=` label (FORBIDDEN_METRIC_LABELS, ADR-028).
 - **Cache:** `TuningCache` in `src/grinder/tuning/cache.py`. Thread-safe, TTL-based. Entries expire on get(). Injectable clock for deterministic testing.
 - **Ownership:** `_run_startup_tuning_shadow()` in `run_trading.py` is the sole writer to both cache and metrics. `run_tuning_shadow()` remains a pure helper.
+
+### ADR-127: Symbol lifecycle state machine (2026-04-01)
+
+- **Decision:** Create `src/grinder/rotation/state_machine.py` — pure deterministic state machine for symbol rotation lifecycle.
+- **Phase:** C1a. Pure logic, no engine wiring, no selector changes, no orchestrator yet.
+- **States:** 9 states from doc 37 Section 5: DISCOVERED, PREFILTER_BLOCKED, ELIGIBLE, TUNING_CHECK, NO_GO, TUNED, ACTIVE, GRACEFUL_EXIT_ONLY, COOLDOWN.
+- **Design:** Data-driven transition table (dict, not if/else). Invalid transitions raise `InvalidTransitionError`. Transition history tracked for audit. Re-entry paths: NO_GO→ELIGIBLE, PREFILTER_BLOCKED→ELIGIBLE, COOLDOWN→ELIGIBLE.
+- **Controller:** `RotationController` in `src/grinder/rotation/controller.py` — reconciles desired active set with current symbol states. Owns per-symbol `SymbolLifecycle` instances. Produces `RotationAction` intents (ACTIVATE, REQUEST_GRACEFUL_EXIT, FINALIZE_DEACTIVATION). Enforces `top_k`, `max_changes_per_cycle`, `min_hold_cycles`. Non-flat symbols go through graceful exit path.
+- **Ownership:** Controller produces symbolic intents only. Orchestrator (C1b) will execute them against real engines.

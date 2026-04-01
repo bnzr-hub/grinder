@@ -194,7 +194,8 @@ SymbolOrchestrator (new)
 ```
 
 **What changes:**
-- New module: `src/grinder/orchestration/` — `SymbolOrchestrator`, `RotationController`
+- `src/grinder/rotation/` — `SymbolLifecycle` (pure SM) + `RotationController` (reconcile/action-intent core). Landed in C1a.
+- `src/grinder/orchestration/` — `SymbolOrchestrator` (engine lifecycle, wiring). Lands in C1b.
 - ActiveSelector receives only TUNED symbols as input (not raw universe)
 - Rotation controller: owns symbol state machine (doc 37 Section 5)
 - Orchestrator on activation: spawn engine instance with tuned config
@@ -319,36 +320,33 @@ SymbolOrchestrator (new)
 **Proof bundle:** pytest, ruff, mypy. Show metrics output.
 **Must stay unchanged:** Dispatch loop. Active selector behavior.
 
-### PR-C1a: Rotation controller state machine
+### PR-C1a: Rotation controller core
 
-**Title:** `feat(rotation): symbol lifecycle state machine`
-**Goal:** Pure state machine for symbol lifecycle (doc 37 Section 5). No engine wiring.
+**Title:** `feat(rotation): symbol lifecycle state machine + rotation controller`
+**Goal:** Pure rotation controller with reconcile/action-intent semantics (doc 37 Sections 5-6). No engine wiring.
 **Files touched:**
 - `src/grinder/rotation/__init__.py` (new)
-- `src/grinder/rotation/state_machine.py` (new) — `SymbolState` enum, `SymbolLifecycle`, transition rules
+- `src/grinder/rotation/state_machine.py` (new) — `SymbolState` (9 states), `SymbolLifecycle`, `VALID_TRANSITIONS`, `InvalidTransitionError`
+- `src/grinder/rotation/controller.py` (new) — `RotationController` (reconcile desired set, bounded changes, graceful exit, action intents)
 - `tests/unit/test_rotation_state_machine.py` (new)
-**Dependencies:** None (pure logic). Can parallel with B3b.
+- `tests/unit/test_rotation_controller.py` (new)
+**Dependencies:** None (pure logic).
 **Tests required:**
-- All 9 states defined (DISCOVERED through COOLDOWN)
-- Valid transitions: DISCOVERED → ELIGIBLE, DISCOVERED → PREFILTER_BLOCKED, ELIGIBLE → TUNING_CHECK, TUNING_CHECK → TUNED, TUNING_CHECK → NO_GO, TUNED → ACTIVE, ACTIVE → GRACEFUL_EXIT_ONLY, GRACEFUL_EXIT_ONLY → COOLDOWN, COOLDOWN → ELIGIBLE
-- Invalid transitions rejected
-- Transition reason codes emitted
-- Determinism: same sequence → same state
-**Observability:** None (pure SM, metrics added in wiring PR).
+- All 9 states, all valid/invalid transitions, reason codes, determinism
+- Controller: activation path, graceful exit for non-flat, finalize on flat, cooldown blocks re-entry, bounded changes, min hold cycles, no churn, top_k respected, replacement deferred for non-flat
+**Observability:** None (pure logic, metrics added in wiring PR).
 **Proof bundle:** pytest, ruff, mypy.
 **Must stay unchanged:** No engine changes. No selector changes.
 
-### PR-C1b: Symbol orchestrator + rotation controller wiring
+### PR-C1b: Symbol orchestrator wiring
 
 **Title:** `feat(orchestration): symbol orchestrator with rotation controller`
-**Goal:** `SymbolOrchestrator` owns active set and per-symbol engine lifecycle. `RotationController` manages state transitions. `LiveEngineV0` is not modified.
+**Goal:** `SymbolOrchestrator` owns per-symbol engine lifecycle. Uses `RotationController` (from C1a) for state transitions. `LiveEngineV0` is not modified.
 **Files touched:**
 - `src/grinder/orchestration/__init__.py` (new)
-- `src/grinder/orchestration/orchestrator.py` (new) — `SymbolOrchestrator` (spawns/stops per-symbol engines, owns active set)
-- `src/grinder/rotation/controller.py` (new) — `RotationController` (per-symbol state, calls selector + cache)
+- `src/grinder/orchestration/orchestrator.py` (new) — `SymbolOrchestrator` (spawns/stops per-symbol engines, executes RotationAction intents)
 - `scripts/run_trading.py` — optional `--orchestrator` mode (feature-flagged, default OFF)
 - `tests/unit/test_symbol_orchestrator.py` (new)
-- `tests/unit/test_rotation_controller.py` (new)
 **Dependencies:** PR-C1a, PR-B3b.
 **Tests required:**
 - Orchestrator spawns engine on TUNED → ACTIVE transition
