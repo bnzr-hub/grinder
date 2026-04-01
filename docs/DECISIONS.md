@@ -4734,3 +4734,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Why:** Future tuning solver needs `min_notional` to compute legal order sizes and declare NO_GO for symbols where minimum notional exceeds budget.
 - **Backward compat:** Default `min_notional = Decimal("0")`. Old cache files without the field load successfully.
 - **Filter priority:** `MIN_NOTIONAL` checked first (more common on futures), then `NOTIONAL` as fallback.
+
+### ADR-124: Deterministic symbol tuning solver (2026-04-01)
+
+- **Decision:** Create `src/grinder/tuning/solver.py` — pure deterministic function that computes legal grid_v2 order size from constraints + price + risk config.
+- **Phase:** B2. Pure computation, no runtime wiring, no dispatch change.
+- **Contract:** `solve(symbol, constraints, price, config) -> TuningResult` with status `TUNED` or `NO_GO`.
+- **NO_GO reasons:** `NOTIONAL_TOO_LOW`, `POSITION_EXCEEDS_CAP`, `TICK_SIZE_UNAVAILABLE`, `STEP_SIZE_UNAVAILABLE`, `PRICE_UNAVAILABLE`, `BLACKLISTED`.
+- **Rounding:** `ceil_to_step()` for notional-driven quantity (rounds up to ensure min_notional met). `floor_to_step()` (existing) not reused here — min-notional needs upward rounding.
+- **Determinism:** Same inputs always produce same `TuningResult`. All arithmetic is `Decimal`, no floats.
