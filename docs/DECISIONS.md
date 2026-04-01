@@ -4864,7 +4864,7 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 ### ADR-139: Execution coordinator and loop integration (2026-04-01)
 
 - **Decision:** Create `src/grinder/execution_plane/coordinator.py` — maps corrective actions to injectable ceremony calls with 4-gate safety chain.
-- **Phase:** E6. Completes the execution-plane plan (doc 40).
+- **Phase:** E6 coordinator. Actual wiring into `AutonomousLoop.run_cycle()` pending. Execution-plane plan completion blocked by E3 live proof gate.
 - **Gate chain:** (1) execution_enabled (default OFF) → (2) operator ACK → (3) safety evaluator → (4) operator pause. All four must pass before any action executes.
 - **Per-action gates:** Quarantined symbols blocked per-action. Unmapped action kinds skipped.
 - **Contract:** `ExecutionCoordinator.execute(report, safety, operator, enabled, acked) -> ExecutionReport` with per-action results, skip reasons, and execution-attempted flag.
