@@ -4766,4 +4766,5 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Phase:** C1a. Pure logic, no engine wiring, no selector changes, no orchestrator yet.
 - **States:** 9 states from doc 37 Section 5: DISCOVERED, PREFILTER_BLOCKED, ELIGIBLE, TUNING_CHECK, NO_GO, TUNED, ACTIVE, GRACEFUL_EXIT_ONLY, COOLDOWN.
 - **Design:** Data-driven transition table (dict, not if/else). Invalid transitions raise `InvalidTransitionError`. Transition history tracked for audit. Re-entry paths: NO_GO→ELIGIBLE, PREFILTER_BLOCKED→ELIGIBLE, COOLDOWN→ELIGIBLE.
-- **Ownership:** `SymbolLifecycle` tracks per-symbol state. Future `RotationController` (C1b) will own multiple `SymbolLifecycle` instances.
+- **Controller:** `RotationController` in `src/grinder/rotation/controller.py` — reconciles desired active set with current symbol states. Owns per-symbol `SymbolLifecycle` instances. Produces `RotationAction` intents (ACTIVATE, REQUEST_GRACEFUL_EXIT, FINALIZE_DEACTIVATION). Enforces `top_k`, `max_changes_per_cycle`, `min_hold_cycles`. Non-flat symbols go through graceful exit path.
+- **Ownership:** Controller produces symbolic intents only. Orchestrator (C1b) will execute them against real engines.
