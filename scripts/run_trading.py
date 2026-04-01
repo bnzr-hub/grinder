@@ -528,6 +528,40 @@ def _load_symbol_constraints() -> dict[str, SymbolConstraints] | None:
     return None
 
 
+def _run_startup_tuning_shadow(
+    symbols: list[str],
+    constraints: dict[str, SymbolConstraints] | None,
+) -> None:
+    """Run shadow tuning at startup and log outcomes.
+
+    Shadow-only: no dispatch mutation, no selector change, no new network I/O.
+    Prices are not available at this startup stage — every symbol will get
+    SYMBOL_NO_GO reason=PRICE_UNAVAILABLE. This is the correct B3a behavior:
+    visibility into constraint readiness without introducing new data acquisition.
+
+    Fail-open: errors are logged but never block startup.
+    """
+    from grinder.tuning.shadow import run_tuning_shadow  # noqa: PLC0415
+    from grinder.tuning.solver import TuningSolverConfig  # noqa: PLC0415
+
+    try:
+        # Use env var if set; otherwise high sentinel (consistent with engine's "no cap" semantics)
+        raw_cap = os.environ.get("GRINDER_MAX_POSITION_USD")
+        max_pos_usd = Decimal(raw_cap) if raw_cap else Decimal("999999999")
+        max_inv = int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "5"))
+
+        config = TuningSolverConfig(
+            max_position_usd=max_pos_usd,
+            max_inventory_levels=max_inv,
+        )
+
+        # No price source at startup in B3a — pass empty prices.
+        # Solver emits PRICE_UNAVAILABLE for each symbol (visible, non-fatal).
+        run_tuning_shadow(symbols, constraints, {}, config)
+    except Exception as e:
+        logging.getLogger(__name__).warning("TUNING_SHADOW_SKIPPED error=%s", e)
+
+
 FuturesPreflightStatus = Literal[
     "skipped",
     "passed",
@@ -1847,6 +1881,10 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     if not preflight_report.passed:
         print("LIVE_PREFLIGHT BLOCKED: armed run cannot start. Fix blockers above.")
         sys.exit(2)
+
+    # Shadow tuning: log SYMBOL_TUNED / SYMBOL_NO_GO per symbol (PR-B3a).
+    # Pure startup visibility — no dispatch change, no selector change.
+    _run_startup_tuning_shadow(symbols, preflight_constraints)
 
     server = run_server(args.metrics_port)
     print(f"  Health endpoint: http://localhost:{args.metrics_port}/healthz")
