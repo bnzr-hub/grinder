@@ -4858,5 +4858,5 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Create `safety.py` (stop-the-line evaluator) and `operator.py` (operator controls) in `src/grinder/execution_plane/`.
 - **Phase:** E5. Pure safety/control logic — no engine execution, no loop integration.
 - **STL-E rules implemented:** STL-E3 (orphan engine), STL-E5 (mismatch threshold). STL-E1/E2/E6 deferred (require runtime health/failure history not yet available).
-- **Operator controls:** pause/resume (global), quarantine/release (per-symbol), force-deactivate (pending intent for coordinator). All produce `AuditRecord`. Quarantine blocks activation. Release does not auto-activate.
+- **Operator controls:** pause/resume (global), quarantine/release (per-symbol), force-deactivate (pending intent for coordinator — not immediate kill). All produce `AuditRecord`. Quarantine blocks activation. Release removes quarantine block only — does not auto-activate or verify clean state. Emergency stop all deferred.
 - **Safety evaluator:** `evaluate_safety(report, paused, config) -> SafetyResult` with `execution_allowed`, `triggered_rules`.
