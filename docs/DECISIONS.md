@@ -4852,3 +4852,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Mismatches:** MISSING (desired but absent/stopped), ORPHAN (present but not desired), STATE_MISMATCH (desired but in wrong state).
 - **Actions:** ACTIVATE_ENGINE, REQUEST_GRACEFUL_EXIT, FINALIZE_DEACTIVATION, QUARANTINE_ENGINE. All symbolic — caller executes.
 - **Bounded:** `max_actions_per_cycle` caps corrective actions. Global sort by symbol before bounding (not bucket-then-symbol).
+
+### ADR-138: Execution safety controls and operator interface (2026-04-01)
+
+- **Decision:** Create `safety.py` (stop-the-line evaluator) and `operator.py` (operator controls) in `src/grinder/execution_plane/`.
+- **Phase:** E5. Pure safety/control logic — no engine execution, no loop integration.
+- **STL-E rules implemented:** STL-E3 (orphan engine), STL-E5 (mismatch threshold). STL-E1/E2/E6 deferred (require runtime health/failure history not yet available).
+- **Operator controls:** pause/resume (global), quarantine/release (per-symbol), force-deactivate (pending intent for coordinator). All produce `AuditRecord`. Quarantine blocks activation. Release does not auto-activate.
+- **Safety evaluator:** `evaluate_safety(report, paused, config) -> SafetyResult` with `execution_allowed`, `triggered_rules`.
