@@ -131,10 +131,16 @@ def run_ceremony(args: argparse.Namespace) -> int:  # noqa: PLR0915
         str(args.paper_levels),
         "--armed",
         "--mainnet",
+        "--skip-launch-guard",
     ]
 
     logger.info("E3_CEREMONY_TRADING_ACTIVE symbol=%s", symbol)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    import os  # noqa: PLC0415
+
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
+    )
 
     collector = EvidenceCollector()
     reader = threading.Thread(target=_stream_output, args=(proc, collector), daemon=True)

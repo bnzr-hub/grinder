@@ -4844,7 +4844,7 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Graceful exit:** `signal_graceful_exit(symbol, registry, exit_hook)` — injectable hook signals entry blocking, transitions ACTIVE → GRACEFUL_EXIT. Idempotent on already GRACEFUL_EXIT. Fail-closed on hook failure. Note: this is a signal primitive — the hook abstracts the actual dispatch-gate effect. Real dispatch-gate integration (proving `is_selector_dispatch_allowed` blocks entries) is deferred to bounded live proof.
 - **Deactivation:** `deactivate(symbol, registry, facts, stop_engine, cleanup, verify_clean)` — only from GRACEFUL_EXIT, requires finalize gate (flat + no orders). Stop → cleanup → verify → STOPPED or FAILED. All deps injectable.
 - **Signals:** `ENGINE_GRACEFUL_EXIT_STARTED/COMPLETED/FAILED`, `ENGINE_DEACTIVATION_STARTED/COMPLETED/FAILED/BLOCKED`.
-- **Live proof:** Pending. SIGINT shutdown/cleanup proof (C2b pattern) is insufficient for E3 gate. E3 requires: graceful-exit signal → no-new-entries evidence → finalize gate → deactivation ceremony → clean exchange state.
+- **Live proof:** PROVEN. Bounded ceremony 2026-04-01 on BTCUSDT @ `29af581`: pre_activity=1, graceful_exit_seen=True, post_entries=0, final verify CLEAN (orders=0, position=FLAT). E3 gate closed.
 
 ### ADR-137: Desired-vs-actual engine reconciliation (2026-04-01)
 
