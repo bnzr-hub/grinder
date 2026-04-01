@@ -4751,3 +4751,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Implementation:** `src/grinder/tuning/shadow.py` (`run_tuning_shadow()`), called after preflight in `scripts/run_trading.py`.
 - **Fail-open:** Missing price → `SYMBOL_NO_GO reason=PRICE_UNAVAILABLE`. Missing constraints → solver emits appropriate NO_GO from zero sentinel. Entire shadow block wrapped in try/except — never blocks startup.
 - **Signals:** `SYMBOL_TUNED symbol=X order_size=N tick_size=T step_size=S min_notional=M price=P`, `SYMBOL_NO_GO symbol=X reason=R price=P min_notional=M`, `TUNING_SHADOW_COMPLETE symbols=N tuned=M no_go=K`.
+
+### ADR-126: Tuning metrics and in-memory readiness cache (2026-04-01)
+
+- **Decision:** Add `TuningCache` (TTL, injectable clock) and `TuningMetrics` (Prometheus counters) for startup tuning results. Startup wrapper records results into both.
+- **Phase:** B3b. Shadow observability only — no selector integration, no dispatch change, no runtime behavior change.
+- **Metrics:** `grinder_tuning_result_total{status}`, `grinder_tuning_no_go_total{reason}`, `grinder_tuning_cache_size`, `grinder_tuning_cache_expired_total`. No `symbol=` label (FORBIDDEN_METRIC_LABELS, ADR-028).
+- **Cache:** `TuningCache` in `src/grinder/tuning/cache.py`. Thread-safe, TTL-based. Entries expire on get(). Injectable clock for deterministic testing.
+- **Ownership:** `_run_startup_tuning_shadow()` in `run_trading.py` is the sole writer to both cache and metrics. `run_tuning_shadow()` remains a pure helper.

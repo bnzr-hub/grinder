@@ -303,6 +303,19 @@ REQUIRED_METRICS_PATTERNS = [
     "# HELP grinder_risk_gate_blocks_total",
     "# TYPE grinder_risk_gate_blocks_total",
     "grinder_risk_gate_blocks_total{reason=",
+    # PR-B3b (ADR-126): Tuning metrics
+    "# HELP grinder_tuning_result_total",
+    "# TYPE grinder_tuning_result_total",
+    "grinder_tuning_result_total{status=",
+    "# HELP grinder_tuning_no_go_total",
+    "# TYPE grinder_tuning_no_go_total",
+    "grinder_tuning_no_go_total{reason=",
+    "# HELP grinder_tuning_cache_size",
+    "# TYPE grinder_tuning_cache_size",
+    "grinder_tuning_cache_size",
+    "# HELP grinder_tuning_cache_expired_total",
+    "# TYPE grinder_tuning_cache_expired_total",
+    "grinder_tuning_cache_expired_total",
 ]
 
 # PR6: Concrete series patterns requiring fill ingest to be running.

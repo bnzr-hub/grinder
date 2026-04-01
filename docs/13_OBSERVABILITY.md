@@ -242,6 +242,38 @@ grinder_ml_inference_latency_ms{mode="..."}
 - `MlActiveModePersistentlyBlocked`: ACTIVE blocked for 15m (info)
 - `MlInferenceStalled`: no inferences for 10m (warning)
 
+### Tuning Metrics (PR-B3b, ADR-126)
+
+Symbol tuning outcome metrics. Shadow-only — no runtime gating. No `symbol=` label (FORBIDDEN_METRIC_LABELS, ADR-028). Per-symbol detail remains in structured logs (`SYMBOL_TUNED`, `SYMBOL_NO_GO`).
+
+```python
+# Counter: Tuning outcomes by status
+# Labels: status (TUNED, NO_GO)
+grinder_tuning_result_total{status="TUNED"}
+grinder_tuning_result_total{status="NO_GO"}
+
+# Counter: NO_GO outcomes by reason
+# Labels: reason (PRICE_UNAVAILABLE, POSITION_EXCEEDS_CAP, NOTIONAL_TOO_LOW,
+#                 TICK_SIZE_UNAVAILABLE, STEP_SIZE_UNAVAILABLE, BLACKLISTED)
+grinder_tuning_no_go_total{reason="..."}
+
+# Gauge: Non-expired entries in TuningCache (live on scrape)
+grinder_tuning_cache_size
+
+# Counter: Total TuningCache expirations (live on scrape)
+grinder_tuning_cache_expired_total
+```
+
+**Operator interpretation:**
+
+| Metric | What it tells the operator |
+|--------|---------------------------|
+| `grinder_tuning_result_total{status="TUNED"}` | How many symbols passed tuning at last startup |
+| `grinder_tuning_result_total{status="NO_GO"}` | How many symbols failed tuning at last startup |
+| `grinder_tuning_no_go_total{reason="..."}` | Why symbols failed — notional too low, price missing, cap exceeded, etc. |
+| `grinder_tuning_cache_size` | How many tuning results are still cached (not yet expired) |
+| `grinder_tuning_cache_expired_total` | How many cache entries have expired since startup |
+
 ---
 
 ## 13.3 Structured Logging
