@@ -114,20 +114,32 @@ Phase E6: Integration into autonomous loop
 
 **Safety:** Activation is fail-closed: any failure → FAILED, no retry without operator/reconciler decision.
 
-### Phase E3: Deactivation ceremony (real engines)
+### Phase E3: Graceful exit + deactivation ceremony (real engines)
 
-**Goal:** Safely stop a per-symbol engine with cleanup verification.
+**Goal:** Execute the full removal path for a per-symbol engine: signal graceful-exit-only mode → verify no new entries while engine remains live → finalize shutdown with cleanup verification.
+
+This phase covers runtime execution of **two** control-plane intents:
+- `REQUEST_GRACEFUL_EXIT` — signal engine to stop new entries, continue exits
+- `FINALIZE_DEACTIVATION` — stop engine, cleanup, verify clean
 
 **What changes:**
-- `DeactivationCeremony` — stop engine, cleanup, verify
-- Uses existing `can_finalize_deactivation()` gate
-- Uses existing `exchange_state cleanup/verify` infrastructure
-- Bounded retries on cleanup failure
-- EngineRegistry integration: GRACEFUL_EXIT → SHUTTING_DOWN → STOPPED/FAILED
+- `GracefulExitSignal` — signal a running engine to enter graceful-exit-only mode
+  - Engine continues processing exits and cancels
+  - Engine blocks new entry placement (via existing `is_selector_dispatch_allowed` gate)
+  - EngineRegistry: ACTIVE → GRACEFUL_EXIT
+  - Verification: monitor that no new entries appear after signal
+- `DeactivationCeremony` — stop engine, cleanup, verify (only after GRACEFUL_EXIT + finalize gate)
+  - Uses existing `can_finalize_deactivation()` gate (flat + no orders)
+  - Uses existing `exchange_state cleanup/verify` infrastructure
+  - Bounded retries on cleanup failure
+  - EngineRegistry: GRACEFUL_EXIT → SHUTTING_DOWN → STOPPED/FAILED
 
-**What stays unchanged:** Deactivation finalize gate. exchange_state.py tool.
+**What stays unchanged:** LiveEngineV0 `is_selector_dispatch_allowed` gate (already exists). Deactivation finalize gate. exchange_state.py tool.
 
-**Safety:** Deactivation must pass cleanup verification. Dirty state → FAILED, not STOPPED.
+**Safety:**
+- Graceful exit does NOT stop the engine — it only blocks new entries.
+- Deactivation only begins after the finalize gate passes (flat + no orders).
+- Dirty state after cleanup → FAILED, not STOPPED.
 
 ### Phase E4: Desired-vs-actual reconciliation
 
@@ -208,21 +220,25 @@ Phase E6: Integration into autonomous loop
 - Registry updated on success/failure
 **Must stay unchanged:** LiveEngineV0 internals.
 
-### PR-E3: Deactivation ceremony
+### PR-E3: Graceful exit signal + deactivation ceremony
 
-**Title:** `feat(execution): per-symbol engine deactivation with cleanup verification`
-**Goal:** Stop engine, cleanup exchange, verify clean state.
+**Title:** `feat(execution): graceful exit signal and per-symbol deactivation with cleanup`
+**Goal:** Execute REQUEST_GRACEFUL_EXIT (signal engine, verify no new entries) and FINALIZE_DEACTIVATION (stop engine, cleanup, verify clean).
 **Files touched:**
-- `src/grinder/execution_plane/deactivation.py` (new)
+- `src/grinder/execution_plane/graceful_exit.py` (new) — signal engine graceful-exit-only mode
+- `src/grinder/execution_plane/deactivation.py` (new) — stop engine, cleanup, verify
+- `tests/unit/test_graceful_exit_signal.py` (new)
 - `tests/unit/test_engine_deactivation.py` (new)
 **Dependencies:** PR-E2.
 **Tests required:**
+- Graceful exit signal → ACTIVE → GRACEFUL_EXIT in registry
+- After graceful exit: no new entries placed (verify via dispatch gate)
+- Finalize gate blocks if not clean (flat + no orders)
 - Clean shutdown → STOPPED
 - Cleanup failure → retry → STOPPED or FAILED
-- Finalize gate blocks if not clean
-- Registry updated
-- Bounded live deactivation ceremony
-**Must stay unchanged:** Deactivation finalize gate. exchange_state.py.
+- Registry updated on all transitions
+- Bounded live ceremony: activate → graceful exit → deactivate → verify clean
+**Must stay unchanged:** LiveEngineV0 `is_selector_dispatch_allowed` gate. Deactivation finalize gate. exchange_state.py.
 
 ### PR-E4: Desired-vs-actual reconciliation
 
@@ -293,13 +309,16 @@ Phase E6: Integration into autonomous loop
 | Failed activation → FAILED state, clean recovery | Unit + live test |
 | Exchange pre-check blocks dirty activation | Unit test |
 
-### Gate E3→E4: Deactivation proven
+### Gate E3→E4: Graceful exit + deactivation proven
 
 | Requirement | Proof |
 |-------------|-------|
+| Graceful exit signal transitions engine to GRACEFUL_EXIT | Unit test |
+| No new entries after graceful exit signal | Unit test (dispatch gate) |
 | Deactivation ceremony reaches clean exchange state | Bounded live test |
 | Failed cleanup → FAILED, not STOPPED | Unit test |
 | Finalize gate enforced | Unit test |
+| Full path: activate → graceful exit → deactivate → clean | Bounded live ceremony |
 
 ### Gate E4→E5: Reconciliation proven
 
