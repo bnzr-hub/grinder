@@ -2002,6 +2002,15 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
+    # SIGUSR1: trigger graceful-exit-only for all symbols (E3 ceremony support)
+    def handle_graceful_exit_signal(*_: object) -> None:
+        for sym in symbols:
+            if engine.force_graceful_exit(sym):
+                print(f"  FORCE_GRACEFUL_EXIT symbol={sym}")
+
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, handle_graceful_exit_signal)
+
     print("\nGRINDER TRADING LOOP running. Press Ctrl+C to stop.")
     exit_code = 0
     loop_stop_reason = "not_started"

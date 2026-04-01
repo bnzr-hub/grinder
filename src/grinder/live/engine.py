@@ -3598,6 +3598,20 @@ class LiveEngineV0:
             return True
         return self._active_selector.is_dispatch_allowed(symbol)
 
+    def force_graceful_exit(self, symbol: str) -> bool:
+        """Force a symbol into graceful-exit-only mode (operator/ceremony use).
+
+        Adds symbol to ActiveSelector.graceful_exit_only, blocking new entries.
+        Exits, cancels, and grid_v2 internal actions continue normally.
+
+        Returns True if applied, False if no active selector configured.
+        """
+        if self._active_selector is None:
+            return False
+        self._active_selector._graceful_exit_only.add(symbol)
+        logger.info("FORCE_GRACEFUL_EXIT symbol=%s", symbol)
+        return True
+
     def _tick_fsm(self, ts_ms: int, symbol: str) -> None:
         """Tick FSM driver with current runtime signals.
 
