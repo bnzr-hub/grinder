@@ -1890,7 +1890,7 @@ Comprehensive adaptive grid system design:
 - **Plan:** `docs/40_EXECUTION_PLANE_IMPLEMENTATION_PLAN.md`
 - **Phase E1 (engine registry):** [DONE] `EngineState` (8 states), `EngineHandle`, `EngineRegistry` in `src/grinder/execution_plane/registry.py`. Validated transitions, duplicate rejection, missing/orphan detection. Pure data model, no engine operations (ADR-134). 27 tests.
 - **Phase E2 (activation ceremony):** [DONE] `activate()` in `src/grinder/execution_plane/activation.py` — clean-verify gated, fail-closed. ABSENT → ACTIVATING → ACTIVE/FAILED. Injectable deps (verifier, factory, health check). Live proof pending (ADR-135). 14 tests.
-- **Phase E3 (deactivation ceremony):** [NOT STARTED] Per-symbol engine shutdown with cleanup verification.
+- **Phase E3 (graceful exit + deactivation):** [DONE] `signal_graceful_exit()` in `graceful_exit.py` (ACTIVE → GRACEFUL_EXIT via injectable hook) + `deactivate()` in `engine_deactivation.py` (finalize-gated, cleanup-verified, GRACEFUL_EXIT → SHUTTING_DOWN → STOPPED/FAILED). All deps injectable. Live proof pending (ADR-136). 21 tests.
 - **Phase E4 (reconciliation):** [NOT STARTED] Desired-vs-actual engine state reconciliation.
 - **Phase E5 (safety controls):** [NOT STARTED] Stop-the-line, quarantine, operator controls.
 - **Phase E6 (integration):** [NOT STARTED] Wire execution into autonomous loop.
