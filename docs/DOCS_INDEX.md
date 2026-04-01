@@ -75,6 +75,8 @@ If documents conflict, trust order is:
 - `docs/36_MULTI_SYMBOL_ELIGIBILITY_ML_INTEGRATION_V1.md` — candidate design for live multi-symbol eligibility orchestration (Phases 1–3b detail)
 - `docs/37_AUTONOMOUS_MULTI_SYMBOL_LIVE_ORCHESTRATION_SPEC.md` — **CANDIDATE** autonomous 24/7 multi-symbol orchestration spec (supersedes doc 36 operationally)
 - `docs/38_AUTONOMOUS_MULTI_SYMBOL_IMPLEMENTATION_PLAN.md` — phased implementation plan for autonomous multi-symbol orchestration (converts doc 37 into PR chain)
+- `docs/39_EXECUTION_PLANE_ARCHITECTURE_SPEC.md` — **CANDIDATE** execution-plane architecture: engine lifecycle, ceremonies, reconciliation, safety
+- `docs/40_EXECUTION_PLANE_IMPLEMENTATION_PLAN.md` — phased implementation plan for execution-plane (converts doc 39 into PR chain)
 
 ---
 

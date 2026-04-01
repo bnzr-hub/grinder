@@ -1884,3 +1884,13 @@ Comprehensive adaptive grid system design:
 - **Phase C2b (live shutdown cleanup proof):** [DONE] Bounded ceremony executed 2026-04-01 on BTCUSDT @ `611d520`. Preflight CLEAN → 60s trading → SIGINT → cleanup-on-exit → post-verify CLEAN (orders=0, position=FLAT). Proves shutdown/cleanup path. Full graceful_exit_only deactivation proof deferred to future iteration.
 - **Phase D1 (universe provider):** [DONE] `UniverseProvider` in `src/grinder/orchestration/universe_provider.py` — provider with fetch, configurable refresh interval (`refresh_s`), fail-safe retention on fetch failure. `filter_candidates()` pure venue-level filter: USDT perpetual, TRADING, blacklist, alphabetical sort. No prefilter/tuning/ranking (ADR-131). 26 tests.
 - **Phase D2 (autonomous loop):** [DONE] `AutonomousLoop` in `src/grinder/orchestration/autonomous_loop.py` — continuous control-plane loop with all doc-37 stages in correct order: UniverseProvider → hard prefilter (injectable) → tuning admission (TuningCache, only TUNED proceed) → scoring/ranking among TUNED only (injectable) → SymbolOrchestrator → CycleReport. `run_forever()` with configurable cadence, injectable clock/sleep. Operator override, stop-the-line, fail-safe degradation per stage. Pure control-plane — action execution is caller's responsibility (ADR-132). 19 tests.
+
+### Execution-plane (runtime action execution)
+- **Spec:** `docs/39_EXECUTION_PLANE_ARCHITECTURE_SPEC.md`
+- **Plan:** `docs/40_EXECUTION_PLANE_IMPLEMENTATION_PLAN.md`
+- **Phase E1 (engine registry):** [NOT STARTED] EngineState model + EngineRegistry.
+- **Phase E2 (activation ceremony):** [NOT STARTED] Per-symbol engine startup with health verification.
+- **Phase E3 (deactivation ceremony):** [NOT STARTED] Per-symbol engine shutdown with cleanup verification.
+- **Phase E4 (reconciliation):** [NOT STARTED] Desired-vs-actual engine state reconciliation.
+- **Phase E5 (safety controls):** [NOT STARTED] Stop-the-line, quarantine, operator controls.
+- **Phase E6 (integration):** [NOT STARTED] Wire execution into autonomous loop.

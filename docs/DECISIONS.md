@@ -4811,3 +4811,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Control-plane only:** Produces action intents and cycle reports. Does not execute engine start/stop or exchange writes. Execution is the caller's responsibility.
 - **Safety:** Orchestrator errors trigger stop-the-line (configurable). Prefilter/ranker failures degrade fail-open (skip stage). Universe fetch failure retains previous via provider. Operator override restricts discovered universe.
 - **Scope boundary:** This completes the autonomous orchestration *plan and control-plane*. Runtime execution of action intents against real per-symbol engines is the next workstream beyond this plan.
+
+### ADR-133: Execution-plane architecture and implementation plan (2026-04-01)
+
+- **Decision:** Create `docs/39_EXECUTION_PLANE_ARCHITECTURE_SPEC.md` (architecture) and `docs/40_EXECUTION_PLANE_IMPLEMENTATION_PLAN.md` (phased plan) for the runtime execution layer.
+- **Scope:** Docs + contracts only. No implementation changes.
+- **Key definitions:** ExecutionCoordinator, EngineRegistry (8 states), ActivationCeremony, DeactivationCeremony, desired-vs-actual reconciliation, 6 STL-E rules, operator controls. 6 phases (E1–E6).
+- **Ownership split:** Control-plane produces action intents. Execution-plane executes them against real per-symbol engines. LiveEngineV0 remains single-symbol, unchanged.
+- **Relationship:** Continues the autonomous multi-symbol workstream. Control-plane (docs 37/38, ADRs 122–132) is complete. Execution-plane is the next layer.
