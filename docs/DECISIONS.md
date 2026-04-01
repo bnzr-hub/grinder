@@ -4801,3 +4801,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Provider:** `UniverseProvider` class with injectable clock + fetcher. `get_candidates()` fetches if stale (beyond `refresh_s`), retains previous universe on fetch failure (fail-safe). Returns empty list only if no successful fetch has ever occurred.
 - **Filter:** `filter_candidates(exchange_info, config) -> list[str]` — pure function: alphabetically sorted USDT perpetual TRADING symbols not in blacklist. Malformed entries skipped. Duplicates deduplicated.
 - **Scope:** Provider + filter. Does not apply liquidity/volume/spread/OI prefilter. Fetch uses stdlib urllib by default; injectable fetcher for tests.
+
+### ADR-132: Autonomous multi-symbol orchestration loop (2026-04-01)
+
+- **Decision:** Create `src/grinder/orchestration/autonomous_loop.py` — continuous control-plane loop that wires UniverseProvider → TuningCache filter → SymbolOrchestrator → CycleReport.
+- **Phase:** D2. Completes the autonomous multi-symbol orchestration plan (doc 38).
+- **Contract:** `AutonomousLoop.run_cycle(facts) -> CycleReport` with `discovered`, `admitted`, `skipped`, `actions`, `error`.
+- **Control-plane only:** Produces action intents and cycle reports. Does not execute engine start/stop or exchange writes. Execution is the caller's responsibility.
+- **Safety:** Orchestrator errors trigger stop-the-line (configurable). Universe fetch failure degrades via provider fail-safe. Operator override restricts discovered universe.
+- **Scope boundary:** This completes the autonomous orchestration *plan and control-plane*. Runtime execution of action intents against real per-symbol engines is the next workstream beyond this plan.
