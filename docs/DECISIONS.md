@@ -4774,5 +4774,5 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Create `src/grinder/orchestration/symbol_orchestrator.py` — top-level owner that wires TuningCache → candidate filtering → RotationController → action intents.
 - **Phase:** C1b. Pure logic, no engine start/stop, no runtime wiring, no exchange I/O.
 - **Contract:** `SymbolOrchestrator.reconcile(candidates, facts) -> OrchestratorDecision` with `admitted`, `skipped` (with `SkipReason`), and `actions`.
-- **Filtering:** Only valid non-expired TUNED cache entries admitted. CACHE_MISS, NOT_TUNED reasons for skipped symbols.
+- **Filtering:** Only valid non-expired TUNED cache entries admitted. Skip reasons: `CACHE_MISS` (not cached or expired), `NOT_TUNED` (cached as NO_GO). No separate CACHE_EXPIRED reason — `TuningCache.get()` returns None for both miss and expiry.
 - **Ownership:** Orchestrator reads TuningCache (does not mutate). Controller owns lifecycle state. Future runtime wiring (C2+) will execute returned action intents against real engines.

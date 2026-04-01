@@ -36,10 +36,14 @@ if TYPE_CHECKING:
 
 
 class SkipReason(Enum):
-    """Why a candidate symbol was excluded from the desired set."""
+    """Why a candidate symbol was excluded from the desired set.
+
+    Note: TuningCache.get() returns None for both miss and expiry,
+    so CACHE_MISS covers both cases. If expiry needs to be distinguished
+    in a future phase, extend TuningCache to expose that signal.
+    """
 
     CACHE_MISS = "CACHE_MISS"
-    CACHE_EXPIRED = "CACHE_EXPIRED"
     NOT_TUNED = "NOT_TUNED"
 
 
@@ -93,9 +97,6 @@ class SymbolOrchestrator:
         for symbol in candidates:
             result = self.cache.get(symbol)
             if result is None:
-                # Distinguish cache miss from expiry: check if symbol was ever cached
-                # by attempting a raw lookup. Since get() already handles expiry,
-                # a None means either never cached or expired.
                 skipped[symbol] = SkipReason.CACHE_MISS
                 continue
 
