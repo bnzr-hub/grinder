@@ -1,16 +1,20 @@
-"""Bounded live deactivation ceremony (PR-C2b, ADR-130).
+"""Bounded shutdown cleanup ceremony (PR-C2b, ADR-130).
 
-Proves that symbol deactivation reaches clean exchange state:
+Proves that bounded trading followed by graceful shutdown + cleanup-on-exit
+reaches clean exchange state:
 - No open orders
 - Flat position
 
 Sequence:
 1. Pre-flight: verify exchange is clean for the target symbol
 2. Start bounded trading run (operator provides duration + budget)
-3. Wait for at least 1 fill (proves the symbol was actually active)
-4. Request deactivation (set graceful_exit_only flag)
-5. Wait for convergence: position FLAT + no open orders
-6. Post-ceremony: verify exchange state is clean
+3. After deactivation_after_s: send SIGINT for graceful shutdown
+4. Cleanup-on-exit runs exchange_state cleanup per symbol
+5. Post-ceremony: verify exchange state is clean (with retries)
+
+Note: This proves the shutdown/cleanup path, not yet the full
+graceful_exit_only deactivation path with observed fills. That requires
+a ceremony iteration with explicit deactivation signal and fill evidence.
 
 Usage:
     python3 -m scripts.deactivation_ceremony \
@@ -99,10 +103,11 @@ def run_trading_phase(
     paper_size: str,
     paper_levels: int,
 ) -> tuple[bool, str]:
-    """Run bounded trading phase with deactivation trigger.
+    """Run bounded trading phase with graceful shutdown.
 
-    Starts trading, waits for deactivation_after_s, then signals
-    graceful exit by stopping the run (cleanup-on-exit handles the rest).
+    Starts trading, waits for deactivation_after_s, then sends SIGINT
+    for graceful shutdown. Cleanup-on-exit handles order cancellation
+    and position closure.
 
     Returns (success, log_output).
     """

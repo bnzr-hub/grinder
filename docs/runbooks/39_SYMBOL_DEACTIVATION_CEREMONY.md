@@ -1,6 +1,6 @@
-# Runbook 39: Symbol Deactivation Ceremony
+# Runbook 39: Bounded Shutdown Cleanup Ceremony
 
-**Purpose:** Bounded live proof that symbol deactivation reaches clean exchange state.
+**Purpose:** Bounded live proof that trading + graceful shutdown + cleanup-on-exit reaches clean exchange state. Proves the shutdown/cleanup path — full graceful_exit_only deactivation proof is a future iteration.
 **ADR:** ADR-130 (PR-C2b)
 **SSOT:** `scripts/deactivation_ceremony.py`
 
@@ -49,8 +49,8 @@ python3 -m scripts.deactivation_ceremony \
 | Phase | Duration | What |
 |-------|----------|------|
 | Pre-flight | ~5s | Verify exchange state is clean |
-| Trading | 60s | Normal grid trading, accumulate fills |
-| Deactivation | Remaining | SIGINT → graceful shutdown → cleanup-on-exit |
+| Trading | 60s | Normal grid trading |
+| Shutdown | Remaining | SIGINT → graceful shutdown → cleanup-on-exit |
 | Post-verify | ~15s | Verify clean state (with retries + cleanup fallback) |
 
 ### Step 3: Success Criteria
