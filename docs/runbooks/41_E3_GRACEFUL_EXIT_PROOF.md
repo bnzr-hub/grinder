@@ -63,21 +63,32 @@ python3 -m scripts.exchange_state check BTCUSDT
 
 ## Success Criteria
 
-1. Preflight: `status=CLEAN`
-2. Trading active: engine placed at least 1 order before graceful-exit
-3. Graceful exit: `FORCE_GRACEFUL_EXIT symbol=BTCUSDT` visible in subprocess output
-4. No new entries: `SELECTOR_BLOCKED` entries visible after graceful-exit signal (or zero new entry placements in observation window)
-5. Post-verify: `status=CLEAN orders=0 position=FLAT`
-6. Final result: `E3_CEREMONY_RESULT status=SUCCESS`
+The harness automatically validates all of these:
+
+1. **Preflight:** `status=CLEAN`
+2. **Pre-signal activity:** `pre_activity > 0` — proves engine was actively trading before signal
+3. **Graceful exit signal:** SIGUSR1 sent to subprocess, `FORCE_GRACEFUL_EXIT` observed in output
+4. **Post-signal entries:** `post_entries == 0` — zero new unblocked entry placements after signal
+5. **Post-verify:** `status=CLEAN orders=0 position=FLAT`
+6. **Final result:** `E3_CEREMONY_RESULT status=SUCCESS` with counts
+
+The ceremony will FAIL (exit 1) if:
+- No pre-signal trading activity detected
+- Any post-signal unblocked entry placements detected
+- Exchange state remains dirty after cleanup retries
 
 ---
 
 ## What counts as "no new entries" evidence
 
-After `FORCE_GRACEFUL_EXIT`:
-- Any `SELECTOR_BLOCKED` log lines confirm the gate is active
-- Zero new `PLACE_ENTRY` actions after the graceful-exit timestamp
-- Existing exits, cancels, and grid_v2 internal actions may continue (that's correct behavior)
+The harness streams subprocess output in real-time and classifies lines:
+
+**Before SIGUSR1 (pre-signal):** Counts entry-related markers (`PLACE_ENTRY`, `PLACE_EXIT`, `grinder_live_engine_initialized`). At least 1 required.
+
+**After SIGUSR1 (post-signal):** 
+- `SELECTOR_BLOCKED` lines = evidence the gate is active (good)
+- `PLACE_ENTRY` without `SELECTOR_BLOCKED` = unblocked entry (bad, fails ceremony)
+- Exits, cancels, grid_v2 internal actions = expected, not counted as entries
 
 ---
 
