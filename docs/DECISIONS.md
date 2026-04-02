@@ -4923,3 +4923,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Constraint source truthfulness:** `_load_symbol_constraints()` returns actual source (cache vs exchange vs unavailable). Source propagated to `ResolvedConstraint` and printed in startup summary.
 - **Coordinator wiring:** Safety gate in `ExecutionCoordinator.execute()` now emits `format_safety_summary()` instead of ad-hoc log.
 - **Behavioral scope:** Coordinator safety log format changes (structured, same fields). Startup gains resolved constraint summary with truthful source for active symbols. `SafetyBlockEvent` and `format_execution_gate_result()` are available formatters not yet emitted at runtime. All helpers are pure functions — no I/O, no metrics. No strategy or runtime changes.
+
+### ADR-147: Autonomous engine host (2026-04-02)
+
+- **Problem:** `run_autonomous.py` used registry-level placeholder ceremony bindings — no real engine instances were created, stopped, or cleaned up. The gap between "all execution-plane pieces exist" and "autonomous runtime owns real engines" was the main blocker for 24/7 launch.
+- **Decision:** Add `src/grinder/runtime/autonomous_host.py` with `AutonomousEngineHost` that owns the authoritative `symbol → engine_ref` map. Four lifecycle operations: `activate()` (create via factory → ACTIVATING → ACTIVE), `request_graceful_exit()` (reach real engine → GRACEFUL_EXIT), `finalize_deactivation()` (stop → cleanup → STOPPED/FAILED), `shutdown_all()` (deterministic order, partial-failure report).
+- **Runtime model:** In-process engine tasks. All operations (factory, stop, cleanup, graceful-exit) are injectable callables. No subprocess management.
+- **Registry/runtime coherence:** Every live engine has a corresponding registry entry. Factory failure → FAILED state. Stop failure → FAILED state + engine removed from host. Duplicate activation rejected.
+- **Scope boundary:** This PR adds the host abstraction with tests. `run_autonomous.py` wiring is deferred to PR 2. No existing code changed.
