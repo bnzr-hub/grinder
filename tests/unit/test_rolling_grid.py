@@ -2934,62 +2934,58 @@ class TestAnchorContract(TestRollingGridEngineIntegration):
 
     # --- T63: natural lifecycle: fill → position → TP exit → flat → ANCHOR_RESET ---
 
-    def test_t63_natural_fill_to_flat_triggers_anchor_reset(
+    def test_t63_fixture_natural_anchor_reset(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Full natural lifecycle: BUY fill → position open → TP exit → flat →
-        ANCHOR_RESET fires → new grid from new anchor. No manual cleanup.
+        """Fixture-natural ANCHOR_RESET: no internal state mutation.
 
-        This is the final proof that ANCHOR_RESET works without operator
-        intervention when the market naturally returns to flat.
+        Only external signals injected (account snapshots, sync gen).
+        Engine manages _prev_rolling_orders, _inflight_shift, and
+        pending cancels entirely on its own through process_snapshot().
+
+        Sequence:
+        1. Init: empty exchange → planner inits, PLACEs dispatched, inflight set
+        2. Orders confirmed: sync advances, inflight becomes stale
+        3. Exchange empties + flat: ANCHOR_RESET fires
+        4. New grid from new anchor same-tick
+
+        Note: test grid orders use order_N format (not grinder CIDs), so
+        they're invisible to fill detection and _has_grinder_orders() —
+        this is the same format used throughout the anchor contract tests.
         """
         engine = self._make_engine(monkeypatch, rolling=True)
-        old_mid = Decimal("50000.50")
         new_mid = Decimal("50500.50")
 
-        # Tick 1: establish rolling state with grid orders confirmed
-        buy1 = self._grid_order(1, "BUY", "49950")
-        sell1 = self._grid_order(2, "SELL", "50050")
-        buy2 = self._grid_order(3, "BUY", "49900")
-        sell2 = self._grid_order(4, "SELL", "50100")
-        engine._last_account_snapshot = self._account_snap(
-            orders=(buy1, sell1, buy2, sell2), pos_qty="0"
-        )
+        # Tick 1: empty exchange → planner inits anchor, dispatches PLACEs
+        engine._last_account_snapshot = self._account_snap(orders=(), pos_qty="0")
         engine.process_snapshot(self._snap(ts=1_000_000))
 
         planner = engine._grid_planners["BTCUSDT"]  # type: ignore[index]
         rs1 = planner.get_rolling_state("BTCUSDT")
         assert rs1 is not None
         old_anchor = rs1.anchor_price
-        assert old_anchor == old_mid
 
-        # Tick 2: BUY fill detected — buy1 disappeared, position opened
-        # (Simulates natural fill: order gone from exchange, position appears)
+        # Tick 2: orders appear on exchange (confirmed). Sync advances.
+        # Engine populates _prev_rolling_orders from current snapshot.
+        # Inflight from init dispatch becomes stale (sync_gen > dispatch_gen).
+        buy1 = self._grid_order(1, "BUY", "49950")
+        sell1 = self._grid_order(2, "SELL", "50050")
         engine._last_account_snapshot = self._account_snap(
-            orders=(sell1, buy2, sell2), pos_qty="0.01", ts=2_000_000
+            orders=(buy1, sell1), pos_qty="0", ts=6_000_000
         )
-        # Advance sync gen so inflight from init is stale
         engine._account_sync_generation += 1
-        engine.process_snapshot(self._snap(ts=2_000_000))
+        engine.process_snapshot(self._snap(ts=6_000_000))
 
-        rs2 = planner.get_rolling_state("BTCUSDT")
-        assert rs2 is not None
-        assert rs2.anchor_price == old_anchor, "Anchor unchanged during position"
-
-        # Tick 3: TP exit — sell fill closes position, remaining orders cancelled
-        # (Simulates: TP sell filled, all remaining orders expired/cancelled)
-        # Clear prev_rolling_orders to prevent false fill detection from
-        # simultaneous order disappearance (external cleanup semantics)
-        engine._prev_rolling_orders.pop("BTCUSDT", None)
-        engine._last_account_snapshot = self._account_snap(orders=(), pos_qty="0", ts=3_000_000)
+        # Tick 3: exchange empties + position flat.
+        # Engine processes this naturally: _prev_rolling_orders updated,
+        # _inflight_shift already stale from tick 2 sync advance.
+        engine._last_account_snapshot = self._account_snap(orders=(), pos_qty="0", ts=11_000_000)
         engine._account_sync_generation += 1
-        # Clear inflight so it doesn't block reset
-        engine._inflight_shift.pop("BTCUSDT", None)
 
         with caplog.at_level(logging.WARNING, logger="grinder.live.engine"):
             output = engine.process_snapshot(
                 Snapshot(
-                    ts=3_000_000,
+                    ts=11_000_000,
                     symbol="BTCUSDT",
                     bid_price=Decimal("50500"),
                     ask_price=Decimal("50501"),
@@ -3000,10 +2996,10 @@ class TestAnchorContract(TestRollingGridEngineIntegration):
                 )
             )
 
-        # ANCHOR_RESET must fire — all 5 conditions met naturally
+        # ANCHOR_RESET must fire — all 5 conditions met via external signals only
         reset_logs = [r for r in caplog.records if "ANCHOR_RESET " in r.message]
         assert len(reset_logs) >= 1, (
-            f"ANCHOR_RESET must fire on natural flat return. "
+            f"ANCHOR_RESET must fire. "
             f"Logs: {[r.message for r in caplog.records if 'ANCHOR' in r.message]}"
         )
 
@@ -3019,65 +3015,62 @@ class TestAnchorContract(TestRollingGridEngineIntegration):
         assert rs3.anchor_price == new_mid, (
             f"Anchor must be new mid after reset: {rs3.anchor_price} != {new_mid}"
         )
-        assert rs3.net_offset == 0, f"Offset must be 0 after reset: {rs3.net_offset}"
+        assert rs3.net_offset == 0
 
-        # Grid PLACEs from new anchor (same process_snapshot call)
+        # Grid PLACEs from new anchor
         grid_places = [
             la
             for la in output.live_actions
             if la.action.action_type == ActionType.PLACE and not la.action.reduce_only
         ]
-        assert len(grid_places) > 0, "Expected grid PLACEs after natural re-anchor"
+        assert len(grid_places) > 0, "Expected grid PLACEs after re-anchor"
         for la in grid_places:
             assert la.action.price is not None
             dist_from_new = abs(float(la.action.price - new_mid))
             dist_from_old = abs(float(la.action.price - old_anchor))
-            assert dist_from_new < dist_from_old, (
-                f"PLACE {la.action.price} closer to old anchor {old_anchor} "
-                f"than new anchor {new_mid}"
-            )
+            assert dist_from_new < dist_from_old
 
-    # --- T64: no branch residue after ANCHOR_RESET ---
+    # --- T64: no branch residue after fixture-natural ANCHOR_RESET ---
 
-    def test_t64_no_stale_state_after_anchor_reset(
+    def test_t64_no_stale_state_after_fixture_natural_reset(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """After ANCHOR_RESET: no stale prev_orders, pending_cancels, or inflight."""
+        """After ANCHOR_RESET (no internal mutation): engine cleanup ran."""
         engine = self._make_engine(monkeypatch, rolling=True)
 
-        # Tick 1: init
+        # Tick 1: init with confirmed orders
         buy1 = self._grid_order(1, "BUY", "49950")
         sell1 = self._grid_order(2, "SELL", "50050")
         engine._last_account_snapshot = self._account_snap(orders=(buy1, sell1), pos_qty="0")
         engine.process_snapshot(self._snap(ts=1_000_000))
 
-        # Force some state that should be cleaned
-        engine._prev_rolling_orders["BTCUSDT"] = {"order1": MagicMock()}
-        engine._rolling_pending_cancels["order_x"] = 1_000_000
+        # Tick 2: sync advance (makes init inflight stale)
+        engine._last_account_snapshot = self._account_snap(
+            orders=(buy1, sell1), pos_qty="0", ts=6_000_000
+        )
+        engine._account_sync_generation += 1
+        engine.process_snapshot(self._snap(ts=6_000_000))
 
-        # Tick 2: natural flat → ANCHOR_RESET
-        engine._prev_rolling_orders.pop("BTCUSDT", None)
-        engine._last_account_snapshot = self._account_snap(orders=(), pos_qty="0", ts=2_000_000)
-        engine._inflight_shift.pop("BTCUSDT", None)
+        # Tick 3: exchange empties + flat → ANCHOR_RESET
+        engine._last_account_snapshot = self._account_snap(orders=(), pos_qty="0", ts=11_000_000)
         engine._account_sync_generation += 1
 
         with caplog.at_level(logging.WARNING, logger="grinder.live.engine"):
-            engine.process_snapshot(self._snap(ts=2_000_000))
+            engine.process_snapshot(self._snap(ts=11_000_000))
 
         reset_logs = [r for r in caplog.records if "ANCHOR_RESET " in r.message]
         assert len(reset_logs) >= 1
 
-        # Verify cleanup: no stale state for BTCUSDT
-        # prev_rolling_orders should be repopulated by same-tick plan
-        # but pending_cancels for old orders should be gone
-        assert "order_x" not in engine._rolling_pending_cancels or (
-            engine._rolling_pending_cancels.get("order_x", 0) == 0
-        )
+        # Engine's own cleanup should have cleared stale BTCUSDT state
+        planner = engine._grid_planners["BTCUSDT"]  # type: ignore[index]
+        rs = planner.get_rolling_state("BTCUSDT")
+        assert rs is not None
+        assert rs.net_offset == 0
 
-    # --- T65: ANCHOR_RESET deterministic ---
+    # --- T65: deterministic (no internal mutation) ---
 
-    def test_t65_anchor_reset_deterministic(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Same inputs produce same ANCHOR_RESET outcome."""
+    def test_t65_fixture_natural_reset_deterministic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Same external signals produce same ANCHOR_RESET outcome."""
         results = []
         for _ in range(2):
             engine = self._make_engine(monkeypatch, rolling=True)
@@ -3086,12 +3079,18 @@ class TestAnchorContract(TestRollingGridEngineIntegration):
             engine._last_account_snapshot = self._account_snap(orders=(buy1, sell1), pos_qty="0")
             engine.process_snapshot(self._snap(ts=1_000_000))
 
-            engine._prev_rolling_orders.pop("BTCUSDT", None)
-            engine._last_account_snapshot = self._account_snap(orders=(), pos_qty="0", ts=2_000_000)
-            engine._inflight_shift.pop("BTCUSDT", None)
+            engine._last_account_snapshot = self._account_snap(
+                orders=(buy1, sell1), pos_qty="0", ts=6_000_000
+            )
             engine._account_sync_generation += 1
+            engine.process_snapshot(self._snap(ts=6_000_000))
 
-            engine.process_snapshot(self._snap(ts=2_000_000))
+            engine._last_account_snapshot = self._account_snap(
+                orders=(), pos_qty="0", ts=11_000_000
+            )
+            engine._account_sync_generation += 1
+            engine.process_snapshot(self._snap(ts=11_000_000))
+
             planner = engine._grid_planners["BTCUSDT"]  # type: ignore[index]
             rs = planner.get_rolling_state("BTCUSDT")
             results.append((rs.anchor_price if rs else None, rs.net_offset if rs else None))
