@@ -102,7 +102,7 @@ class LiveEngineBridge:
         handle.thread.start()
         # Wait for engine construction — fail closed if not ready in time.
         ready = engine_ready.wait(timeout=10.0)
-        if not ready or not handle.thread.is_alive() or handle.engine_ref is None:
+        if not ready or handle.engine_ref is None:
             logger.error(
                 "BRIDGE_ENGINE_STARTUP_FAILED symbol=%s ready=%s alive=%s engine_ref=%s",
                 symbol,
