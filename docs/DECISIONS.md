@@ -4936,6 +4936,13 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 
 - **Problem:** `run_autonomous.py` used registry-only placeholder ceremony bindings despite ADR-147 providing a real engine host.
 - **Decision:** Replace placeholder ceremonies with real host bindings: `coordinator.activate_fn = host.activate`, `graceful_exit_fn = host.request_graceful_exit`, `deactivate_fn = host.finalize_deactivation`. Shutdown path calls `host.shutdown_all()` in finally block.
-- **Engine instances:** Current implementation uses lightweight `_EngineInstance` markers with `start/stop/graceful_exit` methods. Real `LiveEngineV0` integration deferred to PR 3.
 - **Preserved semantics:** Shadow mode default unchanged. Execution requires `--execution-enabled --execution-ack`. Control-plane/execution-plane boundaries unchanged.
-- **Honest scope:** `run_autonomous.py` is no longer scaffold — coordinator ceremonies hit real host lifecycle. Engine instances are still lightweight markers, not full LiveEngineV0. Full engine integration is PR 3.
+
+### ADR-149: LiveEngineBridge — real per-symbol engine threads (2026-04-02)
+
+- **Problem:** ADR-148 wired run_autonomous.py to the host but engine instances were lightweight markers, not real LiveEngineV0.
+- **Decision:** Add `src/grinder/runtime/live_engine_bridge.py` — creates real per-symbol engine threads. Each symbol gets: background thread + asyncio event loop + LiveConnectorV0 (WebSocket) + LiveEngineV0 (snapshot processing). Bridge provides `factory/stop/graceful_exit/cleanup` callables compatible with AutonomousEngineHost protocols.
+- **Thread model:** `factory()` starts daemon thread, waits up to 10s for engine construction via `engine_ready` event. `stop()` sets `shutdown_event`, joins thread with configurable timeout. `graceful_exit()` calls real `engine.force_graceful_exit(symbol)` on the live engine ref.
+- **Engine ref propagation:** Handle created by factory, engine constructed inside thread. `handle_ref` list passed to thread allows engine_ref assignment back to handle before `engine_ready` fires.
+- **Fail-closed factory:** `factory()` waits up to 10s for engine construction. If `engine_ready` not set, thread dead, or `engine_ref` is None, raises `RuntimeError` — host marks symbol FAILED instead of falsely ACTIVE.
+- **Honest scope:** Real LiveEngineV0 runs in each thread with NoOpExchangePort (safe, no real orders). `force_graceful_exit()` returns False for engines with no active ticks (correct — no position). Production exchange port integration (BinanceFuturesPort wiring) is pending — requires explicit BridgeConfig override not yet implemented.

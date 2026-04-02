@@ -63,60 +63,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # ---------------------------------------------------------------------------
-# Engine lifecycle callables (injected into host)
+# Engine lifecycle bridge (real LiveEngineV0 via background threads)
 # ---------------------------------------------------------------------------
 
 
-class _EngineInstance:
-    """Minimal engine instance for autonomous runtime.
+def _build_engine_bridge() -> Any:
+    """Build the LiveEngineBridge with config from environment."""
+    from grinder.runtime.live_engine_bridge import BridgeConfig, LiveEngineBridge  # noqa: PLC0415
 
-    In production, this wraps real LiveEngineV0 infrastructure.
-    Current implementation: lightweight marker with lifecycle state.
-    Real engine start/stop integration deferred to PR 3.
-    """
-
-    def __init__(self, symbol: str) -> None:
-        self.symbol = symbol
-        self.started = True
-        self.graceful_exit_requested = False
-        self.stopped = False
-
-    def request_graceful_exit(self) -> bool:
-        self.graceful_exit_requested = True
-        return True
-
-    def stop(self) -> bool:
-        self.stopped = True
-        self.started = False
-        return True
-
-
-def _engine_factory(symbol: str) -> _EngineInstance:
-    """Create a new engine instance for a symbol."""
-    logger.info("ENGINE_FACTORY_CREATE symbol=%s", symbol)
-    return _EngineInstance(symbol)
-
-
-def _engine_stop(symbol: str, engine_ref: Any) -> bool:
-    """Stop a live engine instance."""
-    logger.info("ENGINE_STOP symbol=%s", symbol)
-    if hasattr(engine_ref, "stop"):
-        return bool(engine_ref.stop())
-    return True
-
-
-def _engine_cleanup(symbol: str, engine_ref: Any) -> bool:  # noqa: ARG001
-    """Cleanup after engine stop."""
-    logger.info("ENGINE_CLEANUP symbol=%s", symbol)
-    return True
-
-
-def _engine_graceful_exit(symbol: str, engine_ref: Any) -> bool:
-    """Signal graceful exit on a live engine."""
-    logger.info("ENGINE_GRACEFUL_EXIT symbol=%s", symbol)
-    if hasattr(engine_ref, "request_graceful_exit"):
-        return bool(engine_ref.request_graceful_exit())
-    return True
+    return LiveEngineBridge(config=BridgeConfig())
 
 
 # ---------------------------------------------------------------------------
@@ -171,13 +126,14 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
     registry = EngineRegistry()
     operator_controls = OperatorControls()
 
-    # Real engine host (ADR-147/148)
+    # Real engine host with LiveEngineBridge (ADR-147/148/149)
+    bridge = _build_engine_bridge()
     host = AutonomousEngineHost(
         registry=registry,
-        engine_factory=_engine_factory,
-        engine_stop_fn=_engine_stop,
-        engine_cleanup_fn=_engine_cleanup,
-        graceful_exit_fn=_engine_graceful_exit,
+        engine_factory=bridge.factory,
+        engine_stop_fn=bridge.stop,
+        engine_cleanup_fn=bridge.cleanup,
+        graceful_exit_fn=bridge.graceful_exit,
     )
 
     # Coordinator with real host bindings
@@ -202,6 +158,7 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
     return {
         "loop": loop,
         "host": host,
+        "bridge": bridge,
         "registry": registry,
         "operator": operator_controls,
         "coordinator": coordinator,

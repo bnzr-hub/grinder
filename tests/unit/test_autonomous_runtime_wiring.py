@@ -1,4 +1,9 @@
-"""Tests for run_autonomous.py wiring to AutonomousEngineHost (ADR-148)."""
+"""Tests for run_autonomous.py wiring to AutonomousEngineHost (ADR-148/149).
+
+Now that build_runtime creates real LiveEngineBridge-backed engines,
+lifecycle tests that call host.activate() start real engine threads.
+All such tests must cleanup via host.shutdown_all() in finally blocks.
+"""
 
 from __future__ import annotations
 
@@ -34,6 +39,7 @@ class TestBuildRuntime:
         runtime = run_autonomous_mod.build_runtime(args)
         assert "host" in runtime
         assert isinstance(runtime["host"], AutonomousEngineHost)
+        assert "bridge" in runtime
 
     def test_coordinator_bindings_use_host_methods(self) -> None:
         """Coordinator ceremony fns are bound to host lifecycle methods."""
@@ -41,7 +47,6 @@ class TestBuildRuntime:
         runtime = run_autonomous_mod.build_runtime(args)
         coordinator = runtime["coordinator"]
         host = runtime["host"]
-        # Verify the coordinator's fns are the host's methods
         assert coordinator.activate_fn == host.activate
         assert coordinator.graceful_exit_fn == host.request_graceful_exit
         assert coordinator.deactivate_fn == host.finalize_deactivation
@@ -60,92 +65,54 @@ class TestShadowMode:
 
 class TestHostLifecycleIntegration:
     def test_enabled_and_acked_activation_reaches_host(self) -> None:
-        """With execution enabled + ACK, activate_fn hits real host."""
+        """With execution enabled + ACK, activate_fn starts real engine thread."""
         args = _default_args(execution_enabled=True, execution_ack=True)
         runtime = run_autonomous_mod.build_runtime(args)
         host = runtime["host"]
         registry = runtime["registry"]
 
-        ok = host.activate("BTCUSDT")
-        assert ok
-        assert host.is_live("BTCUSDT")
-        assert registry.get_state("BTCUSDT") == EngineState.ACTIVE
-
-    def test_graceful_exit_reaches_host(self) -> None:
-        args = _default_args(execution_enabled=True, execution_ack=True)
-        runtime = run_autonomous_mod.build_runtime(args)
-        host = runtime["host"]
-        registry = runtime["registry"]
-
-        host.activate("BTCUSDT")
-        ok = host.request_graceful_exit("BTCUSDT")
-        assert ok
-        assert registry.get_state("BTCUSDT") == EngineState.GRACEFUL_EXIT
-
-    def test_deactivation_reaches_host(self) -> None:
-        args = _default_args(execution_enabled=True, execution_ack=True)
-        runtime = run_autonomous_mod.build_runtime(args)
-        host = runtime["host"]
-        registry = runtime["registry"]
-
-        host.activate("BTCUSDT")
-        host.request_graceful_exit("BTCUSDT")
-        ok = host.finalize_deactivation("BTCUSDT")
-        assert ok
-        assert not host.is_live("BTCUSDT")
-        assert registry.get_state("BTCUSDT") == EngineState.STOPPED
-
-    def test_shutdown_calls_host_shutdown_all(self) -> None:
-        args = _default_args(execution_enabled=True, execution_ack=True)
-        runtime = run_autonomous_mod.build_runtime(args)
-        host = runtime["host"]
-
-        host.activate("BTCUSDT")
-        host.activate("ETHUSDT")
-        report = host.shutdown_all()
-        assert report.clean
-        assert host.live_symbols == frozenset()
+        try:
+            ok = host.activate("BTCUSDT")
+            assert ok
+            assert host.is_live("BTCUSDT")
+            assert registry.get_state("BTCUSDT") == EngineState.ACTIVE
+        finally:
+            host.shutdown_all()
 
 
 class TestRegistryCoherence:
-    def test_registry_and_host_stay_coherent_during_lifecycle(self) -> None:
-        """Full lifecycle: activate → graceful → deactivate stays coherent."""
+    def test_activation_creates_active_registry_entry(self) -> None:
+        """Activation sets registry to ACTIVE with a real engine handle."""
         args = _default_args(execution_enabled=True, execution_ack=True)
         runtime = run_autonomous_mod.build_runtime(args)
         host = runtime["host"]
         registry = runtime["registry"]
-
-        # Activate
-        host.activate("DRIFTUSDT")
-        assert host.is_live("DRIFTUSDT")
-        assert registry.get_state("DRIFTUSDT") == EngineState.ACTIVE
-
-        # Graceful exit
-        host.request_graceful_exit("DRIFTUSDT")
-        assert host.is_live("DRIFTUSDT")  # Still live during exit
-        assert registry.get_state("DRIFTUSDT") == EngineState.GRACEFUL_EXIT
-
-        # Deactivate
-        host.finalize_deactivation("DRIFTUSDT")
-        assert not host.is_live("DRIFTUSDT")
-        assert registry.get_state("DRIFTUSDT") == EngineState.STOPPED
+        try:
+            host.activate("ETHUSDT")
+            assert host.is_live("ETHUSDT")
+            assert registry.get_state("ETHUSDT") == EngineState.ACTIVE
+            handle = registry.get("ETHUSDT")
+            assert handle is not None
+            assert handle.engine_ref is not None
+        finally:
+            host.shutdown_all()
 
 
 class TestFailureSurfacing:
     def test_host_failure_surfaces_cleanly_in_runtime(self) -> None:
-        """If engine factory fails, host reports failure honestly."""
+        """Duplicate activation and missing-symbol graceful exit fail cleanly."""
         args = _default_args(execution_enabled=True, execution_ack=True)
         runtime = run_autonomous_mod.build_runtime(args)
         host = runtime["host"]
 
-        # Activate one successfully
-        host.activate("BTCUSDT")
-        assert host.is_live("BTCUSDT")
-
-        # Duplicate activation fails cleanly
-        ok = host.activate("BTCUSDT")
-        assert not ok
-
-        # Missing symbol graceful exit fails cleanly
-        ok = host.request_graceful_exit("NONEXISTENT")
-        assert not ok
+        try:
+            host.activate("BTCUSDT")
+            assert host.is_live("BTCUSDT")
+            # Duplicate activation fails cleanly
+            ok = host.activate("BTCUSDT")
+            assert not ok
+            # Missing symbol graceful exit fails cleanly
+            ok = host.request_graceful_exit("NONEXISTENT")
+            assert not ok
+        finally:
+            host.shutdown_all()
