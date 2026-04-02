@@ -65,11 +65,15 @@ class TuningSolverConfig:
     Attributes:
         max_position_usd: Maximum total position value in quote asset.
         max_inventory_levels: Maximum number of inventory levels.
+        entry_levels_per_side: Number of entry levels per side of the grid.
+        spacing_pct: Grid spacing as a fraction (e.g., 0.0025 = 25 bps).
         blacklist: Symbols that must be rejected unconditionally.
     """
 
     max_position_usd: Decimal = Decimal("1000")
     max_inventory_levels: int = 5
+    entry_levels_per_side: int = 5
+    spacing_pct: Decimal = Decimal("0.0025")
     blacklist: frozenset[str] = frozenset()
 
 
@@ -129,13 +133,20 @@ def solve(
     if constraints.step_size <= 0:
         return _no_go(symbol, NoGoReason.STEP_SIZE_UNAVAILABLE)
 
-    # --- Compute minimum legal quantity ---
+    # --- Compute worst-case deep entry price ---
+    # Deepest BUY entry sits entry_levels_per_side * spacing below mid price.
+    # min_notional must be satisfied at this worst-case price, not mid.
+    worst_case_price = price * (1 - config.spacing_pct * config.entry_levels_per_side)
+    if worst_case_price <= 0:
+        worst_case_price = constraints.tick_size  # absolute floor
+
+    # --- Compute minimum legal quantity (at worst-case deep price) ---
 
     notional_driven = False
     order_size = constraints.min_qty
 
     if constraints.min_notional > 0:
-        raw_qty_for_notional = constraints.min_notional / price
+        raw_qty_for_notional = constraints.min_notional / worst_case_price
         min_qty_for_notional = ceil_to_step(raw_qty_for_notional, constraints.step_size)
         if min_qty_for_notional > order_size:
             notional_driven = True
