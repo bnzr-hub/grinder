@@ -4915,3 +4915,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Add `src/grinder/live/run_identity.py` — generates a `RunIdentity(run_id, pid, started_at_utc)` at process start. Format: `YYYYMMDD-HHMMSS-<4hex>`. Same identity printed in structured startup banner (with mode, symbols, port) and shutdown banner (with exit_code, stop_reason). Replaces ad-hoc scattered prints with deterministic formatted blocks.
 - **Injectable for tests:** `build_run_identity(clock=, pid=, entropy=)` accepts overrides for deterministic test output.
 - **Behavioral scope:** Startup banner changes from one-line print to structured block. Shutdown banner gains run_id and stop_reason. No strategy or runtime changes.
+
+### ADR-146: Structured events and metadata SSOT (2026-04-02)
+
+- **Problem:** Runtime-critical metadata (tick size, step size, min_notional) had no per-symbol source labeling. STL safety blocks were logged but not in a stable grep-friendly format. Operator triage required parsing scattered freeform logs.
+- **Decision:** Add `src/grinder/observability/structured_events.py` with three capabilities: (1) `ConstraintSource` enum + `ResolvedConstraint` for per-symbol metadata with truthful source label (cache/exchange/stale_cache/unavailable), printed at startup for active symbols. (2) `SafetyBlockEvent` formatter available for future per-rule emission. (3) `format_safety_summary()` emitted in coordinator safety gate; `format_execution_gate_result()` available for future use.
+- **Constraint source truthfulness:** `_load_symbol_constraints()` returns actual source (cache vs exchange vs unavailable). Source propagated to `ResolvedConstraint` and printed in startup summary.
+- **Coordinator wiring:** Safety gate in `ExecutionCoordinator.execute()` now emits `format_safety_summary()` instead of ad-hoc log.
+- **Behavioral scope:** Coordinator safety log format changes (structured, same fields). Startup gains resolved constraint summary with truthful source for active symbols. `SafetyBlockEvent` and `format_execution_gate_result()` are available formatters not yet emitted at runtime. All helpers are pure functions — no I/O, no metrics. No strategy or runtime changes.
