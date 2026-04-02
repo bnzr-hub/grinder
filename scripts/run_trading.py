@@ -210,10 +210,16 @@ class TradingHealthHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _ReusableHTTPServer(HTTPServer):
+    """HTTPServer with SO_REUSEADDR set before bind."""
+
+    allow_reuse_address = True
+
+
 def run_server(port: int) -> HTTPServer:
-    """Start HTTP server in background thread."""
+    """Start HTTP server in background thread with SO_REUSEADDR."""
     set_start_time(time.time())
-    server = HTTPServer(("0.0.0.0", port), TradingHealthHandler)
+    server = _ReusableHTTPServer(("0.0.0.0", port), TradingHealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
@@ -1766,7 +1772,7 @@ def _run_cleanup_on_exit(
     run_cmd: Any = subprocess.run,
     executable: str = sys.executable,
 ) -> int:
-    """Run exchange_state cleanup for each symbol. Returns failed symbol count."""
+    """Run exchange_state cleanup for each symbol with post-verify. Returns failed count."""
     repo_root = Path(__file__).resolve().parents[1]
     failures = 0
     for symbol in symbols:
@@ -1774,14 +1780,21 @@ def _run_cleanup_on_exit(
         env = os.environ.copy()
         env["ALLOW_MAINNET_TRADE"] = "1"
         env.setdefault("PYTHONPATH", ".")
-        result = run_cmd(
-            [executable, "-m", "scripts.exchange_state", "cleanup", symbol],
-            cwd=repo_root,
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        # Cleanup subprocess with timeout (prevent indefinite hang)
+        try:
+            result = run_cmd(
+                [executable, "-m", "scripts.exchange_state", "cleanup", symbol],
+                cwd=repo_root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            failures += 1
+            print(f"  Cleanup-on-exit TIMEOUT symbol={symbol}")
+            continue
         if result.stdout:
             print(result.stdout.strip())
         if result.returncode != 0:
@@ -1789,6 +1802,28 @@ def _run_cleanup_on_exit(
             print(f"  Cleanup-on-exit FAILED symbol={symbol} rc={result.returncode}")
             if result.stderr:
                 print(result.stderr.strip())
+            continue
+        # Post-cleanup re-verify from parent process (Gap 1/9 fix)
+        try:
+            verify_result = run_cmd(
+                [executable, "-m", "scripts.exchange_state", "verify", symbol],
+                cwd=repo_root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            if verify_result.returncode != 0:
+                failures += 1
+                print(f"  Cleanup-on-exit POST_VERIFY_DIRTY symbol={symbol}")
+                if verify_result.stdout:
+                    print(verify_result.stdout.strip())
+            else:
+                print(f"  Cleanup-on-exit VERIFIED_CLEAN symbol={symbol}")
+        except subprocess.TimeoutExpired:
+            failures += 1
+            print(f"  Cleanup-on-exit POST_VERIFY_TIMEOUT symbol={symbol}")
     return failures
 
 
@@ -2032,25 +2067,48 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         print(f"GRINDER TRADING LOOP FATAL: {exc}")
         exit_code = 2
     finally:
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.run_until_complete(_drain_pending_tasks())
-        loop.close()
-        cleanup_exit = finalize_and_cleanup(
-            cleanup_on_exit=args.cleanup_on_exit,
-            mode=mode,
-            exchange_port=args.exchange_port,
-            armed=args.armed,
-            mainnet=args.mainnet,
-            fixture_path=args.fixture,
-            stop_reason=loop_stop_reason,
-            symbols=symbols,
-        )
-        if cleanup_exit > 0 and exit_code == 0:
-            exit_code = cleanup_exit
+        # Shutdown async resources
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(_drain_pending_tasks())
+            loop.close()
+        except Exception as e:
+            print(f"  WARNING: async shutdown error: {e}")
+
+        # Cleanup exchange state (most critical — must always attempt)
+        try:
+            cleanup_exit = finalize_and_cleanup(
+                cleanup_on_exit=args.cleanup_on_exit,
+                mode=mode,
+                exchange_port=args.exchange_port,
+                armed=args.armed,
+                mainnet=args.mainnet,
+                fixture_path=args.fixture,
+                stop_reason=loop_stop_reason,
+                symbols=symbols,
+            )
+            if cleanup_exit > 0 and exit_code == 0:
+                exit_code = cleanup_exit
+        except Exception as e:
+            print(f"  ERROR: cleanup failed with exception: {e}")
+            if exit_code == 0:
+                exit_code = 3
+
+        # Stop LeaderElector (wrapped — must not block server shutdown)
         if elector is not None:
-            print("  Stopping LeaderElector...")
-            elector.stop()
-        server.shutdown()
+            try:
+                print("  Stopping LeaderElector...")
+                elector.stop()
+            except Exception as e:
+                print(f"  WARNING: LeaderElector stop error: {e}")
+
+        # Shutdown HTTP server and release port (always runs)
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception as e:
+            print(f"  WARNING: server shutdown error: {e}")
+
         print("GRINDER TRADING LOOP stopped.")
         sys.exit(exit_code)
 

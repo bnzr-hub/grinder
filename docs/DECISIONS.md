@@ -4870,3 +4870,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Per-action gates:** Quarantined symbols blocked per-action. Unmapped action kinds skipped.
 - **Contract:** `ExecutionCoordinator.execute(report, safety, operator, enabled, acked) -> ExecutionReport` with per-action results, skip reasons, and execution-attempted flag.
 - **Default:** Shadow-only. Execution requires explicit `execution_enabled=True` AND `execution_acknowledged=True`. No silent rollout.
+
+### ADR-140: Shutdown hardening (2026-04-01)
+
+- **Decision:** Harden cleanup-on-exit, server lifecycle, and shutdown sequencing in `run_trading.py`.
+- **Cleanup:** Post-cleanup re-verify per symbol (parent calls `exchange_state verify` after `cleanup`). 60s timeout per cleanup subprocess. Cleanup failure is explicit.
+- **Server:** `SO_REUSEADDR` on metrics server socket. `server.server_close()` called after `server.shutdown()`. Port released immediately on exit.
+- **Finally block:** All shutdown steps wrapped in individual try/except. Cleanup exception does not prevent server shutdown. Server exception does not prevent exit. LeaderElector stop exception does not block.
+- **Fixes:** 6 of 9 identified shutdown gaps closed (post-verify, timeout, exception safety, socket release, LeaderElector wrapping, server_close).

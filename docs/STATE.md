@@ -1894,3 +1894,6 @@ Comprehensive adaptive grid system design:
 - **Phase E4 (reconciliation):** [DONE] `reconcile()` in `src/grinder/execution_plane/reconciler.py` — compares desired set vs EngineRegistry, detects missing/orphan/state-mismatch, emits bounded corrective actions. Pure reconciliation, no engine execution (ADR-137). 12 tests.
 - **Phase E5 (safety controls):** [DONE] `evaluate_safety()` in `safety.py` (STL-E3 orphan, STL-E5 mismatch threshold). `OperatorControls` in `operator.py` (pause/resume/quarantine/release/force-deactivate, all auditable). STL-E1/E2/E6 deferred (need runtime health/failure history). (ADR-138). 15 tests.
 - **Phase E6 (loop integration):** [DONE] `ExecutionCoordinator` wired into `AutonomousLoop.run_cycle()` as optional Stage 8. 4-gate chain: enabled → ACK → safety → pause. Default: shadow-only (`execution_enabled=False`). `CycleReport.execution_report` carries per-cycle execution outcome. (ADR-139). 12 coordinator tests.
+
+### Runtime hardening
+- **Shutdown safety:** [DONE] Cleanup-on-exit with post-verify, 60s timeout per symbol, exception-safe finally block. `server.server_close()` + `SO_REUSEADDR` for clean port release. All shutdown steps wrapped in try/except — server always releases. (ADR-140).
