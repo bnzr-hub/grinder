@@ -1056,7 +1056,7 @@ class LiveEngineV0:
                 shadow_config = GridV2Config(
                     grid_step_pct=Decimal(os.environ.get("GRINDER_GRID_V2_STEP_PCT", "0.0025")),
                     entry_levels_per_side=int(os.environ.get("GRINDER_GRID_V2_ENTRY_LEVELS", "5")),
-                    order_size=Decimal(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE", "0.001")),
+                    order_size=self._grid_v2_order_size_effective,
                     max_inventory_levels=int(
                         os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "20")
                     ),
