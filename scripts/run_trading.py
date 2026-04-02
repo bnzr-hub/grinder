@@ -1943,6 +1943,20 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         sys.exit(1)
     print(f"  Health endpoint: http://localhost:{args.metrics_port}/healthz")
 
+    # Register atexit handler to release server port on ANY exit path.
+    # This covers sys.exit() calls in validators, launch guard, etc.
+    import atexit  # noqa: PLC0415
+
+    def _release_server_on_exit() -> None:
+        if server is not None:
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception:
+                pass
+
+    atexit.register(_release_server_on_exit)
+
     engine = build_engine(
         mode,
         armed=args.armed,
@@ -2110,11 +2124,14 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         except Exception as e:
             print(f"  WARNING: LeaderElector stop error: {e}")
 
-        # Shutdown HTTP server and release port (guard for early startup failure)
+        # Shutdown HTTP server and release port.
+        # atexit handler is also registered as safety net, but explicit
+        # shutdown here is preferred for deterministic ordering.
         try:
             if server is not None:
                 server.shutdown()
                 server.server_close()
+                server = None  # prevent atexit double-close
         except Exception as e:
             print(f"  WARNING: server shutdown error: {e}")
 
