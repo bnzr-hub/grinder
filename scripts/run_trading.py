@@ -1855,6 +1855,10 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     paper_size: Decimal | None = None
     if args.paper_size_per_level is not None:
         paper_size = Decimal(args.paper_size_per_level)
+        # Bridge CLI size to grid_v2 if no explicit GRINDER_GRID_V2_ORDER_SIZE is set.
+        # This ensures --paper-size-per-level feeds grid_v2 as fallback.
+        if not os.environ.get("GRINDER_GRID_V2_ORDER_SIZE"):
+            os.environ["GRINDER_GRID_V2_CLI_SIZE"] = str(paper_size)
 
     # HA lifecycle
     _ha_enabled = is_ha_enabled()
