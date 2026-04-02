@@ -353,6 +353,24 @@ class TestRunCleanupOnExit:
         ]
 
 
+class TestServerPortReuse:
+    """HTTP server releases port immediately for restart."""
+
+    def test_bind_shutdown_rebind_same_port(self) -> None:
+        """Bind, shutdown+close, rebind on same port succeeds."""
+        from scripts.run_trading import run_server  # noqa: PLC0415
+
+        port = 19876  # unlikely to collide
+        server1 = run_server(port)
+        server1.shutdown()
+        server1.server_close()
+
+        # Rebind immediately — must not raise EADDRINUSE
+        server2 = run_server(port)
+        server2.shutdown()
+        server2.server_close()
+
+
 class TestBuildConnector:
     """Test build_connector() network selection."""
 

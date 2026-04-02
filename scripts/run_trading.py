@@ -210,15 +210,16 @@ class TradingHealthHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _ReusableHTTPServer(HTTPServer):
+    """HTTPServer with SO_REUSEADDR set before bind."""
+
+    allow_reuse_address = True
+
+
 def run_server(port: int) -> HTTPServer:
     """Start HTTP server in background thread with SO_REUSEADDR."""
     set_start_time(time.time())
-    server = HTTPServer(("0.0.0.0", port), TradingHealthHandler)
-    server.allow_reuse_address = True
-    # Re-bind with SO_REUSEADDR after setting the flag
-    import socket  # noqa: PLC0415
-
-    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server = _ReusableHTTPServer(("0.0.0.0", port), TradingHealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
