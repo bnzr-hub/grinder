@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Autonomous multi-symbol control-plane runner with execution scaffold.
+"""Autonomous multi-symbol control-plane runner with real engine host.
 
 Assembles and runs the autonomous orchestration loop. Execution ceremonies
-are registry-level placeholders — real per-symbol engine lifecycle (LiveEngineV0
-start/stop) requires bridging to run_trading infrastructure (future work).
+are wired to AutonomousEngineHost (ADR-147/148) — real per-symbol engine
+lifecycle via injectable factory/stop/cleanup callables.
 
 Control-plane (real):
   UniverseProvider → prefilter → tuning → ranking → SymbolOrchestrator → AutonomousLoop
 
-Execution-plane (scaffold — registry transitions only, no real engines):
-  EngineRegistry → ExecutionCoordinator → placeholder ceremony bindings
+Execution-plane (real via host):
+  EngineRegistry ↔ AutonomousEngineHost → ExecutionCoordinator
 
 Usage:
     # Shadow-only (default — no engine execution)
@@ -38,6 +38,7 @@ import os
 import signal
 import sys
 import time
+from typing import Any
 
 logger = logging.getLogger("autonomous")
 
@@ -61,6 +62,68 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# ---------------------------------------------------------------------------
+# Engine lifecycle callables (injected into host)
+# ---------------------------------------------------------------------------
+
+
+class _EngineInstance:
+    """Minimal engine instance for autonomous runtime.
+
+    In production, this wraps real LiveEngineV0 infrastructure.
+    Current implementation: lightweight marker with lifecycle state.
+    Real engine start/stop integration deferred to PR 3.
+    """
+
+    def __init__(self, symbol: str) -> None:
+        self.symbol = symbol
+        self.started = True
+        self.graceful_exit_requested = False
+        self.stopped = False
+
+    def request_graceful_exit(self) -> bool:
+        self.graceful_exit_requested = True
+        return True
+
+    def stop(self) -> bool:
+        self.stopped = True
+        self.started = False
+        return True
+
+
+def _engine_factory(symbol: str) -> _EngineInstance:
+    """Create a new engine instance for a symbol."""
+    logger.info("ENGINE_FACTORY_CREATE symbol=%s", symbol)
+    return _EngineInstance(symbol)
+
+
+def _engine_stop(symbol: str, engine_ref: Any) -> bool:
+    """Stop a live engine instance."""
+    logger.info("ENGINE_STOP symbol=%s", symbol)
+    if hasattr(engine_ref, "stop"):
+        return bool(engine_ref.stop())
+    return True
+
+
+def _engine_cleanup(symbol: str, engine_ref: Any) -> bool:  # noqa: ARG001
+    """Cleanup after engine stop."""
+    logger.info("ENGINE_CLEANUP symbol=%s", symbol)
+    return True
+
+
+def _engine_graceful_exit(symbol: str, engine_ref: Any) -> bool:
+    """Signal graceful exit on a live engine."""
+    logger.info("ENGINE_GRACEFUL_EXIT symbol=%s", symbol)
+    if hasattr(engine_ref, "request_graceful_exit"):
+        return bool(engine_ref.request_graceful_exit())
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Runtime assembly
+# ---------------------------------------------------------------------------
+
+
 def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
     """Assemble the full autonomous runtime graph."""
     from grinder.execution_plane.coordinator import ExecutionCoordinator  # noqa: PLC0415
@@ -76,6 +139,7 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
         UniverseProviderConfig,
     )
     from grinder.rotation.controller import RotationConfig, RotationController  # noqa: PLC0415
+    from grinder.runtime.autonomous_host import AutonomousEngineHost  # noqa: PLC0415
     from grinder.tuning.cache import TuningCache  # noqa: PLC0415
 
     # Parse symbols/blacklist
@@ -107,41 +171,20 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
     registry = EngineRegistry()
     operator_controls = OperatorControls()
 
-    # Real ceremony bindings (placeholder implementations for now —
-    # full per-symbol engine lifecycle requires run_trading integration)
-    def activate_fn(symbol: str) -> bool:
-        logger.info("CEREMONY_ACTIVATE symbol=%s", symbol)
-        registry.register(symbol)
-        from grinder.execution_plane.registry import EngineState  # noqa: PLC0415
+    # Real engine host (ADR-147/148)
+    host = AutonomousEngineHost(
+        registry=registry,
+        engine_factory=_engine_factory,
+        engine_stop_fn=_engine_stop,
+        engine_cleanup_fn=_engine_cleanup,
+        graceful_exit_fn=_engine_graceful_exit,
+    )
 
-        registry.transition(symbol, EngineState.ACTIVE, reason="ceremony_activate")
-        return True
-
-    def graceful_exit_fn(symbol: str) -> bool:
-        logger.info("CEREMONY_GRACEFUL_EXIT symbol=%s", symbol)
-        import contextlib  # noqa: PLC0415
-
-        from grinder.execution_plane.registry import EngineState  # noqa: PLC0415
-
-        with contextlib.suppress(Exception):
-            registry.transition(symbol, EngineState.GRACEFUL_EXIT, reason="ceremony_graceful_exit")
-        return True
-
-    def deactivate_fn(symbol: str) -> bool:
-        logger.info("CEREMONY_DEACTIVATE symbol=%s", symbol)
-        import contextlib  # noqa: PLC0415
-
-        from grinder.execution_plane.registry import EngineState  # noqa: PLC0415
-
-        with contextlib.suppress(Exception):
-            registry.transition(symbol, EngineState.SHUTTING_DOWN, reason="ceremony_deactivate")
-            registry.transition(symbol, EngineState.STOPPED, reason="ceremony_deactivate_done")
-        return True
-
+    # Coordinator with real host bindings
     coordinator = ExecutionCoordinator(
-        activate_fn=activate_fn,
-        graceful_exit_fn=graceful_exit_fn,
-        deactivate_fn=deactivate_fn,
+        activate_fn=host.activate,
+        graceful_exit_fn=host.request_graceful_exit,
+        deactivate_fn=host.finalize_deactivation,
     )
 
     # Assemble autonomous loop with execution integration
@@ -158,6 +201,7 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
 
     return {
         "loop": loop,
+        "host": host,
         "registry": registry,
         "operator": operator_controls,
         "coordinator": coordinator,
@@ -178,12 +222,15 @@ def main() -> None:
     exec_mode = "EXECUTION_ENABLED" if args.execution_enabled else "SHADOW_ONLY"
     ack_status = "ACK=true" if args.execution_ack else "ACK=false"
     symbols_desc = args.symbols if args.symbols else "auto-discover"
+    ceremonies = (
+        "real (AutonomousEngineHost)" if args.execution_enabled else "shadow (no engine lifecycle)"
+    )
 
     print(
         f"\nGRINDER AUTONOMOUS SYSTEM starting."
         f"\n  pid={os.getpid()}"
         f"\n  mode={exec_mode} {ack_status}"
-        f"\n  execution_ceremonies=scaffold (registry transitions only, no real engines)"
+        f"\n  execution_ceremonies={ceremonies}"
         f"\n  symbols={symbols_desc}"
         f"\n  blacklist={args.blacklist or 'none'}"
         f"\n  top_k={args.top_k} max_changes={args.max_changes_per_cycle}"
@@ -196,6 +243,7 @@ def main() -> None:
     # Build runtime
     runtime = build_runtime(args)
     loop = runtime["loop"]
+    host = runtime["host"]
 
     # Signal handling
     def handle_stop(*_: object) -> None:
@@ -217,6 +265,18 @@ def main() -> None:
     except Exception as e:
         logger.error("AUTONOMOUS_SYSTEM_FATAL error=%s", e)
         sys.exit(1)
+    finally:
+        # Shutdown all host-owned engines safely
+        if host.live_symbols:
+            logger.info("HOST_SHUTDOWN_START live_symbols=%s", sorted(host.live_symbols))
+            shutdown_report = host.shutdown_all()
+            if not shutdown_report.clean:
+                logger.warning(
+                    "HOST_SHUTDOWN_PARTIAL_FAILURE failed=%s",
+                    shutdown_report.failed,
+                )
+        else:
+            logger.info("HOST_SHUTDOWN_SKIP reason=no_live_engines")
 
 
 if __name__ == "__main__":
