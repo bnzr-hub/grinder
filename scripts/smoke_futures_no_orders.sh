@@ -92,10 +92,10 @@ done
 sleep 2
 
 # Gate 1: boot line confirms futures port + armed
-if grep -q "port=futures armed=True" "$LOG"; then
-    pass_msg "Boot line: port=futures armed=True"
+if grep -q "exchange_port = futures" "$LOG" && grep -q "armed         = True" "$LOG"; then
+    pass_msg "Boot line: exchange_port=futures armed=True"
 else
-    fail_msg "Missing boot line with port=futures armed=True"
+    fail_msg "Missing boot line with exchange_port=futures armed=True"
 fi
 
 # Gate 2: /metrics contains grinder_live_engine_initialized 1
