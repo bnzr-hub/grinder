@@ -46,17 +46,26 @@ class EngineHandle:
 class BridgeConfig:
     """Configuration for LiveEngineBridge.
 
-    All fields have safe defaults. Override for production.
+    All fields have safe defaults (read_only + NoOp port).
+    Production requires explicit ``exchange_port="futures"`` +
+    ``armed=True`` + ``mode="live_trade"`` + API keys in env.
+
+    Exchange port modes:
+    - ``noop`` (default): NoOpExchangePort, no real orders
+    - ``futures``: BinanceFuturesPort, requires API keys + safety gates
     """
 
     mode: str = "read_only"  # SafeMode value
     armed: bool = False
     use_testnet: bool = True
+    exchange_port: str = "noop"  # "noop" or "futures"
     spacing_bps: float = 10.0
     levels: int = 5
     size_per_level: str = "0.001"
     max_notional_per_order: str = "100"
+    max_orders_per_run: int = 500
     shutdown_timeout_s: float = 30.0
+    ws_transport: Any = None  # Injectable WsTransport for testing (None = real WebSocket)
 
 
 class LiveEngineBridge:
@@ -142,6 +151,63 @@ class LiveEngineBridge:
         logger.info("BRIDGE_ENGINE_CLEANUP symbol=%s", symbol)
         return True
 
+    def _build_port(self, symbol: str, mode: Any) -> Any:
+        """Build exchange port based on config.
+
+        Returns NoOpExchangePort (safe default) or BinanceFuturesPort.
+        Raises RuntimeError if futures port requirements are not met.
+        """
+        import os  # noqa: PLC0415
+
+        cfg = self._config
+        if cfg.exchange_port == "noop":
+            from grinder.execution.port import NoOpExchangePort  # noqa: PLC0415
+
+            return NoOpExchangePort()
+
+        if cfg.exchange_port == "futures":
+            from grinder.execution.binance_futures_port import (  # noqa: PLC0415
+                BinanceFuturesPort,
+                BinanceFuturesPortConfig,
+            )
+
+            api_key = os.environ.get("BINANCE_API_KEY", "").strip()
+            api_secret = os.environ.get("BINANCE_API_SECRET", "").strip()
+            if not api_key or not api_secret:
+                raise RuntimeError(
+                    f"exchange_port=futures requires BINANCE_API_KEY and BINANCE_API_SECRET "
+                    f"for symbol={symbol}"
+                )
+
+            base_url = (
+                "https://testnet.binancefuture.com"
+                if cfg.use_testnet
+                else "https://fapi.binance.com"
+            )
+            port_config = BinanceFuturesPortConfig(
+                mode=mode,
+                base_url=base_url,
+                api_key=api_key,
+                api_secret=api_secret,
+                symbol_whitelist=[symbol],
+                allow_mainnet=not cfg.use_testnet,
+                max_notional_per_order=Decimal(cfg.max_notional_per_order),
+                max_orders_per_run=cfg.max_orders_per_run,
+            )
+            # Use the scripts-level HTTP client factory (same as run_trading.py)
+            from scripts.http_measured_client import RequestsHttpClient  # noqa: PLC0415
+
+            http_client = RequestsHttpClient(port_name=f"bridge-{symbol}")
+            logger.info(
+                "BRIDGE_PORT_FUTURES symbol=%s testnet=%s armed=%s",
+                symbol,
+                cfg.use_testnet,
+                cfg.armed,
+            )
+            return BinanceFuturesPort(http_client=http_client, config=port_config)
+
+        raise RuntimeError(f"Unknown exchange_port={cfg.exchange_port!r}")
+
     def _run_engine_thread(
         self,
         symbol: str,
@@ -180,7 +246,6 @@ class LiveEngineBridge:
             LiveConnectorV0,
             SafeMode,
         )
-        from grinder.execution.port import NoOpExchangePort  # noqa: PLC0415
         from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
         from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
         from grinder.paper.engine import PaperEngine  # noqa: PLC0415
@@ -193,7 +258,7 @@ class LiveEngineBridge:
             levels=cfg.levels,
             size_per_level=Decimal(cfg.size_per_level),
         )
-        port = NoOpExchangePort()
+        port = self._build_port(symbol, mode)
         engine_config = LiveEngineConfig(
             armed=cfg.armed,
             mode=mode,
@@ -208,20 +273,22 @@ class LiveEngineBridge:
         # Propagate engine ref to the handle so graceful_exit can reach it.
         if handle_ref is not None and handle_ref[0] is not None:
             handle_ref[0].engine_ref = engine
-        if engine_ready is not None:
-            engine_ready.set()
 
         connector_config = LiveConnectorConfig(
             mode=mode,
             symbols=[symbol],
             use_testnet=cfg.use_testnet,
+            ws_transport=cfg.ws_transport,
         )
         connector = LiveConnectorV0(config=connector_config)
 
-        logger.info("BRIDGE_ENGINE_CONNECTED symbol=%s mode=%s", symbol, mode.value)
-
+        # Signal readiness AFTER connector.connect() succeeds.
+        # If connect fails, engine_ready never fires → factory fail-closed.
         try:
             await connector.connect()
+            logger.info("BRIDGE_ENGINE_CONNECTED symbol=%s mode=%s", symbol, mode.value)
+            if engine_ready is not None:
+                engine_ready.set()
             async for snapshot in connector.iter_snapshots():
                 if shutdown_event.is_set():
                     break

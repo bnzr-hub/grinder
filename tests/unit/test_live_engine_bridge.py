@@ -9,19 +9,26 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+from grinder.connectors.binance_ws import FakeWsTransport
 from grinder.execution_plane.registry import EngineRegistry, EngineState
 from grinder.runtime.autonomous_host import AutonomousEngineHost
 from grinder.runtime.live_engine_bridge import BridgeConfig, EngineHandle, LiveEngineBridge
 
 
+def _fake_transport() -> FakeWsTransport:
+    """Create a FakeWsTransport that connects instantly and yields no messages."""
+    return FakeWsTransport(messages=[])
+
+
 def _bridge(*, shutdown_timeout_s: float = 5.0) -> LiveEngineBridge:
-    """Build a bridge with safe test defaults."""
+    """Build a bridge with safe test defaults and fake WS transport."""
     return LiveEngineBridge(
         config=BridgeConfig(
             mode="read_only",
             armed=False,
             use_testnet=True,
             shutdown_timeout_s=shutdown_timeout_s,
+            ws_transport=_fake_transport(),
         )
     )
 
@@ -231,6 +238,11 @@ class TestShadowMode:
             execution_enabled=False,
             execution_ack=False,
             max_cycles=None,
+            exchange_port="noop",
+            mainnet=False,
+            armed=False,
+            max_notional_per_order="100",
+            max_orders_per_run=500,
         )
         runtime = mod.build_runtime(args)
         host = runtime["host"]

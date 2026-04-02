@@ -14,6 +14,8 @@ from argparse import Namespace
 
 from scripts.run_autonomous import build_parser, build_runtime
 
+from grinder.connectors.binance_ws import FakeWsTransport
+
 
 def _default_args(**overrides: object) -> Namespace:
     """Build args with defaults."""
@@ -26,6 +28,12 @@ def _default_args(**overrides: object) -> Namespace:
         "execution_enabled": False,
         "execution_ack": False,
         "max_cycles": None,
+        "exchange_port": "noop",
+        "mainnet": False,
+        "armed": False,
+        "max_notional_per_order": "100",
+        "max_orders_per_run": 500,
+        "_ws_transport": FakeWsTransport(messages=[]),
     }
     defaults.update(overrides)
     return Namespace(**defaults)

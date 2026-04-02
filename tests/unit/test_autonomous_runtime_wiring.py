@@ -12,6 +12,7 @@ import argparse
 # Import the module-level helpers and build_runtime
 from scripts import run_autonomous as run_autonomous_mod
 
+from grinder.connectors.binance_ws import FakeWsTransport
 from grinder.execution_plane.registry import EngineState
 from grinder.runtime.autonomous_host import AutonomousEngineHost
 
@@ -27,6 +28,12 @@ def _default_args(**overrides: object) -> argparse.Namespace:
         "execution_enabled": False,
         "execution_ack": False,
         "max_cycles": None,
+        "exchange_port": "noop",
+        "mainnet": False,
+        "armed": False,
+        "max_notional_per_order": "100",
+        "max_orders_per_run": 500,
+        "_ws_transport": FakeWsTransport(messages=[]),
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
