@@ -4962,3 +4962,10 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **No code changes:** ANCHOR_RESET implementation was already correct. The gap was proof coverage, not behavior.
 - **Proof level:** Fixture-natural — external signals only, no internal state mutation. Test grid orders use non-CID format (same as T44-T62 contract tests), so they're invisible to fill detection and `_has_grinder_orders()`. This isolates the ANCHOR_RESET mechanism from fill-detection heuristics while keeping the test fully natural from the engine's perspective.
 - **Complementary:** Grid_v2 return-to-flat with symmetric reseed (ADR-142) covers the two-sided grid path.
+
+### ADR-152: Cold-start tuning bootstrap (2026-04-02)
+
+- **Problem:** Autonomous loop requires TUNED symbols in TuningCache before activation. Tuning needs market prices. Prices come from engine WebSocket feeds. Engines don't start until symbols are activated. Bootstrap deadlock: no engine → no prices → no tuning → no activation.
+- **Decision:** Add `_bootstrap_tuning_cache()` to `run_autonomous.py`. At startup, fetches REST price per symbol from Binance (`/fapi/v1/ticker/price`, no auth needed), runs tuning solver with constraint cache, populates TuningCache. One HTTP call per symbol.
+- **Fail-open:** Price fetch failure or solver NO_GO leaves symbol un-tuned (loop skips it). No fatal error.
+- **Trigger:** Only runs when `--symbols` override is provided (operator-specified symbols). Auto-discover mode would need a different bootstrap path (future work).

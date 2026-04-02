@@ -38,6 +38,7 @@ import os
 import signal
 import sys
 import time
+from decimal import Decimal
 from typing import Any
 
 logger = logging.getLogger("autonomous")
@@ -79,6 +80,96 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max orders per engine instance (default 500).",
     )
     return p
+
+
+# ---------------------------------------------------------------------------
+# Cold-start tuning bootstrap (ADR-152)
+# ---------------------------------------------------------------------------
+
+
+def _fetch_price_rest(symbol: str, testnet: bool = True) -> Decimal | None:
+    """Fetch current price from Binance Futures REST API (no auth needed)."""
+    import json  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+    from decimal import Decimal  # noqa: PLC0415
+
+    base = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
+    url = f"{base}/fapi/v1/ticker/price?symbol={symbol}"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read())
+            return Decimal(data["price"])
+    except Exception as e:
+        logger.warning("BOOTSTRAP_PRICE_FETCH_FAILED symbol=%s error=%s", symbol, e)
+        return None
+
+
+def _bootstrap_tuning_cache(
+    symbols: list[str],
+    cache: Any,
+    args: argparse.Namespace,
+) -> None:
+    """Populate TuningCache with REST-fetched prices + constraint solver.
+
+    Runs once at startup before the autonomous loop starts.
+    Fail-open: if price fetch or solver fails, symbol stays un-tuned.
+    """
+    from grinder.execution.constraint_provider import (  # noqa: PLC0415
+        ConstraintProvider,
+        ConstraintProviderConfig,
+    )
+    from grinder.tuning.solver import TuningSolverConfig, solve  # noqa: PLC0415
+
+    testnet = not getattr(args, "mainnet", False)
+    logger.info("BOOTSTRAP_TUNING_START symbols=%s testnet=%s", symbols, testnet)
+
+    # Load constraints (cache-only, no API fetch — already loaded if available)
+    provider = ConstraintProvider(config=ConstraintProviderConfig(allow_fetch=False))
+    constraints = provider.get_constraints()
+    if not constraints:
+        logger.warning("BOOTSTRAP_TUNING_NO_CONSTRAINTS — solver will use zero constraints")
+
+    config = TuningSolverConfig()
+    tuned_count = 0
+    for symbol in symbols:
+        price = _fetch_price_rest(symbol, testnet=testnet)
+        if price is None or price <= 0:
+            logger.warning("BOOTSTRAP_TUNING_NO_PRICE symbol=%s", symbol)
+            continue
+
+        from grinder.execution.engine import SymbolConstraints  # noqa: PLC0415
+
+        sc = constraints.get(symbol) if constraints else None
+        if sc is None:
+            sc = SymbolConstraints(
+                step_size=Decimal("1"),
+                min_qty=Decimal("1"),
+                tick_size=Decimal("0.0001"),
+                min_notional=Decimal("5"),
+            )
+
+        result = solve(symbol, sc, price, config)
+        cache.put(symbol, result)
+
+        from grinder.tuning.solver import TuningStatus  # noqa: PLC0415
+
+        if result.status == TuningStatus.TUNED:
+            tuned_count += 1
+            logger.info(
+                "BOOTSTRAP_TUNED symbol=%s price=%s order_size=%s",
+                symbol,
+                price,
+                result.order_size,
+            )
+        else:
+            logger.info(
+                "BOOTSTRAP_NO_GO symbol=%s price=%s reason=%s",
+                symbol,
+                price,
+                result.reason.value if result.reason else "UNKNOWN",
+            )
+
+    logger.info("BOOTSTRAP_TUNING_COMPLETE tuned=%d total=%d", tuned_count, len(symbols))
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +228,12 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
     universe_provider = UniverseProvider(config=universe_config)
 
     tuning_cache = TuningCache(ttl_s=300.0)
+
+    # Cold-start tuning bootstrap (ADR-152): fetch REST prices and run solver
+    # so TuningCache is populated BEFORE the first autonomous loop cycle.
+    # Without this, the loop sees CACHE_MISS for every symbol → tuned=0 → no activation.
+    if symbols_override:
+        _bootstrap_tuning_cache(sorted(symbols_override), tuning_cache, args)
 
     rotation_controller = RotationController(
         config=RotationConfig(
