@@ -4901,3 +4901,10 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Gate separation:** `LIVE_PREFLIGHT` always runs. `LAUNCH_GUARD` is independently skippable via `--skip-launch-guard` or auto-skipped for non-futures ports. Skip-launch-guard does NOT skip preflight.
 - **Unsafe combo detection:** 6 patterns detected: rolling without planner, rolling without sync, grid_v2 without sync on futures (BLOCK), grid_v2 without symbol (BLOCK), planner without sync, armed+mainnet+noop. BLOCK-severity warnings halt startup.
 - **Behavioral scope:** Existing gates, validators, and exit paths remain unchanged. The summary adds explicit startup blocking for BLOCK-severity unsafe combinations (grid_v2 without symbol, grid_v2 without sync on futures) — these previously degraded silently.
+
+### ADR-144: Seed validation and config resolution (2026-04-02)
+
+- **Problem:** After ADR-143, startup summary showed gates and runtime mode but not: (1) whether the seed path was actually ready, (2) what preflight thresholds were effective, (3) what grid_v2 sizing was resolved. Operators had to infer these from scattered logs.
+- **Decision:** Extend startup contract with three additions: (1) `SEED_READINESS` gate — validates grid_v2 prerequisites (symbol, order size, tick size, account sync) before engine attempts seed. FAIL blocks startup. (2) `--preflight-clock-drift-ms` CLI flag for explicit threshold override, wired into `PreflightConfig`. (3) `RESOLVED CONFIG` section in summary — prints effective preflight thresholds and grid_v2 sizing with source attribution (env/cli/default).
+- **Seed gate rules:** grid_v2 off → N/A. No symbol → FAIL. Empty/zero order size → FAIL. No account sync → WARN. No tick size → WARN. All present → PASS.
+- **Behavioral scope:** SEED_READINESS FAIL blocks startup (new behavior for grid_v2 misconfigurations that previously failed at runtime). Preflight threshold override is additive — default behavior unchanged when flag not provided.

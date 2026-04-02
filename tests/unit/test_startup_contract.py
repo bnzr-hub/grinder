@@ -1,10 +1,13 @@
-"""Tests for startup contract summary (ADR-143).
+"""Tests for startup contract summary (ADR-143, ADR-144).
 
 Covers:
 - Gate separation (preflight vs launch guard)
 - Effective runtime mode summary
 - Unsafe combination detection
 - Determinism
+- Preflight threshold override (ADR-144)
+- Seed readiness validation (ADR-144)
+- Resolved config in summary (ADR-144)
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from grinder.live.startup_contract import (
     StartupContractSummary,
     build_startup_contract_summary,
     detect_unsafe_combos,
+    evaluate_seed_readiness,
 )
 
 # ---------------------------------------------------------------------------
@@ -39,13 +43,19 @@ def _default_summary(**overrides: object) -> StartupContractSummary:
         "skip_launch_guard": False,
         "launch_guard_status": "verify_clean",
         "launch_guard_reason": "all symbols clean",
+        "preflight_clock_drift_fail_ms": 1500,
+        "preflight_clock_drift_warn_ms": 500,
+        "grid_v2_order_size": "",
+        "grid_v2_order_size_source": "",
+        "grid_v2_tick_size": "",
+        "grid_v2_recovery_mode": "",
     }
     kwargs.update(overrides)
     return build_startup_contract_summary(**kwargs)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
-# T1: skip_launch_guard does not skip live preflight
+# Gate separation (preflight vs launch guard)
 # ---------------------------------------------------------------------------
 
 
@@ -96,7 +106,7 @@ class TestGateSeparation:
 
 
 # ---------------------------------------------------------------------------
-# T2: effective runtime mode summary is printed
+# Effective runtime mode summary
 # ---------------------------------------------------------------------------
 
 
@@ -131,20 +141,20 @@ class TestEffectiveRuntimeModeSummary:
 
 
 # ---------------------------------------------------------------------------
-# T3: execution enabled without ACK warns or blocks
+# Execution without ACK
 # ---------------------------------------------------------------------------
 
 
 class TestExecutionWithoutAck:
     def test_armed_mainnet_noop_warns(self) -> None:
-        """Armed + mainnet + noop port → warning (not block, but clearly flagged)."""
+        """Armed + mainnet + noop port -> warning (not block, but clearly flagged)."""
         summary = _default_summary(armed=True, mainnet=True, exchange_port="noop")
         codes = [w.code for w in summary.warnings]
         assert "ARMED_MAINNET_NOOP" in codes
 
 
 # ---------------------------------------------------------------------------
-# T4: rolling grid feature matrix reported
+# Rolling grid feature matrix
 # ---------------------------------------------------------------------------
 
 
@@ -177,7 +187,7 @@ class TestRollingGridFeatureMatrix:
 
 
 # ---------------------------------------------------------------------------
-# T5: unsafe partial mode combination warns
+# Unsafe partial mode combinations
 # ---------------------------------------------------------------------------
 
 
@@ -210,6 +220,224 @@ class TestUnsafePartialModeCombination:
 
 
 # ---------------------------------------------------------------------------
+# Preflight threshold override (ADR-144)
+# ---------------------------------------------------------------------------
+
+
+class TestPreflightThresholdOverride:
+    def test_preflight_clock_threshold_override_applies(self) -> None:
+        """Explicit config changes the effective threshold."""
+        summary = _default_summary(preflight_clock_drift_fail_ms=3000)
+        assert summary.resolved_config.preflight_clock_drift_fail_ms == 3000
+
+    def test_startup_summary_prints_effective_preflight_threshold(self) -> None:
+        """Operator can see what threshold is active."""
+        summary = _default_summary(preflight_clock_drift_fail_ms=2500)
+        output = summary.format_summary()
+        assert "preflight_clock_drift_fail_ms = 2500" in output
+
+    def test_default_threshold_behavior_preserved_when_no_override(self) -> None:
+        """No regression for default path."""
+        summary = _default_summary()
+        assert summary.resolved_config.preflight_clock_drift_fail_ms == 1500
+        assert summary.resolved_config.preflight_clock_drift_warn_ms == 500
+
+    def test_both_thresholds_in_summary(self) -> None:
+        summary = _default_summary()
+        output = summary.format_summary()
+        assert "preflight_clock_drift_fail_ms = 1500" in output
+        assert "preflight_clock_drift_warn_ms = 500" in output
+
+
+# ---------------------------------------------------------------------------
+# Seed readiness validation (ADR-144)
+# ---------------------------------------------------------------------------
+
+
+class TestSeedReadiness:
+    def test_seed_gate_not_applicable_when_grid_v2_off(self) -> None:
+        result = evaluate_seed_readiness(
+            grid_v2=False,
+            grid_v2_symbol="",
+            account_sync=False,
+            grid_v2_order_size="",
+            grid_v2_tick_size="",
+        )
+        assert result.status == GateStatus.NOT_APPLICABLE
+
+    def test_seed_validation_failure_no_symbol(self) -> None:
+        """Startup output clearly says seed path is not valid."""
+        result = evaluate_seed_readiness(
+            grid_v2=True,
+            grid_v2_symbol="",
+            account_sync=True,
+            grid_v2_order_size="0.001",
+            grid_v2_tick_size="0.01",
+        )
+        assert result.status == GateStatus.FAIL
+        assert "GRINDER_GRID_V2_SYMBOL" in result.reason
+
+    def test_seed_validation_failure_zero_size(self) -> None:
+        result = evaluate_seed_readiness(
+            grid_v2=True,
+            grid_v2_symbol="BTCUSDT",
+            account_sync=True,
+            grid_v2_order_size="0",
+            grid_v2_tick_size="0.01",
+        )
+        assert result.status == GateStatus.FAIL
+        assert "> 0" in result.reason
+
+    def test_seed_validation_failure_decimal_zero_size(self) -> None:
+        """'0.0' and '0.000' must also fail — not just literal '0'."""
+        for val in ("0.0", "0.000", "-1"):
+            result = evaluate_seed_readiness(
+                grid_v2=True,
+                grid_v2_symbol="BTCUSDT",
+                account_sync=True,
+                grid_v2_order_size=val,
+                grid_v2_tick_size="0.01",
+            )
+            assert result.status == GateStatus.FAIL, f"Expected FAIL for order_size={val!r}"
+
+    def test_seed_validation_failure_malformed_size(self) -> None:
+        """Non-numeric order size must fail."""
+        result = evaluate_seed_readiness(
+            grid_v2=True,
+            grid_v2_symbol="BTCUSDT",
+            account_sync=True,
+            grid_v2_order_size="abc",
+            grid_v2_tick_size="0.01",
+        )
+        assert result.status == GateStatus.FAIL
+        assert "not a valid number" in result.reason
+
+    def test_seed_validation_failure_empty_size(self) -> None:
+        result = evaluate_seed_readiness(
+            grid_v2=True,
+            grid_v2_symbol="BTCUSDT",
+            account_sync=True,
+            grid_v2_order_size="",
+            grid_v2_tick_size="0.01",
+        )
+        assert result.status == GateStatus.FAIL
+
+    def test_seed_validation_failure_zero_tick_size(self) -> None:
+        """Zero or negative tick size must fail."""
+        for val in ("0", "0.0", "-0.01"):
+            result = evaluate_seed_readiness(
+                grid_v2=True,
+                grid_v2_symbol="BTCUSDT",
+                account_sync=True,
+                grid_v2_order_size="0.001",
+                grid_v2_tick_size=val,
+            )
+            assert result.status == GateStatus.FAIL, f"Expected FAIL for tick_size={val!r}"
+
+    def test_seed_validation_failure_malformed_tick_size(self) -> None:
+        result = evaluate_seed_readiness(
+            grid_v2=True,
+            grid_v2_symbol="BTCUSDT",
+            account_sync=True,
+            grid_v2_order_size="0.001",
+            grid_v2_tick_size="xyz",
+        )
+        assert result.status == GateStatus.FAIL
+        assert "not a valid number" in result.reason
+
+    def test_seed_validation_warns_no_sync(self) -> None:
+        result = evaluate_seed_readiness(
+            grid_v2=True,
+            grid_v2_symbol="BTCUSDT",
+            account_sync=False,
+            grid_v2_order_size="0.001",
+            grid_v2_tick_size="0.01",
+        )
+        assert result.status == GateStatus.WARN
+        assert "account_sync" in result.reason
+
+    def test_seed_validation_warns_no_tick_size(self) -> None:
+        result = evaluate_seed_readiness(
+            grid_v2=True,
+            grid_v2_symbol="BTCUSDT",
+            account_sync=True,
+            grid_v2_order_size="0.001",
+            grid_v2_tick_size="",
+        )
+        assert result.status == GateStatus.WARN
+        assert "TICK_SIZE" in result.reason
+
+    def test_seed_validation_pass(self) -> None:
+        result = evaluate_seed_readiness(
+            grid_v2=True,
+            grid_v2_symbol="BTCUSDT",
+            account_sync=True,
+            grid_v2_order_size="0.001",
+            grid_v2_tick_size="0.10",
+        )
+        assert result.status == GateStatus.PASS
+
+    def test_seed_gate_status_visible_in_summary(self) -> None:
+        """SEED_READINESS gate appears in formatted summary."""
+        summary = _default_summary(
+            grid_v2=True,
+            grid_v2_symbol="BTCUSDT",
+            account_sync=True,
+            grid_v2_order_size="0.001",
+            grid_v2_tick_size="0.10",
+        )
+        output = summary.format_summary()
+        assert "SEED_READINESS" in output
+        assert "status=PASS" in output
+
+    def test_startup_does_not_claim_seed_ready_when_seed_not_valid(self) -> None:
+        """No misleading ready/success wording when seed is blocked."""
+        summary = _default_summary(
+            grid_v2=True,
+            grid_v2_symbol="",
+            grid_v2_order_size="0.001",
+        )
+        seed = next(g for g in summary.gates if g.name == "SEED_READINESS")
+        assert seed.status == GateStatus.FAIL
+        # Verify the summary does NOT say VERDICT: OK
+        output = summary.format_summary()
+        assert "VERDICT: BLOCKED" in output
+
+
+# ---------------------------------------------------------------------------
+# Resolved config in summary (ADR-144)
+# ---------------------------------------------------------------------------
+
+
+class TestResolvedConfig:
+    def test_resolved_config_section_always_present(self) -> None:
+        summary = _default_summary()
+        output = summary.format_summary()
+        assert "RESOLVED CONFIG" in output
+
+    def test_grid_v2_config_shown_when_enabled(self) -> None:
+        summary = _default_summary(
+            grid_v2=True,
+            grid_v2_symbol="BTCUSDT",
+            account_sync=True,
+            grid_v2_order_size="110",
+            grid_v2_order_size_source="cli",
+            grid_v2_tick_size="0.0001",
+            grid_v2_recovery_mode="restore_then_cleanup_reseed",
+        )
+        output = summary.format_summary()
+        assert "grid_v2_order_size   = 110 (source=cli)" in output
+        assert "grid_v2_tick_size    = 0.0001" in output
+        assert "grid_v2_recovery     = restore_then_cleanup_reseed" in output
+
+    def test_grid_v2_config_hidden_when_disabled(self) -> None:
+        summary = _default_summary(grid_v2=False)
+        output = summary.format_summary()
+        assert "grid_v2_order_size" not in output
+        assert "grid_v2_tick_size" not in output
+
+
+# ---------------------------------------------------------------------------
 # Determinism
 # ---------------------------------------------------------------------------
 
@@ -230,8 +458,12 @@ class TestDeterminism:
             "account_sync": True,
             "preflight_passed": True,
             "skip_launch_guard": False,
-            "launch_guard_status": "clean",
-            "launch_guard_reason": "all_clean",
+            "launch_guard_status": "verify_clean",
+            "launch_guard_reason": "all symbols clean",
+            "preflight_clock_drift_fail_ms": 2000,
+            "grid_v2_order_size": "0.002",
+            "grid_v2_order_size_source": "env",
+            "grid_v2_tick_size": "0.10",
         }
         s1 = build_startup_contract_summary(**kwargs)  # type: ignore[arg-type]
         s2 = build_startup_contract_summary(**kwargs)  # type: ignore[arg-type]
@@ -247,6 +479,22 @@ class TestDeterminism:
         w2 = detect_unsafe_combos(flags)
         assert [(w.code, w.message) for w in w1] == [(w.code, w.message) for w in w2]
 
+    def test_config_resolution_is_deterministic(self) -> None:
+        """Same env/CLI -> same resolved startup config."""
+        kwargs: dict[str, object] = {
+            "preflight_clock_drift_fail_ms": 3000,
+            "grid_v2": True,
+            "grid_v2_symbol": "DRIFTUSDT",
+            "grid_v2_order_size": "110",
+            "grid_v2_order_size_source": "cli",
+            "grid_v2_tick_size": "0.0001",
+            "account_sync": True,
+        }
+        s1 = _default_summary(**kwargs)
+        s2 = _default_summary(**kwargs)
+        assert s1.resolved_config == s2.resolved_config
+        assert s1.format_summary() == s2.format_summary()
+
 
 # ---------------------------------------------------------------------------
 # Format output structure
@@ -259,6 +507,7 @@ class TestFormatOutput:
         output = summary.format_summary()
         assert "STARTUP CONTRACT SUMMARY" in output
         assert "EFFECTIVE RUNTIME MODE" in output
+        assert "RESOLVED CONFIG" in output
         assert "STARTUP GATES" in output
         assert "WARNINGS" in output
         assert "VERDICT" in output
