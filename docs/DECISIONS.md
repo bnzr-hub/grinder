@@ -4945,4 +4945,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Thread model:** `factory()` starts daemon thread, waits up to 10s for engine construction via `engine_ready` event. `stop()` sets `shutdown_event`, joins thread with configurable timeout. `graceful_exit()` calls real `engine.force_graceful_exit(symbol)` on the live engine ref.
 - **Engine ref propagation:** Handle created by factory, engine constructed inside thread. `handle_ref` list passed to thread allows engine_ref assignment back to handle before `engine_ready` fires.
 - **Fail-closed factory:** `factory()` waits up to 10s for engine construction. If `engine_ready` not set, thread dead, or `engine_ref` is None, raises `RuntimeError` — host marks symbol FAILED instead of falsely ACTIVE.
-- **Honest scope:** Real LiveEngineV0 runs in each thread with NoOpExchangePort (safe, no real orders). `force_graceful_exit()` returns False for engines with no active ticks (correct — no position). Production exchange port integration (BinanceFuturesPort wiring) is pending — requires explicit BridgeConfig override not yet implemented.
+- **Honest scope:** Real LiveEngineV0 runs in each thread. `force_graceful_exit()` returns False for engines with no active ticks (correct — no position).
+
+### ADR-150: Bridge port wiring — BinanceFuturesPort support (2026-04-02)
+
+- **Problem:** ADR-149 hardcoded NoOpExchangePort in the bridge. Autonomous runtime could run real engines but not execute real orders.
+- **Decision:** Add `BridgeConfig.exchange_port` field (`"noop"` default, `"futures"` opt-in). Bridge `_build_port()` constructs NoOpExchangePort or BinanceFuturesPort based on config. CLI flags `--exchange-port`, `--mainnet`, `--armed`, `--max-notional-per-order`, `--max-orders-per-run` wired in `run_autonomous.py`.
+- **Safety:** Default remains `noop + testnet + unarmed`. Futures requires `BINANCE_API_KEY` + `BINANCE_API_SECRET` (fail-closed RuntimeError). Mainnet requires explicit `--mainnet` flag. Armed requires explicit `--armed`. Startup banner prints effective port/net/armed state.
+- **Port construction:** Happens inside engine thread (`_build_port` called in `_run_engine_async`). Construction failure → `engine_ready` never fires → factory fail-closed → host marks FAILED.
+- **Readiness contract:** `engine_ready` fires only after `connector.connect()` succeeds. If port construction, engine creation, or connector connection fails, readiness never signals → factory raises → host marks FAILED. No false-ACTIVE state for engines that failed to come up.

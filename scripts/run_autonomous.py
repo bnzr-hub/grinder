@@ -59,6 +59,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--execution-ack", action="store_true", help="Operator ACK for execution")
     p.add_argument("--max-cycles", type=int, default=None, help="Stop after N cycles (for testing)")
+    p.add_argument(
+        "--exchange-port",
+        default="noop",
+        choices=["noop", "futures"],
+        help="Exchange port for engine threads: noop (default) or futures (requires API keys).",
+    )
+    p.add_argument("--mainnet", action="store_true", help="Use mainnet (default: testnet)")
+    p.add_argument("--armed", action="store_true", help="Arm engines for write operations")
+    p.add_argument(
+        "--max-notional-per-order",
+        default="100",
+        help="Max notional per order in USD (default 100).",
+    )
+    p.add_argument(
+        "--max-orders-per-run",
+        type=int,
+        default=500,
+        help="Max orders per engine instance (default 500).",
+    )
     return p
 
 
@@ -67,11 +86,23 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
-def _build_engine_bridge() -> Any:
-    """Build the LiveEngineBridge with config from environment."""
+def _build_engine_bridge(args: argparse.Namespace) -> Any:
+    """Build the LiveEngineBridge with config from CLI args."""
     from grinder.runtime.live_engine_bridge import BridgeConfig, LiveEngineBridge  # noqa: PLC0415
 
-    return LiveEngineBridge(config=BridgeConfig())
+    mode = "live_trade" if args.armed and args.exchange_port == "futures" else "read_only"
+    ws_transport = getattr(args, "_ws_transport", None)
+    return LiveEngineBridge(
+        config=BridgeConfig(
+            mode=mode,
+            armed=args.armed,
+            use_testnet=not args.mainnet,
+            exchange_port=args.exchange_port,
+            max_notional_per_order=args.max_notional_per_order,
+            max_orders_per_run=args.max_orders_per_run,
+            ws_transport=ws_transport,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +158,7 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
     operator_controls = OperatorControls()
 
     # Real engine host with LiveEngineBridge (ADR-147/148/149)
-    bridge = _build_engine_bridge()
+    bridge = _build_engine_bridge(args)
     host = AutonomousEngineHost(
         registry=registry,
         engine_factory=bridge.factory,
@@ -183,11 +214,13 @@ def main() -> None:
         "real (AutonomousEngineHost)" if args.execution_enabled else "shadow (no engine lifecycle)"
     )
 
+    net = "mainnet" if args.mainnet else "testnet"
     print(
         f"\nGRINDER AUTONOMOUS SYSTEM starting."
         f"\n  pid={os.getpid()}"
         f"\n  mode={exec_mode} {ack_status}"
         f"\n  execution_ceremonies={ceremonies}"
+        f"\n  exchange_port={args.exchange_port} net={net} armed={args.armed}"
         f"\n  symbols={symbols_desc}"
         f"\n  blacklist={args.blacklist or 'none'}"
         f"\n  top_k={args.top_k} max_changes={args.max_changes_per_cycle}"
