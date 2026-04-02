@@ -949,8 +949,21 @@ class LiveEngineV0:
         _os_enabled = parse_bool(
             "GRINDER_GRID_V2_ORDER_SIZE_POLICY_ENABLED", default=False, strict=False
         )
-        _base_order_size = float(os.environ.get("GRINDER_GRID_V2_ORDER_SIZE", "0.001"))
+        # Grid_v2 order size: GRINDER_GRID_V2_ORDER_SIZE (explicit) > GRINDER_GRID_V2_CLI_SIZE
+        # (set by run_trading from --paper-size-per-level) > default 0.001.
+        _raw_env = os.environ.get("GRINDER_GRID_V2_ORDER_SIZE")
+        _raw_cli = os.environ.get("GRINDER_GRID_V2_CLI_SIZE")
+        if _raw_env:
+            _base_order_size = float(_raw_env)
+            _size_source = "env:GRINDER_GRID_V2_ORDER_SIZE"
+        elif _raw_cli:
+            _base_order_size = float(_raw_cli)
+            _size_source = "cli:--paper-size-per-level"
+        else:
+            _base_order_size = 0.001
+            _size_source = "default"
         self._grid_v2_order_size_effective = Decimal(str(_base_order_size))
+        logger.info("GRID_V2_ORDER_SIZE effective=%s source=%s", _base_order_size, _size_source)
         self._grid_v2_order_size_last_update_ts = 0
         self._grid_v2_order_size_policy = OrderSizePolicyConfig(
             enabled=_os_enabled,
