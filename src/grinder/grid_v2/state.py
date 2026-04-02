@@ -839,11 +839,18 @@ class GridV2StateMachine:
         new_window = snap.entry_window
         new_mode = BranchMode.FLAT if not new_open else snap.mode
         new_last_recenter_ts = snap.last_recenter_ts
-        restore_without_reseed = (
-            not self._config.reseed_on_flat
-            and not new_open
-            and snap.mode in {BranchMode.LONG_BRANCH, BranchMode.SHORT_BRANCH}
+        _returning_to_flat = not new_open and snap.mode in {
+            BranchMode.LONG_BRANCH,
+            BranchMode.SHORT_BRANCH,
+        }
+        _ladder_skewed = _returning_to_flat and (
+            not snap.entry_window.buy_entry_prices or not snap.entry_window.sell_entry_prices
         )
+        _flat_reseed = _returning_to_flat and (
+            self._config.reseed_on_flat
+            or (self._config.reseed_on_flat_only_on_skew and _ladder_skewed)
+        )
+        restore_without_reseed = _returning_to_flat and not _flat_reseed
         if new_open or restore_without_reseed:
             step_delta = _grid_step_price(
                 snap.entry_window.reference_price,
@@ -991,7 +998,7 @@ class GridV2StateMachine:
                     levels_per_side=snap.entry_window.levels_per_side,
                     step_pct=snap.entry_window.step_pct,
                 )
-        elif self._config.reseed_on_flat:
+        elif _flat_reseed:
             new_window = _build_entry_window(
                 snap.entry_window.reference_price,
                 self._config.entry_levels_per_side,
