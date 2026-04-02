@@ -51,6 +51,7 @@ def _config(
     max_notional: Decimal = Decimal("10000"),
     tick_size: Decimal = Decimal("0.01"),
     reseed_on_flat: bool = True,
+    reseed_on_flat_only_on_skew: bool = True,
 ) -> GridV2Config:
     return GridV2Config(
         grid_step_pct=step,
@@ -60,6 +61,7 @@ def _config(
         max_inventory_notional_usd=max_notional,
         price_tick_size=tick_size,
         reseed_on_flat=reseed_on_flat,
+        reseed_on_flat_only_on_skew=reseed_on_flat_only_on_skew,
     )
 
 
@@ -524,8 +526,9 @@ class TestFullUnwind:
         assert snap.entry_window.sell_entry_prices == fresh.snapshot.entry_window.sell_entry_prices
         assert snap.entry_window.reference_price == window_before_exit.reference_price
 
-    def test_last_exit_goes_flat_without_reseed_when_disabled(self) -> None:
-        cfg = _config(reseed_on_flat=False)
+    def test_last_exit_goes_flat_without_reseed_when_both_disabled(self) -> None:
+        """Both reseed flags off: one-sided dead state is allowed (operator choice)."""
+        cfg = _config(reseed_on_flat=False, reseed_on_flat_only_on_skew=False)
         sm = _sm(cfg=cfg)
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
@@ -545,6 +548,82 @@ class TestFullUnwind:
         assert len(snap.entry_window.sell_entry_prices) == 0
         assert any(a.reason == "EXIT_RESTORE" for a in result.actions)
         assert all(a.reason not in {"RECENTER", "RECENTER_REPLACE"} for a in result.actions)
+
+    def test_last_exit_reseeds_on_skew_long_branch(self) -> None:
+        """Default prod config: LONG_BRANCH → FLAT with empty SELL → reseeds both sides."""
+        cfg = _config(reseed_on_flat=False, reseed_on_flat_only_on_skew=True)
+        sm = _sm(cfg=cfg)
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
+        # After entry fill: LONG_BRANCH, SELL entries cancelled (one-sided).
+        assert sm.snapshot.mode == BranchMode.LONG_BRANCH
+        assert sm.snapshot.entry_window.sell_entry_prices == ()
+
+        lot = sm.snapshot.open_lots[0]
+        exit_eo = sm.snapshot.exit_orders[0]
+        result = sm.apply(
+            ExitFilled(exit_eo.exit_order_id, lot.lot_id, lot.exit_price, _ORDER_SIZE, _BASE_TS + 2)
+        )
+
+        assert not result.rejected
+        snap = result.snapshot
+        assert snap.mode == BranchMode.FLAT
+        # Skew detected: both sides rebuilt symmetrically.
+        assert len(snap.entry_window.buy_entry_prices) == cfg.entry_levels_per_side
+        assert len(snap.entry_window.sell_entry_prices) == cfg.entry_levels_per_side
+        assert any(a.reason == "RECENTER" for a in result.actions)
+
+    def test_last_exit_reseeds_on_skew_short_branch(self) -> None:
+        """Default prod config: SHORT_BRANCH → FLAT with empty BUY → reseeds both sides."""
+        cfg = _config(reseed_on_flat=False, reseed_on_flat_only_on_skew=True)
+        sm = _sm(cfg=cfg)
+        sell1 = sm.snapshot.entry_window.sell_entry_prices[0]
+        sm.apply(EntryFilled("E1", OrderSide.SELL, sell1, _ORDER_SIZE, _BASE_TS + 1))
+        assert sm.snapshot.mode == BranchMode.SHORT_BRANCH
+        assert sm.snapshot.entry_window.buy_entry_prices == ()
+
+        lot = sm.snapshot.open_lots[0]
+        exit_eo = sm.snapshot.exit_orders[0]
+        result = sm.apply(
+            ExitFilled(exit_eo.exit_order_id, lot.lot_id, lot.exit_price, _ORDER_SIZE, _BASE_TS + 2)
+        )
+
+        assert not result.rejected
+        snap = result.snapshot
+        assert snap.mode == BranchMode.FLAT
+        assert len(snap.entry_window.buy_entry_prices) == cfg.entry_levels_per_side
+        assert len(snap.entry_window.sell_entry_prices) == cfg.entry_levels_per_side
+        assert any(a.reason == "RECENTER" for a in result.actions)
+
+    def test_multi_lot_unwind_reseeds_on_skew(self) -> None:
+        """Prod config: 2-lot LONG unwind → FLAT reseeds both sides."""
+        cfg = _config(reseed_on_flat=False, reseed_on_flat_only_on_skew=True)
+        sm = _sm(cfg=cfg)
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
+        buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("E2", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 2))
+        assert sm.snapshot.entry_window.sell_entry_prices == ()
+
+        # Close first lot — still in branch
+        lot1 = sm.snapshot.open_lots[0]
+        exit1 = next(eo for eo in sm.snapshot.exit_orders if eo.lot_id == lot1.lot_id)
+        r1 = sm.apply(
+            ExitFilled(exit1.exit_order_id, lot1.lot_id, lot1.exit_price, _ORDER_SIZE, _BASE_TS + 3)
+        )
+        assert r1.snapshot.mode == BranchMode.LONG_BRANCH
+        assert r1.snapshot.entry_window.sell_entry_prices == ()
+
+        # Close second lot → FLAT with skew → reseed
+        lot2 = sm.snapshot.open_lots[0]
+        exit2 = next(eo for eo in sm.snapshot.exit_orders if eo.lot_id == lot2.lot_id)
+        r2 = sm.apply(
+            ExitFilled(exit2.exit_order_id, lot2.lot_id, lot2.exit_price, _ORDER_SIZE, _BASE_TS + 4)
+        )
+        assert r2.snapshot.mode == BranchMode.FLAT
+        assert len(r2.snapshot.entry_window.buy_entry_prices) == cfg.entry_levels_per_side
+        assert len(r2.snapshot.entry_window.sell_entry_prices) == cfg.entry_levels_per_side
+        assert any(a.reason == "RECENTER" for a in r2.actions)
 
     def test_entry_after_flat_reseed_reactivates_consumed_price(self) -> None:
         """After full unwind, the consumed price becomes active again."""

@@ -4886,3 +4886,18 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Ceremony bindings:** Registry-level placeholders only (transitions ACTIVATING→ACTIVE, etc.). No real LiveEngineV0 start/stop. Real per-symbol engine lifecycle requires bridging to run_trading infrastructure (future work).
 - **Defaults:** Shadow-only (`--execution-enabled` OFF). Execution requires both `--execution-enabled` AND `--execution-ack`.
 - **Config:** All via CLI args: `--symbols`, `--blacklist`, `--top-k`, `--cycle-interval-s`. No hidden env flags.
+
+### ADR-142: Reseed on skewed FLAT return (2026-04-01)
+
+- **Problem:** `reseed_on_flat_only_on_skew` was declared in `GridV2Config` but never checked in the state machine's exit fill handler. In one-sided grid mode, entry fill cancels opposite entries (e.g. BUY fill → LONG_BRANCH → all SELL entries cancelled). When last exit fill returns to FLAT, the `restore_without_reseed` path only restores same-side entries — leaving the grid in a dead state (e.g. 5 BUY / 0 SELL). Observed live on DRIFTUSDT.
+- **Decision:** Wire `reseed_on_flat_only_on_skew` into the state machine's exit fill handler. When returning to FLAT from a branch and the entry ladder is skewed (one side empty), trigger a full symmetric reseed using the existing recenter logic. This is the production default (`reseed_on_flat=False, reseed_on_flat_only_on_skew=True`).
+- **Three reseed modes:** (1) `reseed_on_flat=True`: always reseed on FLAT return. (2) `reseed_on_flat=False, reseed_on_flat_only_on_skew=True` (default): reseed only when ladder is skewed. (3) Both False: no reseed — operator explicitly accepts dead state risk.
+- **No engine changes:** The fix is entirely in the pure state machine. Engine integrity repair already had skew detection as a safety net, but relied on multi-tick mismatch streak to trigger — too slow for production continuity.
+
+### ADR-143: Startup contract summary (2026-04-02)
+
+- **Problem:** Startup output was scattered across multiple print statements. Operators couldn't quickly determine: which gates actually ran, which were skipped, what effective runtime mode was active, or whether partial feature combinations were misleading.
+- **Decision:** Add `src/grinder/live/startup_contract.py` — a pure-function builder that produces a consolidated `StartupContractSummary` with three sections: (1) Effective Runtime Mode (all resolved flags), (2) Startup Gates with explicit PASS/FAIL/SKIP status, (3) Unsafe combination warnings.
+- **Gate separation:** `LIVE_PREFLIGHT` always runs. `LAUNCH_GUARD` is independently skippable via `--skip-launch-guard` or auto-skipped for non-futures ports. Skip-launch-guard does NOT skip preflight.
+- **Unsafe combo detection:** 6 patterns detected: rolling without planner, rolling without sync, grid_v2 without sync on futures (BLOCK), grid_v2 without symbol (BLOCK), planner without sync, armed+mainnet+noop. BLOCK-severity warnings halt startup.
+- **Behavioral scope:** Existing gates, validators, and exit paths remain unchanged. The summary adds explicit startup blocking for BLOCK-severity unsafe combinations (grid_v2 without symbol, grid_v2 without sync on futures) — these previously degraded silently.

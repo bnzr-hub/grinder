@@ -43,6 +43,7 @@ def _config(
     max_levels: int = 10,
     max_notional: Decimal = Decimal("100000"),
     reseed_on_flat: bool = True,
+    reseed_on_flat_only_on_skew: bool = True,
 ) -> GridV2Config:
     return GridV2Config(
         grid_step_pct=step,
@@ -51,6 +52,7 @@ def _config(
         max_inventory_levels=max_levels,
         max_inventory_notional_usd=max_notional,
         reseed_on_flat=reseed_on_flat,
+        reseed_on_flat_only_on_skew=reseed_on_flat_only_on_skew,
     )
 
 
@@ -299,8 +301,10 @@ class TestFillLifecycleExit:
         assert all(ea.reason == "grid_v2_PLACE_ENTRY" for ea in place_actions)
 
     def test_exit_fill_to_flat_preserve_restores_same_side_only(self) -> None:
-        """Preserve mode: exit fill restores BUY entries only (one-sided, was LONG_BRANCH)."""
-        b, seed = _fresh_bridge(config=_config(reseed_on_flat=False))
+        """Preserve mode (both reseed flags off): BUY entries only (one-sided, was LONG_BRANCH)."""
+        b, seed = _fresh_bridge(
+            config=_config(reseed_on_flat=False, reseed_on_flat_only_on_skew=False)
+        )
         buy_seed = [s for s in seed if s.side == OrderSide.BUY]
         buy_cid = buy_seed[0].client_order_id
         buy_price = buy_seed[0].price
