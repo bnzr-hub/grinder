@@ -4878,3 +4878,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Server:** `SO_REUSEADDR` on metrics server socket. `server.server_close()` called after `server.shutdown()`. Port released immediately on exit.
 - **Finally block:** All shutdown steps wrapped in individual try/except. Cleanup exception does not prevent server shutdown. Server exception does not prevent exit. LeaderElector stop exception does not block.
 - **Fixes:** 6 of 9 identified shutdown gaps closed (post-verify, timeout, exception safety, socket release, LeaderElector wrapping, server_close).
+
+### ADR-141: Canonical autonomous production entrypoint (2026-04-02)
+
+- **Decision:** Create `scripts/run_autonomous.py` — the blessed 24/7 entrypoint for the Grinder autonomous system.
+- **Assembly:** Wires AutonomousLoop + UniverseProvider + TuningCache + RotationController + SymbolOrchestrator + EngineRegistry + OperatorControls + ExecutionCoordinator with real ceremony bindings.
+- **Defaults:** Shadow-only (`--execution-enabled` OFF). Execution requires both `--execution-enabled` AND `--execution-ack`.
+- **Config:** All via CLI args: `--symbols`, `--blacklist`, `--top-k`, `--cycle-interval-s`, `--metrics-port`. No hidden env flags.
+- **Ceremony bindings:** activate_fn/graceful_exit_fn/deactivate_fn bound to EngineRegistry transitions. Full per-symbol engine lifecycle integration deferred to run_trading bridge.
