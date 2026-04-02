@@ -561,9 +561,17 @@ def _run_startup_tuning_shadow(
         max_pos_usd = Decimal(raw_cap) if raw_cap else Decimal("999999999")
         max_inv = int(os.environ.get("GRINDER_GRID_V2_MAX_INV_LEVELS", "5"))
 
+        # Wire real grid geometry from env vars so tuning legality matches
+        # the actual live ladder shape (entry_levels = paper_levels, spacing = bps/10000).
+        entry_levels = int(os.environ.get("GRINDER_GRID_V2_ENTRY_LEVELS", "5"))
+        raw_spacing = os.environ.get("GRINDER_GRID_V2_SPACING_BPS")
+        spacing_pct = Decimal(raw_spacing) / 10000 if raw_spacing else Decimal("0.0025")
+
         config = TuningSolverConfig(
             max_position_usd=max_pos_usd,
             max_inventory_levels=max_inv,
+            entry_levels_per_side=entry_levels,
+            spacing_pct=spacing_pct,
         )
 
         # No price source at startup in B3a — pass empty prices.

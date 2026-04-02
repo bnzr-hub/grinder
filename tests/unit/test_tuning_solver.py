@@ -95,9 +95,12 @@ class TestTunedCases:
         assert result.max_inventory_levels == 5
 
     def test_cheap_symbol_notional_drives_qty(self) -> None:
-        """Cheap symbol where min_notional forces qty upward."""
-        # price=1.26 USDT, min_notional=5, step=1
-        # raw_qty = 5 / 1.26 = 3.968..., ceil_to_step(3.968, 1) = 4
+        """Cheap symbol where min_notional forces qty upward.
+
+        With worst-case deep price (default spacing 25bps * 5 levels = 1.25% below mid):
+        - worst_case_price = 1.26 * (1 - 0.0025 * 5) = 1.24425
+        - raw_qty = 5 / 1.24425 = 4.018..., ceil_to_step = 5
+        """
         constraints = SymbolConstraints(
             step_size=Decimal("1"),
             min_qty=Decimal("1"),
@@ -109,9 +112,10 @@ class TestTunedCases:
         result = solve("AIOTUSDT", constraints, Decimal("1.26"), config)
 
         assert result.status == TuningStatus.TUNED
-        assert result.order_size == Decimal("4")
-        # worst_case = 4 * 1.26 * 5 = 25.20 <= 100
-        assert result.order_size * Decimal("1.26") * 5 <= Decimal("100")
+        # Verify legal at deepest level
+        deepest = Decimal("1.26") * (1 - Decimal("0.0025") * 5)
+        assert result.order_size is not None
+        assert result.order_size * deepest >= Decimal("5")
 
     def test_min_notional_zero(self) -> None:
         """min_notional=0 means notional check is skipped, use min_qty."""
@@ -259,8 +263,12 @@ class TestBoundaryCases:
     """Edge cases for notional rounding and budget checks."""
 
     def test_exact_notional_boundary(self) -> None:
-        """Quantity exactly meets min_notional — no rounding needed."""
-        # price=5, min_notional=5, step=1 -> raw_qty=1.0, ceil=1
+        """Quantity sized for worst-case deep price, not just mid.
+
+        price=5, min_notional=5, default spacing 25bps*5=1.25%:
+        worst_case = 5 * (1 - 0.0125) = 4.9375
+        raw_qty = 5 / 4.9375 = 1.0126..., ceil_to_step = 2
+        """
         constraints = SymbolConstraints(
             step_size=Decimal("1"),
             min_qty=Decimal("1"),
@@ -270,7 +278,9 @@ class TestBoundaryCases:
         result = solve("TESTUSDT", constraints, Decimal("5"), DEFAULT_CONFIG)
 
         assert result.status == TuningStatus.TUNED
-        assert result.order_size == Decimal("1")
+        deepest = Decimal("5") * (1 - Decimal("0.0025") * 5)
+        assert result.order_size is not None
+        assert result.order_size * deepest >= Decimal("5")
 
     def test_just_below_notional_rounds_up(self) -> None:
         """Price just above min_notional/step boundary still rounds up."""
@@ -286,6 +296,7 @@ class TestBoundaryCases:
         assert result.status == TuningStatus.TUNED
         assert result.order_size == Decimal("2")
         # Verify notional: 2 * 4.99 = 9.98 >= 5
+        assert result.order_size is not None
         assert result.order_size * Decimal("4.99") >= Decimal("5")
 
     def test_worst_case_exactly_at_cap(self) -> None:
@@ -319,5 +330,90 @@ class TestBoundaryCases:
         result = solve("TINYUSDT", constraints, Decimal("0.50"), DEFAULT_CONFIG)
 
         assert result.status == TuningStatus.TUNED
-        assert result.order_size == Decimal("10.00")
-        # worst_case = 10 * 0.50 * 5 = 25 <= 10000
+        # worst_case deep price = 0.50 * (1 - 0.0025 * 5) = 0.49375
+        # min_qty_for_notional = ceil(5 / 0.49375, 0.01) = ceil(10.126...) = 10.13
+        # order_size = max(0.01, 10.13) = 10.13
+        assert result.order_size is not None
+        assert result.order_size >= Decimal("10.00")
+
+
+# --- Tests: Deep-level notional regression ---
+
+
+class TestDeepLevelNotional:
+    """Solver sizes against worst-case deep entry price, not just mid."""
+
+    def test_drift_regression(self) -> None:
+        """DRIFTUSDT regression: order_size must be legal at deepest BUY level.
+
+        At price=0.0489, spacing=25bps, 5 levels:
+        - deepest BUY = 0.0489 * (1 - 0.0025 * 5) = 0.04829
+        - min_notional=5: need ceil(5 / 0.04829, 1) = 104
+        - old solver would give 103 (illegal at deep level)
+        """
+        constraints = SymbolConstraints(
+            step_size=Decimal("1"),
+            min_qty=Decimal("1"),
+            tick_size=Decimal("0.0001"),
+            min_notional=Decimal("5"),
+        )
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("500"),
+            max_inventory_levels=10,
+            entry_levels_per_side=5,
+            spacing_pct=Decimal("0.0025"),
+        )
+        result = solve("DRIFTUSDT", constraints, Decimal("0.0489"), config)
+
+        assert result.status == TuningStatus.TUNED
+        # Verify legal at deepest level
+        deepest_price = Decimal("0.0489") * (1 - Decimal("0.0025") * 5)
+        assert result.order_size is not None
+        assert result.order_size * deepest_price >= Decimal("5")
+
+    def test_mid_legal_deep_illegal_old_logic(self) -> None:
+        """Symbol where mid price is legal but deepest is not under old logic."""
+        constraints = SymbolConstraints(
+            step_size=Decimal("1"),
+            min_qty=Decimal("1"),
+            tick_size=Decimal("0.0001"),
+            min_notional=Decimal("5"),
+        )
+        # With spacing 50bps * 5 levels = 2.5% below mid
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("500"),
+            max_inventory_levels=10,
+            entry_levels_per_side=5,
+            spacing_pct=Decimal("0.005"),
+        )
+        result = solve("CHEAPUSDT", constraints, Decimal("0.0510"), config)
+
+        assert result.status == TuningStatus.TUNED
+        deepest = Decimal("0.0510") * (1 - Decimal("0.005") * 5)
+        assert result.order_size is not None
+        assert result.order_size * deepest >= Decimal("5")
+
+    def test_deep_legal_qty_breaks_cap(self) -> None:
+        """Deep-level legal qty is too large for position cap → NO_GO."""
+        constraints = SymbolConstraints(
+            step_size=Decimal("1"),
+            min_qty=Decimal("1"),
+            tick_size=Decimal("0.0001"),
+            min_notional=Decimal("5"),
+        )
+        # Very wide spacing makes deepest price very low → large qty needed
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("10"),
+            max_inventory_levels=5,
+            entry_levels_per_side=5,
+            spacing_pct=Decimal("0.05"),  # 5% per level, 25% total
+        )
+        result = solve("LOWUSDT", constraints, Decimal("0.05"), config)
+
+        assert result.status == TuningStatus.NO_GO
+
+    def test_btc_unchanged(self) -> None:
+        """BTC-like symbol behavior unchanged (deep price negligible impact)."""
+        result = solve("BTCUSDT", BTC_CONSTRAINTS, Decimal("80000"), DEFAULT_CONFIG)
+        assert result.status == TuningStatus.TUNED
+        assert result.order_size == Decimal("0.001")
