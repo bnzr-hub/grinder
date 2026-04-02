@@ -136,6 +136,9 @@ def solve(
     # --- Compute worst-case deep entry price ---
     # Deepest BUY entry sits entry_levels_per_side * spacing below mid price.
     # min_notional must be satisfied at this worst-case price, not mid.
+    # NOTE: This fixes tuning legality for the autonomous path. The actual
+    # runtime placement path (run_trading.py) uses operator-set order_size
+    # directly — that path needs separate validation if size diverges.
     worst_case_price = price * (1 - config.spacing_pct * config.entry_levels_per_side)
     if worst_case_price <= 0:
         worst_case_price = constraints.tick_size  # absolute floor
