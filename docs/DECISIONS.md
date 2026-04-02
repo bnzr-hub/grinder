@@ -4908,3 +4908,10 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Extend startup contract with three additions: (1) `SEED_READINESS` gate — validates grid_v2 prerequisites (symbol, order size, tick size, account sync) before engine attempts seed. FAIL blocks startup. (2) `--preflight-clock-drift-ms` CLI flag for explicit threshold override, wired into `PreflightConfig`. (3) `RESOLVED CONFIG` section in summary — prints effective preflight thresholds and grid_v2 sizing with source attribution (env/cli/default).
 - **Seed gate rules:** grid_v2 off → N/A. No symbol → FAIL. Empty/zero order size → FAIL. No account sync → WARN. No tick size → WARN. All present → PASS.
 - **Behavioral scope:** SEED_READINESS FAIL blocks startup (new behavior for grid_v2 misconfigurations that previously failed at runtime). Preflight threshold override is additive — default behavior unchanged when flag not provided.
+
+### ADR-145: Stable run identity (2026-04-02)
+
+- **Problem:** Multiple runs were hard to distinguish in logs and incident triage. Startup/shutdown banners printed pid inconsistently and had no stable identifier to correlate them.
+- **Decision:** Add `src/grinder/live/run_identity.py` — generates a `RunIdentity(run_id, pid, started_at_utc)` at process start. Format: `YYYYMMDD-HHMMSS-<4hex>`. Same identity printed in structured startup banner (with mode, symbols, port) and shutdown banner (with exit_code, stop_reason). Replaces ad-hoc scattered prints with deterministic formatted blocks.
+- **Injectable for tests:** `build_run_identity(clock=, pid=, entropy=)` accepts overrides for deterministic test output.
+- **Behavioral scope:** Startup banner changes from one-line print to structured block. Shutdown banner gains run_id and stop_reason. No strategy or runtime changes.

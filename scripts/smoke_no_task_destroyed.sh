@@ -88,11 +88,11 @@ else
     grep "Read timeout" "$LOG" || true
 fi
 
-# Gate 4: process exited with "GRINDER TRADING LOOP stopped."
-if grep -q "GRINDER TRADING LOOP stopped" "$LOG"; then
+# Gate 4: process exited with clean shutdown banner
+if grep -q "GRINDER RUN SHUTDOWN" "$LOG"; then
     pass_msg "Clean shutdown message present"
 else
-    fail_msg "Missing \"GRINDER TRADING LOOP stopped.\" in output"
+    fail_msg "Missing \"GRINDER RUN SHUTDOWN\" in output"
 fi
 
 echo ""
