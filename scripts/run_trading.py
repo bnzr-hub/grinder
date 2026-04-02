@@ -1935,7 +1935,12 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # Pure startup visibility — no dispatch change, no selector change.
     _run_startup_tuning_shadow(symbols, preflight_constraints)
 
-    server = run_server(args.metrics_port)
+    server: HTTPServer | None = None
+    try:
+        server = run_server(args.metrics_port)
+    except OSError as e:
+        print(f"ERROR: Cannot bind metrics port {args.metrics_port}: {e}")
+        sys.exit(1)
     print(f"  Health endpoint: http://localhost:{args.metrics_port}/healthz")
 
     engine = build_engine(
@@ -2046,7 +2051,10 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     if hasattr(signal, "SIGUSR1"):
         signal.signal(signal.SIGUSR1, handle_graceful_exit_signal)
 
-    print("\nGRINDER TRADING LOOP running. Press Ctrl+C to stop.")
+    print(
+        f"\nGRINDER TRADING LOOP running. pid={os.getpid()} "
+        f"metrics_port={args.metrics_port} Press Ctrl+C to stop."
+    )
     exit_code = 0
     loop_stop_reason = "not_started"
     try:
@@ -2067,7 +2075,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         print(f"GRINDER TRADING LOOP FATAL: {exc}")
         exit_code = 2
     finally:
-        # Shutdown async resources
+        # Shutdown async resources (loop always exists at this point)
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
             loop.run_until_complete(_drain_pending_tasks())
@@ -2095,21 +2103,22 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 exit_code = 3
 
         # Stop LeaderElector (wrapped — must not block server shutdown)
-        if elector is not None:
-            try:
+        try:
+            if elector is not None:
                 print("  Stopping LeaderElector...")
                 elector.stop()
-            except Exception as e:
-                print(f"  WARNING: LeaderElector stop error: {e}")
+        except Exception as e:
+            print(f"  WARNING: LeaderElector stop error: {e}")
 
-        # Shutdown HTTP server and release port (always runs)
+        # Shutdown HTTP server and release port (guard for early startup failure)
         try:
-            server.shutdown()
-            server.server_close()
+            if server is not None:
+                server.shutdown()
+                server.server_close()
         except Exception as e:
             print(f"  WARNING: server shutdown error: {e}")
 
-        print("GRINDER TRADING LOOP stopped.")
+        print(f"GRINDER TRADING LOOP stopped. pid={os.getpid()} exit_code={exit_code}")
         sys.exit(exit_code)
 
 
