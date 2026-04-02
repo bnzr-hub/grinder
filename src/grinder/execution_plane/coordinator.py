@@ -135,7 +135,17 @@ class ExecutionCoordinator:
         # Gate 3: Safety blocks execution
         if not safety_result.execution_allowed:
             rules = [r.value for r in safety_result.triggered_rules]
-            logger.info("EXECUTION_SKIPPED reason=SAFETY_BLOCK rules=%s", rules)
+            from grinder.observability.structured_events import (  # noqa: PLC0415
+                format_safety_summary,
+            )
+
+            logger.info(
+                format_safety_summary(
+                    execution_allowed=False,
+                    triggered_rules=rules,
+                    quarantine_symbols=safety_result.quarantine_symbols,
+                )
+            )
             return ExecutionReport(
                 execution_enabled=True,
                 execution_acknowledged=True,

@@ -444,7 +444,9 @@ class TestFuturesPreflightValidation:
 
     def test_wrapper_constraints_unavailable_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Wrapper: futures + constraints=None → sys.exit(1)."""
-        monkeypatch.setattr(run_trading_mod, "_load_symbol_constraints", lambda: None)
+        monkeypatch.setattr(
+            run_trading_mod, "_load_symbol_constraints", lambda: (None, "unavailable")
+        )
         with pytest.raises(SystemExit) as exc_info:
             run_trading_mod._validate_futures_preflight_or_exit(["BTCUSDT"], "futures", None)
         assert exc_info.value.code == 1
@@ -452,7 +454,7 @@ class TestFuturesPreflightValidation:
     def test_wrapper_missing_symbol_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Wrapper: futures + symbol not in constraints → sys.exit(1)."""
         monkeypatch.setattr(
-            run_trading_mod, "_load_symbol_constraints", lambda: {"BTCUSDT": object()}
+            run_trading_mod, "_load_symbol_constraints", lambda: ({"BTCUSDT": object()}, "cache")
         )
         with pytest.raises(SystemExit) as exc_info:
             run_trading_mod._validate_futures_preflight_or_exit(["FARTCOINUSDT"], "futures", None)

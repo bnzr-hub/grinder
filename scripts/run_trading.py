@@ -505,18 +505,18 @@ def _build_user_data_connector_or_none(
     return FuturesUserDataWsConnector(config=ws_cfg, listen_key_manager=lk_mgr)
 
 
-def _load_symbol_constraints() -> dict[str, SymbolConstraints] | None:
+def _load_symbol_constraints() -> tuple[dict[str, SymbolConstraints] | None, str]:
     """Load symbol constraints from exchange info (fail-open).
 
     Tries local cache first, then Binance Futures API.
-    Returns None if both fail (constraints will be skipped).
+    Returns (constraints, source) where source is "cache", "exchange", or "unavailable".
     """
     provider = ConstraintProvider(
         config=ConstraintProviderConfig(allow_fetch=False),
     )
     constraints = provider.get_constraints()
     if constraints:
-        return constraints
+        return constraints, "cache"
 
     # Try API fetch (requires network)
     try:
@@ -527,11 +527,11 @@ def _load_symbol_constraints() -> dict[str, SymbolConstraints] | None:
         )
         constraints = api_provider.get_constraints()
         if constraints:
-            return constraints
+            return constraints, "exchange"
     except Exception as e:
         print(f"  Constraint fetch failed (fail-open): {e}")
 
-    return None
+    return None, "unavailable"
 
 
 def _run_startup_tuning_shadow(
@@ -886,7 +886,7 @@ def _validate_futures_preflight_or_exit(
     """
     constraints = None
     if exchange_port == "futures" and fixture_path is None:
-        constraints = _load_symbol_constraints()
+        constraints, _ = _load_symbol_constraints()
     result = evaluate_futures_preflight(
         symbols,
         exchange_port,
@@ -1177,7 +1177,7 @@ def build_engine(  # noqa: PLR0912, PLR0915
         Configured LiveEngineV0 instance (gauge set to 1 after init).
     """
     # Load symbol constraints for tick_size rounding (fail-open)
-    symbol_constraints = _load_symbol_constraints()
+    symbol_constraints, _ = _load_symbol_constraints()
     constraints_enabled = symbol_constraints is not None
     if constraints_enabled and symbol_constraints is not None:
         print(f"  Symbol constraints loaded: {len(symbol_constraints)} symbols")
@@ -1923,9 +1923,38 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
     # Load symbol constraints BEFORE preflight so check_symbol_metadata
     # can verify the target symbol exists on exchange.
-    preflight_constraints = _load_symbol_constraints()
+    preflight_constraints, _constraint_source = _load_symbol_constraints()
     if preflight_constraints:
-        print(f"  Preflight constraints loaded: {len(preflight_constraints)} symbols")
+        print(
+            f"  Preflight constraints loaded: {len(preflight_constraints)} symbols (source={_constraint_source})"
+        )
+        # ADR-146: Print resolved constraints for active symbols
+        from grinder.observability.structured_events import (  # noqa: PLC0415
+            ConstraintSource,
+            ResolvedConstraint,
+            format_resolved_constraints,
+        )
+
+        _source_map = {
+            "cache": ConstraintSource.CACHE,
+            "exchange": ConstraintSource.EXCHANGE,
+            "stale_cache": ConstraintSource.STALE_CACHE,
+        }
+        _resolved_source = _source_map.get(_constraint_source, ConstraintSource.UNAVAILABLE)
+        _active_constraints = [
+            ResolvedConstraint(
+                symbol=sym,
+                tick_size=str(c.tick_size),
+                step_size=str(c.step_size),
+                min_qty=str(c.min_qty),
+                min_notional=str(c.min_notional),
+                source=_resolved_source,
+            )
+            for sym in symbols
+            if (c := preflight_constraints.get(sym)) is not None
+        ]
+        if _active_constraints:
+            print(format_resolved_constraints(_active_constraints))
     else:
         print("  WARNING: Preflight constraints unavailable (metadata check will fail-closed)")
 
