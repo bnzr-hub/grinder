@@ -653,6 +653,9 @@ class LiveGridPlannerV1:
             cap_low = None
             cap_high = None
 
+        seen_buy_prices: set[Decimal] = set()
+        seen_sell_prices: set[Decimal] = set()
+
         for i in range(1, cfg.levels + 1):
             buy_price = _round_to_tick(
                 mid_price * (Decimal("1") - spacing_factor * i),
@@ -669,11 +672,27 @@ class LiveGridPlannerV1:
             if cap_high is not None and sell_price > cap_high:
                 continue
 
-            levels.append(
-                _DesiredLevel(key=f"BUY:L{i}", side=OrderSide.BUY, level_id=i, price=buy_price)
-            )
-            levels.append(
-                _DesiredLevel(key=f"SELL:L{i}", side=OrderSide.SELL, level_id=i, price=sell_price)
-            )
+            # Skip duplicate prices after tick rounding (Batch 2 PR-2).
+            # On cheap symbols with coarse tick, spacing < tick causes
+            # adjacent levels to collapse to the same rounded price.
+            if buy_price not in seen_buy_prices:
+                seen_buy_prices.add(buy_price)
+                levels.append(
+                    _DesiredLevel(key=f"BUY:L{i}", side=OrderSide.BUY, level_id=i, price=buy_price)
+                )
+            else:
+                logger.info("GRID_DUPLICATE_PRICE_SKIPPED side=BUY level=%d price=%s", i, buy_price)
+
+            if sell_price not in seen_sell_prices:
+                seen_sell_prices.add(sell_price)
+                levels.append(
+                    _DesiredLevel(
+                        key=f"SELL:L{i}", side=OrderSide.SELL, level_id=i, price=sell_price
+                    )
+                )
+            else:
+                logger.info(
+                    "GRID_DUPLICATE_PRICE_SKIPPED side=SELL level=%d price=%s", i, sell_price
+                )
 
         return levels
