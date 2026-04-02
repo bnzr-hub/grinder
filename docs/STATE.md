@@ -1898,4 +1898,4 @@ Comprehensive adaptive grid system design:
 ### Runtime hardening
 - **Shutdown safety:** [DONE] Cleanup-on-exit with post-verify, 60s timeout per symbol, exception-safe finally block. `server.server_close()` + `SO_REUSEADDR` for clean port release. All shutdown steps wrapped in try/except — server always releases. (ADR-140).
 - **Startup lifecycle:** [DONE] Fail-fast bind, atexit server release, null-safe finally, pid/port in banners. (PR #545).
-- **Production entrypoint:** [DONE] `scripts/run_autonomous.py` — canonical 24/7 entrypoint. Assembles AutonomousLoop + EngineRegistry + OperatorControls + ExecutionCoordinator with real ceremony bindings. Default: shadow-only. Execution requires `--execution-enabled --execution-ack`. (ADR-141).
+- **Autonomous entrypoint:** [DONE] `scripts/run_autonomous.py` — assembles full control-plane loop + execution scaffold. Ceremony bindings are registry-level placeholders (no real LiveEngineV0 start/stop). Real per-symbol engine lifecycle requires run_trading bridge (future work). Default: shadow-only. (ADR-141).

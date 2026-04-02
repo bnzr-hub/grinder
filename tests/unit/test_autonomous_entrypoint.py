@@ -23,7 +23,6 @@ def _default_args(**overrides: object) -> Namespace:
         "cycle_interval_s": 1.0,
         "top_k": 3,
         "max_changes_per_cycle": 1,
-        "metrics_port": 19999,
         "execution_enabled": False,
         "execution_ack": False,
         "max_cycles": None,

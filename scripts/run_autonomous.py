@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Canonical autonomous multi-symbol production entrypoint.
+"""Autonomous multi-symbol control-plane runner with execution scaffold.
 
-This is the blessed 24/7 runtime for the Grinder autonomous system.
-It assembles and wires all components:
+Assembles and runs the autonomous orchestration loop. Execution ceremonies
+are registry-level placeholders — real per-symbol engine lifecycle (LiveEngineV0
+start/stop) requires bridging to run_trading infrastructure (future work).
 
-Control-plane:
+Control-plane (real):
   UniverseProvider → prefilter → tuning → ranking → SymbolOrchestrator → AutonomousLoop
 
-Execution-plane (optional, default OFF):
-  EngineRegistry → ExecutionCoordinator → activation/graceful-exit/deactivation ceremonies
+Execution-plane (scaffold — registry transitions only, no real engines):
+  EngineRegistry → ExecutionCoordinator → placeholder ceremony bindings
 
 Usage:
     # Shadow-only (default — no engine execution)
@@ -50,7 +51,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cycle-interval-s", type=float, default=60.0, help="Seconds between cycles")
     p.add_argument("--top-k", type=int, default=3, help="Max simultaneous active symbols")
     p.add_argument("--max-changes-per-cycle", type=int, default=1, help="Bounded rotation changes")
-    p.add_argument("--metrics-port", type=int, default=9090, help="Health/metrics HTTP port")
     p.add_argument(
         "--execution-enabled",
         action="store_true",
@@ -183,11 +183,11 @@ def main() -> None:
         f"\nGRINDER AUTONOMOUS SYSTEM starting."
         f"\n  pid={os.getpid()}"
         f"\n  mode={exec_mode} {ack_status}"
+        f"\n  execution_ceremonies=scaffold (registry transitions only, no real engines)"
         f"\n  symbols={symbols_desc}"
         f"\n  blacklist={args.blacklist or 'none'}"
         f"\n  top_k={args.top_k} max_changes={args.max_changes_per_cycle}"
         f"\n  cycle_interval={args.cycle_interval_s}s"
-        f"\n  metrics_port={args.metrics_port}"
     )
 
     if args.execution_enabled and not args.execution_ack:
