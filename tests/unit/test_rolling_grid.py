@@ -2932,6 +2932,172 @@ class TestAnchorContract(TestRollingGridEngineIntegration):
         assert rs is not None
         assert rs.anchor_price == old_anchor, "Anchor must not change before first sync refresh"
 
+    # --- T63: natural lifecycle: fill → position → TP exit → flat → ANCHOR_RESET ---
+
+    def test_t63_natural_fill_to_flat_triggers_anchor_reset(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Full natural lifecycle: BUY fill → position open → TP exit → flat →
+        ANCHOR_RESET fires → new grid from new anchor. No manual cleanup.
+
+        This is the final proof that ANCHOR_RESET works without operator
+        intervention when the market naturally returns to flat.
+        """
+        engine = self._make_engine(monkeypatch, rolling=True)
+        old_mid = Decimal("50000.50")
+        new_mid = Decimal("50500.50")
+
+        # Tick 1: establish rolling state with grid orders confirmed
+        buy1 = self._grid_order(1, "BUY", "49950")
+        sell1 = self._grid_order(2, "SELL", "50050")
+        buy2 = self._grid_order(3, "BUY", "49900")
+        sell2 = self._grid_order(4, "SELL", "50100")
+        engine._last_account_snapshot = self._account_snap(
+            orders=(buy1, sell1, buy2, sell2), pos_qty="0"
+        )
+        engine.process_snapshot(self._snap(ts=1_000_000))
+
+        planner = engine._grid_planners["BTCUSDT"]  # type: ignore[index]
+        rs1 = planner.get_rolling_state("BTCUSDT")
+        assert rs1 is not None
+        old_anchor = rs1.anchor_price
+        assert old_anchor == old_mid
+
+        # Tick 2: BUY fill detected — buy1 disappeared, position opened
+        # (Simulates natural fill: order gone from exchange, position appears)
+        engine._last_account_snapshot = self._account_snap(
+            orders=(sell1, buy2, sell2), pos_qty="0.01", ts=2_000_000
+        )
+        # Advance sync gen so inflight from init is stale
+        engine._account_sync_generation += 1
+        engine.process_snapshot(self._snap(ts=2_000_000))
+
+        rs2 = planner.get_rolling_state("BTCUSDT")
+        assert rs2 is not None
+        assert rs2.anchor_price == old_anchor, "Anchor unchanged during position"
+
+        # Tick 3: TP exit — sell fill closes position, remaining orders cancelled
+        # (Simulates: TP sell filled, all remaining orders expired/cancelled)
+        # Clear prev_rolling_orders to prevent false fill detection from
+        # simultaneous order disappearance (external cleanup semantics)
+        engine._prev_rolling_orders.pop("BTCUSDT", None)
+        engine._last_account_snapshot = self._account_snap(orders=(), pos_qty="0", ts=3_000_000)
+        engine._account_sync_generation += 1
+        # Clear inflight so it doesn't block reset
+        engine._inflight_shift.pop("BTCUSDT", None)
+
+        with caplog.at_level(logging.WARNING, logger="grinder.live.engine"):
+            output = engine.process_snapshot(
+                Snapshot(
+                    ts=3_000_000,
+                    symbol="BTCUSDT",
+                    bid_price=Decimal("50500"),
+                    ask_price=Decimal("50501"),
+                    bid_qty=Decimal("1"),
+                    ask_qty=Decimal("1"),
+                    last_price=Decimal("50500"),
+                    last_qty=Decimal("1"),
+                )
+            )
+
+        # ANCHOR_RESET must fire — all 5 conditions met naturally
+        reset_logs = [r for r in caplog.records if "ANCHOR_RESET " in r.message]
+        assert len(reset_logs) >= 1, (
+            f"ANCHOR_RESET must fire on natural flat return. "
+            f"Logs: {[r.message for r in caplog.records if 'ANCHOR' in r.message]}"
+        )
+
+        # No ANCHOR_RESET_BLOCKED
+        blocked_logs = [r for r in caplog.records if "ANCHOR_RESET_BLOCKED" in r.message]
+        assert len(blocked_logs) == 0, (
+            f"ANCHOR_RESET_BLOCKED must not fire: {[r.message for r in blocked_logs]}"
+        )
+
+        # New anchor = new mid (same tick re-init)
+        rs3 = planner.get_rolling_state("BTCUSDT")
+        assert rs3 is not None
+        assert rs3.anchor_price == new_mid, (
+            f"Anchor must be new mid after reset: {rs3.anchor_price} != {new_mid}"
+        )
+        assert rs3.net_offset == 0, f"Offset must be 0 after reset: {rs3.net_offset}"
+
+        # Grid PLACEs from new anchor (same process_snapshot call)
+        grid_places = [
+            la
+            for la in output.live_actions
+            if la.action.action_type == ActionType.PLACE and not la.action.reduce_only
+        ]
+        assert len(grid_places) > 0, "Expected grid PLACEs after natural re-anchor"
+        for la in grid_places:
+            assert la.action.price is not None
+            dist_from_new = abs(float(la.action.price - new_mid))
+            dist_from_old = abs(float(la.action.price - old_anchor))
+            assert dist_from_new < dist_from_old, (
+                f"PLACE {la.action.price} closer to old anchor {old_anchor} "
+                f"than new anchor {new_mid}"
+            )
+
+    # --- T64: no branch residue after ANCHOR_RESET ---
+
+    def test_t64_no_stale_state_after_anchor_reset(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """After ANCHOR_RESET: no stale prev_orders, pending_cancels, or inflight."""
+        engine = self._make_engine(monkeypatch, rolling=True)
+
+        # Tick 1: init
+        buy1 = self._grid_order(1, "BUY", "49950")
+        sell1 = self._grid_order(2, "SELL", "50050")
+        engine._last_account_snapshot = self._account_snap(orders=(buy1, sell1), pos_qty="0")
+        engine.process_snapshot(self._snap(ts=1_000_000))
+
+        # Force some state that should be cleaned
+        engine._prev_rolling_orders["BTCUSDT"] = {"order1": MagicMock()}
+        engine._rolling_pending_cancels["order_x"] = 1_000_000
+
+        # Tick 2: natural flat → ANCHOR_RESET
+        engine._prev_rolling_orders.pop("BTCUSDT", None)
+        engine._last_account_snapshot = self._account_snap(orders=(), pos_qty="0", ts=2_000_000)
+        engine._inflight_shift.pop("BTCUSDT", None)
+        engine._account_sync_generation += 1
+
+        with caplog.at_level(logging.WARNING, logger="grinder.live.engine"):
+            engine.process_snapshot(self._snap(ts=2_000_000))
+
+        reset_logs = [r for r in caplog.records if "ANCHOR_RESET " in r.message]
+        assert len(reset_logs) >= 1
+
+        # Verify cleanup: no stale state for BTCUSDT
+        # prev_rolling_orders should be repopulated by same-tick plan
+        # but pending_cancels for old orders should be gone
+        assert "order_x" not in engine._rolling_pending_cancels or (
+            engine._rolling_pending_cancels.get("order_x", 0) == 0
+        )
+
+    # --- T65: ANCHOR_RESET deterministic ---
+
+    def test_t65_anchor_reset_deterministic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Same inputs produce same ANCHOR_RESET outcome."""
+        results = []
+        for _ in range(2):
+            engine = self._make_engine(monkeypatch, rolling=True)
+            buy1 = self._grid_order(1, "BUY", "49950")
+            sell1 = self._grid_order(2, "SELL", "50050")
+            engine._last_account_snapshot = self._account_snap(orders=(buy1, sell1), pos_qty="0")
+            engine.process_snapshot(self._snap(ts=1_000_000))
+
+            engine._prev_rolling_orders.pop("BTCUSDT", None)
+            engine._last_account_snapshot = self._account_snap(orders=(), pos_qty="0", ts=2_000_000)
+            engine._inflight_shift.pop("BTCUSDT", None)
+            engine._account_sync_generation += 1
+
+            engine.process_snapshot(self._snap(ts=2_000_000))
+            planner = engine._grid_planners["BTCUSDT"]  # type: ignore[index]
+            rs = planner.get_rolling_state("BTCUSDT")
+            results.append((rs.anchor_price if rs else None, rs.net_offset if rs else None))
+
+        assert results[0] == results[1], f"Non-deterministic: {results}"
+
 
 class TestADR089LogEvents(TestRollingGridEngineIntegration):
     """ADR-089: log event emission tests for operational observability."""

@@ -4954,3 +4954,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Safety:** Default remains `noop + testnet + unarmed`. Futures requires `BINANCE_API_KEY` + `BINANCE_API_SECRET` (fail-closed RuntimeError). Mainnet requires explicit `--mainnet` flag. Armed requires explicit `--armed`. Startup banner prints effective port/net/armed state.
 - **Port construction:** Happens inside engine thread (`_build_port` called in `_run_engine_async`). Construction failure → `engine_ready` never fires → factory fail-closed → host marks FAILED.
 - **Readiness contract:** `engine_ready` fires only after `connector.connect()` succeeds. If port construction, engine creation, or connector connection fails, readiness never signals → factory raises → host marks FAILED. No false-ACTIVE state for engines that failed to come up.
+
+### ADR-151: ANCHOR_RESET success path closure (2026-04-02)
+
+- **Problem:** ANCHOR_RESET was fully implemented and unit-tested (T44-T62) but never proven as a natural end-to-end lifecycle: fill → position open → TP exit → flat → ANCHOR_RESET → new grid. All previous ceremonies used manual cleanup.
+- **Decision:** Add white-box integration tests T63-T65. T63: BUY fill → position → TP exit → flat → ANCHOR_RESET → new grid same-tick. T64: no stale state after reset. T65: deterministic. Tests use white-box state setup (`_prev_rolling_orders.pop`, `_inflight_shift.pop`) to isolate the reset path from false-fill-detection noise.
+- **No code changes:** ANCHOR_RESET implementation was already correct. The gap was proof coverage, not behavior.
+- **Honest scope:** These tests prove the 5-condition → reset → reinit sequence works correctly in isolation. They do NOT constitute a fully natural no-intervention live proof — that requires a live ceremony where fills/exits flow through the entire engine pipeline without manual internal state clearing. Deferred to next live ceremony.
+- **Complementary:** Grid_v2 return-to-flat with symmetric reseed (ADR-142) covers the two-sided grid path.
