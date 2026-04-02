@@ -1,8 +1,8 @@
 """Startup contract summary for operator-facing truthful startup output.
 
-Consolidates all runtime mode flags, gate statuses, and unsafe combination
-warnings into a single deterministic block that operators can copy into
-incident chat.
+Consolidates all runtime mode flags, gate statuses, unsafe combination
+warnings, and resolved config into a single deterministic block that
+operators can copy into incident chat.
 
 SSOT: this module. Printed once at startup by run_trading.py.
 """
@@ -10,6 +10,7 @@ SSOT: this module. Printed once at startup by run_trading.py.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 
 
@@ -57,6 +58,22 @@ class RuntimeModeFlags:
     ha_enabled: bool = False
 
 
+@dataclass(frozen=True)
+class ResolvedConfig:
+    """Resolved startup-critical config values.
+
+    Printed in summary so operators see exact effective values,
+    not raw env assumptions.
+    """
+
+    preflight_clock_drift_fail_ms: int = 1500
+    preflight_clock_drift_warn_ms: int = 500
+    grid_v2_order_size: str = ""
+    grid_v2_order_size_source: str = ""
+    grid_v2_tick_size: str = ""
+    grid_v2_recovery_mode: str = ""
+
+
 @dataclass
 class StartupContractSummary:
     """Full startup contract summary."""
@@ -64,6 +81,7 @@ class StartupContractSummary:
     gates: list[GateResult] = field(default_factory=list)
     mode_flags: RuntimeModeFlags = field(default_factory=RuntimeModeFlags)
     warnings: list[UnsafeComboWarning] = field(default_factory=list)
+    resolved_config: ResolvedConfig = field(default_factory=ResolvedConfig)
 
     @property
     def has_blockers(self) -> bool:
@@ -95,14 +113,30 @@ class StartupContractSummary:
         lines.append(f"    planner         = {mf.planner}")
         lines.append(f"    account_sync    = {mf.account_sync}")
 
-        # Section 2: Gate results
+        # Section 2: Resolved config
+        rc = self.resolved_config
+        lines.append("")
+        lines.append("  RESOLVED CONFIG")
+        lines.append(f"    preflight_clock_drift_fail_ms = {rc.preflight_clock_drift_fail_ms}")
+        lines.append(f"    preflight_clock_drift_warn_ms = {rc.preflight_clock_drift_warn_ms}")
+        if mf.grid_v2:
+            lines.append(
+                f"    grid_v2_order_size   = {rc.grid_v2_order_size} "
+                f"(source={rc.grid_v2_order_size_source})"
+            )
+            if rc.grid_v2_tick_size:
+                lines.append(f"    grid_v2_tick_size    = {rc.grid_v2_tick_size}")
+            if rc.grid_v2_recovery_mode:
+                lines.append(f"    grid_v2_recovery     = {rc.grid_v2_recovery_mode}")
+
+        # Section 3: Gate results
         lines.append("")
         lines.append("  STARTUP GATES")
         for g in self.gates:
             reason_part = f" reason={g.reason}" if g.reason else ""
             lines.append(f"    {g.name:<24s} status={g.status.value}{reason_part}")
 
-        # Section 3: Warnings
+        # Section 4: Warnings
         if self.warnings:
             lines.append("")
             lines.append("  WARNINGS")
@@ -154,7 +188,8 @@ def detect_unsafe_combos(flags: RuntimeModeFlags) -> list[UnsafeComboWarning]:
             UnsafeComboWarning(
                 code="GRID_V2_NO_SYNC_FUTURES",
                 message=(
-                    "GRINDER_GRID_V2_ENABLED=true on futures without GRINDER_ACCOUNT_SYNC_ENABLED. "
+                    "GRINDER_GRID_V2_ENABLED=true on futures without "
+                    "GRINDER_ACCOUNT_SYNC_ENABLED. "
                     "Grid_v2 may miss fills without account sync."
                 ),
                 severity="BLOCK",
@@ -166,7 +201,7 @@ def detect_unsafe_combos(flags: RuntimeModeFlags) -> list[UnsafeComboWarning]:
         warnings.append(
             UnsafeComboWarning(
                 code="GRID_V2_NO_SYMBOL",
-                message="GRINDER_GRID_V2_ENABLED=true but GRINDER_GRID_V2_SYMBOL is not set.",
+                message=("GRINDER_GRID_V2_ENABLED=true but GRINDER_GRID_V2_SYMBOL is not set."),
                 severity="BLOCK",
             )
         )
@@ -177,7 +212,8 @@ def detect_unsafe_combos(flags: RuntimeModeFlags) -> list[UnsafeComboWarning]:
             UnsafeComboWarning(
                 code="PLANNER_NO_SYNC",
                 message=(
-                    "GRINDER_LIVE_PLANNER_ENABLED=true but GRINDER_ACCOUNT_SYNC_ENABLED=false. "
+                    "GRINDER_LIVE_PLANNER_ENABLED=true but "
+                    "GRINDER_ACCOUNT_SYNC_ENABLED=false. "
                     "Planner cannot observe fills without account sync."
                 ),
             )
@@ -198,6 +234,90 @@ def detect_unsafe_combos(flags: RuntimeModeFlags) -> list[UnsafeComboWarning]:
     return warnings
 
 
+def evaluate_seed_readiness(  # noqa: PLR0911
+    *,
+    grid_v2: bool,
+    grid_v2_symbol: str,
+    account_sync: bool,
+    grid_v2_order_size: str,
+    grid_v2_tick_size: str,
+) -> GateResult:
+    """Evaluate whether grid_v2 seed path is ready.
+
+    Pure function. Checks that all prerequisites for a successful seed
+    are in place BEFORE the engine attempts startup_fresh.
+    """
+    if not grid_v2:
+        return GateResult(
+            name="SEED_READINESS",
+            status=GateStatus.NOT_APPLICABLE,
+            reason="grid_v2 disabled",
+        )
+
+    if not grid_v2_symbol:
+        return GateResult(
+            name="SEED_READINESS",
+            status=GateStatus.FAIL,
+            reason="GRINDER_GRID_V2_SYMBOL not set",
+        )
+
+    if not account_sync:
+        return GateResult(
+            name="SEED_READINESS",
+            status=GateStatus.WARN,
+            reason="account_sync disabled — seed CID visibility unverifiable",
+        )
+
+    # Validate order size: must parse as Decimal > 0
+    if not grid_v2_order_size:
+        return GateResult(
+            name="SEED_READINESS",
+            status=GateStatus.FAIL,
+            reason="grid_v2_order_size=(empty) — seed orders would be zero-size",
+        )
+    try:
+        _parsed_size = Decimal(grid_v2_order_size)
+    except InvalidOperation:
+        return GateResult(
+            name="SEED_READINESS",
+            status=GateStatus.FAIL,
+            reason=f"grid_v2_order_size={grid_v2_order_size!r} — not a valid number",
+        )
+    if _parsed_size <= 0:
+        return GateResult(
+            name="SEED_READINESS",
+            status=GateStatus.FAIL,
+            reason=f"grid_v2_order_size={grid_v2_order_size} — must be > 0",
+        )
+
+    # Validate tick size: if set, must parse as Decimal > 0
+    if not grid_v2_tick_size:
+        return GateResult(
+            name="SEED_READINESS",
+            status=GateStatus.WARN,
+            reason="GRINDER_GRID_V2_TICK_SIZE not set — will use default 0.01",
+        )
+    try:
+        _parsed_tick = Decimal(grid_v2_tick_size)
+    except InvalidOperation:
+        return GateResult(
+            name="SEED_READINESS",
+            status=GateStatus.FAIL,
+            reason=f"grid_v2_tick_size={grid_v2_tick_size!r} — not a valid number",
+        )
+    if _parsed_tick <= 0:
+        return GateResult(
+            name="SEED_READINESS",
+            status=GateStatus.FAIL,
+            reason=f"grid_v2_tick_size={grid_v2_tick_size} — must be > 0",
+        )
+
+    return GateResult(
+        name="SEED_READINESS",
+        status=GateStatus.PASS,
+    )
+
+
 def build_startup_contract_summary(
     *,
     mode: str,
@@ -214,6 +334,12 @@ def build_startup_contract_summary(
     skip_launch_guard: bool,
     launch_guard_status: str = "",
     launch_guard_reason: str = "",
+    preflight_clock_drift_fail_ms: int = 1500,
+    preflight_clock_drift_warn_ms: int = 500,
+    grid_v2_order_size: str = "",
+    grid_v2_order_size_source: str = "",
+    grid_v2_tick_size: str = "",
+    grid_v2_recovery_mode: str = "",
 ) -> StartupContractSummary:
     """Build the full startup contract summary.
 
@@ -230,6 +356,15 @@ def build_startup_contract_summary(
         mainnet=mainnet,
         mode=mode,
         ha_enabled=ha_enabled,
+    )
+
+    resolved = ResolvedConfig(
+        preflight_clock_drift_fail_ms=preflight_clock_drift_fail_ms,
+        preflight_clock_drift_warn_ms=preflight_clock_drift_warn_ms,
+        grid_v2_order_size=grid_v2_order_size,
+        grid_v2_order_size_source=grid_v2_order_size_source,
+        grid_v2_tick_size=grid_v2_tick_size,
+        grid_v2_recovery_mode=grid_v2_recovery_mode,
     )
 
     gates: list[GateResult] = []
@@ -280,10 +415,21 @@ def build_startup_contract_summary(
             )
         )
 
+    # Gate 3: Seed readiness (grid_v2 only)
+    seed_gate = evaluate_seed_readiness(
+        grid_v2=grid_v2,
+        grid_v2_symbol=grid_v2_symbol,
+        account_sync=account_sync,
+        grid_v2_order_size=grid_v2_order_size,
+        grid_v2_tick_size=grid_v2_tick_size,
+    )
+    gates.append(seed_gate)
+
     warnings = detect_unsafe_combos(flags)
 
     return StartupContractSummary(
         gates=gates,
         mode_flags=flags,
         warnings=warnings,
+        resolved_config=resolved,
     )
