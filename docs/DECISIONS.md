@@ -4967,5 +4967,6 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 
 - **Problem:** Autonomous loop requires TUNED symbols in TuningCache before activation. Tuning needs market prices. Prices come from engine WebSocket feeds. Engines don't start until symbols are activated. Bootstrap deadlock: no engine → no prices → no tuning → no activation.
 - **Decision:** Add `_bootstrap_tuning_cache()` to `run_autonomous.py`. At startup, fetches REST price per symbol from Binance (`/fapi/v1/ticker/price`, no auth needed), runs tuning solver with constraint cache, populates TuningCache. One HTTP call per symbol.
-- **Fail-open:** Price fetch failure or solver NO_GO leaves symbol un-tuned (loop skips it). No fatal error.
+- **Fail-open:** Price fetch failure, missing constraints, or solver NO_GO leaves symbol un-tuned (loop skips it). No fatal error. No synthetic constraints — only real exchange data used for tuning.
+- **Config SSOT:** Bootstrap solver uses the same ladder geometry as the runtime bridge (`BridgeConfig.levels`, `BridgeConfig.spacing_bps` → `spacing_pct`). No config divergence between tuning and execution.
 - **Trigger:** Only runs when `--symbols` override is provided (operator-specified symbols). Auto-discover mode would need a different bootstrap path (future work).

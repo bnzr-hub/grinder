@@ -129,7 +129,14 @@ def _bootstrap_tuning_cache(
     if not constraints:
         logger.warning("BOOTSTRAP_TUNING_NO_CONSTRAINTS — solver will use zero constraints")
 
-    config = TuningSolverConfig()
+    # Wire solver config from bridge/runtime ladder geometry (same SSOT)
+    from grinder.runtime.live_engine_bridge import BridgeConfig  # noqa: PLC0415
+
+    bridge_cfg = BridgeConfig()  # defaults match what bridge actually uses
+    config = TuningSolverConfig(
+        entry_levels_per_side=bridge_cfg.levels,
+        spacing_pct=Decimal(str(bridge_cfg.spacing_bps)) / Decimal("10000"),
+    )
     tuned_count = 0
     for symbol in symbols:
         price = _fetch_price_rest(symbol, testnet=testnet)
@@ -137,16 +144,10 @@ def _bootstrap_tuning_cache(
             logger.warning("BOOTSTRAP_TUNING_NO_PRICE symbol=%s", symbol)
             continue
 
-        from grinder.execution.engine import SymbolConstraints  # noqa: PLC0415
-
         sc = constraints.get(symbol) if constraints else None
         if sc is None:
-            sc = SymbolConstraints(
-                step_size=Decimal("1"),
-                min_qty=Decimal("1"),
-                tick_size=Decimal("0.0001"),
-                min_notional=Decimal("5"),
-            )
+            logger.warning("BOOTSTRAP_TUNING_NO_CONSTRAINTS symbol=%s — skipped", symbol)
+            continue
 
         result = solve(symbol, sc, price, config)
         cache.put(symbol, result)
