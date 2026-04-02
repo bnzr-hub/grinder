@@ -1650,6 +1650,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Use only for testnet/paper/debugging."
         ),
     )
+    parser.add_argument(
+        "--preflight-clock-drift-ms",
+        type=int,
+        default=None,
+        help=(
+            "Override preflight clock drift FAIL threshold in ms (default 1500). "
+            "Values above this block startup on armed+mainnet runs."
+        ),
+    )
     return parser
 
 
@@ -1919,7 +1928,11 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     preflight_port = _PreflightConstraintHolder() if preflight_constraints else port
 
     # Live Preflight Gate (PR-2): fail-closed before trading loop
-    from grinder.live.preflight import run_preflight  # noqa: PLC0415
+    from grinder.live.preflight import PreflightConfig, run_preflight  # noqa: PLC0415
+
+    _preflight_config = PreflightConfig()
+    if args.preflight_clock_drift_ms is not None:
+        _preflight_config = PreflightConfig(clock_drift_fail_ms=args.preflight_clock_drift_ms)
 
     preflight_report = run_preflight(
         armed=args.armed,
@@ -1928,6 +1941,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         syncer=preflight_syncer,
         port=preflight_port,
         symbols=symbols,
+        config=_preflight_config,
         env_acks={
             "ALLOW_MAINNET_TRADE": os.environ.get("ALLOW_MAINNET_TRADE") == "1",
             "GRINDER_REAL_PORT_ACK": os.environ.get("GRINDER_REAL_PORT_ACK")
@@ -2043,6 +2057,16 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # Consolidated startup contract summary (ADR-143).
     from grinder.live.startup_contract import build_startup_contract_summary  # noqa: PLC0415
 
+    # Resolve grid_v2 order size source (mirrors engine 3-level precedence)
+    _g2_size_env = os.environ.get("GRINDER_GRID_V2_ORDER_SIZE", "")
+    _g2_size_cli = os.environ.get("GRINDER_GRID_V2_CLI_SIZE", "")
+    if _g2_size_env:
+        _g2_order_size, _g2_order_size_source = _g2_size_env, "env"
+    elif _g2_size_cli:
+        _g2_order_size, _g2_order_size_source = _g2_size_cli, "cli"
+    else:
+        _g2_order_size, _g2_order_size_source = "0.001", "default"
+
     _startup_summary = build_startup_contract_summary(
         mode=mode.value,
         armed=args.armed,
@@ -2058,6 +2082,14 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         skip_launch_guard=args.skip_launch_guard,
         launch_guard_status=_lg_status,
         launch_guard_reason=_lg_reason,
+        preflight_clock_drift_fail_ms=_preflight_config.clock_drift_fail_ms,
+        preflight_clock_drift_warn_ms=_preflight_config.clock_drift_warn_ms,
+        grid_v2_order_size=_g2_order_size,
+        grid_v2_order_size_source=_g2_order_size_source,
+        grid_v2_tick_size=os.environ.get("GRINDER_GRID_V2_TICK_SIZE", ""),
+        grid_v2_recovery_mode=os.environ.get(
+            "GRINDER_GRID_V2_RECOVERY_MODE", "restore_then_cleanup_reseed"
+        ),
     )
     print(_startup_summary.format_summary())
     if _startup_summary.has_blockers:
