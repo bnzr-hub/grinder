@@ -2001,6 +2001,8 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     _validate_pippin_order_size_lock_or_exit(args.exchange_port, args.fixture)
 
     # Launch guard v2: verify exchange state clean before start (fail-closed).
+    _lg_status = ""
+    _lg_reason = ""
     if not args.skip_launch_guard:
         guard_result = evaluate_launch_guard(
             exchange_port=args.exchange_port,
@@ -2010,6 +2012,8 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             pre_cleanup=args.pre_cleanup,
             symbols=symbols,
         )
+        _lg_status = guard_result.status
+        _lg_reason = guard_result.reason
         print(f"  LAUNCH_GUARD status={guard_result.status} reason={guard_result.reason}")
         if guard_result.status in ("verify_dirty_no_cleanup", "cleanup_then_still_dirty"):
             print(
@@ -2035,6 +2039,30 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             )
     else:
         print("  LAUNCH_GUARD status=skipped reason=--skip-launch-guard")
+
+    # Consolidated startup contract summary (ADR-143).
+    from grinder.live.startup_contract import build_startup_contract_summary  # noqa: PLC0415
+
+    _startup_summary = build_startup_contract_summary(
+        mode=mode.value,
+        armed=args.armed,
+        mainnet=args.mainnet,
+        exchange_port=args.exchange_port,
+        ha_enabled=_ha_enabled,
+        grid_v2=parse_bool("GRINDER_GRID_V2_ENABLED", default=False, strict=False),
+        grid_v2_symbol=os.environ.get("GRINDER_GRID_V2_SYMBOL", ""),
+        rolling_grid=parse_bool("GRINDER_LIVE_ROLLING_GRID", default=False, strict=False),
+        planner=parse_bool("GRINDER_LIVE_PLANNER_ENABLED", default=False, strict=False),
+        account_sync=parse_bool("GRINDER_ACCOUNT_SYNC_ENABLED", default=False, strict=False),
+        preflight_passed=preflight_report.passed,
+        skip_launch_guard=args.skip_launch_guard,
+        launch_guard_status=_lg_status,
+        launch_guard_reason=_lg_reason,
+    )
+    print(_startup_summary.format_summary())
+    if _startup_summary.has_blockers:
+        print("STARTUP CONTRACT BLOCKED: fix warnings above before proceeding.")
+        sys.exit(2)
 
     connector = build_connector(
         symbols,
