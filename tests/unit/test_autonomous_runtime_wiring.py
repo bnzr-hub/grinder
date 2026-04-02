@@ -119,7 +119,9 @@ class TestFailureSurfacing:
             ok = host.activate("BTCUSDT")
             assert not ok
             # Missing symbol graceful exit fails cleanly
-            ok = host.request_graceful_exit("NONEXISTENT")
-            assert not ok
+            from grinder.runtime.autonomous_host import GracefulExitResult  # noqa: PLC0415
+
+            result = host.request_graceful_exit("NONEXISTENT")
+            assert result == GracefulExitResult.FAILED
         finally:
             host.shutdown_all()

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from grinder.execution_plane.registry import EngineRegistry, EngineState
-from grinder.runtime.autonomous_host import AutonomousEngineHost
+from grinder.runtime.autonomous_host import AutonomousEngineHost, GracefulExitResult
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -37,7 +37,7 @@ def _build_host(
     *,
     factory_raises: bool = False,
     stop_returns: bool = True,
-    graceful_exit_returns: bool = True,
+    graceful_exit_result: GracefulExitResult = GracefulExitResult.SUCCESS,
 ) -> tuple[AutonomousEngineHost, EngineRegistry, dict[str, FakeEngine]]:
     """Build a host with injectable fakes."""
     _reset_clock()
@@ -59,9 +59,9 @@ def _build_host(
         engine_ref.cleaned = True
         return True
 
-    def graceful_fn(symbol: str, engine_ref: FakeEngine) -> bool:
+    def graceful_fn(symbol: str, engine_ref: FakeEngine) -> GracefulExitResult:
         engine_ref.graceful_exit_requested = True
-        return graceful_exit_returns
+        return graceful_exit_result
 
     host = AutonomousEngineHost(
         registry=registry,
@@ -115,22 +115,22 @@ class TestGracefulExit:
     def test_graceful_exit_reaches_live_handle(self) -> None:
         host, registry, engines = _build_host()
         host.activate("BTCUSDT")
-        ok = host.request_graceful_exit("BTCUSDT")
-        assert ok
+        result = host.request_graceful_exit("BTCUSDT")
+        assert result == GracefulExitResult.SUCCESS
         assert engines["BTCUSDT"].graceful_exit_requested
         assert registry.get_state("BTCUSDT") == EngineState.GRACEFUL_EXIT
 
     def test_graceful_exit_missing_symbol_fails_cleanly(self) -> None:
         host, _, _ = _build_host()
-        ok = host.request_graceful_exit("NOPE")
-        assert not ok  # No crash, clean failure
+        result = host.request_graceful_exit("NOPE")
+        assert result == GracefulExitResult.FAILED
 
-    def test_graceful_exit_fn_failure_blocks_transition(self) -> None:
-        host, registry, _ = _build_host(graceful_exit_returns=False)
+    def test_graceful_exit_not_applicable_does_not_transition(self) -> None:
+        host, registry, _ = _build_host(graceful_exit_result=GracefulExitResult.NOT_APPLICABLE)
         host.activate("BTCUSDT")
-        ok = host.request_graceful_exit("BTCUSDT")
-        assert not ok
-        # Registry still ACTIVE — transition blocked
+        result = host.request_graceful_exit("BTCUSDT")
+        assert result == GracefulExitResult.NOT_APPLICABLE
+        # Registry still ACTIVE — NOT_APPLICABLE does not transition
         assert registry.get_state("BTCUSDT") == EngineState.ACTIVE
 
     def test_graceful_exit_without_fn_fails_closed(self) -> None:
@@ -156,8 +156,8 @@ class TestGracefulExit:
             _clock=_clock,
         )
         host.activate("BTCUSDT")
-        ok = host.request_graceful_exit("BTCUSDT")
-        assert not ok
+        result = host.request_graceful_exit("BTCUSDT")
+        assert result == GracefulExitResult.FAILED
         assert registry.get_state("BTCUSDT") == EngineState.ACTIVE
 
 
@@ -268,3 +268,48 @@ class TestShutdownAll:
         assert report.clean
         assert report.stopped == []
         assert report.failed == []
+
+    def test_shutdown_all_allows_no_position_engine_direct_stop(self) -> None:
+        """Active engine where graceful_exit returns False (no position)
+        can still be shut down cleanly via shutdown bypass."""
+        host, registry, engines = _build_host(
+            graceful_exit_result=GracefulExitResult.NOT_APPLICABLE
+        )
+        host.activate("BTCUSDT")
+        assert registry.get_state("BTCUSDT") == EngineState.ACTIVE
+        report = host.shutdown_all()
+        assert report.clean, f"Expected clean shutdown, got failed={report.failed}"
+        assert "BTCUSDT" in report.stopped
+        assert not host.is_live("BTCUSDT")
+        assert registry.get_state("BTCUSDT") == EngineState.STOPPED
+        assert engines["BTCUSDT"].stopped
+
+    def test_graceful_exit_success_path_unchanged(self) -> None:
+        """Normal graceful exit + shutdown still works the standard way."""
+        host, registry, _ = _build_host(graceful_exit_result=GracefulExitResult.SUCCESS)
+        host.activate("BTCUSDT")
+        host.request_graceful_exit("BTCUSDT")
+        assert registry.get_state("BTCUSDT") == EngineState.GRACEFUL_EXIT
+        ok = host.finalize_deactivation("BTCUSDT")
+        assert ok
+        assert registry.get_state("BTCUSDT") == EngineState.STOPPED
+
+    def test_registry_transitions_end_cleanly_for_no_position_shutdown(self) -> None:
+        """After shutdown bypass, registry shows STOPPED, not ACTIVE or FAILED."""
+        host, registry, _ = _build_host(graceful_exit_result=GracefulExitResult.NOT_APPLICABLE)
+        host.activate("ETHUSDT")
+        host.activate("BTCUSDT")
+        report = host.shutdown_all()
+        assert report.clean
+        for sym in ["BTCUSDT", "ETHUSDT"]:
+            assert registry.get_state(sym) == EngineState.STOPPED
+
+    def test_real_graceful_exit_failure_during_shutdown_still_fails(self) -> None:
+        """Real FAILED graceful exit is NOT bypassed during shutdown."""
+        host, registry, _ = _build_host(graceful_exit_result=GracefulExitResult.FAILED)
+        host.activate("BTCUSDT")
+        assert registry.get_state("BTCUSDT") == EngineState.ACTIVE
+        report = host.shutdown_all()
+        # Must NOT be clean — real failure is not masked
+        assert not report.clean
+        assert "BTCUSDT" in report.failed

@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Protocol
 
 from grinder.execution_plane.registry import EngineRegistry, EngineState
@@ -43,10 +44,18 @@ class EngineCleanupFn(Protocol):
     def __call__(self, symbol: str, engine_ref: Any) -> bool: ...
 
 
+class GracefulExitResult(Enum):
+    """Result of a graceful exit attempt."""
+
+    SUCCESS = "SUCCESS"
+    NOT_APPLICABLE = "NOT_APPLICABLE"  # No position / read-only — benign
+    FAILED = "FAILED"  # Real failure to signal graceful exit
+
+
 class GracefulExitFn(Protocol):
     """Signals graceful exit on a live engine. Called with (symbol, engine_ref)."""
 
-    def __call__(self, symbol: str, engine_ref: Any) -> bool: ...
+    def __call__(self, symbol: str, engine_ref: Any) -> GracefulExitResult: ...
 
 
 @dataclass(frozen=True)
@@ -126,14 +135,14 @@ class AutonomousEngineHost:
         logger.info("HOST_ACTIVATE_OK symbol=%s", symbol)
         return True
 
-    def request_graceful_exit(self, symbol: str) -> bool:
+    def request_graceful_exit(self, symbol: str) -> GracefulExitResult:  # noqa: PLR0911
         """Signal graceful exit on a live engine.
 
         1. Verify engine is live
         2. Invoke graceful_exit_fn on real engine ref
         3. Transition registry to GRACEFUL_EXIT
 
-        Returns True on success, False on failure.
+        Returns GracefulExitResult: SUCCESS, NOT_APPLICABLE, or FAILED.
         """
         engine_ref = self._live_engines.get(symbol)
         if engine_ref is None:
@@ -141,27 +150,30 @@ class AutonomousEngineHost:
                 "HOST_GRACEFUL_EXIT_MISSING symbol=%s — no live engine",
                 symbol,
             )
-            return False
+            return GracefulExitResult.FAILED
 
         if self.graceful_exit_fn is None:
             logger.error(
                 "HOST_GRACEFUL_EXIT_NO_FN symbol=%s — no graceful_exit_fn wired",
                 symbol,
             )
-            return False
+            return GracefulExitResult.FAILED
 
         try:
-            ok = self.graceful_exit_fn(symbol, engine_ref)
-            if not ok:
+            result = self.graceful_exit_fn(symbol, engine_ref)
+            if result == GracefulExitResult.NOT_APPLICABLE:
+                logger.info("HOST_GRACEFUL_EXIT_NOT_APPLICABLE symbol=%s", symbol)
+                return GracefulExitResult.NOT_APPLICABLE
+            if result == GracefulExitResult.FAILED:
                 logger.error("HOST_GRACEFUL_EXIT_FN_FAILED symbol=%s", symbol)
-                return False
+                return GracefulExitResult.FAILED
         except Exception as e:
             logger.error(
                 "HOST_GRACEFUL_EXIT_FN_ERROR symbol=%s error=%s",
                 symbol,
                 e,
             )
-            return False
+            return GracefulExitResult.FAILED
 
         try:
             self.registry.transition(symbol, EngineState.GRACEFUL_EXIT, reason="host_graceful_exit")
@@ -171,10 +183,10 @@ class AutonomousEngineHost:
                 symbol,
                 e,
             )
-            return False
+            return GracefulExitResult.FAILED
 
         logger.info("HOST_GRACEFUL_EXIT_OK symbol=%s", symbol)
-        return True
+        return GracefulExitResult.SUCCESS
 
     def finalize_deactivation(self, symbol: str) -> bool:
         """Complete deactivation: stop engine, cleanup, remove from host.
@@ -241,11 +253,30 @@ class AutonomousEngineHost:
         failed: list[str] = []
 
         for symbol in sorted(self._live_engines):
-            # Drive through graceful_exit → deactivation for each
-            # Skip graceful_exit if already in that state
             state = self.registry.get_state(symbol)
             if state == EngineState.ACTIVE:
-                self.request_graceful_exit(symbol)
+                ge_result = self.request_graceful_exit(symbol)
+                if ge_result == GracefulExitResult.NOT_APPLICABLE:
+                    # Benign: no position / read-only. Force registry through
+                    # GRACEFUL_EXIT so deactivation transition is legal.
+                    import contextlib  # noqa: PLC0415
+
+                    with contextlib.suppress(Exception):
+                        self.registry.transition(
+                            symbol,
+                            EngineState.GRACEFUL_EXIT,
+                            reason="shutdown_bypass_not_applicable",
+                        )
+                    logger.info(
+                        "HOST_SHUTDOWN_GRACEFUL_BYPASS symbol=%s reason=not_applicable",
+                        symbol,
+                    )
+                elif ge_result == GracefulExitResult.FAILED:
+                    # Real failure — do NOT bypass. Let finalize_deactivation fail.
+                    logger.error(
+                        "HOST_SHUTDOWN_GRACEFUL_EXIT_FAILED symbol=%s",
+                        symbol,
+                    )
 
             ok = self.finalize_deactivation(symbol)
             if ok:

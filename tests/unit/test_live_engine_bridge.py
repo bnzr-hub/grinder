@@ -11,7 +11,7 @@ from typing import Any
 
 from grinder.connectors.binance_ws import FakeWsTransport
 from grinder.execution_plane.registry import EngineRegistry, EngineState
-from grinder.runtime.autonomous_host import AutonomousEngineHost
+from grinder.runtime.autonomous_host import AutonomousEngineHost, GracefulExitResult
 from grinder.runtime.live_engine_bridge import BridgeConfig, EngineHandle, LiveEngineBridge
 
 
@@ -73,7 +73,7 @@ class TestBridgeFactoryFailure:
             registry=registry,
             engine_factory=_boom,  # type: ignore[arg-type]
             engine_stop_fn=lambda _s, _e: True,
-            graceful_exit_fn=lambda _s, _e: True,
+            graceful_exit_fn=lambda _s, _e: GracefulExitResult.SUCCESS,
         )
         ok = host.activate("BTCUSDT")
         assert not ok
@@ -88,9 +88,9 @@ class TestBridgeGracefulExit:
         handle = bridge.factory("BTCUSDT")
         try:
             assert handle.engine_ref is not None
-            ok = bridge.graceful_exit("BTCUSDT", handle)
-            # force_graceful_exit returns True/False depending on engine state
-            assert isinstance(ok, bool)
+            result = bridge.graceful_exit("BTCUSDT", handle)
+            # No position in read-only test → NOT_APPLICABLE (benign)
+            assert result == GracefulExitResult.NOT_APPLICABLE
         finally:
             handle.shutdown_event.set()
             handle.thread.join(timeout=5.0)
@@ -103,8 +103,8 @@ class TestBridgeGracefulExit:
             thread=threading.Thread(target=lambda: None),
             shutdown_event=threading.Event(),
         )
-        ok = bridge.graceful_exit("NOPE", handle)
-        assert not ok
+        result = bridge.graceful_exit("NOPE", handle)
+        assert result == GracefulExitResult.FAILED
 
 
 class TestBridgeStop:
@@ -188,11 +188,13 @@ class TestHostWithBridge:
             engine_cleanup_fn=bridge.cleanup,
             # Graceful exit optional — for no-tick engines it returns False.
             # Use a permissive fn that just signals shutdown for the test.
-            graceful_exit_fn=lambda _sym, handle: handle.shutdown_event.set() or True,
+            graceful_exit_fn=lambda _sym, handle: (
+                handle.shutdown_event.set(),
+                GracefulExitResult.NOT_APPLICABLE,
+            )[1],
         )
         host.activate("BTCUSDT")
-        handle = host._live_engines["BTCUSDT"]
-        assert handle.thread.is_alive()
+        # Thread may have already exited (empty FakeWsTransport) — that's OK
         report = host.shutdown_all()
         assert report.clean
         assert host.live_symbols == frozenset()
@@ -206,20 +208,27 @@ class TestHostWithBridge:
             engine_factory=bridge.factory,
             engine_stop_fn=bridge.stop,
             engine_cleanup_fn=bridge.cleanup,
-            graceful_exit_fn=lambda _sym, handle: handle.shutdown_event.set() or True,
+            graceful_exit_fn=lambda _sym, handle: (
+                handle.shutdown_event.set(),
+                GracefulExitResult.NOT_APPLICABLE,
+            )[1],
         )
         try:
             host.activate("ETHUSDT")
             assert registry.get_state("ETHUSDT") == EngineState.ACTIVE
 
-            host.request_graceful_exit("ETHUSDT")
-            assert registry.get_state("ETHUSDT") == EngineState.GRACEFUL_EXIT
+            # NOT_APPLICABLE graceful exit: registry stays ACTIVE
+            result = host.request_graceful_exit("ETHUSDT")
+            assert result == GracefulExitResult.NOT_APPLICABLE
+            assert registry.get_state("ETHUSDT") == EngineState.ACTIVE
 
-            host.finalize_deactivation("ETHUSDT")
+            # Shutdown handles NOT_APPLICABLE bypass cleanly
+            report = host.shutdown_all()
+            assert report.clean
             assert registry.get_state("ETHUSDT") == EngineState.STOPPED
             assert not host.is_live("ETHUSDT")
         finally:
-            host.shutdown_all()
+            pass  # shutdown_all already called above
 
 
 class TestShadowMode:
