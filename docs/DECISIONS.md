@@ -4931,3 +4931,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Runtime model:** In-process engine tasks. All operations (factory, stop, cleanup, graceful-exit) are injectable callables. No subprocess management.
 - **Registry/runtime coherence:** Every live engine has a corresponding registry entry. Factory failure → FAILED state. Stop failure → FAILED state + engine removed from host. Duplicate activation rejected.
 - **Scope boundary:** This PR adds the host abstraction with tests. `run_autonomous.py` wiring is deferred to PR 2. No existing code changed.
+
+### ADR-148: Wire run_autonomous.py to AutonomousEngineHost (2026-04-02)
+
+- **Problem:** `run_autonomous.py` used registry-only placeholder ceremony bindings despite ADR-147 providing a real engine host.
+- **Decision:** Replace placeholder ceremonies with real host bindings: `coordinator.activate_fn = host.activate`, `graceful_exit_fn = host.request_graceful_exit`, `deactivate_fn = host.finalize_deactivation`. Shutdown path calls `host.shutdown_all()` in finally block.
+- **Engine instances:** Current implementation uses lightweight `_EngineInstance` markers with `start/stop/graceful_exit` methods. Real `LiveEngineV0` integration deferred to PR 3.
+- **Preserved semantics:** Shadow mode default unchanged. Execution requires `--execution-enabled --execution-ack`. Control-plane/execution-plane boundaries unchanged.
+- **Honest scope:** `run_autonomous.py` is no longer scaffold — coordinator ceremonies hit real host lifecycle. Engine instances are still lightweight markers, not full LiveEngineV0. Full engine integration is PR 3.
