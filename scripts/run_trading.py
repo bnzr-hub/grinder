@@ -1881,12 +1881,21 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         args.exchange_port, mode, args.armed, symbols, max_notional, max_orders
     )
 
+    # Run identity (ADR-145): stable per-run, printed in startup/shutdown banners.
+    from grinder.live.run_identity import build_run_identity  # noqa: PLC0415
+
+    _run_identity = build_run_identity()
+
     # Boot summary
     print(
-        f"GRINDER TRADING LOOP | mode={mode.value} symbols={symbols} "
-        f"port={args.exchange_port} armed={args.armed} "
-        f"ha={_ha_enabled} net={'mainnet' if args.mainnet else 'testnet'} "
-        f"max_notional={max_notional}"
+        _run_identity.format_startup_banner(
+            mode=mode.value,
+            armed=args.armed,
+            mainnet=args.mainnet,
+            exchange_port=args.exchange_port,
+            symbols=symbols,
+            metrics_port=args.metrics_port,
+        )
     )
     if paper_size is not None:
         print(f"  Paper size_per_level: {paper_size}")
@@ -2138,8 +2147,9 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         signal.signal(signal.SIGUSR1, handle_graceful_exit_signal)
 
     print(
-        f"\nGRINDER TRADING LOOP running. pid={os.getpid()} "
-        f"metrics_port={args.metrics_port} Press Ctrl+C to stop."
+        f"\nGRINDER TRADING LOOP running. run_id={_run_identity.run_id} "
+        f"pid={_run_identity.pid} metrics_port={args.metrics_port} "
+        f"Press Ctrl+C to stop."
     )
     exit_code = 0
     loop_stop_reason = "not_started"
@@ -2207,7 +2217,12 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         except Exception as e:
             print(f"  WARNING: server shutdown error: {e}")
 
-        print(f"GRINDER TRADING LOOP stopped. pid={os.getpid()} exit_code={exit_code}")
+        print(
+            _run_identity.format_shutdown_banner(
+                exit_code=exit_code,
+                stop_reason=loop_stop_reason,
+            )
+        )
         sys.exit(exit_code)
 
 
