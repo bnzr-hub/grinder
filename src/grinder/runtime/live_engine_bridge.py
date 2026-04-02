@@ -131,20 +131,29 @@ class LiveEngineBridge:
         logger.info("BRIDGE_ENGINE_STOPPED symbol=%s", symbol)
         return True
 
-    def graceful_exit(self, symbol: str, engine_ref: Any) -> bool:
-        """Signal graceful exit on a running engine."""
+    def graceful_exit(self, symbol: str, engine_ref: Any) -> Any:
+        """Signal graceful exit on a running engine.
+
+        Returns GracefulExitResult: SUCCESS, NOT_APPLICABLE, or FAILED.
+        """
+        from grinder.runtime.autonomous_host import GracefulExitResult  # noqa: PLC0415
+
         handle: EngineHandle = engine_ref
         engine = handle.engine_ref
         if engine is None:
             logger.warning("BRIDGE_GRACEFUL_EXIT_NO_ENGINE symbol=%s", symbol)
-            return False
+            return GracefulExitResult.FAILED
         try:
-            result = engine.force_graceful_exit(symbol)
-            logger.info("BRIDGE_GRACEFUL_EXIT symbol=%s result=%s", symbol, result)
-            return bool(result)
+            ok = engine.force_graceful_exit(symbol)
+            logger.info("BRIDGE_GRACEFUL_EXIT symbol=%s result=%s", symbol, ok)
+            if ok:
+                return GracefulExitResult.SUCCESS
+            # force_graceful_exit returns False when no position / nothing to exit.
+            # This is benign — NOT_APPLICABLE, not FAILED.
+            return GracefulExitResult.NOT_APPLICABLE
         except Exception as e:
             logger.error("BRIDGE_GRACEFUL_EXIT_ERROR symbol=%s error=%s", symbol, e)
-            return False
+            return GracefulExitResult.FAILED
 
     def cleanup(self, symbol: str, engine_ref: Any) -> bool:  # noqa: ARG002
         """Cleanup after engine stop. Currently no-op beyond logging."""
@@ -274,11 +283,20 @@ class LiveEngineBridge:
         if handle_ref is not None and handle_ref[0] is not None:
             handle_ref[0].engine_ref = engine
 
+        # Futures WS URL: testnet and mainnet use different endpoints than spot.
+        ws_url = None
+        if cfg.exchange_port == "futures":
+            if cfg.use_testnet:
+                ws_url = "wss://stream.binancefuture.com/ws"
+            else:
+                ws_url = "wss://fstream.binance.com/ws"
+
         connector_config = LiveConnectorConfig(
             mode=mode,
             symbols=[symbol],
             use_testnet=cfg.use_testnet,
             ws_transport=cfg.ws_transport,
+            ws_url=ws_url,
         )
         connector = LiveConnectorV0(config=connector_config)
 
