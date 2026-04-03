@@ -12,6 +12,7 @@ import os
 import threading
 from unittest.mock import MagicMock, patch
 
+from grinder.account.syncer import AccountSyncer
 from grinder.live.engine import LiveEngineV0
 from grinder.paper.engine import PaperEngine
 from grinder.runtime.live_engine_bridge import BridgeConfig, LiveEngineBridge
@@ -32,7 +33,7 @@ class TestEnvPropagation:
     """grid_v2 env vars are set before engine creation and restored after."""
 
     def test_env_set_during_propagation(self) -> None:
-        """After propagation, GRINDER_GRID_V2_* must be set in os.environ."""
+        """After propagation, GRINDER_GRID_V2_* and ACCOUNT_SYNC must be set."""
         bridge = _bridge_with_tuned_symbol()
         saved = {k: os.environ.get(k) for k in bridge._GRID_V2_ENV_KEYS}
         bridge._propagate_grid_v2_env("DRIFTUSDT", "120", bridge._config)
@@ -41,6 +42,7 @@ class TestEnvPropagation:
             assert os.environ.get("GRINDER_GRID_V2_SYMBOL") == "DRIFTUSDT"
             assert os.environ.get("GRINDER_GRID_V2_ORDER_SIZE") == "120"
             assert os.environ.get("GRINDER_GRID_V2_TICK_SIZE") == "0.0001"
+            assert os.environ.get("GRINDER_ACCOUNT_SYNC_ENABLED") == "1"
         finally:
             bridge._restore_grid_v2_env(saved)
 
@@ -50,6 +52,7 @@ class TestEnvPropagation:
 
         before_enabled = os.environ.get("GRINDER_GRID_V2_ENABLED")
         before_symbol = os.environ.get("GRINDER_GRID_V2_SYMBOL")
+        before_sync = os.environ.get("GRINDER_ACCOUNT_SYNC_ENABLED")
 
         # Simulate a failing engine constructor
         with patch(
@@ -72,9 +75,10 @@ class TestEnvPropagation:
             finally:
                 bridge._restore_grid_v2_env(saved)
 
-        # Env must be restored despite the failure
+        # All env vars must be restored despite the failure
         assert os.environ.get("GRINDER_GRID_V2_ENABLED") == before_enabled
         assert os.environ.get("GRINDER_GRID_V2_SYMBOL") == before_symbol
+        assert os.environ.get("GRINDER_ACCOUNT_SYNC_ENABLED") == before_sync
 
     def test_untuned_symbol_skips_env_propagation(self) -> None:
         """Symbol not in _symbol_sizes -> no env changes."""
@@ -148,3 +152,26 @@ class TestGridConfigWiring:
             assert os.environ.get("GRINDER_GRID_V2_TICK_SIZE") == "0.0001"
         finally:
             bridge._restore_grid_v2_env(saved)
+
+
+class TestBuildAccountSyncer:
+    """_build_account_syncer returns syncer only for tuned symbols."""
+
+    def test_tuned_symbol_returns_syncer(self) -> None:
+        bridge = _bridge_with_tuned_symbol()
+        port = MagicMock()
+        syncer = bridge._build_account_syncer("DRIFTUSDT", port)
+        assert isinstance(syncer, AccountSyncer)
+
+    def test_untuned_symbol_returns_none(self) -> None:
+        bridge = LiveEngineBridge(config=BridgeConfig())
+        port = MagicMock()
+        syncer = bridge._build_account_syncer("BTCUSDT", port)
+        assert syncer is None
+
+    def test_syncer_holds_port_reference(self) -> None:
+        bridge = _bridge_with_tuned_symbol()
+        port = MagicMock()
+        syncer = bridge._build_account_syncer("DRIFTUSDT", port)
+        assert syncer is not None
+        assert syncer._port is port
