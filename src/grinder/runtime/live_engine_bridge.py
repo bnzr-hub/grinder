@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -83,11 +84,92 @@ class LiveEngineBridge:
         # Per-symbol tuned order sizes. Set by bootstrap before activation.
         # Key: symbol, Value: order_size string (e.g. "124", "0.002").
         self._symbol_sizes: dict[str, str] = {}
+        # Per-symbol grid_v2 config from tuning (tick_size, step_size, etc.)
+        self._symbol_grid_config: dict[str, dict[str, str]] = {}
+        # Serialize engine construction so env propagation is thread-safe.
+        # grid_v2 config is passed via process-global os.environ; this lock
+        # prevents overlapping engine __init__ calls from reading each other's
+        # symbol/size/tick values.
+        self._engine_construction_lock = threading.Lock()
 
     def set_symbol_size(self, symbol: str, order_size: str) -> None:
         """Register tuning-resolved order size for a symbol."""
         self._symbol_sizes[symbol] = order_size
         logger.info("BRIDGE_SYMBOL_SIZE_SET symbol=%s order_size=%s", symbol, order_size)
+
+    def set_symbol_grid_config(
+        self,
+        symbol: str,
+        tick_size: str,
+        step_size: str,
+    ) -> None:
+        """Register tuning-resolved grid_v2 config for a symbol."""
+        self._symbol_grid_config[symbol] = {
+            "tick_size": tick_size,
+            "step_size": step_size,
+        }
+        logger.info(
+            "BRIDGE_SYMBOL_GRID_CONFIG symbol=%s tick_size=%s step_size=%s",
+            symbol,
+            tick_size,
+            step_size,
+        )
+
+    # Env vars set by _propagate_grid_v2_env (for save/restore)
+    _GRID_V2_ENV_KEYS: tuple[str, ...] = (
+        "GRINDER_GRID_V2_ENABLED",
+        "GRINDER_GRID_V2_SYMBOL",
+        "GRINDER_GRID_V2_ORDER_SIZE",
+        "GRINDER_GRID_V2_RESEED_ON_FLAT",
+        "GRINDER_GRID_V2_SYNC_RECONCILER_ENABLED",
+        "GRINDER_GRID_V2_SYNC_RECONCILER_PRIMARY",
+        "GRINDER_GRID_V2_SYNC_RECONCILER_SHADOW",
+        "GRINDER_GRID_V2_STEP_PCT",
+        "GRINDER_GRID_V2_ENTRY_LEVELS",
+        "GRINDER_GRID_V2_TICK_SIZE",
+    )
+
+    def _propagate_grid_v2_env(self, symbol: str, effective_size: str, cfg: BridgeConfig) -> None:
+        """Set GRINDER_GRID_V2_* env vars so LiveEngineV0 activates grid_v2.
+
+        Called before engine construction. Engine reads these in __init__.
+        Only activates grid_v2 if the symbol has a tuned size (autonomous path).
+        """
+        if symbol not in self._symbol_sizes:
+            return
+
+        os.environ["GRINDER_GRID_V2_ENABLED"] = "1"
+        os.environ["GRINDER_GRID_V2_SYMBOL"] = symbol
+        os.environ["GRINDER_GRID_V2_ORDER_SIZE"] = effective_size
+        os.environ["GRINDER_GRID_V2_RESEED_ON_FLAT"] = "1"
+        os.environ["GRINDER_GRID_V2_SYNC_RECONCILER_ENABLED"] = "1"
+        os.environ["GRINDER_GRID_V2_SYNC_RECONCILER_PRIMARY"] = "1"
+        os.environ["GRINDER_GRID_V2_SYNC_RECONCILER_SHADOW"] = "0"
+        # Spacing: use bridge config (same SSOT as tuning solver)
+        spacing_pct = Decimal(str(cfg.spacing_bps)) / Decimal("10000")
+        os.environ["GRINDER_GRID_V2_STEP_PCT"] = str(spacing_pct)
+        os.environ["GRINDER_GRID_V2_ENTRY_LEVELS"] = str(cfg.levels)
+        # Tick size from tuning result (required by engine)
+        grid_cfg = self._symbol_grid_config.get(symbol)
+        if grid_cfg:
+            os.environ["GRINDER_GRID_V2_TICK_SIZE"] = grid_cfg["tick_size"]
+        logger.info(
+            "BRIDGE_GRID_V2_ENV symbol=%s enabled=1 order_size=%s "
+            "step_pct=%s levels=%s tick_size=%s",
+            symbol,
+            effective_size,
+            spacing_pct,
+            cfg.levels,
+            grid_cfg["tick_size"] if grid_cfg else "NOT_SET",
+        )
+
+    def _restore_grid_v2_env(self, saved: dict[str, str | None]) -> None:
+        """Restore env vars to pre-propagation state."""
+        for key, original in saved.items():
+            if original is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = original
 
     def factory(self, symbol: str) -> EngineHandle:
         """Create and start a real engine for one symbol in a background thread."""
@@ -279,22 +361,31 @@ class LiveEngineBridge:
             "tuning" if symbol in self._symbol_sizes else "default",
         )
 
-        paper = PaperEngine(
-            spacing_bps=cfg.spacing_bps,
-            levels=cfg.levels,
-            size_per_level=Decimal(effective_size),
-        )
-        port = self._build_port(symbol, mode)
-        engine_config = LiveEngineConfig(
-            armed=cfg.armed,
-            mode=mode,
-        )
-        engine = LiveEngineV0(
-            paper_engine=paper,
-            exchange_port=port,
-            config=engine_config,
-            operator_symbols=[symbol],
-        )
+        # Engine construction under lock: grid_v2 config is passed via
+        # process-global os.environ, so overlapping constructions would race.
+        # Lock serializes; try/finally guarantees env restore even on failure.
+        with self._engine_construction_lock:
+            saved_env = {k: os.environ.get(k) for k in self._GRID_V2_ENV_KEYS}
+            self._propagate_grid_v2_env(symbol, effective_size, cfg)
+            try:
+                paper = PaperEngine(
+                    spacing_bps=cfg.spacing_bps,
+                    levels=cfg.levels,
+                    size_per_level=Decimal(effective_size),
+                )
+                port = self._build_port(symbol, mode)
+                engine_config = LiveEngineConfig(
+                    armed=cfg.armed,
+                    mode=mode,
+                )
+                engine = LiveEngineV0(
+                    paper_engine=paper,
+                    exchange_port=port,
+                    config=engine_config,
+                    operator_symbols=[symbol],
+                )
+            finally:
+                self._restore_grid_v2_env(saved_env)
 
         # Propagate engine ref to the handle so graceful_exit can reach it.
         if handle_ref is not None and handle_ref[0] is not None:
