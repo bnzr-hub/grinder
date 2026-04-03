@@ -35,6 +35,7 @@ class EngineHandle:
     thread: threading.Thread
     shutdown_event: threading.Event
     engine_ref: Any = None  # LiveEngineV0 (set after startup inside thread)
+    port_ref: Any = None  # ExchangePort (set during engine creation for shutdown cleanup)
     started_at: float = 0.0
     error: str | None = None
 
@@ -262,10 +263,56 @@ class LiveEngineBridge:
             logger.error("BRIDGE_GRACEFUL_EXIT_ERROR symbol=%s error=%s", symbol, e)
             return GracefulExitResult.FAILED
 
-    def cleanup(self, symbol: str, engine_ref: Any) -> bool:  # noqa: ARG002
-        """Cleanup after engine stop. Currently no-op beyond logging."""
-        logger.info("BRIDGE_ENGINE_CLEANUP symbol=%s", symbol)
-        return True
+    def cleanup(self, symbol: str, engine_ref: Any) -> bool:
+        """Cancel all open orders and close any position for symbol.
+
+        Called after engine thread is stopped. Uses the port reference
+        stored on the handle to perform real exchange writes.
+        Safe to call when already flat/no-orders (idempotent).
+        """
+        handle: EngineHandle = engine_ref
+        port = handle.port_ref
+        if port is None or not hasattr(port, "fetch_positions_raw"):
+            logger.info(
+                "BRIDGE_ENGINE_CLEANUP symbol=%s port=%s (no-op)",
+                symbol,
+                type(port).__name__ if port else "None",
+            )
+            return True
+
+        ok = True
+        # Step 1: cancel all open orders
+        try:
+            cancelled = port.cancel_all_orders(symbol)
+            logger.info("BRIDGE_CLEANUP_CANCEL_ALL symbol=%s cancelled=%s", symbol, cancelled)
+        except Exception as e:
+            logger.error("BRIDGE_CLEANUP_CANCEL_FAILED symbol=%s error=%s", symbol, e)
+            ok = False
+
+        # Step 2: close any open position
+        try:
+            positions = port.fetch_positions_raw(symbol)
+            pos_qty = Decimal("0")
+            for p in positions:
+                qty = Decimal(str(p.get("positionAmt", "0")))
+                if qty != 0:
+                    pos_qty = qty
+            if pos_qty != 0:
+                order_id = port.close_position(symbol)
+                logger.info(
+                    "BRIDGE_CLEANUP_CLOSE_POSITION symbol=%s qty=%s order_id=%s",
+                    symbol,
+                    pos_qty,
+                    order_id,
+                )
+            else:
+                logger.info("BRIDGE_CLEANUP_POSITION_FLAT symbol=%s", symbol)
+        except Exception as e:
+            logger.error("BRIDGE_CLEANUP_CLOSE_FAILED symbol=%s error=%s", symbol, e)
+            ok = False
+
+        logger.info("BRIDGE_ENGINE_CLEANUP symbol=%s ok=%s", symbol, ok)
+        return ok
 
     def _build_port(self, symbol: str, mode: Any) -> Any:
         """Build exchange port based on config.
@@ -407,9 +454,10 @@ class LiveEngineBridge:
             finally:
                 self._restore_grid_v2_env(saved_env)
 
-        # Propagate engine ref to the handle so graceful_exit can reach it.
+        # Propagate engine + port refs to the handle for graceful_exit and cleanup.
         if handle_ref is not None and handle_ref[0] is not None:
             handle_ref[0].engine_ref = engine
+            handle_ref[0].port_ref = port
 
         # Futures WS URL: testnet and mainnet use different endpoints than spot.
         ws_url = None
