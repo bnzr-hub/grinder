@@ -10,7 +10,7 @@ Covers:
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_HALF_UP, Decimal
 
 from grinder.execution.engine import SymbolConstraints
 from grinder.tuning.solver import (
@@ -572,4 +572,120 @@ class TestTickRoundedWorstCase:
             assert notional >= constraints.min_notional, (
                 f"price={price} order_size={result.order_size} "
                 f"rounded_worst={rounded} notional={notional}"
+            )
+
+
+# --- Tests: Exact grid_v2 ladder parity ---
+
+
+class TestGridV2LadderParity:
+    """Solver worst-case matches actual grid_v2 deepest emitted level."""
+
+    def test_drift_canary_deepest_level_regression(self) -> None:
+        """Exact canary regression: price=0.04136, deepest grid_v2 level=0.0409.
+
+        grid_v2 ladder construction:
+          anchor = round(0.04136 / 0.0001, HALF_UP) * 0.0001 = 0.0414
+          step = ceil(0.0414 * 0.001 / 0.0001) * 0.0001 = 0.0001 (1 tick)
+          deepest BUY = 0.0414 - 5 * 0.0001 = 0.0409
+
+        Old solver: 0.04136 * (1 - 0.001*5) = 0.0411532 → rounded = 0.0411
+        Old qty=122, 122 * 0.0409 = 4.9898 < 5 → BLOCKED
+
+        New solver must size against 0.0409 → qty=123, 123 * 0.0409 = 5.0307
+        """
+        constraints = SymbolConstraints(
+            step_size=Decimal("1"),
+            min_qty=Decimal("1"),
+            tick_size=Decimal("0.0001"),
+            min_notional=Decimal("5"),
+        )
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("500"),
+            max_inventory_levels=10,
+            entry_levels_per_side=5,
+            spacing_pct=Decimal("0.001"),
+        )
+        result = solve("DRIFTUSDT", constraints, Decimal("0.04136"), config)
+
+        assert result.status == TuningStatus.TUNED
+        assert result.order_size is not None
+        # Must be legal at the actual deepest grid_v2 level (0.0409)
+        actual_deepest = Decimal("0.0409")
+        assert result.order_size * actual_deepest >= Decimal("5"), (
+            f"order_size={result.order_size} * {actual_deepest} "
+            f"= {result.order_size * actual_deepest} < 5"
+        )
+
+    def test_solver_uses_grid_v2_anchor_step_formula(self) -> None:
+        """Solver must compute deepest level via anchor + tick-aligned step.
+
+        For price=0.05, tick=0.0001, step_pct=0.001:
+          anchor = 0.0500
+          step = ceil(0.0500 * 0.001 / 0.0001) = ceil(0.5) = 1 tick = 0.0001
+          deepest = 0.0500 - 5 * 0.0001 = 0.0495
+
+        Old approximation: 0.05 * (1 - 0.001*5) = 0.04975 → different!
+        """
+        constraints = SymbolConstraints(
+            step_size=Decimal("1"),
+            min_qty=Decimal("1"),
+            tick_size=Decimal("0.0001"),
+            min_notional=Decimal("5"),
+        )
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("500"),
+            max_inventory_levels=10,
+            entry_levels_per_side=5,
+            spacing_pct=Decimal("0.001"),
+        )
+        result = solve("TESTUSDT", constraints, Decimal("0.05"), config)
+
+        assert result.status == TuningStatus.TUNED
+        assert result.order_size is not None
+        # Deepest = 0.0495 (grid_v2 formula), not 0.04975 (old approx)
+        assert result.order_size * Decimal("0.0495") >= Decimal("5")
+
+    def test_btc_high_price_unchanged(self) -> None:
+        """BTC: anchor/step formula produces same result as old approximation."""
+        result = solve("BTCUSDT", BTC_CONSTRAINTS, Decimal("80000"), DEFAULT_CONFIG)
+        assert result.status == TuningStatus.TUNED
+        assert result.order_size == Decimal("0.001")
+
+    def test_property_all_cheap_prices_legal_at_actual_deepest(self) -> None:
+        """For a range of cheap prices, TUNED qty is always legal at grid_v2 deepest."""
+        constraints = SymbolConstraints(
+            step_size=Decimal("1"),
+            min_qty=Decimal("1"),
+            tick_size=Decimal("0.0001"),
+            min_notional=Decimal("5"),
+        )
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("500"),
+            max_inventory_levels=10,
+            entry_levels_per_side=5,
+            spacing_pct=Decimal("0.001"),
+        )
+        tick = constraints.tick_size
+        for p_int in range(300, 600, 5):
+            price = Decimal(p_int) / Decimal(10000)
+            result = solve("TESTUSDT", constraints, price, config)
+            if result.status != TuningStatus.TUNED:
+                continue
+            # Compute actual grid_v2 deepest BUY level
+            anchor = (price / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
+            raw_step = anchor * config.spacing_pct
+            step_ticks = (raw_step / tick).quantize(Decimal("1"), rounding=ROUND_CEILING)
+            if step_ticks < 1:
+                step_ticks = Decimal("1")
+            step_price = step_ticks * tick
+            deepest = anchor - step_price * config.entry_levels_per_side
+            deepest_q = (deepest / tick).quantize(Decimal("1"), rounding=ROUND_DOWN) * tick
+            if deepest_q <= 0:
+                continue
+            assert result.order_size is not None
+            notional = result.order_size * deepest_q
+            assert notional >= constraints.min_notional, (
+                f"price={price} anchor={anchor} step={step_price} "
+                f"deepest={deepest_q} qty={result.order_size} notional={notional}"
             )

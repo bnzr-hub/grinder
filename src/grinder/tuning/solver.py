@@ -9,7 +9,7 @@ Pure computation — no exchange I/O, no state mutation, no runtime wiring.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import ROUND_DOWN, ROUND_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -134,20 +134,27 @@ def solve(
         return _no_go(symbol, NoGoReason.STEP_SIZE_UNAVAILABLE)
 
     # --- Compute worst-case deep entry price ---
-    # Deepest BUY entry sits entry_levels_per_side * spacing below mid price.
-    # min_notional must be satisfied at this worst-case price, not mid.
+    # Must match the EXACT grid_v2 ladder construction from state.py:
+    #   1. anchor = round(price / tick, ROUND_HALF_UP) * tick
+    #   2. step_price = ceil(anchor * step_pct / tick) * tick  (min 1 tick)
+    #   3. deepest_buy = anchor - step_price * levels
+    #   4. quantized = round_down(deepest_buy / tick) * tick  (BUY-side)
     #
-    # Runtime applies tick-aligned ROUND_DOWN for BUY entries
-    # (bridge._quantize_price with side=BUY). We must match that here so
-    # the solver sizes against the actual rounded price runtime will use,
-    # not the raw math price. Without this, cheap symbols like DRIFTUSDT
-    # can be TUNED at a raw price that rounds down below min_notional.
-    raw_worst = price * (1 - config.spacing_pct * config.entry_levels_per_side)
-    if raw_worst <= 0:
-        raw_worst = constraints.tick_size  # absolute floor
-    # Apply BUY-side tick rounding (ROUND_DOWN) — matches runtime _quantize_price
+    # Previous approximation (price * (1 - pct * levels)) diverged by up to
+    # 2 ticks for cheap symbols because it skipped anchor rounding and
+    # tick-aligned step computation.
     tick = constraints.tick_size
-    worst_case_price = (raw_worst / tick).quantize(Decimal("1"), rounding=ROUND_DOWN) * tick
+    anchor = (price / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
+    raw_step = anchor * config.spacing_pct
+    step_ticks = (raw_step / tick).quantize(Decimal("1"), rounding=ROUND_CEILING)
+    if step_ticks < 1:
+        step_ticks = Decimal("1")
+    step_price = step_ticks * tick
+    deepest_raw = anchor - step_price * config.entry_levels_per_side
+    if deepest_raw <= 0:
+        deepest_raw = tick  # absolute floor
+    # Apply BUY-side tick rounding (ROUND_DOWN) — matches bridge._quantize_price
+    worst_case_price = (deepest_raw / tick).quantize(Decimal("1"), rounding=ROUND_DOWN) * tick
     if worst_case_price <= 0:
         worst_case_price = tick  # one tick minimum
 
