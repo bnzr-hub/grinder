@@ -108,11 +108,13 @@ def _bootstrap_tuning_cache(
     symbols: list[str],
     cache: Any,
     args: argparse.Namespace,
-) -> None:
+) -> dict[str, str]:
     """Populate TuningCache with REST-fetched prices + constraint solver.
 
     Runs once at startup before the autonomous loop starts.
     Fail-open: if price fetch or solver fails, symbol stays un-tuned.
+
+    Returns: dict of symbol → tuned order_size (string) for successfully tuned symbols.
     """
     from grinder.execution.constraint_provider import (  # noqa: PLC0415
         ConstraintProvider,
@@ -137,6 +139,7 @@ def _bootstrap_tuning_cache(
         entry_levels_per_side=bridge_cfg.levels,
         spacing_pct=Decimal(str(bridge_cfg.spacing_bps)) / Decimal("10000"),
     )
+    tuned_sizes: dict[str, str] = {}
     tuned_count = 0
     for symbol in symbols:
         price = _fetch_price_rest(symbol, testnet=testnet)
@@ -156,6 +159,7 @@ def _bootstrap_tuning_cache(
 
         if result.status == TuningStatus.TUNED:
             tuned_count += 1
+            tuned_sizes[symbol] = str(result.order_size)
             logger.info(
                 "BOOTSTRAP_TUNED symbol=%s price=%s order_size=%s",
                 symbol,
@@ -171,6 +175,7 @@ def _bootstrap_tuning_cache(
             )
 
     logger.info("BOOTSTRAP_TUNING_COMPLETE tuned=%d total=%d", tuned_count, len(symbols))
+    return tuned_sizes
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +238,9 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
     # Cold-start tuning bootstrap (ADR-152): fetch REST prices and run solver
     # so TuningCache is populated BEFORE the first autonomous loop cycle.
     # Without this, the loop sees CACHE_MISS for every symbol → tuned=0 → no activation.
+    _tuned_sizes: dict[str, str] = {}
     if symbols_override:
-        _bootstrap_tuning_cache(sorted(symbols_override), tuning_cache, args)
+        _tuned_sizes = _bootstrap_tuning_cache(sorted(symbols_override), tuning_cache, args)
 
     rotation_controller = RotationController(
         config=RotationConfig(
@@ -257,6 +263,9 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
 
     # Real engine host with LiveEngineBridge (ADR-147/148/149)
     bridge = _build_engine_bridge(args)
+    # Propagate tuning-resolved per-symbol sizes to bridge
+    for sym, size in _tuned_sizes.items():
+        bridge.set_symbol_size(sym, size)
     host = AutonomousEngineHost(
         registry=registry,
         engine_factory=bridge.factory,
