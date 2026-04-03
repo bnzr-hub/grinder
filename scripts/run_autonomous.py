@@ -121,8 +121,10 @@ def _bootstrap_tuning_cache(
         ConstraintProvider,
         ConstraintProviderConfig,
     )
+    from grinder.observability.latency_telemetry import PhaseTimer, log_bootstrap  # noqa: PLC0415
     from grinder.tuning.solver import TuningSolverConfig, solve  # noqa: PLC0415
 
+    bootstrap_timer = PhaseTimer()
     testnet = not getattr(args, "mainnet", False)
     logger.info("BOOTSTRAP_TUNING_START symbols=%s testnet=%s", symbols, testnet)
 
@@ -178,6 +180,7 @@ def _bootstrap_tuning_cache(
             )
 
     logger.info("BOOTSTRAP_TUNING_COMPLETE tuned=%d total=%d", tuned_count, len(symbols))
+    log_bootstrap(bootstrap_timer.elapsed_ms(), len(symbols), tuned_count)
     return tuned_sizes, tuned_results
 
 
