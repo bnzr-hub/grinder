@@ -535,16 +535,45 @@ class GridV2Bridge:
         self,
         resolved: tuple[ResolvedAction, ...] | Sequence[ResolvedAction],
     ) -> tuple[ExecutionAction, ...]:
-        """Convert ResolvedActions to ExecutionActions for the dispatch pipeline."""
+        """Convert ResolvedActions to ExecutionActions for the dispatch pipeline.
+
+        Entries whose quantized notional is below min_notional are skipped
+        to prevent the pre-send gate from blocking them downstream.
+        """
+        min_notional = self._config.min_notional
         result: list[ExecutionAction] = []
         for ra in resolved:
             if ra.kind in (ActionIntentKind.PLACE_ENTRY, ActionIntentKind.PLACE_EXIT):
+                quantized_price = self._quantize_price(ra.price, ra.side)
+                # Skip entries that would violate min_notional at the actual
+                # rounded price. Exits are always allowed (reduce-only).
+                if (
+                    ra.kind == ActionIntentKind.PLACE_ENTRY
+                    and min_notional > 0
+                    and ra.qty is not None
+                    and quantized_price * ra.qty < min_notional
+                ):
+                    # Remove CID from adapter registry — it was registered
+                    # during resolve but will never be dispatched to exchange.
+                    if ra.cid:
+                        self._adapter.confirm_cancel_entry(ra.cid)
+                    logger.info(
+                        "GRID_V2_ENTRY_BELOW_MIN_NOTIONAL symbol=%s cid=%s "
+                        "price=%s qty=%s notional=%s min=%s — skipped+unregistered",
+                        self._symbol,
+                        ra.cid,
+                        quantized_price,
+                        ra.qty,
+                        quantized_price * ra.qty,
+                        min_notional,
+                    )
+                    continue
                 result.append(
                     ExecutionAction(
                         action_type=ActionType.PLACE,
                         symbol=self._symbol,
                         side=ra.side,
-                        price=self._quantize_price(ra.price, ra.side),
+                        price=quantized_price,
                         quantity=ra.qty,
                         client_order_id=ra.cid,
                         reason=f"grid_v2_{ra.kind.value}",

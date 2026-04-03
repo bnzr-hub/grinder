@@ -6030,3 +6030,114 @@ class TestBridgeOnFillPartialResolution:
         assert not r2.rejected
         # Transition should exist (lot was closed by SM)
         assert r2.transition is not None
+
+
+# --- Tests: min_notional filter in bridge ---
+
+
+class TestMinNotionalFilter:
+    """Bridge skips PLACE_ENTRY when quantized notional < min_notional."""
+
+    def _make_bridge(
+        self, min_notional: str = "5", tick_size: str = "0.0001", order_size: str = "124"
+    ) -> GridV2Bridge:
+        config = GridV2Config(
+            grid_step_pct=Decimal("0.001"),
+            entry_levels_per_side=5,
+            order_size=Decimal(order_size),
+            max_inventory_levels=10,
+            max_inventory_notional_usd=Decimal("500"),
+            price_tick_size=Decimal(tick_size),
+            min_notional=Decimal(min_notional),
+        )
+        return GridV2Bridge(config, "DRIFTUSDT")
+
+    def _resolved_entry(self, price: str, qty: str = "124", cid: str = "g-test") -> MagicMock:
+        ra = MagicMock()
+        ra.kind = ActionIntentKind.PLACE_ENTRY
+        ra.side = OrderSide.SELL
+        ra.price = Decimal(price)
+        ra.qty = Decimal(qty)
+        ra.cid = cid
+        return ra
+
+    def _resolved_exit(self, price: str, qty: str = "124", cid: str = "g-exit") -> MagicMock:
+        ra = MagicMock()
+        ra.kind = ActionIntentKind.PLACE_EXIT
+        ra.side = OrderSide.BUY
+        ra.price = Decimal(price)
+        ra.qty = Decimal(qty)
+        ra.cid = cid
+        return ra
+
+    def test_legal_entry_passes(self) -> None:
+        bridge = self._make_bridge(min_notional="5")
+        ra = self._resolved_entry(price="0.0410", qty="124")
+        # 0.0410 * 124 = 5.084 >= 5
+        actions = bridge._to_execution_actions([ra])
+        assert len(actions) == 1
+        assert actions[0].action_type == ActionType.PLACE
+
+    def test_illegal_entry_skipped(self) -> None:
+        bridge = self._make_bridge(min_notional="5")
+        ra = self._resolved_entry(price="0.0403", qty="124")
+        # SELL side rounds UP: 0.0403 -> 0.0403 (already tick-aligned)
+        # 0.0403 * 124 = 4.9972 < 5
+        actions = bridge._to_execution_actions([ra])
+        assert len(actions) == 0
+
+    def test_exit_always_passes(self) -> None:
+        """Exits (reduce-only) must never be skipped by min_notional."""
+        bridge = self._make_bridge(min_notional="5")
+        ra = self._resolved_exit(price="0.0403", qty="124")
+        actions = bridge._to_execution_actions([ra])
+        assert len(actions) == 1
+        assert actions[0].reduce_only is True
+
+    def test_min_notional_zero_no_filter(self) -> None:
+        """min_notional=0 means no filtering."""
+        bridge = self._make_bridge(min_notional="0")
+        ra = self._resolved_entry(price="0.0001", qty="1")
+        actions = bridge._to_execution_actions([ra])
+        assert len(actions) == 1
+
+    def test_drift_canary_regression(self) -> None:
+        """Exact canary case: price=0.0403 qty=124 notional=4.9972 < 5."""
+        bridge = self._make_bridge(min_notional="5", tick_size="0.0001", order_size="124")
+        ra = self._resolved_entry(price="0.0403", qty="124")
+        actions = bridge._to_execution_actions([ra])
+        assert len(actions) == 0, f"Expected 0 actions (sub-notional), got {len(actions)}"
+
+    def test_mixed_legal_and_illegal(self) -> None:
+        """Legal and illegal entries in same batch: only legal ones pass."""
+        bridge = self._make_bridge(min_notional="5")
+        legal = self._resolved_entry(price="0.0410", qty="124", cid="g-ok")
+        illegal = self._resolved_entry(price="0.0403", qty="124", cid="g-bad")
+        actions = bridge._to_execution_actions([legal, illegal])
+        assert len(actions) == 1
+        assert actions[0].client_order_id == "g-ok"
+
+    def test_skipped_entry_unregistered_from_registry(self) -> None:
+        """Skipped sub-notional entry must be removed from adapter registry."""
+        bridge = self._make_bridge(min_notional="5")
+        # Pre-register CID in registry (simulates what adapter.resolve does)
+        bridge.adapter.registry.register_entry("g-sub", OrderSide.SELL, Decimal("0.0403"))
+        assert bridge.adapter.registry.lookup_entry("g-sub") is not None
+
+        ra = self._resolved_entry(price="0.0403", qty="124", cid="g-sub")
+        actions = bridge._to_execution_actions([ra])
+
+        assert len(actions) == 0
+        # CID must be gone from registry
+        assert bridge.adapter.registry.lookup_entry("g-sub") is None
+        assert "g-sub" not in bridge.adapter.registry.all_entry_cids
+
+    def test_skipped_entry_does_not_block_slot(self) -> None:
+        """After skip+unregister, the (side, price) slot is free for reuse."""
+        bridge = self._make_bridge(min_notional="5")
+        bridge.adapter.registry.register_entry("g-sub", OrderSide.SELL, Decimal("0.0403"))
+        ra = self._resolved_entry(price="0.0403", qty="124", cid="g-sub")
+        bridge._to_execution_actions([ra])
+
+        # Slot should be free — can register a new CID at the same price
+        assert bridge.adapter.registry.cid_for_entry(OrderSide.SELL, Decimal("0.0403")) is None
