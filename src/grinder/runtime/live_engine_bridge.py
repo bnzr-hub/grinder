@@ -80,6 +80,14 @@ class LiveEngineBridge:
 
     def __init__(self, config: BridgeConfig | None = None) -> None:
         self._config = config or BridgeConfig()
+        # Per-symbol tuned order sizes. Set by bootstrap before activation.
+        # Key: symbol, Value: order_size string (e.g. "124", "0.002").
+        self._symbol_sizes: dict[str, str] = {}
+
+    def set_symbol_size(self, symbol: str, order_size: str) -> None:
+        """Register tuning-resolved order size for a symbol."""
+        self._symbol_sizes[symbol] = order_size
+        logger.info("BRIDGE_SYMBOL_SIZE_SET symbol=%s order_size=%s", symbol, order_size)
 
     def factory(self, symbol: str) -> EngineHandle:
         """Create and start a real engine for one symbol in a background thread."""
@@ -262,10 +270,19 @@ class LiveEngineBridge:
         cfg = self._config
         mode = SafeMode(cfg.mode)
 
+        # Per-symbol tuned size takes precedence over bridge default
+        effective_size = self._symbol_sizes.get(symbol, cfg.size_per_level)
+        logger.info(
+            "BRIDGE_ENGINE_SIZE symbol=%s size=%s source=%s",
+            symbol,
+            effective_size,
+            "tuning" if symbol in self._symbol_sizes else "default",
+        )
+
         paper = PaperEngine(
             spacing_bps=cfg.spacing_bps,
             levels=cfg.levels,
-            size_per_level=Decimal(cfg.size_per_level),
+            size_per_level=Decimal(effective_size),
         )
         port = self._build_port(symbol, mode)
         engine_config = LiveEngineConfig(
