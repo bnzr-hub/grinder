@@ -127,6 +127,7 @@ class LiveEngineBridge:
         "GRINDER_GRID_V2_STEP_PCT",
         "GRINDER_GRID_V2_ENTRY_LEVELS",
         "GRINDER_GRID_V2_TICK_SIZE",
+        "GRINDER_ACCOUNT_SYNC_ENABLED",
     )
 
     def _propagate_grid_v2_env(self, symbol: str, effective_size: str, cfg: BridgeConfig) -> None:
@@ -145,6 +146,8 @@ class LiveEngineBridge:
         os.environ["GRINDER_GRID_V2_SYNC_RECONCILER_ENABLED"] = "1"
         os.environ["GRINDER_GRID_V2_SYNC_RECONCILER_PRIMARY"] = "1"
         os.environ["GRINDER_GRID_V2_SYNC_RECONCILER_SHADOW"] = "0"
+        # Account sync: required for grid_v2 startup (needs _last_account_snapshot)
+        os.environ["GRINDER_ACCOUNT_SYNC_ENABLED"] = "1"
         # Spacing: use bridge config (same SSOT as tuning solver)
         spacing_pct = Decimal(str(cfg.spacing_bps)) / Decimal("10000")
         os.environ["GRINDER_GRID_V2_STEP_PCT"] = str(spacing_pct)
@@ -162,6 +165,20 @@ class LiveEngineBridge:
             cfg.levels,
             grid_cfg["tick_size"] if grid_cfg else "NOT_SET",
         )
+
+    def _build_account_syncer(self, symbol: str, port: Any) -> Any:
+        """Create AccountSyncer if symbol has a tuned order size.
+
+        grid_v2 startup requires _last_account_snapshot, which is only
+        populated when an AccountSyncer is present and account sync is enabled.
+        Returns None for symbols not in _symbol_sizes (safe fallback).
+        """
+        if symbol not in self._symbol_sizes:
+            return None
+        from grinder.account.syncer import AccountSyncer  # noqa: PLC0415
+
+        logger.info("BRIDGE_ACCOUNT_SYNCER_CREATED symbol=%s", symbol)
+        return AccountSyncer(port)
 
     def _restore_grid_v2_env(self, saved: dict[str, str | None]) -> None:
         """Restore env vars to pre-propagation state."""
@@ -378,11 +395,14 @@ class LiveEngineBridge:
                     armed=cfg.armed,
                     mode=mode,
                 )
+                # AccountSyncer: grid_v2 needs _last_account_snapshot for startup.
+                account_syncer = self._build_account_syncer(symbol, port)
                 engine = LiveEngineV0(
                     paper_engine=paper,
                     exchange_port=port,
                     config=engine_config,
                     operator_symbols=[symbol],
+                    account_syncer=account_syncer,
                 )
             finally:
                 self._restore_grid_v2_env(saved_env)
