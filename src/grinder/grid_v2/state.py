@@ -68,6 +68,7 @@ class GridV2Config:
     max_inventory_levels: int
     max_inventory_notional_usd: Decimal
     price_tick_size: Decimal = Decimal("0.01")  # PR6: exchange tick size for price quantization
+    min_notional: Decimal = Decimal("0")  # Exchange min order value (0 = no check)
     reseed_on_flat: bool = (
         False  # Default: preserve current window on full unwind to FLAT (no unconditional recenter)
     )

@@ -1166,6 +1166,7 @@ class LiveEngineV0:
                 os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL", "1000")
             ),
             price_tick_size=self._resolve_grid_v2_tick_size(),
+            min_notional=self._min_notional_cache.get(self._grid_v2_symbol, Decimal("0")),
             reseed_on_flat=parse_bool(
                 "GRINDER_GRID_V2_RESEED_ON_FLAT", default=False, strict=False
             ),
