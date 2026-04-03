@@ -417,3 +417,159 @@ class TestDeepLevelNotional:
         result = solve("BTCUSDT", BTC_CONSTRAINTS, Decimal("80000"), DEFAULT_CONFIG)
         assert result.status == TuningStatus.TUNED
         assert result.order_size == Decimal("0.001")
+
+
+# --- Tests: Tick-rounded worst-case price regression ---
+
+
+class TestTickRoundedWorstCase:
+    """Solver must size against tick-rounded worst-case price (BUY ROUND_DOWN).
+
+    Bug class: bootstrap solver computed order_size against raw math price
+    but runtime applies _quantize_price(price, BUY) = ROUND_DOWN to tick.
+    For cheap symbols, the tick-rounded price is lower, making the solver's
+    qty illegal at the actual placement price.
+    """
+
+    def test_raw_legal_rounded_illegal_regression(self) -> None:
+        """Exact DRIFTUSDT regression: raw worst-case legal, rounded is not.
+
+        price=0.0402, tick=0.0001, spacing=25bps*5=1.25%:
+        - raw worst = 0.0402 * (1 - 0.0125) = 0.03969750
+        - rounded worst (ROUND_DOWN) = 0.0396
+        - old solver: qty=126, 126*0.0396 = 4.9896 < 5  ← ILLEGAL
+        - new solver: qty=127, 127*0.0396 = 5.0292 >= 5  ← LEGAL
+        """
+        constraints = SymbolConstraints(
+            step_size=Decimal("1"),
+            min_qty=Decimal("1"),
+            tick_size=Decimal("0.0001"),
+            min_notional=Decimal("5"),
+        )
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("500"),
+            max_inventory_levels=10,
+            entry_levels_per_side=5,
+            spacing_pct=Decimal("0.0025"),
+        )
+        result = solve("DRIFTUSDT", constraints, Decimal("0.0402"), config)
+
+        assert result.status == TuningStatus.TUNED
+        assert result.order_size is not None
+        # Verify at the ROUNDED worst-case price (not raw)
+        rounded_worst = Decimal("0.0396")
+        assert result.order_size * rounded_worst >= Decimal("5"), (
+            f"order_size={result.order_size} * rounded_worst={rounded_worst} "
+            f"= {result.order_size * rounded_worst} < 5"
+        )
+
+    def test_rounded_price_used_not_raw(self) -> None:
+        """Solver sizes against rounded price, producing larger qty than raw-only.
+
+        price=0.0409, tick=0.0001:
+        - raw worst = 0.04038875
+        - rounded worst = 0.0403
+        - old: qty=124, 124*0.0403 = 4.9972 < 5
+        - new: qty=125, 125*0.0403 = 5.0375 >= 5
+        """
+        constraints = SymbolConstraints(
+            step_size=Decimal("1"),
+            min_qty=Decimal("1"),
+            tick_size=Decimal("0.0001"),
+            min_notional=Decimal("5"),
+        )
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("500"),
+            max_inventory_levels=10,
+            entry_levels_per_side=5,
+            spacing_pct=Decimal("0.0025"),
+        )
+        result = solve("DRIFTUSDT", constraints, Decimal("0.0409"), config)
+
+        assert result.status == TuningStatus.TUNED
+        assert result.order_size is not None
+        assert result.order_size >= Decimal("125"), f"Expected >=125, got {result.order_size}"
+        assert result.order_size * Decimal("0.0403") >= Decimal("5")
+
+    def test_btc_high_price_unchanged(self) -> None:
+        """BTC: tick rounding is negligible, order_size unchanged."""
+        result = solve("BTCUSDT", BTC_CONSTRAINTS, Decimal("80000"), DEFAULT_CONFIG)
+        assert result.status == TuningStatus.TUNED
+        assert result.order_size == Decimal("0.001")
+
+    def test_deterministic_same_inputs(self) -> None:
+        """Same inputs always produce same order_size (with tick rounding)."""
+        constraints = SymbolConstraints(
+            step_size=Decimal("1"),
+            min_qty=Decimal("1"),
+            tick_size=Decimal("0.0001"),
+            min_notional=Decimal("5"),
+        )
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("500"),
+            max_inventory_levels=10,
+        )
+        r1 = solve("DRIFTUSDT", constraints, Decimal("0.0402"), config)
+        r2 = solve("DRIFTUSDT", constraints, Decimal("0.0402"), config)
+        assert r1 == r2
+
+    def test_larger_tick_size_larger_impact(self) -> None:
+        """Coarser tick (0.01 vs 0.0001) amplifies rounding impact.
+
+        price=3.27, tick=0.01, spacing=25bps*5=1.25%:
+        - raw worst = 3.27 * 0.9875 = 3.229125
+        - rounded worst (ROUND_DOWN to 0.01) = 3.22
+        - Solver must size against 3.22, not 3.229125
+        """
+        constraints = SymbolConstraints(
+            step_size=Decimal("0.1"),
+            min_qty=Decimal("0.1"),
+            tick_size=Decimal("0.01"),
+            min_notional=Decimal("5"),
+        )
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("500"),
+            max_inventory_levels=10,
+            entry_levels_per_side=5,
+            spacing_pct=Decimal("0.0025"),
+        )
+        result = solve("MIDUSDT", constraints, Decimal("3.27"), config)
+
+        assert result.status == TuningStatus.TUNED
+        assert result.order_size is not None
+        rounded_worst = Decimal("3.22")
+        assert result.order_size * rounded_worst >= Decimal("5")
+
+    def test_notional_at_rounded_worst_sufficient(self) -> None:
+        """Generic property: TUNED result must be legal at rounded worst-case price."""
+        from decimal import ROUND_DOWN as _RD  # noqa: PLC0415
+
+        constraints = SymbolConstraints(
+            step_size=Decimal("1"),
+            min_qty=Decimal("1"),
+            tick_size=Decimal("0.0001"),
+            min_notional=Decimal("5"),
+        )
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("500"),
+            max_inventory_levels=10,
+            entry_levels_per_side=5,
+            spacing_pct=Decimal("0.0025"),
+        )
+        # Test across a range of cheap prices
+        for p_int in range(300, 600, 7):
+            price = Decimal(p_int) / Decimal(10000)
+            result = solve("TESTUSDT", constraints, price, config)
+            if result.status != TuningStatus.TUNED:
+                continue
+            raw_worst = price * (1 - config.spacing_pct * config.entry_levels_per_side)
+            tick = constraints.tick_size
+            rounded = (raw_worst / tick).quantize(Decimal("1"), rounding=_RD) * tick
+            if rounded <= 0:
+                continue
+            assert result.order_size is not None
+            notional = result.order_size * rounded
+            assert notional >= constraints.min_notional, (
+                f"price={price} order_size={result.order_size} "
+                f"rounded_worst={rounded} notional={notional}"
+            )

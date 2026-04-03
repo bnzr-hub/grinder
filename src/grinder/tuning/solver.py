@@ -9,7 +9,7 @@ Pure computation — no exchange I/O, no state mutation, no runtime wiring.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import ROUND_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -136,12 +136,20 @@ def solve(
     # --- Compute worst-case deep entry price ---
     # Deepest BUY entry sits entry_levels_per_side * spacing below mid price.
     # min_notional must be satisfied at this worst-case price, not mid.
-    # NOTE: This fixes tuning legality for the autonomous path. The actual
-    # runtime placement path (run_trading.py) uses operator-set order_size
-    # directly — that path needs separate validation if size diverges.
-    worst_case_price = price * (1 - config.spacing_pct * config.entry_levels_per_side)
+    #
+    # Runtime applies tick-aligned ROUND_DOWN for BUY entries
+    # (bridge._quantize_price with side=BUY). We must match that here so
+    # the solver sizes against the actual rounded price runtime will use,
+    # not the raw math price. Without this, cheap symbols like DRIFTUSDT
+    # can be TUNED at a raw price that rounds down below min_notional.
+    raw_worst = price * (1 - config.spacing_pct * config.entry_levels_per_side)
+    if raw_worst <= 0:
+        raw_worst = constraints.tick_size  # absolute floor
+    # Apply BUY-side tick rounding (ROUND_DOWN) — matches runtime _quantize_price
+    tick = constraints.tick_size
+    worst_case_price = (raw_worst / tick).quantize(Decimal("1"), rounding=ROUND_DOWN) * tick
     if worst_case_price <= 0:
-        worst_case_price = constraints.tick_size  # absolute floor
+        worst_case_price = tick  # one tick minimum
 
     # --- Compute minimum legal quantity (at worst-case deep price) ---
 
