@@ -245,6 +245,7 @@ class BlockReason(Enum):
     RISK_PORTFOLIO_DD_KILL_SWITCH = "RISK_PORTFOLIO_DD_KILL_SWITCH"
     REDUCE_ONLY_BUDGET_EXCEEDED = "REDUCE_ONLY_BUDGET_EXCEEDED"
     HEALTH_GATE_UNSAFE = "HEALTH_GATE_UNSAFE"
+    NOTIONAL_TOO_LOW = "NOTIONAL_TOO_LOW"
 
 
 # PR-2 (ADR-092): Map RiskGateReason → BlockReason for risk base enforcement gate.
@@ -513,6 +514,12 @@ class LiveEngineV0:
         # Doc-36 Phase 2: active selector (controlled activation)
         self._active_selector = active_selector
         self._operator_symbols = operator_symbols or []
+        # Min-notional cache: symbol → Decimal. Loaded from constraint provider at init.
+        # Used by pre-send notional gate to block sub-minimum orders before HTTP.
+        # Only loaded when operator_symbols are set (autonomous/production path).
+        self._min_notional_cache: dict[str, Decimal] = {}
+        if operator_symbols:
+            self._load_min_notional_cache()
         # Read GRINDER_LIVE_PLANNER_ENABLED once at init (PR-L2)
         self._live_planner_env_override = parse_bool(
             "GRINDER_LIVE_PLANNER_ENABLED", default=False, strict=False
@@ -4844,6 +4851,27 @@ class LiveEngineV0:
         # Normal writes
         return result.write_allowed
 
+    def _load_min_notional_cache(self) -> None:
+        """Load min_notional per symbol from constraint provider cache.
+
+        Fail-open: if constraints unavailable, cache stays empty (no blocking).
+        """
+        try:
+            from grinder.execution.constraint_provider import (  # noqa: PLC0415
+                ConstraintProvider,
+                ConstraintProviderConfig,
+            )
+
+            provider = ConstraintProvider(config=ConstraintProviderConfig(allow_fetch=False))
+            constraints = provider.get_constraints()
+            if constraints:
+                for sym, sc in constraints.items():
+                    if sc.min_notional > 0:
+                        self._min_notional_cache[sym] = sc.min_notional
+                logger.info("MIN_NOTIONAL_CACHE_LOADED symbols=%d", len(self._min_notional_cache))
+        except Exception as e:
+            logger.warning("MIN_NOTIONAL_CACHE_FAILED error=%s", e)
+
     def _get_position_sign(self, symbol: str) -> int | None:
         """Determine net position direction for a symbol (PR-INV-1).
 
@@ -6618,7 +6646,7 @@ class LiveEngineV0:
         self._tp_close_retries.update(to_update)
         return results
 
-    def _execute_action(self, action: ExecutionAction, ts: int, intent: RiskIntent) -> LiveAction:  # noqa: PLR0912, PLR0915
+    def _execute_action(self, action: ExecutionAction, ts: int, intent: RiskIntent) -> LiveAction:  # noqa: PLR0911, PLR0912, PLR0915
         """Execute action on exchange port with retries.
 
         Args:
@@ -6635,6 +6663,36 @@ class LiveEngineV0:
                 status=LiveActionStatus.SKIPPED,
                 intent=intent,
             )
+
+        # Min-notional pre-send gate: block non-reduce-only PLACE orders where
+        # price*qty < min_notional. Exempt reduce_only exits so the engine can
+        # always flatten/unwind positions even when notional is small.
+        if (
+            action.action_type == ActionType.PLACE
+            and not action.reduce_only
+            and action.price is not None
+            and action.quantity is not None
+            and action.symbol
+        ):
+            _min_notional = self._min_notional_cache.get(action.symbol)
+            if _min_notional is not None and _min_notional > 0:
+                _notional = action.price * action.quantity
+                if _notional < _min_notional:
+                    logger.warning(
+                        "MIN_NOTIONAL_BLOCKED symbol=%s price=%s qty=%s notional=%s min=%s",
+                        action.symbol,
+                        action.price,
+                        action.quantity,
+                        _notional,
+                        _min_notional,
+                    )
+                    return LiveAction(
+                        action=action,
+                        status=LiveActionStatus.BLOCKED,
+                        block_reason=BlockReason.NOTIONAL_TOO_LOW,
+                        intent=intent,
+                        pre_send=True,
+                    )
 
         # PR-VIS-1: log place intent before execution (env-gated)
         if action.action_type == ActionType.PLACE and self._debug_open_orders:
