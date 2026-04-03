@@ -108,13 +108,14 @@ def _bootstrap_tuning_cache(
     symbols: list[str],
     cache: Any,
     args: argparse.Namespace,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, Any]]:
     """Populate TuningCache with REST-fetched prices + constraint solver.
 
     Runs once at startup before the autonomous loop starts.
     Fail-open: if price fetch or solver fails, symbol stays un-tuned.
 
-    Returns: dict of symbol → tuned order_size (string) for successfully tuned symbols.
+    Returns: (sizes, results) where sizes is symbol→order_size string,
+    results is symbol→TuningResult for successfully tuned symbols.
     """
     from grinder.execution.constraint_provider import (  # noqa: PLC0415
         ConstraintProvider,
@@ -140,6 +141,7 @@ def _bootstrap_tuning_cache(
         spacing_pct=Decimal(str(bridge_cfg.spacing_bps)) / Decimal("10000"),
     )
     tuned_sizes: dict[str, str] = {}
+    tuned_results: dict[str, Any] = {}
     tuned_count = 0
     for symbol in symbols:
         price = _fetch_price_rest(symbol, testnet=testnet)
@@ -160,6 +162,7 @@ def _bootstrap_tuning_cache(
         if result.status == TuningStatus.TUNED:
             tuned_count += 1
             tuned_sizes[symbol] = str(result.order_size)
+            tuned_results[symbol] = result
             logger.info(
                 "BOOTSTRAP_TUNED symbol=%s price=%s order_size=%s",
                 symbol,
@@ -175,7 +178,7 @@ def _bootstrap_tuning_cache(
             )
 
     logger.info("BOOTSTRAP_TUNING_COMPLETE tuned=%d total=%d", tuned_count, len(symbols))
-    return tuned_sizes
+    return tuned_sizes, tuned_results
 
 
 # ---------------------------------------------------------------------------
@@ -239,8 +242,11 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
     # so TuningCache is populated BEFORE the first autonomous loop cycle.
     # Without this, the loop sees CACHE_MISS for every symbol → tuned=0 → no activation.
     _tuned_sizes: dict[str, str] = {}
+    _tuned_results: dict[str, Any] = {}
     if symbols_override:
-        _tuned_sizes = _bootstrap_tuning_cache(sorted(symbols_override), tuning_cache, args)
+        _tuned_sizes, _tuned_results = _bootstrap_tuning_cache(
+            sorted(symbols_override), tuning_cache, args
+        )
 
     rotation_controller = RotationController(
         config=RotationConfig(
@@ -263,9 +269,16 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
 
     # Real engine host with LiveEngineBridge (ADR-147/148/149)
     bridge = _build_engine_bridge(args)
-    # Propagate tuning-resolved per-symbol sizes to bridge
+    # Propagate tuning-resolved per-symbol sizes and grid config to bridge
     for sym, size in _tuned_sizes.items():
         bridge.set_symbol_size(sym, size)
+        result = _tuned_results.get(sym)
+        if result and result.tick_size and result.step_size:
+            bridge.set_symbol_grid_config(
+                sym,
+                tick_size=str(result.tick_size),
+                step_size=str(result.step_size),
+            )
     host = AutonomousEngineHost(
         registry=registry,
         engine_factory=bridge.factory,
