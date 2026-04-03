@@ -37,6 +37,7 @@ def _build_host(
     *,
     factory_raises: bool = False,
     stop_returns: bool = True,
+    cleanup_returns: bool = True,
     graceful_exit_result: GracefulExitResult = GracefulExitResult.SUCCESS,
 ) -> tuple[AutonomousEngineHost, EngineRegistry, dict[str, FakeEngine]]:
     """Build a host with injectable fakes."""
@@ -57,7 +58,7 @@ def _build_host(
 
     def cleanup_fn(symbol: str, engine_ref: FakeEngine) -> bool:
         engine_ref.cleaned = True
-        return True
+        return cleanup_returns
 
     def graceful_fn(symbol: str, engine_ref: FakeEngine) -> GracefulExitResult:
         engine_ref.graceful_exit_requested = True
@@ -268,6 +269,15 @@ class TestShutdownAll:
         assert report.clean
         assert report.stopped == []
         assert report.failed == []
+
+    def test_cleanup_failure_makes_shutdown_non_clean(self) -> None:
+        """Failed exchange cleanup must surface as shutdown failure."""
+        host, registry, _engines = _build_host(cleanup_returns=False)
+        host.activate("DRIFTUSDT")
+        report = host.shutdown_all()
+        assert not report.clean
+        assert "DRIFTUSDT" in report.failed
+        assert registry.get_state("DRIFTUSDT") == EngineState.FAILED
 
     def test_shutdown_all_allows_no_position_engine_direct_stop(self) -> None:
         """Active engine where graceful_exit returns False (no position)

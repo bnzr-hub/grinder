@@ -224,25 +224,28 @@ class AutonomousEngineHost:
             logger.error("HOST_DEACTIVATE_STOP_FAILED symbol=%s error=%s", symbol, e)
             stop_ok = False
 
+        cleanup_ok = True
         if self.engine_cleanup_fn is not None:
             try:
-                self.engine_cleanup_fn(symbol, engine_ref)
+                cleanup_ok = bool(self.engine_cleanup_fn(symbol, engine_ref))
             except Exception as e:
-                logger.warning(
+                logger.error(
                     "HOST_DEACTIVATE_CLEANUP_FAILED symbol=%s error=%s",
                     symbol,
                     e,
                 )
+                cleanup_ok = False
 
         import contextlib  # noqa: PLC0415
 
-        target_state = EngineState.STOPPED if stop_ok else EngineState.FAILED
+        all_ok = stop_ok and cleanup_ok
+        target_state = EngineState.STOPPED if all_ok else EngineState.FAILED
         with contextlib.suppress(Exception):
             self.registry.transition(symbol, target_state, reason="host_deactivate_done")
 
         self._live_engines.pop(symbol, None)
         logger.info("HOST_DEACTIVATE_OK symbol=%s final_state=%s", symbol, target_state.value)
-        return stop_ok
+        return all_ok
 
     def shutdown_all(self) -> HostShutdownReport:
         """Stop all live engines in deterministic order.

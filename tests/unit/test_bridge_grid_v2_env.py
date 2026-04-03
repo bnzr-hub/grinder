@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 from grinder.account.syncer import AccountSyncer
 from grinder.live.engine import LiveEngineV0
 from grinder.paper.engine import PaperEngine
-from grinder.runtime.live_engine_bridge import BridgeConfig, LiveEngineBridge
+from grinder.runtime.live_engine_bridge import BridgeConfig, EngineHandle, LiveEngineBridge
 
 
 def _bridge_with_tuned_symbol(
@@ -175,3 +175,84 @@ class TestBuildAccountSyncer:
         syncer = bridge._build_account_syncer("DRIFTUSDT", port)
         assert syncer is not None
         assert syncer._port is port
+
+
+class TestCleanup:
+    """bridge.cleanup() cancels orders and closes position via port."""
+
+    def test_cleanup_cancels_orders_and_closes_position(self) -> None:
+        """When port has open orders and position, cleanup cancels/closes both."""
+
+        bridge = LiveEngineBridge(config=BridgeConfig())
+        port = MagicMock()
+        port.cancel_all_orders.return_value = 6
+        port.fetch_positions_raw.return_value = [{"positionAmt": "-372"}]
+        port.close_position.return_value = "order-123"
+
+        handle = MagicMock(spec=EngineHandle)
+        handle.port_ref = port
+
+        ok = bridge.cleanup("DRIFTUSDT", handle)
+
+        assert ok is True
+        port.cancel_all_orders.assert_called_once_with("DRIFTUSDT")
+        port.fetch_positions_raw.assert_called_once_with("DRIFTUSDT")
+        port.close_position.assert_called_once_with("DRIFTUSDT")
+
+    def test_cleanup_skips_close_when_flat(self) -> None:
+        """Flat position: cancel orders but skip close_position."""
+
+        bridge = LiveEngineBridge(config=BridgeConfig())
+        port = MagicMock()
+        port.cancel_all_orders.return_value = 0
+        port.fetch_positions_raw.return_value = [{"positionAmt": "0"}]
+
+        handle = MagicMock(spec=EngineHandle)
+        handle.port_ref = port
+
+        ok = bridge.cleanup("DRIFTUSDT", handle)
+
+        assert ok is True
+        port.cancel_all_orders.assert_called_once()
+        port.close_position.assert_not_called()
+
+    def test_cleanup_no_port_is_noop(self) -> None:
+        """No port reference: cleanup is safe no-op."""
+
+        bridge = LiveEngineBridge(config=BridgeConfig())
+        handle = MagicMock(spec=EngineHandle)
+        handle.port_ref = None
+
+        ok = bridge.cleanup("DRIFTUSDT", handle)
+        assert ok is True
+
+    def test_cleanup_cancel_failure_returns_false(self) -> None:
+        """Cancel failure: returns False but still attempts close."""
+
+        bridge = LiveEngineBridge(config=BridgeConfig())
+        port = MagicMock()
+        port.cancel_all_orders.side_effect = RuntimeError("cancel failed")
+        port.fetch_positions_raw.return_value = [{"positionAmt": "0"}]
+
+        handle = MagicMock(spec=EngineHandle)
+        handle.port_ref = port
+
+        ok = bridge.cleanup("DRIFTUSDT", handle)
+
+        assert ok is False
+        # Still attempted position check
+        port.fetch_positions_raw.assert_called_once()
+
+    def test_cleanup_close_failure_returns_false(self) -> None:
+        """Close failure: returns False."""
+
+        bridge = LiveEngineBridge(config=BridgeConfig())
+        port = MagicMock()
+        port.cancel_all_orders.return_value = 0
+        port.fetch_positions_raw.side_effect = RuntimeError("fetch failed")
+
+        handle = MagicMock(spec=EngineHandle)
+        handle.port_ref = port
+
+        ok = bridge.cleanup("DRIFTUSDT", handle)
+        assert ok is False
