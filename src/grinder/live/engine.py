@@ -3218,6 +3218,7 @@ class LiveEngineV0:
             grid_v2_integrity_actions = []
 
         _seed_batch: list[ExecutionAction] = []  # tracked for latency logging
+        _fill_cancel_batch: list[ExecutionAction] = []  # post-fill concurrent cancel wave
         # Step 1: Get actions -- either from GridV2Bridge, LiveGridPlannerV1, or PaperEngine
         if self._grid_v2_enabled and snapshot.symbol == self._grid_v2_symbol:
             # Grid V2 symbol: either active (dispatch actions) or blocked (no actions).
@@ -3230,8 +3231,25 @@ class LiveEngineV0:
                 fill_actions = _reorder_fill_actions(grid_v2_fill_actions)
                 _seed_batch = list(self._grid_v2_seed_actions)
                 self._grid_v2_seed_actions.clear()
-                # Seeds dispatched via isolated helper (not the serial loop)
-                raw_actions: list[ExecutionAction] = fill_actions + list(grid_v2_integrity_actions)
+                # Split fill actions: exits serial, grid_v2 cancels concurrent, rest serial.
+                # Only grid_v2-originated cancels are safe for concurrent dispatch —
+                # they bypass TP atomicity guards which only apply to non-grid_v2 cancels.
+                _fill_cancel_batch = [
+                    a
+                    for a in fill_actions
+                    if a.action_type == ActionType.CANCEL
+                    and a.reason is not None
+                    and a.reason.startswith("grid_v2_")
+                ]
+                _fill_cancel_cids = {a.order_id for a in _fill_cancel_batch}
+                _fill_non_cancel = [
+                    a
+                    for a in fill_actions
+                    if not (a.action_type == ActionType.CANCEL and a.order_id in _fill_cancel_cids)
+                ]
+                raw_actions: list[ExecutionAction] = _fill_non_cancel + list(
+                    grid_v2_integrity_actions
+                )
             else:
                 # Blocked: startup not done, failed, or non-flat/no-orders guard hit.
                 raw_actions = []
@@ -3422,6 +3440,20 @@ class LiveEngineV0:
         if _seed_batch:
             seed_result = self._dispatch_grid_v2_seed_batch(_seed_batch, snapshot.ts)
             live_actions.extend(seed_result.live_actions)
+
+        # Dispatch post-fill cancel wave with bounded concurrency
+        if _fill_cancel_batch:
+            _cancel_wave_start = _fill_phase_timer.elapsed_ms() if _fill_phase_timer else 0
+            cancel_results = self._dispatch_cancel_wave(_fill_cancel_batch, snapshot.ts)
+            live_actions.extend(cancel_results)
+            # Feed cancel wave timing into fill phase trackers
+            if _fill_phase_timer is not None:
+                _cancel_wave_end = _fill_phase_timer.elapsed_ms()
+                _fill_first_cancel_ms = _cancel_wave_start
+                _fill_last_cancel_ms = _cancel_wave_end
+                _fill_cancel_count = len(
+                    [r for r in cancel_results if r.status != LiveActionStatus.SKIPPED]
+                )
 
         for raw_action in raw_actions:
             # PaperOutput.actions is list[dict], but tests may pass ExecutionAction directly
@@ -6216,6 +6248,110 @@ class LiveEngineV0:
             )
         else:
             self._symbol_consecutive_losses[symbol] = 0
+
+    def _filter_cancel_guards(
+        self, cancel_actions: list[ExecutionAction]
+    ) -> tuple[list[ExecutionAction], list[tuple[int, LiveAction]]]:
+        """Apply serial cancel guards (duplicate/failed suppression)."""
+        filtered: list[ExecutionAction] = []
+        skipped: list[tuple[int, LiveAction]] = []
+        for i, action in enumerate(cancel_actions):
+            oid = action.order_id
+            if oid and (
+                oid in self._cancel_failed_ids or oid in self._cancel_dispatched_pending_sync
+            ):
+                skipped.append(
+                    (
+                        i,
+                        LiveAction(
+                            action=action,
+                            status=LiveActionStatus.SKIPPED,
+                            block_reason=BlockReason.CANCEL_ALREADY_FAILED,
+                            intent=RiskIntent.CANCEL,
+                        ),
+                    )
+                )
+            else:
+                filtered.append(action)
+        return filtered, skipped
+
+    def _dispatch_cancel_wave(
+        self,
+        cancel_actions: list[ExecutionAction],
+        ts: int,
+    ) -> list[LiveAction]:
+        """Dispatch post-fill cancel wave with bounded concurrency.
+
+        Same pattern as seed dispatch:
+        1. Concurrent HTTP submit via _submit_to_exchange (thread-safe)
+        2. Serial apply via _apply_submit_outcome in original order
+
+        Only for grid_v2 post-fill opposite-side cancels.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: PLC0415
+
+        _CANCEL_CONCURRENCY = 3
+        results: list[LiveAction] = []
+
+        if not cancel_actions:
+            return results
+
+        # Serial pre-submit guards: skip duplicates and already-failed cancels
+        filtered, skipped_results = self._filter_cancel_guards(cancel_actions)
+
+        # Classify intent for submit-eligible cancels
+        intents: list[Any] = []
+        for action in filtered:
+            pos_sign = self._get_position_sign(action.symbol) if action.symbol else None
+            intents.append(classify_intent(action, pos_sign))
+
+        # Concurrent HTTP submit (filtered only)
+        outcomes: list[SubmitOutcome | None] = [None] * len(filtered)
+        if len(filtered) == 1:
+            outcomes[0] = self._submit_to_exchange(filtered[0], ts)
+        elif filtered:
+            with ThreadPoolExecutor(max_workers=_CANCEL_CONCURRENCY) as pool:
+                future_to_idx = {
+                    pool.submit(self._submit_to_exchange, action, ts): idx
+                    for idx, action in enumerate(filtered)
+                }
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        outcomes[idx] = future.result()
+                    except Exception as e:
+                        outcomes[idx] = SubmitOutcome(error=str(e), attempts=1)
+
+        # Serial apply in original order (filtered cancels)
+        for i, action in enumerate(filtered):
+            outcome = outcomes[i]
+            assert outcome is not None
+            live_action = self._apply_submit_outcome(action, outcome, intents[i])
+            results.append(live_action)
+
+            # Post-cancel bookkeeping (same as serial loop)
+            if (
+                action.action_type == ActionType.CANCEL
+                and action.order_id is not None
+                and live_action.status == LiveActionStatus.FAILED
+                and not self._grid_v2_handle_failed_cancel(
+                    action.order_id, live_action.exchange_code
+                )
+            ):
+                self._cancel_failed_ids.add(action.order_id)
+
+            if (
+                action.action_type == ActionType.CANCEL
+                and action.order_id is not None
+                and live_action.status in (LiveActionStatus.EXECUTED, LiveActionStatus.FAILED)
+            ):
+                self._cancel_dispatched_pending_sync.add(action.order_id)
+
+        # Include pre-filtered skipped results
+        for _idx, skipped_action in skipped_results:
+            results.append(skipped_action)
+
+        return results
 
     def _dispatch_grid_v2_seed_batch(
         self,
