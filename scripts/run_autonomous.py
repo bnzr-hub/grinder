@@ -213,6 +213,46 @@ def _build_engine_bridge(args: argparse.Namespace) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _build_v1_selector(
+    tuned_results: dict[str, Any],
+    tuning_cache: Any,
+    blacklist: frozenset[str],
+    mainnet: bool,
+    max_notional_per_order: str = "100",
+) -> tuple[Any, Any]:
+    """Build V1 prefilter and ranker closures for symbol selection."""
+    from decimal import Decimal as _D  # noqa: PLC0415
+
+    from grinder.selector.feature_provider import fetch_selection_features  # noqa: PLC0415
+    from grinder.selector.prefilter import prefilter_v1  # noqa: PLC0415
+    from grinder.selector.ranker import rank_v1  # noqa: PLC0415
+
+    _max_notional = _D(max_notional_per_order)
+    selector_features: dict[str, Any] = {}
+    if tuned_results:
+        selector_features = fetch_selection_features(list(tuned_results.keys()), mainnet=mainnet)
+
+    def prefilter(candidates: list[str]) -> list[str]:
+        eligible, _skipped = prefilter_v1(
+            candidates,
+            tuning_results={
+                sym: tuning_cache.get(sym)
+                for sym in candidates
+                if tuning_cache.get(sym) is not None
+            },
+            features=selector_features,
+            blacklist=blacklist,
+            max_notional_per_order=_max_notional,
+        )
+        return eligible
+
+    def ranker(candidates: list[str]) -> list[str]:
+        scored = rank_v1(candidates, selector_features)
+        return [s.symbol for s in scored]
+
+    return prefilter, ranker
+
+
 def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
     """Assemble the full autonomous runtime graph."""
     from grinder.execution_plane.coordinator import ExecutionCoordinator  # noqa: PLC0415
@@ -318,11 +358,22 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
         deactivate_fn=host.finalize_deactivation,
     )
 
+    # V1 selector
+    _prefilter, _ranker = _build_v1_selector(
+        _tuned_results,
+        tuning_cache,
+        blacklist,
+        getattr(args, "mainnet", False),
+        max_notional_per_order=args.max_notional_per_order,
+    )
+
     # Assemble autonomous loop with execution integration
     loop = AutonomousLoop(
         universe_provider=universe_provider,
         orchestrator=orchestrator,
         config=loop_config,
+        prefilter_fn=_prefilter,
+        ranker_fn=_ranker,
         execution_coordinator=coordinator,
         execution_registry=registry,
         execution_operator=operator_controls,
