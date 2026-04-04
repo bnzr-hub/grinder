@@ -102,6 +102,38 @@ def log_reconcile(symbol: str, cycle_ms: int, actions: int) -> None:
     )
 
 
+def log_fill_exit(symbol: str, action_ms: int) -> None:
+    """Log time from fill detection to protective exit action dispatched."""
+    logger.info(
+        "LATENCY_FILL_EXIT symbol=%s action_ms=%d",
+        symbol,
+        action_ms,
+    )
+
+
+def log_fill_cancel_wave(
+    symbol: str, first_submit_ms: int, last_submit_ms: int, count: int
+) -> None:
+    """Log latency of opposite-side cancel wave after fill."""
+    logger.info(
+        "LATENCY_FILL_CANCEL_WAVE symbol=%s first_submit_ms=%d last_submit_ms=%d count=%d",
+        symbol,
+        first_submit_ms,
+        last_submit_ms,
+        count,
+    )
+
+
+def log_branch_convergence(symbol: str, total_ms: int, actions: int) -> None:
+    """Log total time from fill detection to all branch actions dispatched."""
+    logger.info(
+        "LATENCY_BRANCH_CONVERGENCE symbol=%s total_ms=%d actions=%d",
+        symbol,
+        total_ms,
+        actions,
+    )
+
+
 def log_shutdown(symbol: str, cancel_ms: int, close_ms: int, total_ms: int) -> None:
     logger.info(
         "LATENCY_SHUTDOWN symbol=%s cancel_ms=%d close_ms=%d total_ms=%d",

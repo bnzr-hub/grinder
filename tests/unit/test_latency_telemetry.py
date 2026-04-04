@@ -13,7 +13,10 @@ from grinder.observability.latency_telemetry import (
     PhaseTimer,
     log_account_sync,
     log_bootstrap,
+    log_branch_convergence,
     log_engine_startup,
+    log_fill_cancel_wave,
+    log_fill_exit,
     log_fill_reaction,
     log_grid_v2_startup,
     log_reconcile,
@@ -83,6 +86,24 @@ class TestLogFunctions:
         with caplog.at_level(logging.INFO):
             log_reconcile("DRIFTUSDT", 15, 3)
         assert "LATENCY_RECONCILE" in caplog.text
+
+    def test_log_fill_exit(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO):
+            log_fill_exit("AIAUSDT", 281)
+        assert "LATENCY_FILL_EXIT" in caplog.text
+        assert "action_ms=281" in caplog.text
+
+    def test_log_fill_cancel_wave(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO):
+            log_fill_cancel_wave("AIAUSDT", 18, 744, 4)
+        assert "LATENCY_FILL_CANCEL_WAVE" in caplog.text
+        assert "count=4" in caplog.text
+
+    def test_log_branch_convergence(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO):
+            log_branch_convergence("AIAUSDT", 1280, 7)
+        assert "LATENCY_BRANCH_CONVERGENCE" in caplog.text
+        assert "total_ms=1280" in caplog.text
 
     def test_log_shutdown(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.INFO):
