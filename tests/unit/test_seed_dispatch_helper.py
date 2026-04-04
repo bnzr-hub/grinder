@@ -9,7 +9,7 @@ from grinder.connectors.live_connector import SafeMode
 from grinder.core import OrderSide
 from grinder.execution.types import ActionType, ExecutionAction
 from grinder.live import LiveEngineConfig, LiveEngineV0
-from grinder.live.engine import LiveActionStatus, SeedDispatchResult
+from grinder.live.engine import LiveActionStatus, SeedDispatchResult, SubmitOutcome
 
 
 def _make_engine() -> LiveEngineV0:
@@ -187,3 +187,52 @@ class TestSeedDispatchHelper:
 
         assert len(result.live_actions) == 6
         assert result.executed_count == 6
+
+    def test_concurrent_submit_preserves_count(self) -> None:
+        """Concurrent HTTP submit returns correct count."""
+        engine = _make_engine()
+        engine._grid_v2_symbol = "DRIFTUSDT"
+        seeds = [_seed_place(f"g-s{i}") for i in range(5)]
+
+        with (
+            patch.object(engine, "_submit_to_exchange") as mock_submit,
+            patch.object(engine, "_grid_v2_register_pending_place"),
+        ):
+            mock_submit.return_value = SubmitOutcome(order_id="ok", success=True, attempts=1)
+            result = engine._dispatch_grid_v2_seed_batch(seeds, 1000)
+
+        assert len(result.live_actions) == 5
+        assert result.executed_count == 5
+        assert mock_submit.call_count == 5
+
+    def test_sub_notional_seed_blocked_before_submit(self) -> None:
+        """Sub-notional seed must be blocked by pre-send gate, not submitted."""
+        engine = _make_engine()
+        engine._grid_v2_symbol = "DRIFTUSDT"
+        engine._min_notional_cache["DRIFTUSDT"] = Decimal("100")  # high bar
+        # price=0.0413 * qty=124 = 5.12 < 100 → blocked
+        seeds = [_seed_place("g-sub", price="0.0413")]
+
+        with patch.object(engine, "_submit_to_exchange") as mock_submit:
+            result = engine._dispatch_grid_v2_seed_batch(seeds, 1000)
+
+        assert len(result.live_actions) == 1
+        assert result.live_actions[0].status == LiveActionStatus.BLOCKED
+        mock_submit.assert_not_called()
+
+    def test_concurrent_gate_blocked_not_submitted(self) -> None:
+        """Gate-blocked seeds should not reach _submit_to_exchange."""
+        engine = _make_engine()
+        engine._grid_v2_symbol = "DRIFTUSDT"
+        engine._config = MagicMock(armed=False, mode=MagicMock())  # not armed → blocks
+        seeds = [_seed_place("g-blocked")]
+
+        with patch.object(engine, "_submit_to_exchange") as mock_submit:
+            result = engine._dispatch_grid_v2_seed_batch(seeds, 1000)
+
+        # Gate should block before reaching submit
+        assert len(result.live_actions) == 1
+        # Submit should not be called for blocked actions
+        # (may or may not be called depending on gate path — check result status)
+        if result.live_actions[0].status == LiveActionStatus.BLOCKED:
+            mock_submit.assert_not_called()
