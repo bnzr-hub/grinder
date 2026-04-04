@@ -6104,14 +6104,17 @@ class LiveEngineV0:
 
         This method owns all seed-specific state mutation.
 
-        Two phases:
-        A. Serial gate check + dispatch via _process_action (single-threaded)
-        B. Serial post-dispatch bookkeeping in original order
+        Three phases:
+        A. Serial gate check + dispatch via _process_action (single-threaded,
+           includes gate chain + HTTP call + post-HTTP state tracking)
+        B. Serial bookkeeping in original order (_apply_seed_bookkeeping)
+        C. Logging
 
-        Concurrency deferred: _process_action mutates shared engine state
-        (reduce_only enforcement, risk counters, etc.) and cannot be called
-        from worker threads safely. Future concurrent dispatch requires
-        splitting _process_action into gate-check + pure-submit seam.
+        Note: _process_action handles both gates AND execution serially.
+        HTTP calls dominate seed latency (~250ms each x 10 = ~2.5s), but
+        _process_action mutates shared state so it cannot be parallelized.
+        Future optimization requires extracting a pure HTTP-only submit from
+        _execute_action that can be called from threads.
         """
         from grinder.observability.latency_telemetry import (  # noqa: PLC0415
             PhaseTimer,
@@ -6125,9 +6128,7 @@ class LiveEngineV0:
             log_seed_dispatch(self._grid_v2_symbol or "?", 0, 0)
             return result
 
-        # Phase A: serial gate check + dispatch (all state mutation safe)
-        # _process_action handles gates AND execution — it's the SSOT.
-        # For seeds, we batch the results then apply bookkeeping.
+        # Phase A: serial gate check + dispatch
         raw_results: list[Any] = []
         for action in seed_actions:
             raw_results.append(self._process_action(action, ts))
