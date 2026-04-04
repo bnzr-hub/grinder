@@ -241,7 +241,12 @@ class AutonomousLoop:
         )
 
         # Stage 8: Optional execution-plane integration
-        exec_report = self._run_execution_phase(decision.admitted, facts)
+        # Limit execution desired set to top_k — the rotation controller's
+        # actual activation target. Without this, the reconciler sees all
+        # admitted symbols as "desired" and triggers STL_E5_MISMATCH_THRESHOLD.
+        top_k = self.orchestrator.controller.config.top_k
+        execution_desired = decision.admitted[:top_k]
+        exec_report = self._run_execution_phase(execution_desired, facts)
         if exec_report is not None:
             # Attach execution report to cycle report
             report = CycleReport(
