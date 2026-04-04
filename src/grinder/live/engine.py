@@ -6102,9 +6102,16 @@ class LiveEngineV0:
         _process_action, then applies pending-place tracking, failed-place
         cleanup, and seed CID clearing — all in one isolated helper.
 
-        This method owns all seed-specific state mutation. Future bounded
-        concurrency can replace the internal loop without touching the
-        outer engine dispatch path.
+        This method owns all seed-specific state mutation.
+
+        Two phases:
+        A. Serial gate check + dispatch via _process_action (single-threaded)
+        B. Serial post-dispatch bookkeeping in original order
+
+        Concurrency deferred: _process_action mutates shared engine state
+        (reduce_only enforcement, risk counters, etc.) and cannot be called
+        from worker threads safely. Future concurrent dispatch requires
+        splitting _process_action into gate-check + pure-submit seam.
         """
         from grinder.observability.latency_telemetry import (  # noqa: PLC0415
             PhaseTimer,
@@ -6114,70 +6121,92 @@ class LiveEngineV0:
         timer = PhaseTimer()
         result = SeedDispatchResult(live_actions=[])
 
+        if not seed_actions:
+            log_seed_dispatch(self._grid_v2_symbol or "?", 0, 0)
+            return result
+
+        # Phase A: serial gate check + dispatch (all state mutation safe)
+        # _process_action handles gates AND execution — it's the SSOT.
+        # For seeds, we batch the results then apply bookkeeping.
+        raw_results: list[Any] = []
         for action in seed_actions:
-            live_action = self._process_action(action, ts)
+            raw_results.append(self._process_action(action, ts))
+
+        # Phase B: serial bookkeeping in original seed order
+        for i, action in enumerate(seed_actions):
+            live_action = raw_results[i]
             result.live_actions.append(live_action)
-
-            # --- Post-dispatch bookkeeping (same as serial loop) ---
-            if action.action_type != ActionType.PLACE or action.client_order_id is None:
-                continue
-
-            # Pending-place tracking
-            if live_action.status == LiveActionStatus.EXECUTED:
-                self._grid_v2_register_pending_place(action.client_order_id)
-                result.executed_count += 1
-            elif live_action.status in (
-                LiveActionStatus.BLOCKED,
-                LiveActionStatus.SKIPPED,
-            ):
-                self._grid_v2_clean_failed_place(action.client_order_id)
-                result.blocked_count += 1
-            elif live_action.status == LiveActionStatus.FAILED and live_action.pre_send:
-                self._grid_v2_clean_failed_place(action.client_order_id)
-                result.failed_count += 1
-            elif live_action.status == LiveActionStatus.FAILED:
-                if _grid_v2_is_exchange_code_ambiguous(live_action.exchange_code):
-                    self._grid_v2_register_pending_place(action.client_order_id)
-                    logger.warning(
-                        "GRID_V2_FAILED_PLACE_QUARANTINED cid=%s code=%s reason=%s",
-                        action.client_order_id,
-                        live_action.exchange_code,
-                        live_action.block_reason.value if live_action.block_reason else "?",
-                    )
-                else:
-                    self._grid_v2_clean_failed_place(action.client_order_id)
-                result.failed_count += 1
-
-            # Seed CID clearing (awaiting_sync deadlock prevention)
-            seed_definitive_fail = action.client_order_id in self._grid_v2_pending_seed_cids and (
-                live_action.status in (LiveActionStatus.BLOCKED, LiveActionStatus.SKIPPED)
-                or (live_action.status == LiveActionStatus.FAILED and live_action.pre_send)
-                or (
-                    live_action.status == LiveActionStatus.FAILED
-                    and not live_action.pre_send
-                    and not _grid_v2_is_exchange_code_ambiguous(live_action.exchange_code)
-                )
-            )
-            if seed_definitive_fail:
-                self._grid_v2_pending_seed_cids = self._grid_v2_pending_seed_cids - {
-                    action.client_order_id
-                }
-                logger.warning(
-                    "GRID_V2_SEED_CID_CLEARED cid=%s status=%s code=%s",
-                    action.client_order_id,
-                    live_action.status.value,
-                    live_action.exchange_code,
-                )
-                if not self._grid_v2_pending_seed_cids:
-                    self._grid_v2_awaiting_sync = False
-                    logger.warning(
-                        "GRID_V2_AWAITING_SYNC_CLEARED_ON_SEED_FAILURE "
-                        "reason=all_seeds_definitively_failed"
-                    )
+            self._apply_seed_bookkeeping(action, live_action, result)
 
         symbol = self._grid_v2_symbol or "?"
         log_seed_dispatch(symbol, timer.elapsed_ms(), len(seed_actions))
+        logger.info(
+            "SEED_DISPATCH_RESULT symbol=%s count=%d executed=%d failed=%d blocked=%d ms=%d",
+            symbol,
+            len(seed_actions),
+            result.executed_count,
+            result.failed_count,
+            result.blocked_count,
+            timer.elapsed_ms(),
+        )
         return result
+
+    def _apply_seed_bookkeeping(
+        self, action: ExecutionAction, live_action: Any, result: SeedDispatchResult
+    ) -> None:
+        """Apply post-dispatch bookkeeping for one seed action (serial, safe)."""
+        if action.action_type != ActionType.PLACE or action.client_order_id is None:
+            return
+
+        cid = action.client_order_id
+
+        # Pending-place tracking
+        if live_action.status == LiveActionStatus.EXECUTED:
+            self._grid_v2_register_pending_place(cid)
+            result.executed_count += 1
+        elif live_action.status in (LiveActionStatus.BLOCKED, LiveActionStatus.SKIPPED):
+            self._grid_v2_clean_failed_place(cid)
+            result.blocked_count += 1
+        elif live_action.status == LiveActionStatus.FAILED and live_action.pre_send:
+            self._grid_v2_clean_failed_place(cid)
+            result.failed_count += 1
+        elif live_action.status == LiveActionStatus.FAILED:
+            if _grid_v2_is_exchange_code_ambiguous(live_action.exchange_code):
+                self._grid_v2_register_pending_place(cid)
+                logger.warning(
+                    "GRID_V2_FAILED_PLACE_QUARANTINED cid=%s code=%s reason=%s",
+                    cid,
+                    live_action.exchange_code,
+                    live_action.block_reason.value if live_action.block_reason else "?",
+                )
+            else:
+                self._grid_v2_clean_failed_place(cid)
+            result.failed_count += 1
+
+        # Seed CID clearing (awaiting_sync deadlock prevention)
+        seed_definitive_fail = cid in self._grid_v2_pending_seed_cids and (
+            live_action.status in (LiveActionStatus.BLOCKED, LiveActionStatus.SKIPPED)
+            or (live_action.status == LiveActionStatus.FAILED and live_action.pre_send)
+            or (
+                live_action.status == LiveActionStatus.FAILED
+                and not live_action.pre_send
+                and not _grid_v2_is_exchange_code_ambiguous(live_action.exchange_code)
+            )
+        )
+        if seed_definitive_fail:
+            self._grid_v2_pending_seed_cids = self._grid_v2_pending_seed_cids - {cid}
+            logger.warning(
+                "GRID_V2_SEED_CID_CLEARED cid=%s status=%s code=%s",
+                cid,
+                live_action.status.value,
+                live_action.exchange_code,
+            )
+            if not self._grid_v2_pending_seed_cids:
+                self._grid_v2_awaiting_sync = False
+                logger.warning(
+                    "GRID_V2_AWAITING_SYNC_CLEARED_ON_SEED_FAILURE "
+                    "reason=all_seeds_definitively_failed"
+                )
 
     def _process_action(self, action: ExecutionAction, ts: int) -> LiveAction:  # noqa: PLR0911, PLR0912, PLR0915
         """Process single action through safety gates and execute.
