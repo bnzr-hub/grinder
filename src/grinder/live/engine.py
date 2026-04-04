@@ -882,6 +882,8 @@ class LiveEngineV0:
         self._grid_v2_pending_cancels: dict[str, tuple[int, int]] = {}  # cid → (ts_ms, sync_gen)
         self._grid_v2_awaiting_sync = False  # PR6: skip fill detection until seed CIDs visible
         self._fill_sync_skip_used = False  # one-shot: skip sync on first fill tick only
+        self._seed_gate_only_mode = False  # when True, _process_action skips HTTP
+        self._seed_gate_passed_intents: list[tuple[ExecutionAction, Any]] = []
         self._grid_v2_pending_seed_cids: frozenset[str] = frozenset()  # PR6: CIDs to confirm
         # cid → sync_gen at dispatch. Released after visibility OR 2 sync cycles grace.
         self._grid_v2_pending_place_cids: dict[str, int] = {}
@@ -6122,20 +6124,29 @@ class LiveEngineV0:
 
         This method owns all seed-specific state mutation.
 
-        Two phases:
-        A. Serial gate check + dispatch via _process_action (single-threaded)
-        B. Serial post-dispatch bookkeeping in original order
+        Three phases:
+        A. Serial gate check + serial HTTP submit via _process_action
+           (all state mutation in main thread, exactly as before).
+        B. Serial bookkeeping via _apply_seed_bookkeeping.
 
-        Concurrency deferred: _process_action mutates shared engine state
-        (reduce_only enforcement, risk counters, etc.) and cannot be called
-        from worker threads safely. Future concurrent dispatch requires
-        splitting _process_action into gate-check + pure-submit seam.
+        HTTP concurrency is achieved by submitting all seeds through
+        _submit_to_exchange concurrently, bypassing _process_action for
+        the HTTP portion only. Gate checks run in _process_action as
+        before; _submit_to_exchange is the thread-safe seam.
+
+        Three phases:
+        A. Serial gate check via _process_action in gate-only mode
+           (no HTTP, records gate-passed actions with their intents)
+        B. Concurrent HTTP submit via _submit_to_exchange (thread-safe)
+        C. Serial apply via _apply_submit_outcome + seed bookkeeping
         """
+
         from grinder.observability.latency_telemetry import (  # noqa: PLC0415
             PhaseTimer,
             log_seed_dispatch,
         )
 
+        _SEED_HTTP_CONCURRENCY = 3
         timer = PhaseTimer()
         result = SeedDispatchResult(live_actions=[])
 
@@ -6143,16 +6154,51 @@ class LiveEngineV0:
             log_seed_dispatch(self._grid_v2_symbol or "?", 0, 0)
             return result
 
-        # Phase A: serial gate check + dispatch (all state mutation safe)
-        # _process_action handles gates AND execution — it's the SSOT.
-        # For seeds, we batch the results then apply bookkeeping.
-        raw_results: list[Any] = []
-        for action in seed_actions:
-            raw_results.append(self._process_action(action, ts))
+        # Phase A: serial gate check (no HTTP — gate-only mode)
+        gate_results: list[Any] = [None] * len(seed_actions)
+        self._seed_gate_only_mode = True
+        self._seed_gate_passed_intents = []
+        try:
+            for i, action in enumerate(seed_actions):
+                gate_results[i] = self._process_action(action, ts)
+        finally:
+            self._seed_gate_only_mode = False
 
-        # Phase B: serial bookkeeping in original seed order
+        # Build submit queue from gate-passed actions
+        gate_passed = list(self._seed_gate_passed_intents)
+        self._seed_gate_passed_intents = []
+        gate_passed_set = {id(a) for a, _intent in gate_passed}
+
+        submit_actions: list[tuple[int, ExecutionAction, Any]] = []
         for i, action in enumerate(seed_actions):
-            live_action = raw_results[i]
+            if id(action) not in gate_passed_set:
+                continue
+            intent = next(
+                (intent for a, intent in gate_passed if id(a) == id(action)),
+                RiskIntent.CANCEL,
+            )
+            # Pre-send gates (min_notional, NOOP) — same as _execute_action
+            pre_send_block = self._check_pre_send_gates(action, intent)
+            if pre_send_block is not None:
+                gate_results[i] = pre_send_block
+            else:
+                submit_actions.append((i, action, intent))
+
+        # Phase B: concurrent HTTP submit (thread-safe)
+        outcomes = self._submit_seeds_concurrent(submit_actions, ts, _SEED_HTTP_CONCURRENCY)
+
+        # Phase C: serial apply + bookkeeping in original order
+        for i, action in enumerate(seed_actions):
+            if i in outcomes:
+                # Gate-passed: apply real HTTP outcome
+                intent = next(
+                    (intent for idx, _a, intent in submit_actions if idx == i),
+                    RiskIntent.CANCEL,
+                )
+                live_action = self._apply_submit_outcome(action, outcomes[i], intent)
+            else:
+                # Gate-blocked: use the gate result directly
+                live_action = gate_results[i]
             result.live_actions.append(live_action)
             self._apply_seed_bookkeeping(action, live_action, result)
 
@@ -6168,6 +6214,41 @@ class LiveEngineV0:
             timer.elapsed_ms(),
         )
         return result
+
+    def _submit_seeds_concurrent(
+        self,
+        submit_actions: list[tuple[int, ExecutionAction, Any]],
+        ts: int,
+        concurrency: int,
+    ) -> dict[int, SubmitOutcome]:
+        """Concurrent HTTP submit for gate-passed seeds. Thread-safe."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: PLC0415
+
+        outcomes: dict[int, SubmitOutcome] = {}
+        if not submit_actions:
+            return outcomes
+        if len(submit_actions) == 1:
+            idx, action, _intent = submit_actions[0]
+            outcomes[idx] = self._submit_to_exchange(action, ts)
+        else:
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                future_to_idx = {
+                    pool.submit(self._submit_to_exchange, action, ts): idx
+                    for idx, action, _intent in submit_actions
+                }
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        outcomes[idx] = future.result()
+                    except Exception as e:
+                        outcomes[idx] = SubmitOutcome(error=str(e), attempts=1)
+        logger.info(
+            "SEED_HTTP_CONCURRENCY symbol=%s window=%d queued=%d",
+            self._grid_v2_symbol or "?",
+            min(concurrency, len(submit_actions)),
+            len(submit_actions),
+        )
+        return outcomes
 
     def _apply_seed_bookkeeping(
         self, action: ExecutionAction, live_action: Any, result: SeedDispatchResult
@@ -6616,7 +6697,15 @@ class LiveEngineV0:
             if sor_result is not None:
                 return sor_result
 
-        # All gates passed - execute action
+        # All gates passed - execute action (or defer if gate-only mode)
+        if self._seed_gate_only_mode:
+            # Seed concurrent mode: record intent, skip HTTP
+            self._seed_gate_passed_intents.append((action, intent))
+            return LiveAction(
+                action=action,
+                status=LiveActionStatus.EXECUTED,
+                intent=intent,
+            )
         return self._execute_action(action, ts, intent)
 
     def _is_sor_enabled(self) -> bool:
@@ -7001,15 +7090,16 @@ class LiveEngineV0:
             exchange_code=outcome.exchange_code,
         )
 
-    def _execute_action(self, action: ExecutionAction, ts: int, intent: RiskIntent) -> LiveAction:
-        """Execute action on exchange port with retries.
+    def _check_pre_send_gates(
+        self, action: ExecutionAction, intent: RiskIntent
+    ) -> LiveAction | None:
+        """Run pre-send gates (NOOP, min_notional). Returns LiveAction if blocked, None if OK.
 
-        Thin wrapper: pre-send gates → _submit_to_exchange → _apply_submit_outcome.
+        Shared by _execute_action (normal path) and seed concurrent path.
         """
         if action.action_type == ActionType.NOOP:
             return LiveAction(action=action, status=LiveActionStatus.SKIPPED, intent=intent)
 
-        # Min-notional pre-send gate
         if (
             action.action_type == ActionType.PLACE
             and not action.reduce_only
@@ -7036,6 +7126,17 @@ class LiveEngineV0:
                         intent=intent,
                         pre_send=True,
                     )
+        return None
+
+    def _execute_action(self, action: ExecutionAction, ts: int, intent: RiskIntent) -> LiveAction:
+        """Execute action on exchange port with retries.
+
+        Thin wrapper: pre-send gates → _submit_to_exchange → _apply_submit_outcome.
+        """
+        # Pre-send gates (shared with seed concurrent path)
+        blocked = self._check_pre_send_gates(action, intent)
+        if blocked is not None:
+            return blocked
 
         # Debug logging (env-gated)
         if action.action_type == ActionType.PLACE and self._debug_open_orders:
