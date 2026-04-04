@@ -202,6 +202,29 @@ def _extract_binance_error_code(error: str | None) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _reorder_fill_actions(actions: list[ExecutionAction]) -> list[ExecutionAction]:
+    """Reorder fill-generated actions for safe dispatch after a fill.
+
+    Priority order:
+    0. reduce-only PLACE (protective exit) — hedge first
+    1. CANCEL (opposite-side cleanup) — remove stale exposure
+    2. PLACE (new entries) — only after cleanup is dispatched
+    """
+    if not actions:
+        return actions
+
+    def _priority(a: ExecutionAction) -> int:
+        if a.action_type == ActionType.PLACE and a.reduce_only:
+            return 0  # protective exit first
+        if a.action_type == ActionType.CANCEL:
+            return 1  # opposite-side cleanup second
+        if a.action_type == ActionType.PLACE:
+            return 2  # new entries last
+        return 3
+
+    return sorted(actions, key=_priority)
+
+
 class GridV2RecoveryMode(Enum):
     """Startup recovery mode for grid_v2 when reconstruction fails."""
 
@@ -830,6 +853,7 @@ class LiveEngineV0:
         self._grid_v2_seed_actions: list[ExecutionAction] = []
         self._grid_v2_pending_cancels: dict[str, tuple[int, int]] = {}  # cid → (ts_ms, sync_gen)
         self._grid_v2_awaiting_sync = False  # PR6: skip fill detection until seed CIDs visible
+        self._fill_sync_skip_used = False  # one-shot: skip sync on first fill tick only
         self._grid_v2_pending_seed_cids: frozenset[str] = frozenset()  # PR6: CIDs to confirm
         # cid → sync_gen at dispatch. Released after visibility OR 2 sync cycles grace.
         self._grid_v2_pending_place_cids: dict[str, int] = {}
@@ -3163,10 +3187,14 @@ class LiveEngineV0:
             # Grid V2 symbol: either active (dispatch actions) or blocked (no actions).
             # Never falls through to legacy planner for this symbol.
             if self._is_grid_v2_active(snapshot.symbol):
-                # Drain seed actions on first active tick, then fill-driven
+                # Drain seed actions on first active tick, then fill-driven.
+                # Fill actions are reordered: reduce-only exits first (protective),
+                # then entry PLACEs, then CANCELs last. This minimizes time-to-hedge
+                # after a real fill.
+                fill_actions = _reorder_fill_actions(grid_v2_fill_actions)
                 raw_actions: list[ExecutionAction] = (
                     list(self._grid_v2_seed_actions)
-                    + list(grid_v2_fill_actions)
+                    + fill_actions
                     + list(grid_v2_integrity_actions)
                 )
                 self._grid_v2_seed_actions.clear()
@@ -3292,8 +3320,17 @@ class LiveEngineV0:
             self._execute_emergency_exit(snapshot.ts)
 
         # Account sync: read-only fetch + mismatch detection (Launch-15)
-        # Throttled: at most once per _account_sync_interval_ms to avoid REST rate-limits
-        if self._is_account_sync_enabled() and snapshot.ts > 0:
+        # Throttled: at most once per _account_sync_interval_ms to avoid REST rate-limits.
+        # One-shot skip on the first fill tick to avoid blocking the fill→exit hot
+        # path with a ~500ms REST roundtrip. The skip fires once then clears, so
+        # sustained fills still get periodic sync (bounded, not indefinite).
+        _fill_tick = bool(grid_v2_fill_actions) if self._grid_v2_enabled else False
+        _skip_sync = _fill_tick and not getattr(self, "_fill_sync_skip_used", False)
+        if _skip_sync:
+            self._fill_sync_skip_used = True
+        elif not _fill_tick:
+            self._fill_sync_skip_used = False  # reset on non-fill tick
+        if self._is_account_sync_enabled() and snapshot.ts > 0 and not _skip_sync:
             elapsed = snapshot.ts - self._account_sync_last_attempt_ms
             if elapsed >= self._account_sync_interval_ms:
                 self._account_sync_last_attempt_ms = snapshot.ts
@@ -3325,6 +3362,13 @@ class LiveEngineV0:
         # Cross-tick: successful CANCEL on tick N, planner re-generates on tick N+1
         # (snapshot not refreshed yet). Both caught by instance-level set,
         # cleared on AccountSync refresh.
+
+        # Track dispatch latency for fill actions
+        _dispatch_timer = None
+        if grid_v2_fill_actions and self._grid_v2_enabled:
+            from grinder.observability.latency_telemetry import PhaseTimer  # noqa: PLC0415
+
+            _dispatch_timer = PhaseTimer()
 
         for raw_action in raw_actions:
             # PaperOutput.actions is list[dict], but tests may pass ExecutionAction directly
@@ -3593,6 +3637,12 @@ class LiveEngineV0:
                 tp_renew_place_ok[action.symbol or ""] = (
                     live_action.status == LiveActionStatus.EXECUTED
                 )
+
+        # Log fill dispatch latency (actions ready → all dispatched)
+        if _dispatch_timer is not None:
+            from grinder.observability.latency_telemetry import log_seed_dispatch  # noqa: PLC0415
+
+            log_seed_dispatch(snapshot.symbol, _dispatch_timer.elapsed_ms(), len(live_actions))
 
         # Doc-36 Phase 1: shadow selector tick (post-dispatch, no side effects)
         if self._shadow_selector is not None and self._last_feature_snapshot is not None:
