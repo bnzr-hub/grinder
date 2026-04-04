@@ -250,6 +250,27 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
         _tuned_sizes, _tuned_results = _bootstrap_tuning_cache(
             sorted(symbols_override), tuning_cache, args
         )
+    else:
+        # Auto-discovery mode: bootstrap tune a bounded subset of discovered universe.
+        # This seeds TuningCache so the first loop cycle can rank and admit symbols.
+        # Fail-open: if discovery raises, continue with empty bootstrap.
+        _BOOTSTRAP_UNIVERSE_LIMIT = 30
+        try:
+            discovered = universe_provider.get_candidates()
+        except Exception:
+            logger.warning("BOOTSTRAP_UNIVERSE_DISCOVERY_FAILED — continuing without bootstrap")
+            discovered = []
+        bootstrap_subset = discovered[:_BOOTSTRAP_UNIVERSE_LIMIT]
+        logger.info(
+            "BOOTSTRAP_UNIVERSE_DISCOVERED count=%d limit=%d bootstrap=%d",
+            len(discovered),
+            _BOOTSTRAP_UNIVERSE_LIMIT,
+            len(bootstrap_subset),
+        )
+        if bootstrap_subset:
+            _tuned_sizes, _tuned_results = _bootstrap_tuning_cache(
+                bootstrap_subset, tuning_cache, args
+            )
 
     rotation_controller = RotationController(
         config=RotationConfig(
