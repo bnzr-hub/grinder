@@ -3400,6 +3400,18 @@ class LiveEngineV0:
         # If PLACE failed, skip paired TP_SLOT_TAKEOVER CANCEL (same correlation_id).
         tp_close_place_ok: dict[str, bool] = {}
 
+        # Post-fill phase tracking for detailed latency telemetry.
+        # Only active when fill actions are being dispatched.
+        _fill_phase_timer: Any = None
+        _fill_exit_ms: int = -1
+        _fill_first_cancel_ms: int = -1
+        _fill_last_cancel_ms: int = -1
+        _fill_cancel_count: int = 0
+        if grid_v2_fill_actions and self._grid_v2_enabled:
+            from grinder.observability.latency_telemetry import PhaseTimer as _FT  # noqa: PLC0415
+
+            _fill_phase_timer = _FT()
+
         # ADR-090 follow-up: per-sync-cycle CANCEL dedup (mechanisms 1+4).
         # Same-tick: planner + cycle_layer both emit CANCEL for same CID.
         # Cross-tick: successful CANCEL on tick N, planner re-generates on tick N+1
@@ -3551,6 +3563,25 @@ class LiveEngineV0:
             live_action = self._process_action(action, snapshot.ts)
             live_actions.append(live_action)
 
+            # Post-fill phase timing capture
+            if (
+                _fill_phase_timer is not None
+                and action.reason
+                and action.reason.startswith("grid_v2_")
+            ):
+                elapsed = _fill_phase_timer.elapsed_ms()
+                if (
+                    action.action_type == ActionType.PLACE
+                    and action.reduce_only
+                    and _fill_exit_ms < 0
+                ):
+                    _fill_exit_ms = elapsed
+                elif action.action_type == ActionType.CANCEL:
+                    if _fill_first_cancel_ms < 0:
+                        _fill_first_cancel_ms = elapsed
+                    _fill_last_cancel_ms = elapsed
+                    _fill_cancel_count += 1
+
             # BUG-4: track failed CANCELs for -2011 suppression
             if (
                 action.action_type == ActionType.CANCEL
@@ -3678,6 +3709,24 @@ class LiveEngineV0:
                 tp_renew_place_ok[action.symbol or ""] = (
                     live_action.status == LiveActionStatus.EXECUTED
                 )
+
+        # Emit post-fill phase latency summaries
+        if _fill_phase_timer is not None and (_fill_exit_ms >= 0 or _fill_cancel_count > 0):
+            from grinder.observability.latency_telemetry import (  # noqa: PLC0415
+                log_branch_convergence,
+                log_fill_cancel_wave,
+                log_fill_exit,
+            )
+
+            total_ms = _fill_phase_timer.elapsed_ms()
+            sym = snapshot.symbol
+            if _fill_exit_ms >= 0:
+                log_fill_exit(sym, _fill_exit_ms)
+            if _fill_cancel_count > 0:
+                log_fill_cancel_wave(
+                    sym, _fill_first_cancel_ms, _fill_last_cancel_ms, _fill_cancel_count
+                )
+            log_branch_convergence(sym, total_ms, len(grid_v2_fill_actions))
 
         # Doc-36 Phase 1: shadow selector tick (post-dispatch, no side effects)
         if self._shadow_selector is not None and self._last_feature_snapshot is not None:
