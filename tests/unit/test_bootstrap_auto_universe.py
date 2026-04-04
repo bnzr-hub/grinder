@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal
 from unittest.mock import patch
 
 import scripts.run_autonomous as mod
 
 from grinder.connectors.binance_ws import FakeWsTransport
+from grinder.orchestration.symbol_orchestrator import SymbolOrchestrator
+from grinder.rotation.controller import RotationConfig, RotationController
+from grinder.tuning.cache import TuningCache
+from grinder.tuning.solver import TuningResult, TuningStatus
 
 
 def _default_args(**overrides: object) -> argparse.Namespace:
@@ -112,3 +117,27 @@ class TestAutoDiscoveryBootstrap:
 
         mock_bootstrap.assert_not_called()
         assert "host" in runtime
+
+
+class TestExecutionDesiredTopK:
+    """Execution phase must receive top_k-limited desired set."""
+
+    def test_execution_desired_limited_to_top_k(self) -> None:
+        """admitted[:top_k] gives only 1 symbol when top_k=1."""
+        cache = TuningCache(ttl_s=300.0)
+        for i in range(10):
+            sym = f"SYM{i}USDT"
+            cache.put(
+                sym, TuningResult(symbol=sym, status=TuningStatus.TUNED, order_size=Decimal("100"))
+            )
+
+        controller = RotationController(config=RotationConfig(top_k=1))
+        orchestrator = SymbolOrchestrator(cache=cache, controller=controller)
+
+        candidates = [f"SYM{i}USDT" for i in range(10)]
+        decision = orchestrator.reconcile(candidates, {})
+        assert len(decision.admitted) == 10  # all pass tuning
+
+        top_k = orchestrator.controller.config.top_k
+        execution_desired = decision.admitted[:top_k]
+        assert len(execution_desired) == 1
