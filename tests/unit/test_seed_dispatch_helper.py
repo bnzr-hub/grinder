@@ -166,3 +166,24 @@ class TestSeedDispatchHelper:
         result = engine._dispatch_grid_v2_seed_batch([], 1000)
         assert result.live_actions == []
         assert result.executed_count == 0
+
+    def test_result_order_matches_input(self) -> None:
+        """Results must be in seed_actions order."""
+        engine = _make_engine()
+        engine._grid_v2_symbol = "DRIFTUSDT"
+        seeds = [_seed_place(f"g-s{i}") for i in range(6)]
+
+        with (
+            patch.object(engine, "_process_action") as mock_pa,
+            patch.object(engine, "_grid_v2_register_pending_place"),
+        ):
+            mock_pa.return_value = MagicMock(
+                status=LiveActionStatus.EXECUTED,
+                pre_send=False,
+                exchange_code=None,
+                block_reason=None,
+            )
+            result = engine._dispatch_grid_v2_seed_batch(seeds, 1000)
+
+        assert len(result.live_actions) == 6
+        assert result.executed_count == 6
