@@ -280,16 +280,25 @@ class LiveEngineBridge:
             )
             return True
 
+        from grinder.observability.latency_telemetry import (  # noqa: PLC0415
+            PhaseTimer,
+            log_shutdown,
+        )
+
+        cleanup_timer = PhaseTimer()
         ok = True
         # Step 1: cancel all open orders
+        cancel_timer = PhaseTimer()
         try:
             cancelled = port.cancel_all_orders(symbol)
             logger.info("BRIDGE_CLEANUP_CANCEL_ALL symbol=%s cancelled=%s", symbol, cancelled)
         except Exception as e:
             logger.error("BRIDGE_CLEANUP_CANCEL_FAILED symbol=%s error=%s", symbol, e)
             ok = False
+        cancel_ms = cancel_timer.elapsed_ms()
 
         # Step 2: close any open position
+        close_timer = PhaseTimer()
         try:
             positions = port.fetch_positions_raw(symbol)
             pos_qty = Decimal("0")
@@ -310,7 +319,9 @@ class LiveEngineBridge:
         except Exception as e:
             logger.error("BRIDGE_CLEANUP_CLOSE_FAILED symbol=%s error=%s", symbol, e)
             ok = False
+        close_ms = close_timer.elapsed_ms()
 
+        log_shutdown(symbol, cancel_ms, close_ms, cleanup_timer.elapsed_ms())
         logger.info("BRIDGE_ENGINE_CLEANUP symbol=%s ok=%s", symbol, ok)
         return ok
 
@@ -411,8 +422,13 @@ class LiveEngineBridge:
         )
         from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
         from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+        from grinder.observability.latency_telemetry import (  # noqa: PLC0415
+            PhaseTimer,
+            log_engine_startup,
+        )
         from grinder.paper.engine import PaperEngine  # noqa: PLC0415
 
+        startup_timer = PhaseTimer()
         cfg = self._config
         mode = SafeMode(cfg.mode)
 
@@ -453,6 +469,7 @@ class LiveEngineBridge:
                 )
             finally:
                 self._restore_grid_v2_env(saved_env)
+        engine_ms = startup_timer.elapsed_ms()
 
         # Propagate engine + port refs to the handle for graceful_exit and cleanup.
         if handle_ref is not None and handle_ref[0] is not None:
@@ -460,13 +477,15 @@ class LiveEngineBridge:
             handle_ref[0].port_ref = port
 
         # Futures WS URL: testnet and mainnet use different endpoints than spot.
-        ws_url = None
-        if cfg.exchange_port == "futures":
-            if cfg.use_testnet:
-                ws_url = "wss://stream.binancefuture.com/ws"
-            else:
-                ws_url = "wss://fstream.binance.com/ws"
-
+        ws_url = (
+            (
+                "wss://stream.binancefuture.com/ws"
+                if cfg.use_testnet
+                else "wss://fstream.binance.com/ws"
+            )
+            if cfg.exchange_port == "futures"
+            else None
+        )
         connector_config = LiveConnectorConfig(
             mode=mode,
             symbols=[symbol],
@@ -481,6 +500,12 @@ class LiveEngineBridge:
         try:
             await connector.connect()
             logger.info("BRIDGE_ENGINE_CONNECTED symbol=%s mode=%s", symbol, mode.value)
+            log_engine_startup(
+                symbol,
+                engine_ms,
+                startup_timer.elapsed_ms() - engine_ms,
+                startup_timer.elapsed_ms(),
+            )
             if engine_ready is not None:
                 engine_ready.set()
             async for snapshot in connector.iter_snapshots():

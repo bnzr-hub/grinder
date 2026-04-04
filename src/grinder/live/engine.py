@@ -1044,6 +1044,9 @@ class LiveEngineV0:
                 raise ValueError(
                     f"Invalid GRINDER_GRID_V2_RECOVERY_MODE={raw_mode!r}, must be one of {valid}"
                 ) from None
+            import time as _time  # noqa: PLC0415
+
+            self._grid_v2_startup_begin_mono: float = _time.monotonic()
             logger.info(
                 "GRID_V2_ENABLED symbol=%s recovery_mode=%s",
                 self._grid_v2_symbol,
@@ -1951,6 +1954,9 @@ class LiveEngineV0:
         Iterates in sorted order for deterministic action sequence.
         Returns ExecutionActions from bridge.on_fill() for dispatch.
         """
+        from grinder.observability.latency_telemetry import PhaseTimer  # noqa: PLC0415
+
+        fill_timer = PhaseTimer()
         bridge = self._grid_v2_bridge
         if bridge is None or not bridge.reconstruction_ok:
             return []
@@ -2053,6 +2059,10 @@ class LiveEngineV0:
             self._maybe_track_lot_closure(symbol, result)
             actions.extend(result.execution_actions)
 
+        if actions:
+            from grinder.observability.latency_telemetry import log_fill_reaction  # noqa: PLC0415
+
+            log_fill_reaction(symbol, fill_timer.elapsed_ms(), len(actions))
         return actions
 
     def _grid_v2_track_flat_transition(self) -> None:
@@ -3038,7 +3048,24 @@ class LiveEngineV0:
 
         # PR4 (doc-27): Grid V2 startup + fill processing + cancel-ack routing
         if self._grid_v2_enabled and snapshot.symbol == self._grid_v2_symbol:
+            _was_started = self._grid_v2_started
             self._grid_v2_try_startup(snapshot)
+            if not _was_started and self._grid_v2_started:
+                import time as _time  # noqa: PLC0415
+
+                from grinder.observability.latency_telemetry import (  # noqa: PLC0415
+                    log_grid_v2_startup,
+                )
+
+                startup_ms = int(
+                    (
+                        _time.monotonic()
+                        - getattr(self, "_grid_v2_startup_begin_mono", _time.monotonic())
+                    )
+                    * 1000
+                )
+                seed_count = len(self._grid_v2_seed_actions)
+                log_grid_v2_startup(snapshot.symbol, startup_ms, seed_count)
             # Flat-only automatic sizing: may trigger controlled reseed.
             self._maybe_update_grid_v2_order_size(snapshot)
             # Skip fill/cancel-ack detection while awaiting first account sync after
@@ -4078,8 +4105,16 @@ class LiveEngineV0:
         Evidence writing is delegated to evidence.py (env-gated).
         """
         assert self._account_syncer is not None  # caller guards
+        from grinder.observability.latency_telemetry import (  # noqa: PLC0415
+            PhaseTimer,
+            log_account_sync,
+        )
 
+        sync_timer = PhaseTimer()
         result = self._account_syncer.sync()
+        sync_ms = sync_timer.elapsed_ms()
+        if self._grid_v2_symbol:
+            log_account_sync(self._grid_v2_symbol, sync_ms)
 
         if result.error is not None:
             logger.warning("Account sync failed: %s", result.error)
