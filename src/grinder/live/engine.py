@@ -3182,6 +3182,7 @@ class LiveEngineV0:
             grid_v2_fill_actions = []
             grid_v2_integrity_actions = []
 
+        _seed_batch: list[ExecutionAction] = []  # tracked for latency logging
         # Step 1: Get actions -- either from GridV2Bridge, LiveGridPlannerV1, or PaperEngine
         if self._grid_v2_enabled and snapshot.symbol == self._grid_v2_symbol:
             # Grid V2 symbol: either active (dispatch actions) or blocked (no actions).
@@ -3192,12 +3193,11 @@ class LiveEngineV0:
                 # then entry PLACEs, then CANCELs last. This minimizes time-to-hedge
                 # after a real fill.
                 fill_actions = _reorder_fill_actions(grid_v2_fill_actions)
-                raw_actions: list[ExecutionAction] = (
-                    list(self._grid_v2_seed_actions)
-                    + fill_actions
-                    + list(grid_v2_integrity_actions)
-                )
+                _seed_batch = list(self._grid_v2_seed_actions)
                 self._grid_v2_seed_actions.clear()
+                raw_actions: list[ExecutionAction] = (
+                    _seed_batch + fill_actions + list(grid_v2_integrity_actions)
+                )
             else:
                 # Blocked: startup not done, failed, or non-flat/no-orders guard hit.
                 raw_actions = []
@@ -3363,12 +3363,12 @@ class LiveEngineV0:
         # (snapshot not refreshed yet). Both caught by instance-level set,
         # cleared on AccountSync refresh.
 
-        # Track dispatch latency for fill actions
-        _dispatch_timer = None
-        if grid_v2_fill_actions and self._grid_v2_enabled:
-            from grinder.observability.latency_telemetry import PhaseTimer  # noqa: PLC0415
+        # Track seed dispatch latency (seed-only)
+        _seed_timer = None
+        if _seed_batch:
+            from grinder.observability.latency_telemetry import PhaseTimer as _PT  # noqa: PLC0415
 
-            _dispatch_timer = PhaseTimer()
+            _seed_timer = _PT()
 
         for raw_action in raw_actions:
             # PaperOutput.actions is list[dict], but tests may pass ExecutionAction directly
@@ -3638,11 +3638,11 @@ class LiveEngineV0:
                     live_action.status == LiveActionStatus.EXECUTED
                 )
 
-        # Log fill dispatch latency (actions ready → all dispatched)
-        if _dispatch_timer is not None:
+        # Log seed dispatch latency (seed-only, not fill actions)
+        if _seed_timer is not None:
             from grinder.observability.latency_telemetry import log_seed_dispatch  # noqa: PLC0415
 
-            log_seed_dispatch(snapshot.symbol, _dispatch_timer.elapsed_ms(), len(live_actions))
+            log_seed_dispatch(snapshot.symbol, _seed_timer.elapsed_ms(), len(_seed_batch))
 
         # Doc-36 Phase 1: shadow selector tick (post-dispatch, no side effects)
         if self._shadow_selector is not None and self._last_feature_snapshot is not None:
