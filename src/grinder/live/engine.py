@@ -235,6 +235,24 @@ class SeedDispatchResult:
     blocked_count: int = 0
 
 
+@dataclass(frozen=True)
+class SubmitOutcome:
+    """Raw result of an HTTP submit — no engine state mutations.
+
+    Produced by _submit_to_exchange (thread-safe).
+    Consumed by _apply_submit_outcome (serial, mutates engine state).
+    """
+
+    order_id: str | None = None
+    error: str | None = None
+    exchange_code: int | None = None
+    pre_send: bool = False
+    attempts: int = 1
+    success: bool = False
+    circuit_open: bool = False
+    retries_exhausted: bool = False
+
+
 class GridV2RecoveryMode(Enum):
     """Startup recovery mode for grid_v2 when reconstruction fails."""
 
@@ -6850,27 +6868,148 @@ class LiveEngineV0:
         self._tp_close_retries.update(to_update)
         return results
 
-    def _execute_action(self, action: ExecutionAction, ts: int, intent: RiskIntent) -> LiveAction:  # noqa: PLR0911, PLR0912, PLR0915
-        """Execute action on exchange port with retries.
+    def _submit_to_exchange(self, action: ExecutionAction, ts: int) -> SubmitOutcome:
+        """Pure HTTP submit with retries — no engine state mutations.
 
-        Args:
-            action: ExecutionAction to execute
-            ts: Current timestamp
-            intent: Risk intent classification
+        Thread-safe: only calls exchange port methods and retry policy.
+        Does not touch pending maps, counters, or any mutable engine state.
 
-        Returns:
-            LiveAction with execution result
+        Returns SubmitOutcome describing what happened on the network.
         """
-        if action.action_type == ActionType.NOOP:
+        max_attempts = self._retry_policy.max_attempts
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                order_id = self._execute_single(action, ts)
+                return SubmitOutcome(order_id=order_id, attempts=attempt, success=True)
+            except ConnectorNonRetryableError as e:
+                return SubmitOutcome(
+                    error=str(e),
+                    exchange_code=getattr(e, "exchange_code", None),
+                    pre_send=getattr(e, "pre_send", False),
+                    attempts=attempt,
+                )
+            except CircuitOpenError as e:
+                return SubmitOutcome(
+                    error=str(e), pre_send=True, attempts=attempt, circuit_open=True
+                )
+            except ConnectorTransientError as e:
+                last_error = e
+                if attempt < max_attempts:
+                    delay_ms = self._retry_policy.compute_delay_ms(attempt)
+                    time.sleep(delay_ms / 1000.0)
+            except ConnectorError as e:
+                if is_retryable(e, self._retry_policy):
+                    last_error = e
+                    if attempt < max_attempts:
+                        delay_ms = self._retry_policy.compute_delay_ms(attempt)
+                        time.sleep(delay_ms / 1000.0)
+                else:
+                    return SubmitOutcome(
+                        error=str(e),
+                        exchange_code=_extract_binance_error_code(str(e)),
+                        attempts=attempt,
+                    )
+
+        return SubmitOutcome(
+            error=str(last_error) if last_error else "Unknown",
+            attempts=max_attempts,
+            retries_exhausted=True,
+        )
+
+    def _apply_submit_outcome(
+        self,
+        action: ExecutionAction,
+        outcome: SubmitOutcome,
+        intent: RiskIntent,
+    ) -> LiveAction:
+        """Apply post-submit state mutations and build LiveAction.
+
+        Serial only — mutates shared engine state (pending maps, counters).
+        """
+        if outcome.success:
+            live_action = LiveAction(
+                action=action,
+                status=LiveActionStatus.EXECUTED,
+                order_id=outcome.order_id,
+                attempts=outcome.attempts,
+                intent=intent,
+            )
+            # Post-success bookkeeping
+            if action.action_type == ActionType.PLACE:
+                cid_sent = action.client_order_id or outcome.order_id or ""
+                self._recent_places.append((cid_sent, int(time.time() * 1000), action.symbol))
+                if self._rolling_grid_enabled and action.side is not None:
+                    self._inflight_placed_cids[cid_sent] = _InflightPlacedOrder(
+                        symbol=action.symbol,
+                        side=action.side.value,
+                        sync_gen=self._account_sync_generation,
+                    )
+                    sym_counts = self._unreconciled_place_count.setdefault(
+                        action.symbol, {"BUY": 0, "SELL": 0}
+                    )
+                    sym_counts[action.side.value] += 1
+            return live_action
+
+        if outcome.circuit_open:
             return LiveAction(
                 action=action,
-                status=LiveActionStatus.SKIPPED,
+                status=LiveActionStatus.FAILED,
+                block_reason=BlockReason.CIRCUIT_BREAKER_OPEN,
+                error=outcome.error,
+                attempts=outcome.attempts,
+                intent=intent,
+                pre_send=True,
+            )
+
+        if outcome.retries_exhausted:
+            # Post-exhaustion health signals
+            error_str = outcome.error or ""
+            if "-1021" in error_str:
+                self._on_clock_drift_error()
+                if hasattr(self._exchange_port, "refresh_ts_offset"):
+                    self._exchange_port.refresh_ts_offset()
+            if "name resolution" in error_str.lower() or "connection error" in error_str.lower():
+                self._on_dns_error()
+            return LiveAction(
+                action=action,
+                status=LiveActionStatus.FAILED,
+                block_reason=BlockReason.MAX_RETRIES_EXCEEDED,
+                error=outcome.error,
+                attempts=outcome.attempts,
                 intent=intent,
             )
 
-        # Min-notional pre-send gate: block non-reduce-only PLACE orders where
-        # price*qty < min_notional. Exempt reduce_only exits so the engine can
-        # always flatten/unwind positions even when notional is small.
+        # Non-retryable failure
+        error_msg = outcome.error or ""
+        if "Order count limit reached" in error_msg and not self._order_budget_exhausted:
+            self._order_budget_exhausted = True
+            logger.warning("ORDER_BUDGET_LATCH activated — planner suppressed for remaining run")
+        if action.reduce_only and action.symbol and action.side is not None:
+            err_code = outcome.exchange_code or _extract_binance_error_code(error_msg)
+            if err_code == -2022:
+                self._on_reduce_only_reject(action.symbol, action.side.value, err_code)
+        return LiveAction(
+            action=action,
+            status=LiveActionStatus.FAILED,
+            block_reason=BlockReason.NON_RETRYABLE_ERROR,
+            error=outcome.error,
+            attempts=outcome.attempts,
+            intent=intent,
+            pre_send=outcome.pre_send,
+            exchange_code=outcome.exchange_code,
+        )
+
+    def _execute_action(self, action: ExecutionAction, ts: int, intent: RiskIntent) -> LiveAction:
+        """Execute action on exchange port with retries.
+
+        Thin wrapper: pre-send gates → _submit_to_exchange → _apply_submit_outcome.
+        """
+        if action.action_type == ActionType.NOOP:
+            return LiveAction(action=action, status=LiveActionStatus.SKIPPED, intent=intent)
+
+        # Min-notional pre-send gate
         if (
             action.action_type == ActionType.PLACE
             and not action.reduce_only
@@ -6898,7 +7037,7 @@ class LiveEngineV0:
                         pre_send=True,
                     )
 
-        # PR-VIS-1: log place intent before execution (env-gated)
+        # Debug logging (env-gated)
         if action.action_type == ActionType.PLACE and self._debug_open_orders:
             logger.warning(
                 "PLACE_INTENT order_id=%s symbol=%s side=%s price=%s qty=%s "
@@ -6911,8 +7050,6 @@ class LiveEngineV0:
                 action.reduce_only,
                 action.reason or "planner",
             )
-
-        # P0-2d: log cancel intent before execution (env-gated)
         if action.action_type == ActionType.CANCEL and self._debug_open_orders:
             logger.warning(
                 "CANCEL_INTENT order_id=%s symbol=%s reason=%s",
@@ -6921,142 +7058,9 @@ class LiveEngineV0:
                 action.reason or "planner",
             )
 
-        max_attempts = self._retry_policy.max_attempts
-        last_error: Exception | None = None
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                order_id = self._execute_single(action, ts)
-                live_action = LiveAction(
-                    action=action,
-                    status=LiveActionStatus.EXECUTED,
-                    order_id=order_id,
-                    attempts=attempt,
-                    intent=intent,
-                )
-                # P0-2: track successful PLACEs for AccountSync correlation
-                if action.action_type == ActionType.PLACE:
-                    cid_sent = action.client_order_id or live_action.order_id or ""
-                    self._recent_places.append((cid_sent, int(time.time() * 1000), action.symbol))
-                    # ADR-090: track dispatched PLACE CID for inflight fill detection
-                    if self._rolling_grid_enabled and action.side is not None:
-                        self._inflight_placed_cids[cid_sent] = _InflightPlacedOrder(
-                            symbol=action.symbol,
-                            side=action.side.value,
-                            sync_gen=self._account_sync_generation,
-                        )
-                        sym_counts = self._unreconciled_place_count.setdefault(
-                            action.symbol, {"BUY": 0, "SELL": 0}
-                        )
-                        sym_counts[action.side.value] += 1
-                return live_action
-            except ConnectorNonRetryableError as e:
-                # Non-retryable: fail immediately
-                error_msg = str(e)
-                _pre_send = getattr(e, "pre_send", False)
-                _exchange_code = getattr(e, "exchange_code", None)
-                logger.error(
-                    "Non-retryable error on %s: %s (pre_send=%s)",
-                    action.action_type.value,
-                    error_msg,
-                    _pre_send,
-                )
-                # Latch: order budget exhausted → suppress planner on future ticks
-                if "Order count limit reached" in error_msg and not self._order_budget_exhausted:
-                    self._order_budget_exhausted = True
-                    logger.warning(
-                        "ORDER_BUDGET_LATCH activated — planner suppressed for remaining run"
-                    )
-                # ADR-104: Detect -2022 on reduce-only exits → flag for repair.
-                # This MUST be in the NonRetryable handler (not Transient) because
-                # Binance returns -2022 as a non-retryable error.
-                if action.reduce_only and action.symbol and action.side is not None:
-                    err_code = _exchange_code or _extract_binance_error_code(error_msg)
-                    if err_code == -2022:
-                        self._on_reduce_only_reject(action.symbol, action.side.value, err_code)
-                return LiveAction(
-                    action=action,
-                    status=LiveActionStatus.FAILED,
-                    block_reason=BlockReason.NON_RETRYABLE_ERROR,
-                    error=error_msg,
-                    attempts=attempt,
-                    intent=intent,
-                    pre_send=_pre_send,
-                    exchange_code=_exchange_code,
-                )
-            except ConnectorTransientError as e:
-                # Transient: retry with backoff
-                last_error = e
-                if attempt < max_attempts:
-                    delay_ms = self._retry_policy.compute_delay_ms(attempt)
-                    logger.warning(
-                        "Transient error on %s (attempt %d/%d), retrying in %dms: %s",
-                        action.action_type.value,
-                        attempt,
-                        max_attempts,
-                        delay_ms,
-                        str(e),
-                    )
-                    time.sleep(delay_ms / 1000.0)
-            except CircuitOpenError as e:
-                # Circuit breaker is OPEN: request never sent
-                logger.warning(
-                    "Circuit breaker OPEN for %s: %s",
-                    action.action_type.value,
-                    str(e),
-                )
-                return LiveAction(
-                    action=action,
-                    status=LiveActionStatus.FAILED,
-                    block_reason=BlockReason.CIRCUIT_BREAKER_OPEN,
-                    error=str(e),
-                    attempts=attempt,
-                    intent=intent,
-                    pre_send=True,
-                )
-            except ConnectorError as e:
-                # Other connector errors: check if retryable
-                if is_retryable(e, self._retry_policy):
-                    last_error = e
-                    if attempt < max_attempts:
-                        delay_ms = self._retry_policy.compute_delay_ms(attempt)
-                        time.sleep(delay_ms / 1000.0)
-                else:
-                    # ADR-104: Detect -2022 on reduce-only exits → flag for repair
-                    if action.reduce_only and action.symbol and action.side is not None:
-                        err_code = _extract_binance_error_code(str(e))
-                        if err_code == -2022:
-                            self._on_reduce_only_reject(action.symbol, action.side.value, err_code)
-                    return LiveAction(
-                        action=action,
-                        status=LiveActionStatus.FAILED,
-                        block_reason=BlockReason.NON_RETRYABLE_ERROR,
-                        error=str(e),
-                        attempts=attempt,
-                        intent=intent,
-                    )
-
-        # All retries exhausted — detect health signals from error
-        error_str = str(last_error) if last_error else ""
-        if "-1021" in error_str:
-            self._on_clock_drift_error()
-            if hasattr(self._exchange_port, "refresh_ts_offset"):
-                self._exchange_port.refresh_ts_offset()
-        if "name resolution" in error_str.lower() or "connection error" in error_str.lower():
-            self._on_dns_error()
-        logger.error(
-            "Max retries exceeded for %s: %s",
-            action.action_type.value,
-            error_str,
-        )
-        return LiveAction(
-            action=action,
-            status=LiveActionStatus.FAILED,
-            block_reason=BlockReason.MAX_RETRIES_EXCEEDED,
-            error=str(last_error) if last_error else "Unknown error",
-            attempts=max_attempts,
-            intent=intent,
-        )
+        # Submit (thread-safe) → apply (serial state mutations)
+        outcome = self._submit_to_exchange(action, ts)
+        return self._apply_submit_outcome(action, outcome, intent)
 
     def _execute_single(self, action: ExecutionAction, ts: int) -> str | None:
         """Execute single action on exchange port (no retries).
