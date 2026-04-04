@@ -629,9 +629,13 @@ class LiveEngineV0:
         self._emergency_exit_executor: EmergencyExitExecutor | None = None
         self._emergency_exit_executed = False
         self._position_notional_usd: float | None = None  # measured by AccountSyncer
-        # Account sync throttle: at most once per interval to avoid REST rate-limits
-        self._account_sync_interval_ms: int = 5_000  # 5s default
+        # Account sync throttle: at most once per interval to avoid REST rate-limits.
+        # When EventLedger is trusted and user-data events are fresh, the interval
+        # extends to reduce unnecessary REST polls.
+        self._account_sync_interval_ms: int = 5_000  # base interval (used when not trusted)
+        self._account_sync_trusted_interval_ms: int = 15_000  # extended when ledger trusted
         self._account_sync_last_attempt_ms: int = -(5_000)  # ensures first tick always syncs
+        self._last_user_data_event_mono: float = 0.0  # monotonic ts of last WS order event
         # P0-2: debug open orders + recent places correlation
         self._debug_open_orders = parse_bool(
             "GRINDER_ACCOUNT_SYNC_DEBUG_OPEN_ORDERS", default=False, strict=False
@@ -2653,6 +2657,7 @@ class LiveEngineV0:
         # Zero behavioral change — ledger is observability only.
         if event.order_event is not None:
             self._event_ledger.apply_order_event(event.order_event)
+            self._last_user_data_event_mono = time.monotonic()
 
         if not self._is_grid_v2_active(self._grid_v2_symbol):
             return
@@ -3360,8 +3365,17 @@ class LiveEngineV0:
         elif not _fill_tick:
             self._fill_sync_skip_used = False  # reset on non-fill tick
         if self._is_account_sync_enabled() and snapshot.ts > 0 and not _skip_sync:
+            effective_interval, sync_reason = self._get_effective_sync_interval()
             elapsed = snapshot.ts - self._account_sync_last_attempt_ms
-            if elapsed >= self._account_sync_interval_ms:
+            if elapsed >= effective_interval:
+                if sync_reason == "trusted_fresh":
+                    logger.debug(
+                        "REST_SYNC_DEFERRED_UNTIL_NOW symbol=%s reason=%s interval=%d elapsed=%d",
+                        snapshot.symbol,
+                        sync_reason,
+                        effective_interval,
+                        elapsed,
+                    )
                 self._account_sync_last_attempt_ms = snapshot.ts
                 self._tick_account_sync()
 
@@ -3841,6 +3855,49 @@ class LiveEngineV0:
             logger.debug("Account sync flag ON but no syncer instance, skipping")
             return False
         return True
+
+    def _get_effective_sync_interval(self) -> tuple[int, str]:
+        """Determine sync interval based on EventLedger trust + user-data freshness.
+
+        Returns (interval_ms, reason) for logging.
+
+        Policy:
+        - Startup not converged → base interval (5s)
+        - EventLedger not trusted → base interval (5s)
+        - User-data events stale (>5s) → base interval (5s)
+        - All fresh + trusted → extended interval (15s)
+        """
+        # Startup: always use base interval until grid_v2 is active
+        if not self._grid_v2_started:
+            return self._account_sync_interval_ms, "startup"
+
+        # EventLedger trust check
+        if not self._event_ledger.is_trusted:
+            return self._account_sync_interval_ms, "ledger_not_trusted"
+
+        # User-data freshness check (monotonic, >5s = stale)
+        now = time.monotonic()
+        user_data_age = now - self._last_user_data_event_mono
+        if self._last_user_data_event_mono <= 0 or user_data_age > 5.0:
+            return self._account_sync_interval_ms, "user_data_stale"
+
+        # Convergence check: pending state means reconciliation needs REST truth
+        if (
+            self._grid_v2_awaiting_sync
+            or self._grid_v2_pending_place_cids
+            or self._grid_v2_pending_cancels
+        ):
+            reason = (
+                "awaiting_sync"
+                if self._grid_v2_awaiting_sync
+                else "pending_places"
+                if self._grid_v2_pending_place_cids
+                else "pending_cancels"
+            )
+            return self._account_sync_interval_ms, reason
+
+        # All conditions met: extend interval
+        return self._account_sync_trusted_interval_ms, "trusted_fresh"
 
     def _is_live_planner_enabled(self) -> bool:
         """Check if live grid planner is active (PR-L2).
