@@ -6212,9 +6212,7 @@ class TestDefinitiveRejectBlocklist:
         result = engine._grid_v2_process_fills("BTCUSDT", _BASE_TS + 10000)
 
         # The blocked CID must NOT have been treated as a fill
-        fill_cids_processed = {
-            a.order_id for a in result if a.order_id == blocked_cid
-        }
+        fill_cids_processed = {a.order_id for a in result if a.order_id == blocked_cid}
         assert blocked_cid not in fill_cids_processed
 
     def test_clean_failed_place_adds_to_blocklist(
@@ -6297,9 +6295,7 @@ class TestDefinitiveRejectBlocklist:
         def place_then_ambiguous(*args: object, **kwargs: object) -> str:
             call_count["n"] += 1
             if call_count["n"] > 10:
-                raise ConnectorNonRetryableError(
-                    "Binance error -2010", exchange_code=-2010
-                )
+                raise ConnectorNonRetryableError("Binance error -2010", exchange_code=-2010)
             return f"ORDER_{call_count['n']}"
 
         port = MagicMock()
