@@ -140,6 +140,7 @@ class TestFuturesPositionEventPositionSide:
             "a": {"P": [{"s": "BTCUSDT", "pa": "0.001", "ep": "50000", "up": "0.5", "ps": "LONG"}]},
         }
         event = FuturesPositionEvent.from_binance(data, "BTCUSDT")
+        assert event is not None
         assert event.position_side == "LONG"
 
     def test_position_side_default_when_absent(self) -> None:
@@ -149,6 +150,7 @@ class TestFuturesPositionEventPositionSide:
             "a": {"P": [{"s": "BTCUSDT", "pa": "0.001", "ep": "50000", "up": "0.5"}]},
         }
         event = FuturesPositionEvent.from_binance(data, "BTCUSDT")
+        assert event is not None
         assert event.position_side == "BOTH"
 
     def test_to_dict_includes_position_side(self) -> None:
@@ -172,3 +174,80 @@ class TestFuturesPositionEventPositionSide:
         restored = FuturesPositionEvent.from_dict(original.to_dict())
         assert restored.position_side == "LONG"
         assert restored.position_amt == original.position_amt
+
+
+class TestPositionLedgerTrustState:
+    def test_trust_false_before_bootstrap(self) -> None:
+        ledger = PositionLedger()
+        assert not ledger.is_trusted
+
+    def test_trust_false_after_flat_event_only(self) -> None:
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(position_amt="0"))
+        assert not ledger.is_trusted
+
+    def test_bootstrap_set_on_nonzero_event(self) -> None:
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(position_amt="0.001"))
+        assert ledger._bootstrapped
+
+    def test_trust_false_until_convergence(self) -> None:
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(position_amt="0.001"))
+        assert not ledger.is_trusted  # bootstrapped but not converged
+
+    def test_trust_true_after_convergence(self) -> None:
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(position_amt="0.001"))
+        ledger.record_comparison_result(converged=True)
+        assert ledger.is_trusted
+
+    def test_trust_revoked_on_divergence(self) -> None:
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(position_amt="0.001"))
+        ledger.record_comparison_result(converged=True)
+        assert ledger.is_trusted
+        ledger.record_comparison_result(converged=False)
+        assert not ledger.is_trusted
+        assert ledger.trust_revoked
+
+    def test_trust_restored_after_convergence(self) -> None:
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(position_amt="0.001"))
+        ledger.record_comparison_result(converged=True)
+        ledger.record_comparison_result(converged=False)
+        assert ledger.trust_revoked
+        ledger.record_comparison_result(converged=True)
+        assert ledger.is_trusted
+        assert not ledger.trust_revoked
+
+    def test_reset_clears_trust(self) -> None:
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(position_amt="0.001"))
+        ledger.record_comparison_result(converged=True)
+        assert ledger.is_trusted
+        ledger.reset()
+        assert not ledger.is_trusted
+        assert not ledger._bootstrapped
+
+    def test_revoke_idempotent(self) -> None:
+        ledger = PositionLedger()
+        ledger.revoke_trust("test1")
+        ledger.revoke_trust("test2")  # should not re-log
+        assert ledger.trust_revoked
+
+
+class TestPositionLedgerGetSignedQty:
+    def test_returns_zero_when_missing(self) -> None:
+        ledger = PositionLedger()
+        assert ledger.get_signed_qty("UNKNOWN") == Decimal("0")
+
+    def test_returns_ledger_amt(self) -> None:
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(position_amt="0.005"))
+        assert ledger.get_signed_qty("BTCUSDT") == Decimal("0.005")
+
+    def test_negative_short(self) -> None:
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(position_amt="-0.003"))
+        assert ledger.get_signed_qty("BTCUSDT") == Decimal("-0.003")

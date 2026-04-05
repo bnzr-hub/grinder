@@ -5036,3 +5036,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Add shadow `PositionLedger` in `src/grinder/account/position_ledger.py`. Feed from ACCOUNT_UPDATE via `process_user_data_event()`. Compare against `AccountSnapshot.positions` on each sync. Log divergences. Zero behavioral change — shadow/observability only.
 - **Changes:** `FuturesPositionEvent` enriched with `position_side` (from Binance `"ps"` field, default `"BOTH"`). `PositionLedger` keyed by `(symbol, position_side)`, stale-event suppressed. Comparison detects missing/mismatch. Engine wired at init, event feed, and sync comparison.
 - **Scope:** Shadow only. No authority switch, no consumer migration, no risk/budget changes. Position truth authority remains with REST snapshot.
+
+
+### ADR-109 Phase 3 PR-2: Trusted PositionLedger read model (2026-04-05)
+
+- **Problem:** Phase 3 PR-1 added shadow PositionLedger but it had no trust state and no read API. Consumer migration requires a trusted read model with explicit snapshot fallback.
+- **Decision:** Extend `PositionLedger` with trust state machine (bootstrapped + converged + not revoked). Add `record_comparison_result()` to update trust from sync. Add `get_signed_qty(symbol)` for ledger reads. Add engine-side `_is_position_ledger_fresh_for_reads()` predicate (trusted + fresh within 5s). Add `get_effective_signed_position_qty(symbol)` read API with snapshot fallback.
+- **Trust contract:** `is_trusted = bootstrapped AND last_convergence_ok AND NOT trust_revoked`. Bootstrap on first non-zero position event. Divergence revokes immediately. Convergence restores.
+- **Scope:** Trust infrastructure + read API only. Zero consumer migration — `_get_signed_position_qty()` unchanged. Phase 3 PR-3 will switch first consumer.

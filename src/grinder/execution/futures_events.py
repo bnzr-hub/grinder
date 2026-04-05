@@ -207,40 +207,23 @@ class FuturesPositionEvent:
         )
 
     @classmethod
-    def from_binance(cls, data: dict[str, Any], symbol: str) -> FuturesPositionEvent:
+    def from_binance(cls, data: dict[str, Any], symbol: str) -> FuturesPositionEvent | None:
         """Create from Binance ACCOUNT_UPDATE message for a specific symbol.
 
-        Expected format:
-        {
-          "e": "ACCOUNT_UPDATE",
-          "E": 1564745798939,  # Event time
-          "T": 1564745798938,  # Transaction time
-          "a": {
-            "m": "ORDER",      # Reason
-            "B": [...],        # Balances (ignored for v0.1)
-            "P": [             # Positions
-              {
-                "s": "BTCUSDT",  # Symbol
-                "pa": "0.001",   # Position amount
-                "ep": "50000",   # Entry price
-                "up": "0.5",     # Unrealized PnL
-                ...
-              }
-            ]
-          }
-        }
+        Returns None if the symbol is not present in the position update.
+        This avoids synthesizing a flat position that would corrupt the
+        PositionLedger when the update is for a different symbol.
 
         Args:
             data: Full ACCOUNT_UPDATE message
             symbol: Symbol to extract position for
 
         Returns:
-            FuturesPositionEvent for the specified symbol
+            FuturesPositionEvent for the specified symbol, or None if absent
         """
         a = data.get("a", {})
         positions = a.get("P", [])
 
-        # Find position for requested symbol
         for pos in positions:
             if pos.get("s") == symbol:
                 return cls(
@@ -252,14 +235,7 @@ class FuturesPositionEvent:
                     position_side=pos.get("ps", "BOTH"),
                 )
 
-        # Symbol not in positions - return zero position
-        return cls(
-            ts=data.get("E", 0),
-            symbol=symbol,
-            position_amt=Decimal("0"),
-            entry_price=Decimal("0"),
-            unrealized_pnl=Decimal("0"),
-        )
+        return None
 
     @classmethod
     def all_from_binance(cls, data: dict[str, Any]) -> list[FuturesPositionEvent]:
@@ -369,25 +345,19 @@ class UserDataEvent:
             )
 
         if event_type_str == "ACCOUNT_UPDATE":
-            # For ACCOUNT_UPDATE, extract position for first symbol or filtered symbol
+            # For ACCOUNT_UPDATE, extract position for filtered or first symbol.
+            # Returns None when the filtered symbol is not present — avoids
+            # synthesizing a false flat that would corrupt PositionLedger.
             a = data.get("a", {})
             positions = a.get("P", [])
+            position_event: FuturesPositionEvent | None = None
 
             if symbol_filter:
                 position_event = FuturesPositionEvent.from_binance(data, symbol_filter)
             elif positions:
-                # Use first position's symbol if no filter
                 first_symbol = positions[0].get("s", "")
-                position_event = FuturesPositionEvent.from_binance(data, first_symbol)
-            else:
-                # No positions in update
-                position_event = FuturesPositionEvent(
-                    ts=data.get("E", 0),
-                    symbol="",
-                    position_amt=Decimal("0"),
-                    entry_price=Decimal("0"),
-                    unrealized_pnl=Decimal("0"),
-                )
+                if first_symbol:
+                    position_event = FuturesPositionEvent.from_binance(data, first_symbol)
 
             return cls(
                 event_type=UserDataEventType.ACCOUNT_UPDATE,
