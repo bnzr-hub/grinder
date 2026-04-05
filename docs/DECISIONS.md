@@ -5005,3 +5005,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Add `_grid_v2_definitively_rejected_cids: set[str]` to `LiveEngineV0`. Populated in `_grid_v2_clean_failed_place()` (all FAILED/BLOCKED/SKIPPED PLACEs). Excluded in `_grid_v2_process_fills()` alongside pending_cancels and pending_places. Cleared on every bridge-reset path (reseed, drift reconstruct, order-size update).
 - **Ambiguous rejects unchanged:** CIDs from `-2010` or `None` responses are NOT added to the blocklist — they follow the existing quarantine path via `_grid_v2_pending_place_cids`.
 - **Consequences:** Definitive-rejected PLACE CIDs can never become fill candidates. False fills after exchange rejections are impossible.
+
+
+### ADR-158: Fill-eligible positive allowlist — close cascading false-fill loop (2026-04-05)
+
+- **Problem:** ADR-157 blocklist prevented false fills from definitively rejected seeds, but response-action CIDs (from `bridge.on_fill()`) are pre-registered in the adapter registry before their PLACE submission is attempted. If that PLACE fails with 400, the CID is cleaned — but fill detection in the same or next tick already sees "CID in registry, absent from exchange" and treats it as a fill. This creates cascading false-fill loops: each phantom fill produces new response-action CIDs that also fail and become phantom fills.
+- **Observed in:** STOUSDT repeat canary — seeds `e0-e9` were real, but `e10, e13, e16...` (response-action CIDs) all produced `GRID_V2_FILL_PROCESSED` AND `GRID_V2_FAILED_PLACE_CLEANED`.
+- **Decision:** Replace negative-exclusion with positive-allowlist. Add `_grid_v2_fill_eligible_cids: set[str]`. Only CIDs with credible live-on-exchange evidence (EXECUTED or ambiguous quarantine) may be fill candidates. Populated in `_grid_v2_register_pending_place()`. Discarded in `_grid_v2_clean_failed_place()`. Cleared on bridge reset. Fill detection formula: `(disappeared & fill_eligible_cids) - pending_cancels - pending_places - definitively_rejected_cids`.
+- **Consequences:** Mere registry presence no longer implies fill candidacy. ADR-157 blocklist retained as belt-and-suspenders. Cascading false-fill loops structurally impossible.

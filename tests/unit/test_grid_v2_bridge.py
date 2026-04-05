@@ -2143,6 +2143,13 @@ class TestEngineFillOrdering:
         assert sm_before is not None
         assert sm_before.mode == BranchMode.LONG_BRANCH
 
+        # After on_fill(), response-action CIDs are in registry. In real runtime
+        # these would be submitted → EXECUTED → fill-eligible. Simulate that.
+        for cid in set(bridge.adapter.registry.all_entry_cids) | set(
+            bridge.adapter.registry.all_exit_cids
+        ):
+            engine._grid_v2_fill_eligible_cids.add(cid)
+
         # One-sided: after BUY fill, only BUY entry CIDs remain (no SELL entries).
         # Pick one exit CID and one BUY-entry CID to disappear in the same tick.
         exit_cid = next(iter(bridge.adapter.registry.all_exit_cids))
@@ -6346,3 +6353,232 @@ class TestDefinitiveRejectBlocklist:
         # Ambiguous rejects must NOT be in the blocklist
         # They should be quarantined in pending_place_cids instead
         assert len(engine._grid_v2_definitively_rejected_cids) == 0
+
+
+class TestFillEligibleCids:
+    """Tests for fill-eligible positive allowlist (ADR-158)."""
+
+    def test_response_action_cid_not_eligible_not_treated_as_fill(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """CID in registry but NOT in fill_eligible_cids → no fill."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def always_succeed(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = always_succeed
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        # Remove all seed CIDs from fill-eligible (simulate non-eligible state)
+        engine._grid_v2_fill_eligible_cids.clear()
+
+        # All CIDs are in registry but NOT fill-eligible → should produce zero fills
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS + 10000, source="test"
+        )
+        result = engine._grid_v2_process_fills("BTCUSDT", _BASE_TS + 10000)
+        assert result == []
+
+    def test_eligible_cid_detected_as_fill(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """CID in fill_eligible_cids AND disappeared from exchange → detected as fill."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def always_succeed(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = always_succeed
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        # Seeds ARE fill-eligible (they went through submit → EXECUTED)
+        assert len(engine._grid_v2_fill_eligible_cids) > 0
+
+        # Empty exchange → all eligible CIDs disappeared → should detect fills
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS + 10000, source="test"
+        )
+        result = engine._grid_v2_process_fills("BTCUSDT", _BASE_TS + 10000)
+        assert len(result) > 0  # Real fills detected
+
+    def test_restored_exchange_orders_are_fill_eligible(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Orders restored from exchange during startup are fill-eligible."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def always_succeed(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = always_succeed
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # First: fresh startup to get seed CIDs
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        # Capture seed CIDs as if they are on exchange
+        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+        assert len(seed_cids) > 0
+
+        # Now simulate a restart: create a NEW engine that restores from exchange
+        engine2 = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # Pre-populate account snapshot with existing orders (as if exchange has them)
+        exchange_orders = []
+        for cid in seed_cids:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            exchange_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS,
+                )
+            )
+        engine2._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(exchange_orders),
+            ts=_BASE_TS,
+            source="test",
+        )
+
+        # Startup with existing exchange orders → restore path
+        engine2.process_snapshot(snap)
+        bridge2 = engine2._grid_v2_bridge
+        assert bridge2 is not None
+
+        # Restored orders should be fill-eligible
+        restored_cids = set(bridge2.adapter.registry.all_entry_cids) | set(
+            bridge2.adapter.registry.all_exit_cids
+        )
+        for cid in restored_cids:
+            assert cid in engine2._grid_v2_fill_eligible_cids, (
+                f"Restored CID {cid} must be fill-eligible"
+            )

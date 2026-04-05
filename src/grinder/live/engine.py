@@ -899,6 +899,10 @@ class LiveEngineV0:
         # Definitive-reject blocklist: CIDs cleaned by _grid_v2_clean_failed_place
         # must never be treated as fills. Cleared on bridge reset.
         self._grid_v2_definitively_rejected_cids: set[str] = set()
+        # Fill-eligible positive allowlist: only CIDs with credible live-on-exchange
+        # evidence (EXECUTED or ambiguous failure) may be treated as fill candidates.
+        # Mere registry presence is not sufficient. Cleared on bridge reset.
+        self._grid_v2_fill_eligible_cids: set[str] = set()
         self._grid_v2_user_fill_seen: set[str] = set()
         self._grid_v2_integrity_mismatch_streak = 0
         self._grid_v2_integrity_mismatch_last_ts = 0
@@ -1369,6 +1373,7 @@ class LiveEngineV0:
         self._grid_v2_pending_cancels.clear()
         self._grid_v2_pending_place_cids.clear()
         self._grid_v2_definitively_rejected_cids.clear()
+        self._grid_v2_fill_eligible_cids.clear()
         logger.warning(
             "GRID_V2_ORDER_SIZE_RESEED_APPLIED symbol=%s old=%s new=%s cancel=%d seed=%d",
             self._grid_v2_symbol,
@@ -1473,6 +1478,8 @@ class LiveEngineV0:
         if g_orders:
             # Reconstruct from exchange state
             ok = bridge.startup(g_orders, pos_qty, snapshot.mid_price, snapshot.ts)
+            if ok:
+                self._grid_v2_seed_fill_eligible_from_registry()
             if not ok:
                 logger.error(
                     "GRID_V2_STARTUP_FAILED symbol=%s reason=%s mode=%s",
@@ -1532,6 +1539,8 @@ class LiveEngineV0:
             # Pass empty orders list to reconstruct_snapshot which will synthesize
             # a protective lot + exit from position_qty.
             ok = bridge.startup([], pos_qty, snapshot.mid_price, snapshot.ts)
+            if ok:
+                self._grid_v2_seed_fill_eligible_from_registry()
             if not ok:
                 logger.error(
                     "GRID_V2_STARTUP_FAILED symbol=%s reason=%s mode=%s",
@@ -1573,6 +1582,7 @@ class LiveEngineV0:
             # false positives until account sync confirms orders are visible.
             self._grid_v2_awaiting_sync = True
             self._grid_v2_definitively_rejected_cids.clear()
+            self._grid_v2_fill_eligible_cids.clear()
             self._grid_v2_pending_seed_cids = frozenset(
                 ea.client_order_id for ea in seed if ea.client_order_id is not None
             )
@@ -1636,6 +1646,7 @@ class LiveEngineV0:
         seed = bridge_fresh.startup_fresh(snapshot.mid_price, snapshot.ts)
         self._grid_v2_bridge = bridge_fresh
         self._grid_v2_seed_actions = list(seed)
+        self._grid_v2_fill_eligible_cids.clear()
         self._grid_v2_awaiting_sync = True
         self._grid_v2_definitively_rejected_cids.clear()
         self._grid_v2_pending_seed_cids = frozenset(
@@ -1768,12 +1779,15 @@ class LiveEngineV0:
             return
 
         self._grid_v2_bridge = rebuilt
+        self._grid_v2_fill_eligible_cids.clear()
         self._grid_v2_pending_cancels.clear()
         self._grid_v2_pending_place_cids.clear()
         self._grid_v2_definitively_rejected_cids.clear()
         self._sync_reconciler_pending_actions = []
         self._grid_v2_awaiting_sync = False
         self._grid_v2_pending_seed_cids = frozenset()
+        # Reconstructed orders from exchange are provably live
+        self._grid_v2_seed_fill_eligible_from_registry()
 
         if rebuilt.f2_protective_recovery:
             protective = rebuilt.get_f2_protective_exit_actions(snapshot.ts)
@@ -1854,6 +1868,7 @@ class LiveEngineV0:
         """
         self._grid_v2_pending_place_cids.pop(cid, None)
         self._grid_v2_definitively_rejected_cids.add(cid)
+        self._grid_v2_fill_eligible_cids.discard(cid)
         bridge = self._grid_v2_bridge
         if bridge is None:
             return
@@ -1900,13 +1915,32 @@ class LiveEngineV0:
         return True
 
     def _grid_v2_register_pending_place(self, cid: str) -> None:
-        """Track an EXECUTED PLACE CID until visible on exchange.
+        """Track an EXECUTED or ambiguous PLACE CID until visible on exchange.
 
         Stores current account_sync_generation so the CID can be released
         after a bounded grace period (2 sync cycles) even if never visible
         (e.g. immediate fill before first snapshot).
+
+        Also marks the CID as fill-eligible: only CIDs registered here may
+        later be treated as fill candidates by _grid_v2_process_fills.
         """
         self._grid_v2_pending_place_cids[cid] = self._account_sync_generation
+        self._grid_v2_fill_eligible_cids.add(cid)
+
+    def _grid_v2_seed_fill_eligible_from_registry(self) -> None:
+        """Seed fill-eligible set from current bridge registry.
+
+        Called after startup/reconstruct paths that import already-live
+        exchange orders into the registry. These orders are provably live
+        on exchange and must be fill-eligible.
+        """
+        bridge = self._grid_v2_bridge
+        if bridge is None:
+            return
+        for cid in bridge.adapter.registry.all_entry_cids:
+            self._grid_v2_fill_eligible_cids.add(cid)
+        for cid in bridge.adapter.registry.all_exit_cids:
+            self._grid_v2_fill_eligible_cids.add(cid)
 
     def _grid_v2_process_cancel_acks(self, symbol: str, _ts: int) -> None:
         """Detect confirmed cancels and route through bridge.on_cancel_ack().
@@ -2043,11 +2077,12 @@ class LiveEngineV0:
         )
         disappeared = registry_cids - current_cids
 
-        # Exclude pending cancels — those are cancel-acks, not fills.
-        # Exclude pending places — those haven't appeared on exchange yet.
-        # Exclude definitively rejected — those were never live on exchange.
+        # Fill-eligible gate: only CIDs with credible live-on-exchange evidence
+        # (EXECUTED or ambiguous quarantine) may be fill candidates. Mere registry
+        # presence from response-action pre-registration is not sufficient.
+        # Also exclude pending cancels, pending places, and definitively rejected.
         filled_cids = (
-            disappeared
+            (disappeared & self._grid_v2_fill_eligible_cids)
             - set(self._grid_v2_pending_cancels)
             - set(self._grid_v2_pending_place_cids)
             - self._grid_v2_definitively_rejected_cids
