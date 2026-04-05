@@ -436,13 +436,19 @@ class LiveEngineBridge:
         shutdown_bridge_task = asyncio.create_task(
             bridge_shutdown_from_threading_event(shutdown_event, async_shutdown)
         )
-        ud_conn = build_user_data_connector(symbol=symbol, use_testnet=cfg.use_testnet)
-        if ud_conn is None:
+        # Verify connector can be built before starting the loop.
+        # Pass a factory (not a single instance) so each retry gets a fresh connector —
+        # close() is terminal and a reused connector would fail on reconnect.
+        probe = build_user_data_connector(symbol=symbol, use_testnet=cfg.use_testnet)
+        if probe is None:
             return None, shutdown_bridge_task
+
+        def _make_fresh_connector() -> Any:
+            return build_user_data_connector(symbol=symbol, use_testnet=cfg.use_testnet)
 
         user_data_task = asyncio.create_task(
             run_user_data_loop(
-                make_conn=lambda: ud_conn,
+                make_conn=_make_fresh_connector,
                 on_event=engine.process_user_data_event,
                 shutdown=async_shutdown,
             )
