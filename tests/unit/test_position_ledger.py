@@ -137,9 +137,7 @@ class TestFuturesPositionEventPositionSide:
         data = {
             "e": "ACCOUNT_UPDATE",
             "E": 1000,
-            "a": {
-                "P": [{"s": "BTCUSDT", "pa": "0.001", "ep": "50000", "up": "0.5", "ps": "LONG"}]
-            },
+            "a": {"P": [{"s": "BTCUSDT", "pa": "0.001", "ep": "50000", "up": "0.5", "ps": "LONG"}]},
         }
         event = FuturesPositionEvent.from_binance(data, "BTCUSDT")
         assert event.position_side == "LONG"
