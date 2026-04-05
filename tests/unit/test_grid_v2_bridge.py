@@ -6700,7 +6700,7 @@ class TestEventLedgerVisibilityFallback:
         monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
 
         port = MagicMock()
-        port.place_order.side_effect = lambda *a, **kw: "ORDER_1"
+        port.place_order.side_effect = lambda *_a, **_kw: "ORDER_1"
         engine = LiveEngineV0(
             paper_engine=MagicMock(),
             exchange_port=port,
