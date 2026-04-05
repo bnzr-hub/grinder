@@ -896,6 +896,9 @@ class LiveEngineV0:
         # to avoid racing with fill detection (filled entries disappear
         # from snapshot but should be processed as fills, not cleaned).
         self._prev_absent_registry_cids: set[str] = set()
+        # Definitive-reject blocklist: CIDs cleaned by _grid_v2_clean_failed_place
+        # must never be treated as fills. Cleared on bridge reset.
+        self._grid_v2_definitively_rejected_cids: set[str] = set()
         self._grid_v2_user_fill_seen: set[str] = set()
         self._grid_v2_integrity_mismatch_streak = 0
         self._grid_v2_integrity_mismatch_last_ts = 0
@@ -1365,6 +1368,7 @@ class LiveEngineV0:
         )
         self._grid_v2_pending_cancels.clear()
         self._grid_v2_pending_place_cids.clear()
+        self._grid_v2_definitively_rejected_cids.clear()
         logger.warning(
             "GRID_V2_ORDER_SIZE_RESEED_APPLIED symbol=%s old=%s new=%s cancel=%d seed=%d",
             self._grid_v2_symbol,
@@ -1568,6 +1572,7 @@ class LiveEngineV0:
             # Seeds are not on exchange yet; registry-vs-exchange diff would be all
             # false positives until account sync confirms orders are visible.
             self._grid_v2_awaiting_sync = True
+            self._grid_v2_definitively_rejected_cids.clear()
             self._grid_v2_pending_seed_cids = frozenset(
                 ea.client_order_id for ea in seed if ea.client_order_id is not None
             )
@@ -1632,6 +1637,7 @@ class LiveEngineV0:
         self._grid_v2_bridge = bridge_fresh
         self._grid_v2_seed_actions = list(seed)
         self._grid_v2_awaiting_sync = True
+        self._grid_v2_definitively_rejected_cids.clear()
         self._grid_v2_pending_seed_cids = frozenset(
             ea.client_order_id for ea in seed if ea.client_order_id is not None
         )
@@ -1764,6 +1770,7 @@ class LiveEngineV0:
         self._grid_v2_bridge = rebuilt
         self._grid_v2_pending_cancels.clear()
         self._grid_v2_pending_place_cids.clear()
+        self._grid_v2_definitively_rejected_cids.clear()
         self._sync_reconciler_pending_actions = []
         self._grid_v2_awaiting_sync = False
         self._grid_v2_pending_seed_cids = frozenset()
@@ -1840,8 +1847,13 @@ class LiveEngineV0:
         return materialized
 
     def _grid_v2_clean_failed_place(self, cid: str) -> None:
-        """Remove a FAILED/BLOCKED/SKIPPED PLACE CID from registry and pending."""
+        """Remove a FAILED/BLOCKED/SKIPPED PLACE CID from registry and pending.
+
+        Also adds the CID to the definitive-reject blocklist so it can never
+        be mistaken for a fill when it appears absent from exchange snapshots.
+        """
         self._grid_v2_pending_place_cids.pop(cid, None)
+        self._grid_v2_definitively_rejected_cids.add(cid)
         bridge = self._grid_v2_bridge
         if bridge is None:
             return
@@ -2033,8 +2045,12 @@ class LiveEngineV0:
 
         # Exclude pending cancels — those are cancel-acks, not fills.
         # Exclude pending places — those haven't appeared on exchange yet.
+        # Exclude definitively rejected — those were never live on exchange.
         filled_cids = (
-            disappeared - set(self._grid_v2_pending_cancels) - set(self._grid_v2_pending_place_cids)
+            disappeared
+            - set(self._grid_v2_pending_cancels)
+            - set(self._grid_v2_pending_place_cids)
+            - self._grid_v2_definitively_rejected_cids
         )
         if not filled_cids:
             return []

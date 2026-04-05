@@ -6141,3 +6141,208 @@ class TestMinNotionalFilter:
 
         # Slot should be free — can register a new CID at the same price
         assert bridge.adapter.registry.cid_for_entry(OrderSide.SELL, Decimal("0.0403")) is None
+
+
+class TestDefinitiveRejectBlocklist:
+    """Tests for false-fill prevention after definitive exchange rejects (ADR-157)."""
+
+    def test_definitively_rejected_cid_not_treated_as_fill(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """CID in definitively_rejected_cids must not appear in filled_cids."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def always_succeed(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = always_succeed
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        # Add ALL seed CIDs to blocklist (simulating all-seeds-rejected scenario)
+        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+        exit_cids = list(bridge.adapter.registry.all_exit_cids)
+        all_cids = set(seed_cids) | set(exit_cids)
+        assert len(all_cids) > 0
+        for cid in all_cids:
+            engine._grid_v2_definitively_rejected_cids.add(cid)
+
+        # Empty exchange snapshot — all CIDs "disappeared"
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS + 10000, source="test"
+        )
+        # Process fills — all CIDs are in blocklist, so zero fills expected
+        result = engine._grid_v2_process_fills("BTCUSDT", _BASE_TS + 10000)
+        assert result == []
+
+    def test_clean_failed_place_adds_to_blocklist(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """_grid_v2_clean_failed_place adds CID to definitively_rejected_cids."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def always_succeed(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = always_succeed
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        # Pick a seed CID and directly call clean_failed_place
+        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+        assert len(seed_cids) > 0
+        test_cid = seed_cids[0]
+
+        assert test_cid not in engine._grid_v2_definitively_rejected_cids
+        engine._grid_v2_clean_failed_place(test_cid)
+        assert test_cid in engine._grid_v2_definitively_rejected_cids
+
+    def test_ambiguous_reject_not_in_blocklist(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Ambiguous reject (-2010) must NOT add CID to blocklist."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.connectors.errors import ConnectorNonRetryableError  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def place_then_ambiguous(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            if call_count["n"] > 10:
+                raise ConnectorNonRetryableError("Binance error -2010", exchange_code=-2010)
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = place_then_ambiguous
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+
+        snap2 = Snapshot(
+            ts=_BASE_TS + 10000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=(),
+            ts=_BASE_TS + 10000,
+            source="test",
+        )
+        engine.process_snapshot(snap2)
+
+        # Ambiguous rejects must NOT be in the blocklist
+        # They should be quarantined in pending_place_cids instead
+        assert len(engine._grid_v2_definitively_rejected_cids) == 0
