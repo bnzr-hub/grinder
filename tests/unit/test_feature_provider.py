@@ -6,8 +6,6 @@ from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from grinder.selector.feature_provider import (
     _compute_12x5m_volume,
     _compute_natr,
@@ -98,7 +96,7 @@ class TestUnclosedCandleExclusion:
         # 18 klines: 17 closed + 1 unclosed
         closed_candles = _make_klines(17, quote_volume="1000000")
         unclosed = _make_kline(quote_volume="9999999")
-        all_klines = closed_candles + [unclosed]
+        all_klines = [*closed_candles, unclosed]
 
         # Simulate what _fetch_one does: closed = data[:-1]
         closed = all_klines[:-1]
@@ -113,7 +111,7 @@ class TestUnclosedCandleExclusion:
 
         # Adding an unclosed candle should not change NATR when we slice properly
         unclosed = _make_kline(high="999", low="1", close="500")
-        all_klines = closed + [unclosed]
+        all_klines = [*closed, unclosed]
         natr_with_unclosed_sliced = _compute_natr(all_klines[:-1], period=14)
 
         assert natr_from_closed == natr_with_unclosed_sliced
@@ -203,7 +201,7 @@ class TestFetchOne:
     @patch("grinder.selector.feature_provider._fetch_book_ticker")
     @patch("grinder.selector.feature_provider._fetch_5m_klines")
     def test_returns_none_on_kline_failure(
-        self, mock_klines: MagicMock, mock_book: MagicMock
+        self, mock_klines: MagicMock, _mock_book: MagicMock
     ) -> None:
         mock_klines.return_value = None
         assert _fetch_one("BTCUSDT", "https://fapi.binance.com", 5) is None
@@ -211,7 +209,7 @@ class TestFetchOne:
     @patch("grinder.selector.feature_provider._fetch_book_ticker")
     @patch("grinder.selector.feature_provider._fetch_5m_klines")
     def test_returns_none_on_insufficient_closed(
-        self, mock_klines: MagicMock, mock_book: MagicMock
+        self, mock_klines: MagicMock, _mock_book: MagicMock
     ) -> None:
         """Returns None when closed candles < 15 after excluding unclosed."""
         # 15 total → 14 closed → below _MIN_CLOSED_CANDLES
