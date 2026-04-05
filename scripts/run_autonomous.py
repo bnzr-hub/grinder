@@ -45,6 +45,8 @@ from typing import Any
 
 logger = logging.getLogger("autonomous")
 
+_CONSTRAINT_CACHE_TTL_HOURLY_S = 3600
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Grinder autonomous multi-symbol runtime")
@@ -191,13 +193,28 @@ def _bootstrap_tuning_cache(
     )
     from grinder.observability.latency_telemetry import PhaseTimer, log_bootstrap  # noqa: PLC0415
     from grinder.tuning.solver import TuningSolverConfig, solve  # noqa: PLC0415
+    from scripts.http_measured_client import RequestsHttpClient  # noqa: PLC0415
 
     bootstrap_timer = PhaseTimer()
     testnet = not getattr(args, "mainnet", False)
     logger.info("BOOTSTRAP_TUNING_START symbols=%s testnet=%s", symbols, testnet)
 
-    # Load constraints (cache-only, no API fetch — already loaded if available)
-    provider = ConstraintProvider(config=ConstraintProviderConfig(allow_fetch=False))
+    # Refresh constraints at most once per hour. If the cache is stale, fetch fresh
+    # exchangeInfo and update the cache; if fetch fails, ConstraintProvider still
+    # fails open to the stale cache.
+    exchange_info_url = (
+        "https://testnet.binancefuture.com/fapi/v1/exchangeInfo"
+        if testnet
+        else "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    )
+    provider = ConstraintProvider(
+        http_client=RequestsHttpClient(port_name="constraint_fetch"),
+        config=ConstraintProviderConfig(
+            cache_ttl_seconds=_CONSTRAINT_CACHE_TTL_HOURLY_S,
+            allow_fetch=True,
+            exchange_info_url=exchange_info_url,
+        ),
+    )
     constraints = provider.get_constraints()
     if not constraints:
         logger.warning("BOOTSTRAP_TUNING_NO_CONSTRAINTS — solver will use zero constraints")

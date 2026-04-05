@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import scripts.run_autonomous as mod
 
@@ -186,3 +186,27 @@ class TestExecutionDesiredTopK:
         top_k = orchestrator.controller.config.top_k
         execution_desired = decision.admitted[:top_k]
         assert len(execution_desired) == 1
+
+
+class TestBootstrapConstraintRefresh:
+    """Bootstrap tuning should auto-refresh constraint cache hourly."""
+
+    def test_bootstrap_uses_hourly_refreshable_constraints(self) -> None:
+        args = _default_args(mainnet=True)
+
+        with (
+            patch("grinder.execution.constraint_provider.ConstraintProvider") as mock_provider_cls,
+            patch("scripts.http_measured_client.RequestsHttpClient") as mock_http_cls,
+        ):
+            mock_provider = MagicMock()
+            mock_provider.get_constraints.return_value = {}
+            mock_provider_cls.return_value = mock_provider
+            mock_http_cls.return_value = MagicMock()
+
+            mod._bootstrap_tuning_cache([], MagicMock(), args)
+
+        _, kwargs = mock_provider_cls.call_args
+        config = kwargs["config"]
+        assert config.allow_fetch is True
+        assert config.cache_ttl_seconds == 3600
+        assert config.exchange_info_url == "https://fapi.binance.com/fapi/v1/exchangeInfo"
