@@ -178,6 +178,8 @@ def _bootstrap_tuning_cache(
     symbols: list[str],
     cache: Any,
     args: argparse.Namespace,
+    *,
+    natr_map: dict[str, Decimal] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any]]:
     """Populate TuningCache with REST-fetched prices + constraint solver.
 
@@ -221,12 +223,11 @@ def _bootstrap_tuning_cache(
 
     # Wire solver config from bridge/runtime ladder geometry (same SSOT)
     from grinder.runtime.live_engine_bridge import BridgeConfig  # noqa: PLC0415
+    from grinder.selector.spacing import compute_adaptive_spacing_bps  # noqa: PLC0415
 
     bridge_cfg = BridgeConfig()  # defaults match what bridge actually uses
-    config = TuningSolverConfig(
-        entry_levels_per_side=bridge_cfg.levels,
-        spacing_pct=Decimal(str(bridge_cfg.spacing_bps)) / Decimal("10000"),
-    )
+    _static_spacing_pct = Decimal(str(bridge_cfg.spacing_bps)) / Decimal("10000")
+    _natr = natr_map or {}
     tuned_sizes: dict[str, str] = {}
     tuned_results: dict[str, Any] = {}
     tuned_count = 0
@@ -241,6 +242,18 @@ def _bootstrap_tuning_cache(
             logger.warning("BOOTSTRAP_TUNING_NO_CONSTRAINTS symbol=%s — skipped", symbol)
             continue
 
+        # Per-symbol adaptive spacing from NATR (fall back to static if unavailable)
+        natr_val = _natr.get(symbol)
+        if natr_val is not None:
+            adaptive_bps = compute_adaptive_spacing_bps(natr_val)
+            spacing_pct = adaptive_bps / Decimal("10000")
+        else:
+            spacing_pct = _static_spacing_pct
+
+        config = TuningSolverConfig(
+            entry_levels_per_side=bridge_cfg.levels,
+            spacing_pct=spacing_pct,
+        )
         result = solve(symbol, sc, price, config)
         cache.put(symbol, result)
 
@@ -251,10 +264,11 @@ def _bootstrap_tuning_cache(
             tuned_sizes[symbol] = str(result.order_size)
             tuned_results[symbol] = result
             logger.info(
-                "BOOTSTRAP_TUNED symbol=%s price=%s order_size=%s",
+                "BOOTSTRAP_TUNED symbol=%s price=%s order_size=%s spacing_pct=%s",
                 symbol,
                 price,
                 result.order_size,
+                spacing_pct,
             )
         else:
             logger.info(
@@ -267,6 +281,18 @@ def _bootstrap_tuning_cache(
     logger.info("BOOTSTRAP_TUNING_COMPLETE tuned=%d total=%d", tuned_count, len(symbols))
     log_bootstrap(bootstrap_timer.elapsed_ms(), len(symbols), tuned_count)
     return tuned_sizes, tuned_results
+
+
+def _fetch_natr_map(symbols: list[str], *, mainnet: bool) -> dict[str, Decimal]:
+    """Fetch NATR map from selector features for adaptive spacing. Fail-open."""
+    try:
+        from grinder.selector.feature_provider import fetch_selection_features  # noqa: PLC0415
+
+        feats = fetch_selection_features(symbols, mainnet=mainnet)
+        return {sym: f.natr_14_5m for sym, f in feats.items()}
+    except Exception as e:
+        logger.warning("BOOTSTRAP_NATR_FETCH_FAILED error=%s — using static spacing", e)
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +400,29 @@ def _build_v2_selector(
     return prefilter, ranker
 
 
+def _propagate_tuning_to_bridge(
+    bridge: Any,
+    tuned_sizes: dict[str, str],
+    tuned_results: dict[str, Any],
+    natr_map: dict[str, Decimal],
+) -> None:
+    """Propagate tuning-resolved per-symbol config to bridge."""
+    from grinder.selector.spacing import compute_adaptive_spacing_bps  # noqa: PLC0415
+
+    for sym, size in tuned_sizes.items():
+        bridge.set_symbol_size(sym, size)
+        result = tuned_results.get(sym)
+        if result and result.tick_size and result.step_size:
+            bridge.set_symbol_grid_config(
+                sym,
+                tick_size=str(result.tick_size),
+                step_size=str(result.step_size),
+            )
+        natr_val = natr_map.get(sym)
+        if natr_val is not None:
+            bridge.set_symbol_spacing(sym, compute_adaptive_spacing_bps(natr_val))
+
+
 def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
     """Assemble the full autonomous runtime graph."""
     from grinder.execution_plane.coordinator import ExecutionCoordinator  # noqa: PLC0415
@@ -407,16 +456,18 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
     # Without this, the loop sees CACHE_MISS for every symbol → tuned=0 → no activation.
     _tuned_sizes: dict[str, str] = {}
     _tuned_results: dict[str, Any] = {}
+    _natr_map: dict[str, Decimal] = {}
+    mainnet = getattr(args, "mainnet", False)
     if symbols_override:
+        # Fetch NATR for adaptive spacing before bootstrap (fail-open)
+        _natr_map = _fetch_natr_map(sorted(symbols_override), mainnet=mainnet)
         _tuned_sizes, _tuned_results = _bootstrap_tuning_cache(
-            sorted(symbols_override), tuning_cache, args
+            sorted(symbols_override), tuning_cache, args, natr_map=_natr_map
         )
     else:
         # Auto-discovery mode: bootstrap tune a bounded subset of discovered universe.
-        # This seeds TuningCache so the first loop cycle can rank and admit symbols.
-        # Fail-open: if discovery raises, continue with empty bootstrap.
         _BOOTSTRAP_UNIVERSE_LIMIT = 30
-        testnet = not getattr(args, "mainnet", False)
+        testnet = not mainnet
         try:
             discovered = universe_provider.get_candidates()
         except Exception:
@@ -434,8 +485,9 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
             len(bootstrap_subset),
         )
         if bootstrap_subset:
+            _natr_map = _fetch_natr_map(bootstrap_subset, mainnet=mainnet)
             _tuned_sizes, _tuned_results = _bootstrap_tuning_cache(
-                bootstrap_subset, tuning_cache, args
+                bootstrap_subset, tuning_cache, args, natr_map=_natr_map
             )
 
     rotation_controller = RotationController(
@@ -459,16 +511,7 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
 
     # Real engine host with LiveEngineBridge (ADR-147/148/149)
     bridge = _build_engine_bridge(args)
-    # Propagate tuning-resolved per-symbol sizes and grid config to bridge
-    for sym, size in _tuned_sizes.items():
-        bridge.set_symbol_size(sym, size)
-        result = _tuned_results.get(sym)
-        if result and result.tick_size and result.step_size:
-            bridge.set_symbol_grid_config(
-                sym,
-                tick_size=str(result.tick_size),
-                step_size=str(result.step_size),
-            )
+    _propagate_tuning_to_bridge(bridge, _tuned_sizes, _tuned_results, _natr_map)
     host = AutonomousEngineHost(
         registry=registry,
         engine_factory=bridge.factory,
