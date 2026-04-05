@@ -1,8 +1,10 @@
-"""Shadow PositionLedger from ACCOUNT_UPDATE events (Phase 3 PR-1).
+"""PositionLedger from ACCOUNT_UPDATE events (Phase 3).
 
-Tracks position state from user-data WebSocket events. Shadow-only:
-does not affect any trading decision. Compared against AccountSnapshot
-positions on each sync for divergence visibility.
+Tracks position state from user-data WebSocket events. Compared against
+AccountSnapshot positions on each sync for divergence visibility.
+
+Phase 3 PR-1: shadow only.
+Phase 3 PR-2: trusted read model with snapshot fallback.
 
 Keyed by (symbol, position_side) to support both one-way and hedge modes.
 """
@@ -11,12 +13,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from decimal import Decimal
-
     from grinder.account.contracts import AccountSnapshot
     from grinder.execution.futures_events import FuturesPositionEvent
 
@@ -65,16 +66,32 @@ class PositionComparisonResult:
 
 
 class PositionLedger:
-    """Shadow position read model from ACCOUNT_UPDATE events.
+    """Position read model from ACCOUNT_UPDATE events.
 
-    Phase 3 PR-1: shadow/observability only. Does not affect any trading
-    decision, risk gate, or position query. Compared against REST snapshot
-    positions for divergence logging.
+    Trust state machine mirrors EventLedger (ADR-109 Phase 2):
+    - bootstrapped: at least one non-zero position event received
+    - last_convergence_ok: last comparison with snapshot converged
+    - trust_revoked: explicitly revoked on divergence or degraded mode
+
+    is_trusted = bootstrapped AND last_convergence_ok AND NOT trust_revoked
     """
 
     def __init__(self) -> None:
         self._positions: dict[tuple[str, str], LedgerPosition] = {}
         self._stale_event_count = 0
+        # Trust state
+        self._bootstrapped = False
+        self._last_convergence_ok = False
+        self._trust_revoked = False
+
+    @property
+    def is_trusted(self) -> bool:
+        """True when ledger can be used as position read model."""
+        return self._bootstrapped and self._last_convergence_ok and not self._trust_revoked
+
+    @property
+    def trust_revoked(self) -> bool:
+        return self._trust_revoked
 
     def apply_position_event(self, event: FuturesPositionEvent) -> None:
         """Apply a position event. Stale events (older ts) are suppressed."""
@@ -91,6 +108,36 @@ class PositionLedger:
             unrealized_pnl=event.unrealized_pnl,
             last_event_ts=event.ts,
         )
+        # Bootstrap on first non-zero position event
+        if event.position_amt != 0 and not self._bootstrapped:
+            self._bootstrapped = True
+
+    def record_comparison_result(self, converged: bool) -> None:
+        """Update trust state based on comparison result.
+
+        Called by engine after compare_with_snapshot() on each sync.
+        Convergence restores trust; divergence revokes it immediately.
+        """
+        self._last_convergence_ok = converged
+        if converged:
+            if self._trust_revoked and self._bootstrapped:
+                self._trust_revoked = False
+                logger.info("POSITION_LEDGER_TRUST_RESTORED")
+        else:
+            self.revoke_trust("divergence")
+
+    def revoke_trust(self, reason: str) -> None:
+        """Revoke trust. Idempotent — logs only on first revoke."""
+        if not self._trust_revoked:
+            self._trust_revoked = True
+            logger.info("POSITION_LEDGER_TRUST_REVOKED reason=%s", reason)
+
+    def get_signed_qty(self, symbol: str, position_side: str = "BOTH") -> Decimal:
+        """Get position amount from ledger. Returns 0 if missing."""
+        lp = self._positions.get((symbol, position_side))
+        if lp is None:
+            return Decimal("0")
+        return lp.position_amt
 
     def compare_with_snapshot(self, snapshot: AccountSnapshot) -> PositionComparisonResult:
         """Compare ledger positions against snapshot positions.
@@ -142,7 +189,9 @@ class PositionLedger:
             )
 
         non_flat_ledger = sum(1 for lp in self._positions.values() if lp.position_amt != 0)
-        non_flat_snap = sum(1 for p in snapshot.positions if p.signed_qty != 0)
+        non_flat_snap = sum(
+            1 for p in snapshot.positions if (p.signed_qty if p.signed_qty is not None else p.qty) != 0
+        )
 
         return PositionComparisonResult(
             divergences=tuple(divergences),
@@ -155,6 +204,9 @@ class PositionLedger:
         return dict(self._positions)
 
     def reset(self) -> None:
-        """Clear all state."""
+        """Clear all state including trust."""
         self._positions.clear()
         self._stale_event_count = 0
+        self._bootstrapped = False
+        self._last_convergence_ok = False
+        self._trust_revoked = False

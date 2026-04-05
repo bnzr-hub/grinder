@@ -636,6 +636,7 @@ class LiveEngineV0:
         self._account_sync_trusted_interval_ms: int = 15_000  # extended when ledger trusted
         self._account_sync_last_attempt_ms: int = -(5_000)  # ensures first tick always syncs
         self._last_user_data_event_mono: float = 0.0  # monotonic ts of last WS order event
+        self._last_position_event_mono: float = 0.0  # monotonic ts of last WS position event
         # P0-2: debug open orders + recent places correlation
         self._debug_open_orders = parse_bool(
             "GRINDER_ACCOUNT_SYNC_DEBUG_OPEN_ORDERS", default=False, strict=False
@@ -1679,6 +1680,31 @@ class LiveEngineV0:
 
         age = time.monotonic() - self._last_user_data_event_mono
         return age <= 5.0
+
+    def _is_position_ledger_fresh_for_reads(self) -> bool:
+        """Check if PositionLedger is safe to use for position reads.
+
+        Trusted + fresh position events must both hold. Without fresh events,
+        the ledger may be stale and should not override snapshot positions.
+        """
+        if not self._position_ledger.is_trusted:
+            return False
+        if self._last_position_event_mono <= 0:
+            return False
+        import time  # noqa: PLC0415
+
+        age = time.monotonic() - self._last_position_event_mono
+        return age <= 5.0
+
+    def get_effective_signed_position_qty(self, symbol: str) -> Decimal:
+        """Get position qty from trusted PositionLedger or snapshot fallback.
+
+        Phase 3 PR-2: trusted read API. Not yet called by any consumer —
+        consumer migration is Phase 3 PR-3.
+        """
+        if self._is_position_ledger_fresh_for_reads():
+            return self._position_ledger.get_signed_qty(symbol)
+        return self._get_signed_position_qty(symbol)
 
     def _grid_v2_exchange_cids(self, symbol: str) -> set[str]:
         """Get current grid_v2 CIDs on exchange.
@@ -2727,10 +2753,10 @@ class LiveEngineV0:
             self._event_ledger.apply_order_event(event.order_event)
             self._last_user_data_event_mono = time.monotonic()
 
-        # ADR-109 Phase 3: Feed position events to shadow PositionLedger.
-        # Shadow only — zero behavioral change. No authority switch.
+        # ADR-109 Phase 3: Feed position events to PositionLedger.
         if event.position_event is not None:
             self._position_ledger.apply_position_event(event.position_event)
+            self._last_position_event_mono = time.monotonic()
 
         if not self._is_grid_v2_active(self._grid_v2_symbol):
             return
@@ -4481,9 +4507,10 @@ class LiveEngineV0:
                         shadow.ledger_open_orders,
                         shadow.snapshot_open_orders,
                     )
-            # ADR-109 Phase 3: shadow PositionLedger comparison (no authority)
+            # ADR-109 Phase 3: PositionLedger comparison + trust decision
             try:
                 pos_cmp = self._position_ledger.compare_with_snapshot(result.snapshot)
+                self._position_ledger.record_comparison_result(pos_cmp.is_converged)
                 if not pos_cmp.is_converged:
                     for div in pos_cmp.divergences[:5]:
                         logger.info(
@@ -4493,6 +4520,12 @@ class LiveEngineV0:
                             div.kind.value,
                             div.detail,
                         )
+                elif self._position_ledger.is_trusted:
+                    logger.debug(
+                        "POSITION_LEDGER_TRUSTED_READ_MODEL ledger_positions=%d snapshot_positions=%d",
+                        pos_cmp.ledger_count,
+                        pos_cmp.snapshot_count,
+                    )
             except Exception:
                 logger.debug("POSITION_LEDGER_COMPARE_ERROR", exc_info=True)
 
