@@ -276,6 +276,7 @@ class TestFuturesPositionEvent:
             },
         }
         event = FuturesPositionEvent.from_binance(binance_msg, "BTCUSDT")
+        assert event is not None
 
         assert event.ts == 1564745798939
         assert event.symbol == "BTCUSDT"
@@ -299,6 +300,7 @@ class TestFuturesPositionEvent:
             },
         }
         event = FuturesPositionEvent.from_binance(binance_msg, "BTCUSDT")
+        assert event is not None
 
         assert event.position_amt == Decimal("-0.002")
         assert event.unrealized_pnl == Decimal("-10.0")
