@@ -12,14 +12,14 @@ from grinder.tuning.solver import TuningResult, TuningStatus
 
 def _feat(
     symbol: str,
-    volume: str = "100000",
+    volume: str = "3000000",
     bid: str = "1.0",
     ask: str = "1.001",
     natr: str = "2.0",
 ) -> SelectionFeatures:
     return SelectionFeatures(
         symbol=symbol,
-        quote_volume_1h=Decimal(volume),
+        quote_volume_last_12x5m=Decimal(volume),
         best_bid=Decimal(bid),
         best_ask=Decimal(ask),
         natr_14_5m=Decimal(natr),
@@ -51,10 +51,20 @@ class TestPrefilterV1:
         eligible, _skipped = prefilter_v1(
             ["LOWVOL"],
             {"LOWVOL": _tuned("LOWVOL")},
-            {"LOWVOL": _feat("LOWVOL", volume="100")},  # below 50k
+            {"LOWVOL": _feat("LOWVOL", volume="1999999")},  # below $2M
         )
         assert eligible == []
-        assert _skipped["LOWVOL"] == SkipReason.LOW_VOLUME_1H
+        assert _skipped["LOWVOL"] == SkipReason.LOW_VOLUME_LAST_12X5M
+
+    def test_volume_at_floor_passes(self) -> None:
+        """Symbol with exactly $2M rolling volume passes prefilter."""
+        eligible, _skipped = prefilter_v1(
+            ["EXACT"],
+            {"EXACT": _tuned("EXACT")},
+            {"EXACT": _feat("EXACT", volume="2000000")},
+        )
+        assert eligible == ["EXACT"]
+        assert _skipped == {}
 
     def test_low_natr_excluded(self) -> None:
         eligible, _skipped = prefilter_v1(
@@ -102,7 +112,7 @@ class TestPrefilterV1:
                 "FLAT": _tuned("FLAT"),
             },
             {
-                "GOOD": _feat("GOOD", volume="200000", natr="3.0"),
+                "GOOD": _feat("GOOD", volume="5000000", natr="3.0"),
                 "LOW": _feat("LOW", volume="100"),
                 "FLAT": _feat("FLAT", natr="0.1"),
             },
@@ -150,8 +160,8 @@ class TestPrefilterV1:
 class TestRankerV1:
     def test_higher_volume_ranks_higher(self) -> None:
         features = {
-            "HIGH": _feat("HIGH", volume="500000"),
-            "LOW": _feat("LOW", volume="50000"),
+            "HIGH": _feat("HIGH", volume="10000000"),
+            "LOW": _feat("LOW", volume="2000000"),
         }
         scored = rank_v1(["HIGH", "LOW"], features)
         assert scored[0].symbol == "HIGH"
@@ -174,8 +184,8 @@ class TestRankerV1:
 
     def test_combined_score_deterministic(self) -> None:
         features = {
-            "A": _feat("A", volume="100000", natr="2.0", bid="1.0", ask="1.001"),
-            "B": _feat("B", volume="200000", natr="1.5", bid="1.0", ask="1.002"),
+            "A": _feat("A", volume="3000000", natr="2.0", bid="1.0", ask="1.001"),
+            "B": _feat("B", volume="5000000", natr="1.5", bid="1.0", ask="1.002"),
         }
         r1 = rank_v1(["A", "B"], features)
         r2 = rank_v1(["A", "B"], features)
@@ -198,8 +208,8 @@ class TestRankerV1:
     def test_no_alphabetical_default_order(self) -> None:
         """Selection must not just be first alphabetically."""
         features = {
-            "AAUSDT": _feat("AAUSDT", volume="50000", natr="1.0"),
-            "ZZUSDT": _feat("ZZUSDT", volume="500000", natr="5.0"),
+            "AAUSDT": _feat("AAUSDT", volume="2000000", natr="1.0"),
+            "ZZUSDT": _feat("ZZUSDT", volume="10000000", natr="5.0"),
         }
         scored = rank_v1(["AAUSDT", "ZZUSDT"], features)
         assert scored[0].symbol == "ZZUSDT"  # higher on all metrics

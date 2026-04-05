@@ -12,7 +12,7 @@ class SkipReason(Enum):
 
     NOT_TUNED = "NOT_TUNED"
     NOT_TRADING = "NOT_TRADING"
-    LOW_VOLUME_1H = "LOW_VOLUME_1H"
+    LOW_VOLUME_LAST_12X5M = "LOW_VOLUME_LAST_12X5M"
     LOW_NATR_5M = "LOW_NATR_5M"
     FEATURES_UNAVAILABLE = "FEATURES_UNAVAILABLE"
     BLACKLISTED = "BLACKLISTED"
@@ -27,7 +27,7 @@ class SelectionFeatures:
     """
 
     symbol: str
-    quote_volume_1h: Decimal  # 1h quote volume from latest closed kline
+    quote_volume_last_12x5m: Decimal  # sum of last 12 closed 5m kline quote volumes
     best_bid: Decimal
     best_ask: Decimal
     natr_14_5m: Decimal  # NATR(14) on 5m candles, as percentage (e.g. 1.5 = 1.5%)

@@ -56,7 +56,7 @@ def rank_v1(
         feat = features.get(sym)
         if feat is None:
             continue
-        vol = float(feat.quote_volume_1h)
+        vol = float(feat.quote_volume_last_12x5m)
         log_vol = math.log1p(vol)  # log(1+vol) for scale
         spread = float(feat.spread_bps)
         natr = float(feat.natr_14_5m)

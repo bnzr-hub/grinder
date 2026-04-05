@@ -4970,3 +4970,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Fail-open:** Price fetch failure, missing constraints, or solver NO_GO leaves symbol un-tuned (loop skips it). No fatal error. No synthetic constraints — only real exchange data used for tuning.
 - **Config SSOT:** Bootstrap solver uses the same ladder geometry as the runtime bridge (`BridgeConfig.levels`, `BridgeConfig.spacing_bps` → `spacing_pct`). No config divergence between tuning and execution.
 - **Trigger:** Only runs when `--symbols` override is provided (operator-specified symbols). Auto-discover mode would need a different bootstrap path (future work).
+
+### ADR-153: Selector V2 — rolling 12×5m volume with $2M floor (2026-04-05)
+
+- **Problem:** V1 selector used a single closed 1h candle for volume filtering with a $50k floor. This was too coarse (one boundary-aligned sample) and too soft (nearly all symbols passed). The volume metric did not reflect current market quality accurately enough for live autonomous selection.
+- **Decision:** Replace 1h candle volume with the sum of last 12 closed 5m candles (`quote_volume_last_12x5m`). Raise the hard prefilter floor from $50k to $2M. Unify the 5m kline fetch: one REST call (`limit=18`) provides data for both volume (last 12 closed) and NATR(14) (needs 15 closed). The old separate 1h kline call is removed entirely.
+- **Why $2M:** A $2M rolling-hour floor is meaningful for real futures liquidity. It rejects dead and semi-dead symbols that only appeared viable on a coarse 1h candle. The 40× increase over $50k reflects the actual quality bar needed for autonomous grid execution.
+- **Why 12×5m instead of 1h:** Finer granularity gives a more current "what is liquid now?" signal. The sum of 12 closed 5m candles covers the same 1-hour window but updates every 5 minutes instead of every hour. This catches temporary liquidity drops faster.
+- **Contract changes:** `SelectionFeatures.quote_volume_1h` → `quote_volume_last_12x5m`; `SkipReason.LOW_VOLUME_1H` → `LOW_VOLUME_LAST_12X5M`; `DEFAULT_VOLUME_1H_MIN` → `DEFAULT_VOLUME_LAST_12X5M_MIN = $2M`; `prefilter_v1(volume_1h_min=)` → `prefilter_v1(volume_last_12x5m_min=)`.
+- **Side effect:** One fewer REST call per symbol (1h kline call eliminated). Net improvement in fetch efficiency.

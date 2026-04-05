@@ -12,7 +12,7 @@
 |----------|---------|-------|-------------|
 | `SPREAD_MAX_BPS` | 15.0 | 5-50 | Max spread to consider symbol |
 | `VOL_MIN_24H_USD` | 10,000,000 | 1M-100M | Min 24h volume |
-| `VOL_MIN_1H_USD` | 500,000 | 100K-10M | Min 1h volume |
+| `VOL_MIN_LAST_12X5M_USD` | 2,000,000 | 500K-20M | Min rolling 12×5m quote volume |
 | `TRADE_COUNT_MIN_1M` | 100 | 10-1000 | Min trades per minute |
 | `OI_MIN_USD` | 5,000,000 | 1M-50M | Min open interest |
 
@@ -21,7 +21,7 @@
 
 SPREAD_MAX_BPS = 15.0
 VOL_MIN_24H_USD = 10_000_000
-VOL_MIN_1H_USD = 500_000
+VOL_MIN_LAST_12X5M_USD = 2_000_000
 TRADE_COUNT_MIN_1M = 100
 OI_MIN_USD = 5_000_000
 ```
