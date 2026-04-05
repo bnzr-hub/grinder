@@ -2755,8 +2755,16 @@ class LiveEngineV0:
 
         # ADR-109 Phase 3: Feed position events to PositionLedger.
         if event.position_event is not None:
-            self._position_ledger.apply_position_event(event.position_event)
+            pe = event.position_event
+            self._position_ledger.apply_position_event(pe)
             self._last_position_event_mono = time.monotonic()
+            logger.debug(
+                "POSITION_LEDGER_EVENT_APPLIED symbol=%s side=%s amt=%s ts=%d",
+                pe.symbol,
+                pe.position_side,
+                pe.position_amt,
+                pe.ts,
+            )
 
         if not self._is_grid_v2_active(self._grid_v2_symbol):
             return
@@ -4511,6 +4519,15 @@ class LiveEngineV0:
             try:
                 pos_cmp = self._position_ledger.compare_with_snapshot(result.snapshot)
                 self._position_ledger.record_comparison_result(pos_cmp.is_converged)
+                logger.debug(
+                    "POSITION_LEDGER_COMPARE converged=%s bootstrapped=%s trusted=%s "
+                    "ledger=%d snapshot=%d",
+                    pos_cmp.is_converged,
+                    self._position_ledger._bootstrapped,
+                    self._position_ledger.is_trusted,
+                    pos_cmp.ledger_count,
+                    pos_cmp.snapshot_count,
+                )
                 if not pos_cmp.is_converged:
                     for div in pos_cmp.divergences[:5]:
                         logger.info(
