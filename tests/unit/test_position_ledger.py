@@ -140,6 +140,7 @@ class TestFuturesPositionEventPositionSide:
             "a": {"P": [{"s": "BTCUSDT", "pa": "0.001", "ep": "50000", "up": "0.5", "ps": "LONG"}]},
         }
         event = FuturesPositionEvent.from_binance(data, "BTCUSDT")
+        assert event is not None
         assert event.position_side == "LONG"
 
     def test_position_side_default_when_absent(self) -> None:
@@ -149,6 +150,7 @@ class TestFuturesPositionEventPositionSide:
             "a": {"P": [{"s": "BTCUSDT", "pa": "0.001", "ep": "50000", "up": "0.5"}]},
         }
         event = FuturesPositionEvent.from_binance(data, "BTCUSDT")
+        assert event is not None
         assert event.position_side == "BOTH"
 
     def test_to_dict_includes_position_side(self) -> None:
