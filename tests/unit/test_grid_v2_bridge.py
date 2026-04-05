@@ -6351,3 +6351,58 @@ class TestDefinitiveRejectBlocklist:
         # Ambiguous rejects must NOT be in the blocklist
         # They should be quarantined in pending_place_cids instead
         assert len(engine._grid_v2_definitively_rejected_cids) == 0
+
+    def test_fresh_startup_clears_blocklist(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Normal fresh-start path clears definitively_rejected_cids."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def always_succeed(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = always_succeed
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # Pre-populate blocklist with stale entries (simulating prior session)
+        engine._grid_v2_definitively_rejected_cids.add("stale_cid_1")
+        engine._grid_v2_definitively_rejected_cids.add("stale_cid_2")
+        assert len(engine._grid_v2_definitively_rejected_cids) == 2
+
+        # Normal fresh startup
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+
+        # Blocklist must be cleared after fresh startup
+        assert len(engine._grid_v2_definitively_rejected_cids) == 0

@@ -1572,6 +1572,7 @@ class LiveEngineV0:
             # Seeds are not on exchange yet; registry-vs-exchange diff would be all
             # false positives until account sync confirms orders are visible.
             self._grid_v2_awaiting_sync = True
+            self._grid_v2_definitively_rejected_cids.clear()
             self._grid_v2_pending_seed_cids = frozenset(
                 ea.client_order_id for ea in seed if ea.client_order_id is not None
             )
