@@ -76,6 +76,7 @@ class TestAutoDiscoveryBootstrap:
 
         with (
             patch.object(mod, "_bootstrap_tuning_cache", return_value=({}, {})) as mock_bootstrap,
+            patch.object(mod, "_fetch_quote_volume_24h_map", return_value={}),
             patch(
                 "grinder.orchestration.universe_provider.UniverseProvider.get_candidates",
                 return_value=many_symbols,
@@ -117,6 +118,50 @@ class TestAutoDiscoveryBootstrap:
 
         mock_bootstrap.assert_not_called()
         assert "host" in runtime
+
+    def test_bootstrap_prefers_high_volume_symbols_over_alphabetical_order(self) -> None:
+        """Bootstrap subset should include liquid symbols, not just first alphabetical 30."""
+        args = _default_args()
+        discovered = [f"SYM{i:03d}USDT" for i in range(40)]
+        discovered[35] = "BTCUSDT"
+        discovered[36] = "ETHUSDT"
+
+        volume_map = {sym: Decimal("1") for sym in discovered}
+        volume_map["BTCUSDT"] = Decimal("100000000")
+        volume_map["ETHUSDT"] = Decimal("90000000")
+
+        with (
+            patch.object(mod, "_bootstrap_tuning_cache", return_value=({}, {})) as mock_bootstrap,
+            patch.object(mod, "_fetch_quote_volume_24h_map", return_value=volume_map),
+            patch(
+                "grinder.orchestration.universe_provider.UniverseProvider.get_candidates",
+                return_value=discovered,
+            ),
+        ):
+            mod.build_runtime(args)
+
+        bootstrap_symbols = mock_bootstrap.call_args[0][0]
+        assert len(bootstrap_symbols) <= 30
+        assert "BTCUSDT" in bootstrap_symbols
+        assert "ETHUSDT" in bootstrap_symbols
+
+    def test_volume_ranking_failure_falls_back_to_discovery_order(self) -> None:
+        """If 24h volume fetch fails, preserve discovery-order subset."""
+        args = _default_args()
+        discovered = [f"SYM{i}USDT" for i in range(40)]
+
+        with (
+            patch.object(mod, "_bootstrap_tuning_cache", return_value=({}, {})) as mock_bootstrap,
+            patch.object(mod, "_fetch_quote_volume_24h_map", side_effect=RuntimeError("down")),
+            patch(
+                "grinder.orchestration.universe_provider.UniverseProvider.get_candidates",
+                return_value=discovered,
+            ),
+        ):
+            mod.build_runtime(args)
+
+        bootstrap_symbols = mock_bootstrap.call_args[0][0]
+        assert bootstrap_symbols == discovered[:30]
 
 
 class TestExecutionDesiredTopK:

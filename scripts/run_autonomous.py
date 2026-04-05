@@ -33,11 +33,13 @@ Env vars:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import signal
 import sys
 import time
+import urllib.request
 from decimal import Decimal
 from typing import Any
 
@@ -89,8 +91,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _fetch_price_rest(symbol: str, testnet: bool = True) -> Decimal | None:
     """Fetch current price from Binance Futures REST API (no auth needed)."""
-    import json  # noqa: PLC0415
-    import urllib.request  # noqa: PLC0415
     from decimal import Decimal  # noqa: PLC0415
 
     base = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
@@ -102,6 +102,74 @@ def _fetch_price_rest(symbol: str, testnet: bool = True) -> Decimal | None:
     except Exception as e:
         logger.warning("BOOTSTRAP_PRICE_FETCH_FAILED symbol=%s error=%s", symbol, e)
         return None
+
+
+def _fetch_quote_volume_24h_map(testnet: bool = True) -> dict[str, Decimal]:
+    """Fetch 24h quote volume map for all futures symbols.
+
+    Used only for bootstrap subset ranking: a single cheap bulk call lets us
+    prefer liquid symbols over the provider's alphabetical discovery order.
+    Fail-open: callers should fall back to original order on any exception.
+    """
+    base = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
+    url = f"{base}/fapi/v1/ticker/24hr"
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        data = json.loads(resp.read())
+
+    volume_map: dict[str, Decimal] = {}
+    if not isinstance(data, list):
+        return volume_map
+
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        symbol = entry.get("symbol")
+        quote_volume = entry.get("quoteVolume")
+        if not isinstance(symbol, str) or quote_volume is None:
+            continue
+        try:
+            volume_map[symbol] = Decimal(str(quote_volume))
+        except Exception:
+            continue
+    return volume_map
+
+
+def _select_bootstrap_subset(
+    discovered: list[str],
+    limit: int,
+    *,
+    testnet: bool,
+) -> list[str]:
+    """Select a bounded startup subset for bootstrap tuning.
+
+    Prefers symbols with higher 24h quote volume so the bootstrap-tuned set is
+    operationally useful, instead of taking the first alphabetical slice.
+    Fail-open: if volume ranking fails, preserve the provider order.
+    """
+    if limit <= 0 or not discovered:
+        return []
+
+    try:
+        volume_map = _fetch_quote_volume_24h_map(testnet=testnet)
+    except Exception as e:
+        logger.warning(
+            "BOOTSTRAP_UNIVERSE_VOLUME_RANK_FAILED error=%s — falling back to discovery order",
+            e,
+        )
+        return discovered[:limit]
+
+    ranked = sorted(
+        discovered,
+        key=lambda sym: (-volume_map.get(sym, Decimal("0")), sym),
+    )
+    subset = ranked[:limit]
+    if subset:
+        logger.info(
+            "BOOTSTRAP_UNIVERSE_RANKED_BY_24H_VOLUME limit=%d top=%s",
+            limit,
+            ",".join(subset[:5]),
+        )
+    return subset
 
 
 def _bootstrap_tuning_cache(
@@ -295,12 +363,17 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
         # This seeds TuningCache so the first loop cycle can rank and admit symbols.
         # Fail-open: if discovery raises, continue with empty bootstrap.
         _BOOTSTRAP_UNIVERSE_LIMIT = 30
+        testnet = not getattr(args, "mainnet", False)
         try:
             discovered = universe_provider.get_candidates()
         except Exception:
             logger.warning("BOOTSTRAP_UNIVERSE_DISCOVERY_FAILED — continuing without bootstrap")
             discovered = []
-        bootstrap_subset = discovered[:_BOOTSTRAP_UNIVERSE_LIMIT]
+        bootstrap_subset = _select_bootstrap_subset(
+            discovered,
+            _BOOTSTRAP_UNIVERSE_LIMIT,
+            testnet=testnet,
+        )
         logger.info(
             "BOOTSTRAP_UNIVERSE_DISCOVERED count=%d limit=%d bootstrap=%d",
             len(discovered),
