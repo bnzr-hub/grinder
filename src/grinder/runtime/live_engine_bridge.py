@@ -87,6 +87,8 @@ class LiveEngineBridge:
         self._symbol_sizes: dict[str, str] = {}
         # Per-symbol grid_v2 config from tuning (tick_size, step_size, etc.)
         self._symbol_grid_config: dict[str, dict[str, str]] = {}
+        # Per-symbol adaptive spacing in bps (from NATR via compute_adaptive_spacing_bps).
+        self._symbol_spacings: dict[str, Decimal] = {}
         # Serialize engine construction so env propagation is thread-safe.
         # grid_v2 config is passed via process-global os.environ; this lock
         # prevents overlapping engine __init__ calls from reading each other's
@@ -97,6 +99,11 @@ class LiveEngineBridge:
         """Register tuning-resolved order size for a symbol."""
         self._symbol_sizes[symbol] = order_size
         logger.info("BRIDGE_SYMBOL_SIZE_SET symbol=%s order_size=%s", symbol, order_size)
+
+    def set_symbol_spacing(self, symbol: str, spacing_bps: Decimal) -> None:
+        """Register tuning-resolved adaptive spacing for a symbol."""
+        self._symbol_spacings[symbol] = spacing_bps
+        logger.info("BRIDGE_SYMBOL_SPACING_SET symbol=%s spacing_bps=%s", symbol, spacing_bps)
 
     def set_symbol_grid_config(
         self,
@@ -149,8 +156,9 @@ class LiveEngineBridge:
         os.environ["GRINDER_GRID_V2_SYNC_RECONCILER_SHADOW"] = "0"
         # Account sync: required for grid_v2 startup (needs _last_account_snapshot)
         os.environ["GRINDER_ACCOUNT_SYNC_ENABLED"] = "1"
-        # Spacing: use bridge config (same SSOT as tuning solver)
-        spacing_pct = Decimal(str(cfg.spacing_bps)) / Decimal("10000")
+        # Spacing: per-symbol adaptive if available, else bridge config fallback
+        effective_spacing_bps = self._symbol_spacings.get(symbol, Decimal(str(cfg.spacing_bps)))
+        spacing_pct = effective_spacing_bps / Decimal("10000")
         os.environ["GRINDER_GRID_V2_STEP_PCT"] = str(spacing_pct)
         os.environ["GRINDER_GRID_V2_ENTRY_LEVELS"] = str(cfg.levels)
         # Tick size from tuning result (required by engine)

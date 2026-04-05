@@ -4990,10 +4990,9 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Wiring complete** (follow-on): `_build_v2_selector()` in `run_autonomous.py` replaces `_build_v1_selector()`. `rank_v2` is now the live ranker. `prefilter_v1` unchanged (uses V1 features). Two separate feature fetches: V1 for prefilter, V2 for ranker. Fail-open: V2 fetch failure falls back to V1 ranking. `SELECTOR_TOP_V2` replaces `SELECTOR_TOP` on the ranker path.
 
 
-### ADR-155: Adaptive Grid Spacing Policy — tradability gate (2026-04-05)
+### ADR-156: Wire adaptive spacing into bootstrap tuning and live bridge (2026-04-05)
 
-- **Problem:** Static `spacing_bps = 10` for all symbols. A symbol like PIPPINUSDT with NATR=1.33% gets a 10bps grid step — 13× smaller than its 5m volatility. Grid is too dense, fills are micro, round-trips unprofitable.
-- **Decision:** Introduce `compute_adaptive_spacing_bps(natr_percent) = natr_percent * 50`. If computed spacing < 50 bps: symbol is NOT tradable for grid — reject, not clamp. This is a hard gate in `prefilter_v1`.
-- **Formula:** `spacing_bps = NATR% × 50`. Examples: NATR 1.0% → 50 bps (boundary, passes), NATR 2.0% → 100 bps, NATR 3.0% → 150 bps, NATR 0.9% → 45 bps (rejected).
-- **Latent-at-default invariant:** With default `natr_5m_min=1.0%`, every symbol passing the NATR gate also passes the spacing gate (since 1.0% × 50 = 50 bps ≥ 50). The spacing gate activates independently when `natr_5m_min` is lowered or `min_spacing_bps` is raised.
-- **Scope:** This ADR covers the policy + selector gate only. Wiring adaptive spacing into bootstrap tuning and live bridge is a separate follow-on PR (PR B).
+- **Problem:** ADR-155 introduced the adaptive spacing policy and selector gate, but execution still used static `spacing_bps = 10.0`. Selector and execution were out of sync.
+- **Decision:** Wire `compute_adaptive_spacing_bps(natr_percent)` into both bootstrap tuning and live bridge. Bootstrap computes per-symbol `spacing_pct` from NATR before running the solver. Bridge stores per-symbol adaptive spacing and propagates it as `GRINDER_GRID_V2_STEP_PCT`. Fallback to static `BridgeConfig.spacing_bps` only when NATR is unavailable. SSOT is `grinder.selector.spacing` — no duplicate formulas.
+- **Data flow:** `build_runtime()` → `_fetch_natr_map()` → `_bootstrap_tuning_cache(natr_map=...)` → per-symbol `TuningSolverConfig(spacing_pct=...)` → `bridge.set_symbol_spacing()` → `_propagate_grid_v2_env()` → `GRINDER_GRID_V2_STEP_PCT`.
+- **Consequences:** Closes ADR-155 PR B. Selector and execution now use the same spacing policy end-to-end.
