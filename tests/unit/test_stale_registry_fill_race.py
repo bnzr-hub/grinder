@@ -307,6 +307,8 @@ class TestRealFillPathBeatsStaleClean:
         stay_cids = ["g_g_BTCUSDT_e1_1000_0", "g_g_BTCUSDT_e2_1000_0"]
         bridge.adapter.registry.all_entry_cids = frozenset({fill_cid, *stay_cids})
         bridge.adapter.registry.all_exit_cids = frozenset()
+        # Mark CIDs as fill-eligible (simulating they were live on exchange)
+        engine._grid_v2_fill_eligible_cids.update({fill_cid, *stay_cids})
 
         # Make bridge.on_fill return a non-rejected result
         bridge.on_fill = MagicMock(
