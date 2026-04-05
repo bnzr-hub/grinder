@@ -6,6 +6,8 @@ from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from grinder.selector.feature_provider import (
     _compute_12x5m_volume,
     _compute_natr,
@@ -144,6 +146,10 @@ class TestComputeNatr:
 # --- _fetch_5m_klines tests ---
 
 
+_has_requests = bool(__import__("importlib").util.find_spec("requests"))
+
+
+@pytest.mark.skipif(not _has_requests, reason="requests not installed")
 class TestFetch5mKlines:
     @patch("requests.get")
     def test_uses_5m_interval_and_limit_18(self, mock_get: MagicMock) -> None:
