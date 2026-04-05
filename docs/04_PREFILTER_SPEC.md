@@ -70,8 +70,8 @@ def hard_filter(symbol: str, features: dict) -> tuple[bool, str]:
     if features["vol_24h_usd"] < VOL_MIN_24H:
         return False, "VOL_24H_TOO_LOW"
 
-    if features["vol_1h_usd"] < VOL_MIN_1H:
-        return False, "VOL_1H_TOO_LOW"
+    if features["vol_last_12x5m_usd"] < VOL_MIN_LAST_12X5M:
+        return False, "VOL_LAST_12X5M_TOO_LOW"
 
     if features["trade_count_1m"] < TRADE_COUNT_MIN_1M:
         return False, "ACTIVITY_TOO_LOW"
@@ -91,7 +91,7 @@ def hard_filter(symbol: str, features: dict) -> tuple[bool, str]:
 |------|---------|-------------|
 | `SPREAD_MAX` | 15 bps | Max bid-ask spread |
 | `VOL_MIN_24H` | $10M | Min 24h volume |
-| `VOL_MIN_1H` | $500K | Min 1h volume |
+| `VOL_MIN_LAST_12X5M` | $2M | Min rolling 12×5m quote volume |
 | `TRADE_COUNT_MIN_1M` | 100 | Min trades per minute |
 | `OI_MIN` | $5M | Min open interest |
 

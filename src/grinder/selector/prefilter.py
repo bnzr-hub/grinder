@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # V1 defaults
-DEFAULT_VOLUME_1H_MIN = Decimal("50000")  # $50k 1h quote volume
+DEFAULT_VOLUME_LAST_12X5M_MIN = Decimal("2000000")  # $2M rolling 12x5m quote volume
 DEFAULT_NATR_5M_MIN = Decimal("1.0")  # 1% NATR minimum
 
 
@@ -25,7 +25,7 @@ def prefilter_v1(
     tuning_results: dict[str, TuningResult],
     features: dict[str, SelectionFeatures],
     *,
-    volume_1h_min: Decimal = DEFAULT_VOLUME_1H_MIN,
+    volume_last_12x5m_min: Decimal = DEFAULT_VOLUME_LAST_12X5M_MIN,
     natr_5m_min: Decimal = DEFAULT_NATR_5M_MIN,
     blacklist: frozenset[str] = frozenset(),
     max_notional_per_order: Decimal | None = None,
@@ -58,14 +58,14 @@ def prefilter_v1(
             skipped[symbol] = SkipReason.FEATURES_UNAVAILABLE
             continue
 
-        # 1h volume floor
-        if feat.quote_volume_1h < volume_1h_min:
-            skipped[symbol] = SkipReason.LOW_VOLUME_1H
+        # Rolling 12x5m volume floor
+        if feat.quote_volume_last_12x5m < volume_last_12x5m_min:
+            skipped[symbol] = SkipReason.LOW_VOLUME_LAST_12X5M
             logger.debug(
-                "SELECTOR_PREFILTER_SKIP symbol=%s reason=LOW_VOLUME_1H volume=%s min=%s",
+                "SELECTOR_PREFILTER_SKIP symbol=%s reason=LOW_VOLUME_LAST_12X5M volume=%s min=%s",
                 symbol,
-                feat.quote_volume_1h,
-                volume_1h_min,
+                feat.quote_volume_last_12x5m,
+                volume_last_12x5m_min,
             )
             continue
 

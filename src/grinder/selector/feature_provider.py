@@ -1,7 +1,7 @@
 """Fetch market-data features for V1 symbol selection.
 
 Uses Binance Futures REST endpoints:
-- /fapi/v1/klines for 1h volume and 5m NATR
+- /fapi/v1/klines for 5m volume and NATR
 - /fapi/v1/ticker/bookTicker for spread
 """
 
@@ -16,6 +16,10 @@ from grinder.selector.models import SelectionFeatures
 logger = logging.getLogger(__name__)
 
 _ZERO = Decimal("0")
+
+# Minimum closed candles required (15 for NATR(14) which needs 14 TRs + 1 prev close;
+# also guarantees >= 12 for volume since 15 > 12).
+_MIN_CLOSED_CANDLES = 15
 
 
 def fetch_selection_features(
@@ -46,9 +50,24 @@ def fetch_selection_features(
 
 def _fetch_one(symbol: str, base: str, timeout: int) -> SelectionFeatures | None:
     """Fetch features for one symbol. Returns None on failure."""
-    # 1h kline for volume
-    volume_1h = _fetch_1h_volume(symbol, base, timeout)
-    if volume_1h is None:
+    # Single 5m kline fetch for both volume and NATR
+    klines = _fetch_5m_klines(symbol, base, timeout)
+    if klines is None:
+        return None
+
+    # Exclude current unclosed candle
+    closed = klines[:-1]
+    if len(closed) < _MIN_CLOSED_CANDLES:
+        return None
+
+    # Rolling volume from last 12 closed 5m candles
+    volume = _compute_12x5m_volume(closed)
+    if volume is None:
+        return None
+
+    # NATR(14) from closed candles
+    natr = _compute_natr(closed, period=14)
+    if natr is None:
         return None
 
     # Book ticker for spread
@@ -56,36 +75,55 @@ def _fetch_one(symbol: str, base: str, timeout: int) -> SelectionFeatures | None
     if bid is None or ask is None:
         return None
 
-    # 5m klines for NATR(14)
-    natr = _fetch_natr_5m(symbol, base, timeout)
-    if natr is None:
-        return None
-
     return SelectionFeatures(
         symbol=symbol,
-        quote_volume_1h=volume_1h,
+        quote_volume_last_12x5m=volume,
         best_bid=bid,
         best_ask=ask,
         natr_14_5m=natr,
     )
 
 
-def _fetch_1h_volume(symbol: str, base: str, timeout: int) -> Decimal | None:
-    """Fetch 1h quote volume from latest closed kline."""
+def _fetch_5m_klines(symbol: str, base: str, timeout: int) -> list[Any] | None:
+    """Fetch 5m klines. Returns raw kline list or None on failure.
+
+    Requests limit=18 to guarantee at least 17 closed candles after
+    excluding the current unclosed one — enough for both:
+    - rolling volume (last 12 closed)
+    - NATR(14) (needs 15 closed: 14 TRs + 1 prev close)
+    """
     import requests  # noqa: PLC0415
 
     try:
         resp = requests.get(
             f"{base}/fapi/v1/klines",
-            params={"symbol": symbol, "interval": "1h", "limit": 2},
+            params={"symbol": symbol, "interval": "5m", "limit": 18},
             timeout=timeout,
         )
-        data = resp.json()
-        if not data or len(data) < 2:
+        data: list[Any] = resp.json()
+        if not data or len(data) < _MIN_CLOSED_CANDLES + 1:
             return None
-        # Use second-to-last kline (latest closed)
-        return Decimal(str(data[-2][7]))  # quoteAssetVolume
+        return data
     except (Exception, InvalidOperation):
+        return None
+
+
+def _compute_12x5m_volume(closed_klines: list[Any]) -> Decimal | None:
+    """Compute rolling volume as sum of last 12 closed 5m candle quote volumes.
+
+    Args:
+        closed_klines: list of closed klines (current unclosed already excluded).
+
+    Returns:
+        Sum of quoteAssetVolume (index 7) for the last 12 candles, or None if
+        fewer than 12 closed candles available.
+    """
+    if len(closed_klines) < 12:
+        return None
+    last_12 = closed_klines[-12:]
+    try:
+        return sum((Decimal(str(k[7])) for k in last_12), _ZERO)
+    except (InvalidOperation, IndexError, TypeError):
         return None
 
 
@@ -107,24 +145,6 @@ def _fetch_book_ticker(
         return bid, ask
     except (Exception, InvalidOperation):
         return None, None
-
-
-def _fetch_natr_5m(symbol: str, base: str, timeout: int) -> Decimal | None:
-    """Compute NATR(14) from 5m klines."""
-    import requests  # noqa: PLC0415
-
-    try:
-        resp = requests.get(
-            f"{base}/fapi/v1/klines",
-            params={"symbol": symbol, "interval": "5m", "limit": 16},
-            timeout=timeout,
-        )
-        data = resp.json()
-        if not data or len(data) < 15:
-            return None
-        return _compute_natr(data[:-1], period=14)  # exclude current unclosed
-    except (Exception, InvalidOperation):
-        return None
 
 
 def _compute_natr(klines: list[Any], period: int = 14) -> Decimal | None:
