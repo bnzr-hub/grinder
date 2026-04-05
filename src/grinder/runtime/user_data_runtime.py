@@ -64,18 +64,9 @@ def build_user_data_connector(
     )
     lk_cfg = ListenKeyConfig(base_url=base_url, api_key=api_key)
 
-    try:
-        from scripts.http_measured_client import RequestsHttpClient  # noqa: PLC0415
+    from scripts.http_measured_client import RequestsHttpClient  # noqa: PLC0415
 
-        http_client = RequestsHttpClient(port_name="user_data")
-    except ImportError:
-        from grinder.connectors.binance_user_data_ws import (  # noqa: PLC0415
-            RequestsHttpClient as FallbackClient,
-        )
-
-        http_client = FallbackClient()  # type: ignore[call-arg]
-
-    lk_mgr = ListenKeyManager(http_client, lk_cfg)
+    lk_mgr = ListenKeyManager(RequestsHttpClient(port_name="user_data"), lk_cfg)
     logger.info(
         "USER_DATA_CONNECTOR_BUILT symbol_filter=%s net=%s",
         symbol or "none",

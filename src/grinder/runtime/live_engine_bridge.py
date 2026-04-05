@@ -552,7 +552,7 @@ class LiveEngineBridge:
         try:
             await connector.connect()
             logger.info("BRIDGE_ENGINE_CONNECTED symbol=%s mode=%s", symbol, cfg.mode)
-            log_engine_startup(symbol, engine_ms, 0, engine_ms)
+            log_engine_startup(symbol, int(engine_ms), 0, int(engine_ms))
             if engine_ready is not None:
                 engine_ready.set()
 
