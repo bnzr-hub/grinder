@@ -6582,3 +6582,151 @@ class TestFillEligibleCids:
             assert cid in engine2._grid_v2_fill_eligible_cids, (
                 f"Restored CID {cid} must be fill-eligible"
             )
+
+
+class TestEventLedgerVisibilityFallback:
+    """Tests for trusted-but-stale ledger fallback to snapshot (ADR-160)."""
+
+    def test_stale_ledger_falls_back_to_snapshot(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Trusted ledger with no user-data events → snapshot used for CID visibility."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def always_succeed(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = always_succeed
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        engine._grid_v2_awaiting_sync = False
+        engine._grid_v2_pending_seed_cids = frozenset()
+        engine._grid_v2_pending_place_cids.clear()
+
+        # Simulate: ledger is trusted but NO user-data events ever received
+        engine._event_ledger._bootstrapped = True
+        engine._event_ledger._last_convergence_ok = True
+        engine._event_ledger._trust_revoked = False
+        engine._last_user_data_event_mono = 0.0  # never received
+
+        # Snapshot shows only 9 orders (one disappeared = fill)
+        seed_cids = sorted(bridge.adapter.registry.all_entry_cids)
+        filled_cid = seed_cids[0]
+        remaining = []
+        for cid in seed_cids[1:]:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            remaining.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS + 10000,
+                )
+            )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(remaining),
+            ts=_BASE_TS + 10000,
+            source="test",
+        )
+
+        # With stale ledger, _grid_v2_exchange_cids should use snapshot (9 CIDs)
+        exchange_cids = engine._grid_v2_exchange_cids("BTCUSDT")
+        assert filled_cid not in exchange_cids, (
+            "Stale ledger must not mask filled order — snapshot should be used"
+        )
+        assert len(exchange_cids) == len(seed_cids) - 1
+
+    def test_fresh_ledger_used_when_events_flowing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Trusted + fresh ledger → ledger used for CID visibility."""
+        import time  # noqa: PLC0415
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        port = MagicMock()
+        port.place_order.side_effect = lambda *_a, **_kw: "ORDER_1"
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+
+        # Simulate: ledger trusted AND user-data event just received
+        engine._event_ledger._bootstrapped = True
+        engine._event_ledger._last_convergence_ok = True
+        engine._event_ledger._trust_revoked = False
+        engine._last_user_data_event_mono = time.monotonic()  # fresh
+
+        assert engine._event_ledger.is_trusted
+        assert engine._is_event_ledger_fresh_for_visibility()

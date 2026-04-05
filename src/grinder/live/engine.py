@@ -1662,13 +1662,30 @@ class LiveEngineV0:
         )
         return True
 
+    def _is_event_ledger_fresh_for_visibility(self) -> bool:
+        """Check if EventLedger is safe to use as current open-order visibility source.
+
+        Trusted is necessary but not sufficient: user-data order events must
+        also be flowing. A trusted-but-stale ledger can blind disappearance-based
+        fill detection when user-data WS is silent.
+        """
+        if not self._event_ledger.is_trusted:
+            return False
+        if self._last_user_data_event_mono <= 0:
+            return False  # no order event ever received
+        import time  # noqa: PLC0415
+
+        age = time.monotonic() - self._last_user_data_event_mono
+        return age <= 5.0
+
     def _grid_v2_exchange_cids(self, symbol: str) -> set[str]:
         """Get current grid_v2 CIDs on exchange.
 
-        ADR-109 Phase 2 PR-2: prefer EventLedger when trusted for faster
-        fill/cancel detection. Falls back to last account snapshot otherwise.
+        ADR-109 Phase 2 PR-2: prefer EventLedger when trusted AND fresh for
+        faster fill/cancel detection. Falls back to last account snapshot when
+        ledger is stale (no recent user-data order events).
         """
-        if self._event_ledger.is_trusted:
+        if self._is_event_ledger_fresh_for_visibility():
             cids: set[str] = set()
             for cid in self._event_ledger.open_orders_for_symbol(symbol):
                 parsed = parse_client_order_id(cid)

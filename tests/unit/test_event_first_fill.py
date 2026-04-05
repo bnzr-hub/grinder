@@ -95,6 +95,8 @@ class TestExchangeCidsLedgerPreference:
     """_grid_v2_exchange_cids prefers ledger when trusted."""
 
     def test_trusted_ledger_used(self) -> None:
+        import time  # noqa: PLC0415
+
         engine = _make_engine()
         engine._grid_v2_enabled = True
         engine._grid_v2_symbol = "BTCUSDT"
@@ -106,6 +108,7 @@ class TestExchangeCidsLedgerPreference:
         ledger.compare_with_snapshot(snap)
         assert ledger.is_trusted
         engine._event_ledger = ledger
+        engine._last_user_data_event_mono = time.monotonic()  # fresh events
 
         # Snapshot is stale/empty
         engine._last_account_snapshot = _snap(orders=[], ts=500)
@@ -164,6 +167,8 @@ class TestExchangeCidsLedgerPreference:
         assert _G_ENTRY_CID not in ledger.open_orders()
 
     def test_filters_by_symbol(self) -> None:
+        import time  # noqa: PLC0415
+
         engine = _make_engine()
         engine._grid_v2_enabled = True
         engine._grid_v2_symbol = "BTCUSDT"
@@ -178,6 +183,7 @@ class TestExchangeCidsLedgerPreference:
         ledger.hydrate_from_snapshot(snap)
         ledger.compare_with_snapshot(snap)
         engine._event_ledger = ledger
+        engine._last_user_data_event_mono = time.monotonic()  # fresh events
 
         cids = engine._grid_v2_exchange_cids("BTCUSDT")
         assert _G_ENTRY_CID in cids
