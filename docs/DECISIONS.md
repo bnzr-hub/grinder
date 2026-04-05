@@ -5028,3 +5028,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Observed in:** DRIFTUSDT canary — order fully filled on exchange, 39 sync cycles ran, but zero GRID_V2_FILL_PROCESSED events. Ledger was trusted=True from initial hydration. No user-data order events ever received.
 - **Decision:** Add `_is_event_ledger_fresh_for_visibility()` helper. Ledger is used for CID visibility only when trusted AND `_last_user_data_event_mono` is within 5s. Otherwise falls back to `_last_account_snapshot.open_orders`. This is a visibility-consumer fallback, not a global trust revocation.
 - **Consequences:** When user-data WS delivers events, ledger provides fast fill detection. When silent, snapshot fallback restores backup fill detection. No blind spots.
+
+
+### ADR-109 Phase 3 PR-1: Shadow PositionLedger from ACCOUNT_UPDATE (2026-04-05)
+
+- **Problem:** Position truth is snapshot-only (REST positionRisk). No event-driven position model exists. No visibility into whether ACCOUNT_UPDATE position events agree with REST snapshots.
+- **Decision:** Add shadow `PositionLedger` in `src/grinder/account/position_ledger.py`. Feed from ACCOUNT_UPDATE via `process_user_data_event()`. Compare against `AccountSnapshot.positions` on each sync. Log divergences. Zero behavioral change — shadow/observability only.
+- **Changes:** `FuturesPositionEvent` enriched with `position_side` (from Binance `"ps"` field, default `"BOTH"`). `PositionLedger` keyed by `(symbol, position_side)`, stale-event suppressed. Comparison detects missing/mismatch. Engine wired at init, event feed, and sync comparison.
+- **Scope:** Shadow only. No authority switch, no consumer migration, no risk/budget changes. Position truth authority remains with REST snapshot.
