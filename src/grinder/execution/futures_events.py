@@ -177,6 +177,7 @@ class FuturesPositionEvent:
     position_amt: Decimal
     entry_price: Decimal
     unrealized_pnl: Decimal
+    position_side: str = "BOTH"  # Binance "ps" field: BOTH, LONG, SHORT
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to JSON-serializable dict."""
@@ -186,6 +187,7 @@ class FuturesPositionEvent:
             "position_amt": str(self.position_amt),
             "entry_price": str(self.entry_price),
             "unrealized_pnl": str(self.unrealized_pnl),
+            "position_side": self.position_side,
         }
 
     def to_json(self) -> str:
@@ -201,6 +203,7 @@ class FuturesPositionEvent:
             position_amt=Decimal(d["position_amt"]),
             entry_price=Decimal(d["entry_price"]),
             unrealized_pnl=Decimal(d["unrealized_pnl"]),
+            position_side=d.get("position_side", "BOTH"),
         )
 
     @classmethod
@@ -246,6 +249,7 @@ class FuturesPositionEvent:
                     position_amt=Decimal(pos.get("pa", "0")),
                     entry_price=Decimal(pos.get("ep", "0")),
                     unrealized_pnl=Decimal(pos.get("up", "0")),
+                    position_side=pos.get("ps", "BOTH"),
                 )
 
         # Symbol not in positions - return zero position
@@ -282,6 +286,7 @@ class FuturesPositionEvent:
                         position_amt=Decimal(pos.get("pa", "0")),
                         entry_price=Decimal(pos.get("ep", "0")),
                         unrealized_pnl=Decimal(pos.get("up", "0")),
+                        position_side=pos.get("ps", "BOTH"),
                     )
                 )
         return result

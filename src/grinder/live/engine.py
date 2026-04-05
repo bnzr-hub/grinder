@@ -709,8 +709,10 @@ class LiveEngineV0:
         self._health_mode_prev = LiveHealthMode.HEALTHY
         # ADR-109 Phase 2: EventLedger as trusted read model (healthy mode)
         from grinder.account.event_ledger import EventLedger  # noqa: PLC0415
+        from grinder.account.position_ledger import PositionLedger  # noqa: PLC0415
 
         self._event_ledger = EventLedger()
+        self._position_ledger = PositionLedger()
         # ADR-102: Risk-Saturated Mode — per-symbol tracking
         # Consecutive RISK_SYMBOL_CAP blocks (reset on allow, non-cap block, or sync headroom)
         self._risk_cap_consecutive_blocks: dict[str, int] = {}
@@ -2720,12 +2722,15 @@ class LiveEngineV0:
         This path is a low-latency supplement to account-sync polling:
         terminal ORDER_TRADE_UPDATE events are applied immediately.
         """
-        # ADR-109 Phase 1: Feed order events to shadow EventLedger.
-        # Order-only in Phase 1. Position tracking deferred to Phase 2.
-        # Zero behavioral change — ledger is observability only.
+        # ADR-109 Phase 1/2: Feed order events to EventLedger.
         if event.order_event is not None:
             self._event_ledger.apply_order_event(event.order_event)
             self._last_user_data_event_mono = time.monotonic()
+
+        # ADR-109 Phase 3: Feed position events to shadow PositionLedger.
+        # Shadow only — zero behavioral change. No authority switch.
+        if event.position_event is not None:
+            self._position_ledger.apply_position_event(event.position_event)
 
         if not self._is_grid_v2_active(self._grid_v2_symbol):
             return
@@ -4476,6 +4481,21 @@ class LiveEngineV0:
                         shadow.ledger_open_orders,
                         shadow.snapshot_open_orders,
                     )
+            # ADR-109 Phase 3: shadow PositionLedger comparison (no authority)
+            try:
+                pos_cmp = self._position_ledger.compare_with_snapshot(result.snapshot)
+                if not pos_cmp.is_converged:
+                    for d in pos_cmp.divergences[:5]:
+                        logger.info(
+                            "POSITION_LEDGER_SHADOW_DIVERGENCE symbol=%s side=%s kind=%s detail=%s",
+                            d.symbol,
+                            d.position_side,
+                            d.kind.value,
+                            d.detail,
+                        )
+            except Exception:
+                logger.debug("POSITION_LEDGER_COMPARE_ERROR", exc_info=True)
+
             # PR6: clear awaiting-sync flag only when ALL seed CIDs are visible.
             # ADR-109 Phase 2: prefer ledger for visibility when trusted,
             # fall back to snapshot. Ledger may know about orders sooner
