@@ -4488,10 +4488,10 @@ class LiveEngineV0:
                     for div in pos_cmp.divergences[:5]:
                         logger.info(
                             "POSITION_LEDGER_SHADOW_DIVERGENCE symbol=%s side=%s kind=%s detail=%s",
-                            div.symbol,  # type: ignore[attr-defined]
-                            div.position_side,  # type: ignore[attr-defined]
-                            div.kind.value,  # type: ignore[attr-defined]
-                            div.detail,  # type: ignore[attr-defined]
+                            div.symbol,
+                            div.position_side,
+                            div.kind.value,
+                            div.detail,
                         )
             except Exception:
                 logger.debug("POSITION_LEDGER_COMPARE_ERROR", exc_info=True)

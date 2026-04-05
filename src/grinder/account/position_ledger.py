@@ -102,8 +102,9 @@ class PositionLedger:
         # Build snapshot position map: (symbol, side) → signed_qty
         snap_positions: dict[tuple[str, str], Decimal] = {}
         for pos in snapshot.positions:
-            if pos.signed_qty != 0:
-                snap_positions[(pos.symbol, pos.side)] = pos.signed_qty
+            qty = pos.signed_qty if pos.signed_qty is not None else pos.qty
+            if qty != 0:
+                snap_positions[(pos.symbol, pos.side)] = qty
 
         # Check ledger positions against snapshot
         for key, lp in sorted(self._positions.items()):
