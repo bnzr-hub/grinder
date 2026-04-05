@@ -154,6 +154,52 @@ class TestPrefilterV1:
         assert eligible == ["ANY"]
 
 
+class TestPrefilterAdaptiveSpacing:
+    def test_below_min_spacing_excluded(self) -> None:
+        """Symbol with NATR producing spacing < 50 bps is rejected."""
+        # NATR=0.9% → spacing=45 bps < 50 → rejected
+        # Must lower natr_5m_min so LOW_NATR_5M doesn't shadow the spacing gate
+        eligible, _skipped = prefilter_v1(
+            ["LOW"],
+            {"LOW": _tuned("LOW")},
+            {"LOW": _feat("LOW", natr="0.9")},
+            natr_5m_min=Decimal("0.5"),  # lower NATR floor so spacing gate fires
+        )
+        assert eligible == []
+        assert _skipped["LOW"] == SkipReason.GRID_SPACING_BELOW_MIN
+
+    def test_at_boundary_natr_1pct_passes(self) -> None:
+        """NATR=1.0% → spacing=50 bps → exactly at boundary → passes."""
+        eligible, _skipped = prefilter_v1(
+            ["BOUNDARY"],
+            {"BOUNDARY": _tuned("BOUNDARY")},
+            {"BOUNDARY": _feat("BOUNDARY", natr="1.0")},
+        )
+        assert eligible == ["BOUNDARY"]
+
+    def test_gate_order_low_natr_wins(self) -> None:
+        """Symbol with NATR=0.5% gets LOW_NATR_5M, not GRID_SPACING_BELOW_MIN."""
+        eligible, _skipped = prefilter_v1(
+            ["VERYLOW"],
+            {"VERYLOW": _tuned("VERYLOW")},
+            {"VERYLOW": _feat("VERYLOW", natr="0.5")},
+        )
+        assert eligible == []
+        assert _skipped["VERYLOW"] == SkipReason.LOW_NATR_5M
+
+    def test_custom_min_spacing_bps(self) -> None:
+        """Caller can raise min_spacing_bps to reject symbols with moderate NATR."""
+        # NATR=1.5% → spacing=75 bps. With min_spacing_bps=100, rejected.
+        eligible, _skipped = prefilter_v1(
+            ["MED"],
+            {"MED": _tuned("MED")},
+            {"MED": _feat("MED", natr="1.5")},
+            min_spacing_bps=Decimal("100"),
+        )
+        assert eligible == []
+        assert _skipped["MED"] == SkipReason.GRID_SPACING_BELOW_MIN
+
+
 # --- Ranker tests ---
 
 

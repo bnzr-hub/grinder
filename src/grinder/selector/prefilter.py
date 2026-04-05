@@ -27,6 +27,7 @@ def prefilter_v1(
     *,
     volume_last_12x5m_min: Decimal = DEFAULT_VOLUME_LAST_12X5M_MIN,
     natr_5m_min: Decimal = DEFAULT_NATR_5M_MIN,
+    min_spacing_bps: Decimal | None = None,
     blacklist: frozenset[str] = frozenset(),
     max_notional_per_order: Decimal | None = None,
 ) -> tuple[list[str], dict[str, SkipReason]]:
@@ -35,7 +36,13 @@ def prefilter_v1(
     Returns (eligible, skipped) where skipped maps symbol → reason.
     """
     from grinder.selector.models import SkipReason  # noqa: PLC0415
+    from grinder.selector.spacing import (  # noqa: PLC0415
+        DEFAULT_MIN_SPACING_BPS,
+        compute_adaptive_spacing_bps,
+    )
     from grinder.tuning.solver import TuningStatus  # noqa: PLC0415
+
+    _min_spacing = min_spacing_bps if min_spacing_bps is not None else DEFAULT_MIN_SPACING_BPS
 
     eligible: list[str] = []
     skipped: dict[str, SkipReason] = {}
@@ -77,6 +84,19 @@ def prefilter_v1(
                 symbol,
                 feat.natr_14_5m,
                 natr_5m_min,
+            )
+            continue
+
+        # Adaptive grid spacing tradability
+        spacing_bps = compute_adaptive_spacing_bps(feat.natr_14_5m)
+        if spacing_bps < _min_spacing:
+            skipped[symbol] = SkipReason.GRID_SPACING_BELOW_MIN
+            logger.debug(
+                "SELECTOR_PREFILTER_SKIP symbol=%s reason=GRID_SPACING_BELOW_MIN"
+                " spacing_bps=%s min=%s",
+                symbol,
+                spacing_bps,
+                _min_spacing,
             )
             continue
 
