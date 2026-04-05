@@ -4485,13 +4485,13 @@ class LiveEngineV0:
             try:
                 pos_cmp = self._position_ledger.compare_with_snapshot(result.snapshot)
                 if not pos_cmp.is_converged:
-                    for d in pos_cmp.divergences[:5]:
+                    for div in pos_cmp.divergences[:5]:
                         logger.info(
                             "POSITION_LEDGER_SHADOW_DIVERGENCE symbol=%s side=%s kind=%s detail=%s",
-                            d.symbol,
-                            d.position_side,
-                            d.kind.value,
-                            d.detail,
+                            div.symbol,  # type: ignore[attr-defined]
+                            div.position_side,  # type: ignore[attr-defined]
+                            div.kind.value,  # type: ignore[attr-defined]
+                            div.detail,  # type: ignore[attr-defined]
                         )
             except Exception:
                 logger.debug("POSITION_LEDGER_COMPARE_ERROR", exc_info=True)
