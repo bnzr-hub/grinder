@@ -1699,12 +1699,12 @@ class LiveEngineV0:
     def get_effective_signed_position_qty(self, symbol: str) -> Decimal:
         """Get position qty from trusted PositionLedger or snapshot fallback.
 
-        Phase 3 PR-2: trusted read API. Not yet called by any consumer —
-        consumer migration is Phase 3 PR-3.
+        Phase 3: switched boundary. Uses PositionLedger when trusted+fresh,
+        falls back to REST snapshot otherwise.
         """
         if self._is_position_ledger_fresh_for_reads():
             return self._position_ledger.get_signed_qty(symbol)
-        return self._get_signed_position_qty(symbol)
+        return self._get_signed_position_qty_from_snapshot(symbol)
 
     def _grid_v2_exchange_cids(self, symbol: str) -> set[str]:
         """Get current grid_v2 CIDs on exchange.
@@ -5712,8 +5712,8 @@ class LiveEngineV0:
                 return p.qty
         return Decimal("0")
 
-    def _get_signed_position_qty(self, symbol: str) -> Decimal:
-        """Get signed position quantity for symbol.
+    def _get_signed_position_qty_from_snapshot(self, symbol: str) -> Decimal:
+        """Get signed position quantity from REST snapshot only.
 
         Returns:
             Positive for LONG, negative for SHORT, zero if flat/no snapshot.
@@ -5729,6 +5729,14 @@ class LiveEngineV0:
                     return p.signed_qty
                 return p.qty  # fallback: positive (legacy PositionSnap without signed_qty)
         return Decimal("0")
+
+    def _get_signed_position_qty(self, symbol: str) -> Decimal:
+        """Get signed position quantity for symbol (Phase 3 switched boundary).
+
+        Delegates to trusted PositionLedger when fresh and converged,
+        falls back to REST snapshot otherwise.
+        """
+        return self.get_effective_signed_position_qty(symbol)
 
     def _has_grinder_orders(self, symbol: str) -> bool:
         """Check if exchange has any grinder-owned orders for symbol.

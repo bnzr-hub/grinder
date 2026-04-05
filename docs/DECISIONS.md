@@ -5044,3 +5044,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Extend `PositionLedger` with trust state machine (bootstrapped + converged + not revoked). Add `record_comparison_result()` to update trust from sync. Add `get_signed_qty(symbol)` for ledger reads. Add engine-side `_is_position_ledger_fresh_for_reads()` predicate (trusted + fresh within 5s). Add `get_effective_signed_position_qty(symbol)` read API with snapshot fallback.
 - **Trust contract:** `is_trusted = bootstrapped AND last_convergence_ok AND NOT trust_revoked`. Bootstrap on first non-zero position event. Divergence revokes immediately. Convergence restores.
 - **Scope:** Trust infrastructure + read API only. Zero consumer migration — `_get_signed_position_qty()` unchanged. Phase 3 PR-3 will switch first consumer.
+
+
+### ADR-109 Phase 3 PR-3: First consumer switch — _get_signed_position_qty (2026-04-05)
+
+- **Problem:** Phase 3 PR-2 added the trusted read model but no consumer used it. Position truth was still snapshot-only in all engine decisions.
+- **Decision:** Switch `_get_signed_position_qty()` to delegate to `get_effective_signed_position_qty()`. Extract old implementation to `_get_signed_position_qty_from_snapshot()`. All existing call sites automatically use the new authority path without code changes.
+- **Layering:** `_get_signed_position_qty()` → `get_effective_signed_position_qty()` → trusted ledger if fresh, `_get_signed_position_qty_from_snapshot()` otherwise. No recursion risk.
+- **Scope:** Only `_get_signed_position_qty()` authority changes. No reduce-only budget, portfolio risk, or startup/reconstruct changes. Narrow, reversible boundary switch.
