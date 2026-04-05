@@ -1478,6 +1478,8 @@ class LiveEngineV0:
         if g_orders:
             # Reconstruct from exchange state
             ok = bridge.startup(g_orders, pos_qty, snapshot.mid_price, snapshot.ts)
+            if ok:
+                self._grid_v2_seed_fill_eligible_from_registry()
             if not ok:
                 logger.error(
                     "GRID_V2_STARTUP_FAILED symbol=%s reason=%s mode=%s",
@@ -1537,6 +1539,8 @@ class LiveEngineV0:
             # Pass empty orders list to reconstruct_snapshot which will synthesize
             # a protective lot + exit from position_qty.
             ok = bridge.startup([], pos_qty, snapshot.mid_price, snapshot.ts)
+            if ok:
+                self._grid_v2_seed_fill_eligible_from_registry()
             if not ok:
                 logger.error(
                     "GRID_V2_STARTUP_FAILED symbol=%s reason=%s mode=%s",
@@ -1782,6 +1786,8 @@ class LiveEngineV0:
         self._sync_reconciler_pending_actions = []
         self._grid_v2_awaiting_sync = False
         self._grid_v2_pending_seed_cids = frozenset()
+        # Reconstructed orders from exchange are provably live
+        self._grid_v2_seed_fill_eligible_from_registry()
 
         if rebuilt.f2_protective_recovery:
             protective = rebuilt.get_f2_protective_exit_actions(snapshot.ts)
@@ -1920,6 +1926,21 @@ class LiveEngineV0:
         """
         self._grid_v2_pending_place_cids[cid] = self._account_sync_generation
         self._grid_v2_fill_eligible_cids.add(cid)
+
+    def _grid_v2_seed_fill_eligible_from_registry(self) -> None:
+        """Seed fill-eligible set from current bridge registry.
+
+        Called after startup/reconstruct paths that import already-live
+        exchange orders into the registry. These orders are provably live
+        on exchange and must be fill-eligible.
+        """
+        bridge = self._grid_v2_bridge
+        if bridge is None:
+            return
+        for cid in bridge.adapter.registry.all_entry_cids:
+            self._grid_v2_fill_eligible_cids.add(cid)
+        for cid in bridge.adapter.registry.all_exit_cids:
+            self._grid_v2_fill_eligible_cids.add(cid)
 
     def _grid_v2_process_cancel_acks(self, symbol: str, _ts: int) -> None:
         """Detect confirmed cancels and route through bridge.on_cancel_ack().

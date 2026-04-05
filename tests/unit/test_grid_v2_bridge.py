@@ -6481,3 +6481,104 @@ class TestFillEligibleCids:
         )
         result = engine._grid_v2_process_fills("BTCUSDT", _BASE_TS + 10000)
         assert len(result) > 0  # Real fills detected
+
+    def test_restored_exchange_orders_are_fill_eligible(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Orders restored from exchange during startup are fill-eligible."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from grinder.account.contracts import AccountSnapshot, OpenOrderSnap  # noqa: PLC0415
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.contracts import Snapshot  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+
+        monkeypatch.setenv("GRINDER_GRID_V2_ENABLED", "1")
+        monkeypatch.setenv("GRINDER_GRID_V2_SYMBOL", "BTCUSDT")
+        monkeypatch.setenv("GRINDER_GRID_V2_TICK_SIZE", "0.01")
+
+        call_count = {"n": 0}
+
+        def always_succeed(*args: object, **kwargs: object) -> str:
+            call_count["n"] += 1
+            return f"ORDER_{call_count['n']}"
+
+        port = MagicMock()
+        port.place_order.side_effect = always_succeed
+        engine = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # First: fresh startup to get seed CIDs
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=_BASE_TS, source="test"
+        )
+        snap = Snapshot(
+            ts=_BASE_TS,
+            symbol="BTCUSDT",
+            bid_price=Decimal("49999"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000"),
+            last_qty=Decimal("1"),
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        # Capture seed CIDs as if they are on exchange
+        seed_cids = list(bridge.adapter.registry.all_entry_cids)
+        assert len(seed_cids) > 0
+
+        # Now simulate a restart: create a NEW engine that restores from exchange
+        engine2 = LiveEngineV0(
+            paper_engine=MagicMock(),
+            exchange_port=port,
+            config=LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE),
+        )
+
+        # Pre-populate account snapshot with existing orders (as if exchange has them)
+        exchange_orders = []
+        for cid in seed_cids:
+            reg = bridge.adapter.registry.lookup_entry(cid)
+            if reg is None:
+                continue
+            exchange_orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol="BTCUSDT",
+                    side=reg.side.value,
+                    order_type="LIMIT",
+                    price=reg.price,
+                    qty=_ORDER_SIZE,
+                    filled_qty=Decimal(0),
+                    reduce_only=False,
+                    status="NEW",
+                    ts=_BASE_TS,
+                )
+            )
+        engine2._last_account_snapshot = AccountSnapshot(
+            positions=(),
+            open_orders=tuple(exchange_orders),
+            ts=_BASE_TS,
+            source="test",
+        )
+
+        # Startup with existing exchange orders → restore path
+        engine2.process_snapshot(snap)
+        bridge2 = engine2._grid_v2_bridge
+        assert bridge2 is not None
+
+        # Restored orders should be fill-eligible
+        restored_cids = set(bridge2.adapter.registry.all_entry_cids) | set(
+            bridge2.adapter.registry.all_exit_cids
+        )
+        for cid in restored_cids:
+            assert cid in engine2._grid_v2_fill_eligible_cids, (
+                f"Restored CID {cid} must be fill-eligible"
+            )
