@@ -4996,3 +4996,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Wire `compute_adaptive_spacing_bps(natr_percent)` into both bootstrap tuning and live bridge. Bootstrap computes per-symbol `spacing_pct` from NATR before running the solver. Bridge stores per-symbol adaptive spacing and propagates it as `GRINDER_GRID_V2_STEP_PCT`. Fallback to static `BridgeConfig.spacing_bps` only when NATR is unavailable. SSOT is `grinder.selector.spacing` — no duplicate formulas.
 - **Data flow:** `build_runtime()` → `_fetch_natr_map()` → `_bootstrap_tuning_cache(natr_map=...)` → per-symbol `TuningSolverConfig(spacing_pct=...)` → `bridge.set_symbol_spacing()` → `_propagate_grid_v2_env()` → `GRINDER_GRID_V2_STEP_PCT`.
 - **Consequences:** Closes ADR-155 PR B. Selector and execution now use the same spacing policy end-to-end.
+
+
+### ADR-157: Definitive-reject fill gate — prevent false fills (2026-04-05)
+
+- **Problem:** When exchange rejects a PLACE order with definitive 400/-2027 (or -4164 etc), the CID was cleaned from the adapter registry but could still be misinterpreted as "filled" when the next account snapshot showed no such order. This caused false `GRID_V2_FILL_PROCESSED` events and phantom cancel waves/exit orders.
+- **Observed in:** SIRENUSDT canary — all 30 order placements returned 400 (-2027), 0 successful, but engine logged 4 false fill events.
+- **Decision:** Add `_grid_v2_definitively_rejected_cids: set[str]` to `LiveEngineV0`. Populated in `_grid_v2_clean_failed_place()` (all FAILED/BLOCKED/SKIPPED PLACEs). Excluded in `_grid_v2_process_fills()` alongside pending_cancels and pending_places. Cleared on every bridge-reset path (reseed, drift reconstruct, order-size update).
+- **Ambiguous rejects unchanged:** CIDs from `-2010` or `None` responses are NOT added to the blocklist — they follow the existing quarantine path via `_grid_v2_pending_place_cids`.
+- **Consequences:** Definitive-rejected PLACE CIDs can never become fill candidates. False fills after exchange rejections are impossible.
