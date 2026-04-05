@@ -4979,3 +4979,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Why 12×5m instead of 1h:** Finer granularity gives a more current "what is liquid now?" signal. The sum of 12 closed 5m candles covers the same 1-hour window but updates every 5 minutes instead of every hour. This catches temporary liquidity drops faster.
 - **Contract changes:** `SelectionFeatures.quote_volume_1h` → `quote_volume_last_12x5m`; `SkipReason.LOW_VOLUME_1H` → `LOW_VOLUME_LAST_12X5M`; `DEFAULT_VOLUME_1H_MIN` → `DEFAULT_VOLUME_LAST_12X5M_MIN = $2M`; `prefilter_v1(volume_1h_min=)` → `prefilter_v1(volume_last_12x5m_min=)`.
 - **Side effect:** One fewer REST call per symbol (1h kline call eliminated). Net improvement in fetch efficiency.
+
+
+### ADR-154: Autonomous Ranker V2 — range/trend/toxicity/execution_fit (2026-04-05)
+
+- **Problem:** V1 ranker used 3 factors (volume, spread, NATR). It selected the most liquid+volatile symbol, but not necessarily the best symbol for grid trading. A trending symbol with high volume could outrank a choppier symbol that would produce more fill round-trips.
+- **Decision:** Add V2 ranker with 7-component formula: `score = 0.25L + 0.15S + 0.20V + 0.25R + 0.15E - 0.15T - 0.10X`. L=liquidity, S=spread, V=volatility, R=range_score (choppiness), E=execution_fit, T=trend_penalty, X=toxicity_penalty. Range score rewards mean-reverting price action (sum_abs_returns / net_return). Trend penalty discourages directional symbols. Toxicity is a simple spread-based first pass. Execution fit rewards symbols comfortably under runtime caps.
+- **Implementation:** `SelectionFeaturesV2` and `ScoredSymbolV2` models, `fetch_selection_features_v2()`, `rank_v2()` — all additive alongside V1. `_compute_range_trend_klines()` mirrors `compute_range_trend()` from `indicators.py` but operates on raw kline data without MidBar dependency. No new REST calls — all V2 features computed from the same 5m klines already fetched.
+- **Scope:** This ADR covers the V2 scoring engine only. Wiring `rank_v2` into the `AutonomousLoop` as the live ranker is a separate follow-on PR. V1 `rank_v1`, `prefilter_v1`, and `SelectionFeatures` are unchanged.
+- **Consequences:** V2 ranker is available as `rank_v2()` library function. Float-based scoring (unlike V1 integer convention from ADR-023). Deterministic tie-break by `(-score, symbol)`. 10 ranker tests + 14 feature tests.
