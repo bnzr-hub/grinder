@@ -4988,3 +4988,12 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Implementation:** `SelectionFeaturesV2` and `ScoredSymbolV2` models, `fetch_selection_features_v2()`, `rank_v2()` — all additive alongside V1. `_compute_range_trend_klines()` mirrors `compute_range_trend()` from `indicators.py` but operates on raw kline data without MidBar dependency. No new REST calls — all V2 features computed from the same 5m klines already fetched.
 - **Consequences:** V2 ranker is available as `rank_v2()` library function. Float-based scoring (unlike V1 integer convention from ADR-023). Deterministic tie-break by `(-score, symbol)`. 10 ranker tests + 14 feature tests.
 - **Wiring complete** (follow-on): `_build_v2_selector()` in `run_autonomous.py` replaces `_build_v1_selector()`. `rank_v2` is now the live ranker. `prefilter_v1` unchanged (uses V1 features). Two separate feature fetches: V1 for prefilter, V2 for ranker. Fail-open: V2 fetch failure falls back to V1 ranking. `SELECTOR_TOP_V2` replaces `SELECTOR_TOP` on the ranker path.
+
+
+### ADR-155: Adaptive Grid Spacing Policy — tradability gate (2026-04-05)
+
+- **Problem:** Static `spacing_bps = 10` for all symbols. A symbol like PIPPINUSDT with NATR=1.33% gets a 10bps grid step — 13× smaller than its 5m volatility. Grid is too dense, fills are micro, round-trips unprofitable.
+- **Decision:** Introduce `compute_adaptive_spacing_bps(natr_percent) = natr_percent * 50`. If computed spacing < 50 bps: symbol is NOT tradable for grid — reject, not clamp. This is a hard gate in `prefilter_v1`.
+- **Formula:** `spacing_bps = NATR% × 50`. Examples: NATR 1.0% → 50 bps (boundary, passes), NATR 2.0% → 100 bps, NATR 3.0% → 150 bps, NATR 0.9% → 45 bps (rejected).
+- **Latent-at-default invariant:** With default `natr_5m_min=1.0%`, every symbol passing the NATR gate also passes the spacing gate (since 1.0% × 50 = 50 bps ≥ 50). The spacing gate activates independently when `natr_5m_min` is lowered or `min_spacing_bps` is raised.
+- **Scope:** This ADR covers the policy + selector gate only. Wiring adaptive spacing into bootstrap tuning and live bridge is a separate follow-on PR (PR B).
