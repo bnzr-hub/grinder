@@ -190,7 +190,9 @@ class PositionLedger:
 
         non_flat_ledger = sum(1 for lp in self._positions.values() if lp.position_amt != 0)
         non_flat_snap = sum(
-            1 for p in snapshot.positions if (p.signed_qty if p.signed_qty is not None else p.qty) != 0
+            1
+            for p in snapshot.positions
+            if (p.signed_qty if p.signed_qty is not None else p.qty) != 0
         )
 
         return PositionComparisonResult(
