@@ -494,6 +494,16 @@ class FuturesUserDataWsConnector:
             # Parse event
             event = UserDataEvent.from_binance(data, self._config.symbol_filter)
 
+            # Debug: log ACCOUNT_UPDATE arrival for position truth investigation
+            if data.get("e") == "ACCOUNT_UPDATE":
+                p_symbols = [p.get("s") for p in data.get("a", {}).get("P", [])]
+                logger.debug(
+                    "USER_DATA_ACCOUNT_UPDATE_RAW symbols_in_P=%s filter=%s position_event=%s",
+                    p_symbols,
+                    self._config.symbol_filter,
+                    event.position_event is not None,
+                )
+
             # Update stats by event type
             if event.order_event is not None:
                 self._stats.order_events += 1
