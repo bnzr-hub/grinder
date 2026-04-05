@@ -312,6 +312,7 @@ def _build_engine_bridge(args: argparse.Namespace) -> Any:
             armed=args.armed,
             use_testnet=not args.mainnet,
             exchange_port=args.exchange_port,
+            enable_user_data=args.exchange_port == "futures" and args.armed,
             max_notional_per_order=args.max_notional_per_order,
             max_orders_per_run=args.max_orders_per_run,
             ws_transport=ws_transport,

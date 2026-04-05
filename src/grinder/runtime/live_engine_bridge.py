@@ -61,6 +61,7 @@ class BridgeConfig:
     armed: bool = False
     use_testnet: bool = True
     exchange_port: str = "noop"  # "noop" or "futures"
+    enable_user_data: bool = False  # opt-in for user-data WS (Phase 2 event-first path)
     spacing_bps: float = 10.0
     levels: int = 5
     size_per_level: str = "0.001"
@@ -414,15 +415,49 @@ class LiveEngineBridge:
         except Exception as e:
             logger.error("BRIDGE_ENGINE_THREAD_FATAL symbol=%s error=%s", symbol, e)
 
-    async def _run_engine_async(
+    def _start_user_data_task(
         self,
         symbol: str,
-        shutdown_event: threading.Event,
-        handle_ref: list | None = None,  # type: ignore[type-arg]
-        *,
-        engine_ready: threading.Event | None = None,
-    ) -> None:
-        """Async engine lifecycle: connect → process snapshots → shutdown."""
+        engine: Any,
+        cfg: BridgeConfig,
+        shutdown_event: Any,
+        async_shutdown: asyncio.Event,
+    ) -> tuple[asyncio.Task | None, asyncio.Task | None]:  # type: ignore[type-arg]
+        """Start user-data WS task if enabled. Returns (user_data_task, shutdown_bridge_task)."""
+        if not cfg.enable_user_data or cfg.exchange_port != "futures":
+            return None, None
+
+        from grinder.runtime.user_data_runtime import (  # noqa: PLC0415
+            bridge_shutdown_from_threading_event,
+            build_user_data_connector,
+            run_user_data_loop,
+        )
+
+        shutdown_bridge_task = asyncio.create_task(
+            bridge_shutdown_from_threading_event(shutdown_event, async_shutdown)
+        )
+        # Verify connector can be built before starting the loop.
+        # Pass a factory (not a single instance) so each retry gets a fresh connector —
+        # close() is terminal and a reused connector would fail on reconnect.
+        probe = build_user_data_connector(symbol=symbol, use_testnet=cfg.use_testnet)
+        if probe is None:
+            return None, shutdown_bridge_task
+
+        def _make_fresh_connector() -> Any:
+            return build_user_data_connector(symbol=symbol, use_testnet=cfg.use_testnet)
+
+        user_data_task = asyncio.create_task(
+            run_user_data_loop(
+                make_conn=_make_fresh_connector,
+                on_event=engine.process_user_data_event,
+                shutdown=async_shutdown,
+            )
+        )
+        logger.info("BRIDGE_USER_DATA_LOOP_STARTED symbol=%s", symbol)
+        return user_data_task, shutdown_bridge_task
+
+    def _build_engine_and_connector(self, symbol: str) -> tuple[Any, Any, Any, float]:
+        """Build engine + connector for a symbol. Returns (engine, port, connector, engine_ms)."""
         from grinder.connectors.live_connector import (  # noqa: PLC0415
             LiveConnectorConfig,
             LiveConnectorV0,
@@ -430,17 +465,13 @@ class LiveEngineBridge:
         )
         from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
         from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
-        from grinder.observability.latency_telemetry import (  # noqa: PLC0415
-            PhaseTimer,
-            log_engine_startup,
-        )
+        from grinder.observability.latency_telemetry import PhaseTimer  # noqa: PLC0415
         from grinder.paper.engine import PaperEngine  # noqa: PLC0415
 
         startup_timer = PhaseTimer()
         cfg = self._config
         mode = SafeMode(cfg.mode)
 
-        # Per-symbol tuned size takes precedence over bridge default
         effective_size = self._symbol_sizes.get(symbol, cfg.size_per_level)
         logger.info(
             "BRIDGE_ENGINE_SIZE symbol=%s size=%s source=%s",
@@ -449,9 +480,6 @@ class LiveEngineBridge:
             "tuning" if symbol in self._symbol_sizes else "default",
         )
 
-        # Engine construction under lock: grid_v2 config is passed via
-        # process-global os.environ, so overlapping constructions would race.
-        # Lock serializes; try/finally guarantees env restore even on failure.
         with self._engine_construction_lock:
             saved_env = {k: os.environ.get(k) for k in self._GRID_V2_ENV_KEYS}
             self._propagate_grid_v2_env(symbol, effective_size, cfg)
@@ -462,11 +490,7 @@ class LiveEngineBridge:
                     size_per_level=Decimal(effective_size),
                 )
                 port = self._build_port(symbol, mode)
-                engine_config = LiveEngineConfig(
-                    armed=cfg.armed,
-                    mode=mode,
-                )
-                # AccountSyncer: grid_v2 needs _last_account_snapshot for startup.
+                engine_config = LiveEngineConfig(armed=cfg.armed, mode=mode)
                 account_syncer = self._build_account_syncer(symbol, port)
                 engine = LiveEngineV0(
                     paper_engine=paper,
@@ -479,12 +503,6 @@ class LiveEngineBridge:
                 self._restore_grid_v2_env(saved_env)
         engine_ms = startup_timer.elapsed_ms()
 
-        # Propagate engine + port refs to the handle for graceful_exit and cleanup.
-        if handle_ref is not None and handle_ref[0] is not None:
-            handle_ref[0].engine_ref = engine
-            handle_ref[0].port_ref = port
-
-        # Futures WS URL: testnet and mainnet use different endpoints than spot.
         ws_url = (
             (
                 "wss://stream.binancefuture.com/ws"
@@ -494,28 +512,55 @@ class LiveEngineBridge:
             if cfg.exchange_port == "futures"
             else None
         )
-        connector_config = LiveConnectorConfig(
-            mode=mode,
-            symbols=[symbol],
-            use_testnet=cfg.use_testnet,
-            ws_transport=cfg.ws_transport,
-            ws_url=ws_url,
+        connector = LiveConnectorV0(
+            config=LiveConnectorConfig(
+                mode=mode,
+                symbols=[symbol],
+                use_testnet=cfg.use_testnet,
+                ws_transport=cfg.ws_transport,
+                ws_url=ws_url,
+            )
         )
-        connector = LiveConnectorV0(config=connector_config)
+        return engine, port, connector, engine_ms
+
+    async def _run_engine_async(
+        self,
+        symbol: str,
+        shutdown_event: threading.Event,
+        handle_ref: list | None = None,  # type: ignore[type-arg]
+        *,
+        engine_ready: threading.Event | None = None,
+    ) -> None:
+        """Async engine lifecycle: connect → process snapshots → shutdown."""
+        from grinder.observability.latency_telemetry import log_engine_startup  # noqa: PLC0415
+
+        engine, port, connector, engine_ms = self._build_engine_and_connector(symbol)
+        cfg = self._config
+
+        # Propagate engine + port refs to the handle for graceful_exit and cleanup.
+        if handle_ref is not None and handle_ref[0] is not None:
+            handle_ref[0].engine_ref = engine
+            handle_ref[0].port_ref = port
 
         # Signal readiness AFTER connector.connect() succeeds.
         # If connect fails, engine_ready never fires → factory fail-closed.
+        # User-data task setup (Phase 2 event-first path)
+        user_data_task: asyncio.Task[None] | None = None
+        async_shutdown = asyncio.Event()
+        shutdown_bridge_task: asyncio.Task[None] | None = None
+
         try:
             await connector.connect()
-            logger.info("BRIDGE_ENGINE_CONNECTED symbol=%s mode=%s", symbol, mode.value)
-            log_engine_startup(
-                symbol,
-                engine_ms,
-                startup_timer.elapsed_ms() - engine_ms,
-                startup_timer.elapsed_ms(),
-            )
+            logger.info("BRIDGE_ENGINE_CONNECTED symbol=%s mode=%s", symbol, cfg.mode)
+            log_engine_startup(symbol, int(engine_ms), 0, int(engine_ms))
             if engine_ready is not None:
                 engine_ready.set()
+
+            # Start user-data loop if enabled and conditions met
+            user_data_task, shutdown_bridge_task = self._start_user_data_task(
+                symbol, engine, cfg, shutdown_event, async_shutdown
+            )
+
             async for snapshot in connector.iter_snapshots():
                 if shutdown_event.is_set():
                     break
@@ -525,6 +570,16 @@ class LiveEngineBridge:
         finally:
             import contextlib  # noqa: PLC0415
 
+            async_shutdown.set()
+            if user_data_task is not None and not user_data_task.done():
+                user_data_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await user_data_task
+                logger.info("BRIDGE_USER_DATA_LOOP_ENDED symbol=%s", symbol)
+            if shutdown_bridge_task is not None and not shutdown_bridge_task.done():
+                shutdown_bridge_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await shutdown_bridge_task
             with contextlib.suppress(Exception):
                 await connector.close()
             logger.info("BRIDGE_ENGINE_LOOP_ENDED symbol=%s", symbol)

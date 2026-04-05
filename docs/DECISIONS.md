@@ -5013,3 +5013,10 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Observed in:** STOUSDT repeat canary — seeds `e0-e9` were real, but `e10, e13, e16...` (response-action CIDs) all produced `GRID_V2_FILL_PROCESSED` AND `GRID_V2_FAILED_PLACE_CLEANED`.
 - **Decision:** Replace negative-exclusion with positive-allowlist. Add `_grid_v2_fill_eligible_cids: set[str]`. Only CIDs with credible live-on-exchange evidence (EXECUTED or ambiguous quarantine) may be fill candidates. Populated in `_grid_v2_register_pending_place()`. Discarded in `_grid_v2_clean_failed_place()`. Cleared on bridge reset. Fill detection formula: `(disappeared & fill_eligible_cids) - pending_cancels - pending_places - definitively_rejected_cids`.
 - **Consequences:** Mere registry presence no longer implies fill candidacy. ADR-157 blocklist retained as belt-and-suspenders. Cascading false-fill loops structurally impossible.
+
+### ADR-159: Autonomous user-data EventLedger parity (Phase 2) (2026-04-05)
+
+- **Problem:** Autonomous engines used the same `LiveEngineV0` as `run_trading` but did not start a user-data WebSocket loop. `ORDER_TRADE_UPDATE` events never reached `engine.process_user_data_event()`, so event-first fills/cancel-acks and EventLedger trust/freshness were inactive. The engine relied entirely on snapshot-diff fill detection.
+- **Decision:** Add user-data WS task to `LiveEngineBridge._run_engine_async()` as a concurrent `asyncio.Task` alongside the market-data loop. Extract shared `run_user_data_loop()` and `build_user_data_connector()` into `src/grinder/runtime/user_data_runtime.py` (used by both `run_trading.py` and bridge). New `BridgeConfig.enable_user_data: bool = False` opt-in field. `threading.Event` → `asyncio.Event` bridged via polling task.
+- **Fail-open:** If user-data connector cannot be built (noop port, missing API key, disabled env) or task dies, engine continues on market-data snapshots only. No startup hard dependency.
+- **Scope:** Phase 2 only (ORDER_TRADE_UPDATE). Phase 3 (ACCOUNT_UPDATE position authority) not included.
