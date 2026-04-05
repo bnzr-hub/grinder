@@ -81,8 +81,15 @@ class TestRankV2:
 
     def test_score_formula_matches_weighted_sum(self) -> None:
         """Score for a single symbol equals the exact weighted formula."""
-        feat = _feat_v2("ONLY", volume="5000000", natr="2.0", range_score=50,
-                        net_return_bps=10, execution_fit_score=0.8, toxicity_penalty_raw=0.1)
+        feat = _feat_v2(
+            "ONLY",
+            volume="5000000",
+            natr="2.0",
+            range_score=50,
+            net_return_bps=10,
+            execution_fit_score=0.8,
+            toxicity_penalty_raw=0.1,
+        )
         scored = rank_v2(["ONLY"], {"ONLY": feat})
         assert len(scored) == 1
         s = scored[0]
@@ -133,13 +140,15 @@ class TestRankV2:
             "BIGVOL": SelectionFeatures(
                 symbol="BIGVOL",
                 quote_volume_last_12x5m=Decimal("10000000"),
-                best_bid=Decimal("1.0"), best_ask=Decimal("1.001"),
+                best_bid=Decimal("1.0"),
+                best_ask=Decimal("1.001"),
                 natr_14_5m=Decimal("2.0"),
             ),
             "CHOPPY": SelectionFeatures(
                 symbol="CHOPPY",
                 quote_volume_last_12x5m=Decimal("4000000"),
-                best_bid=Decimal("1.0"), best_ask=Decimal("1.001"),
+                best_bid=Decimal("1.0"),
+                best_ask=Decimal("1.001"),
                 natr_14_5m=Decimal("2.0"),
             ),
         }
@@ -148,10 +157,20 @@ class TestRankV2:
 
         # V2 features: CHOPPY has much higher range_score, BIGVOL is trending
         v2_features = {
-            "BIGVOL": _feat_v2("BIGVOL", volume="10000000", range_score=5,
-                               net_return_bps=150, toxicity_penalty_raw=0.3),
-            "CHOPPY": _feat_v2("CHOPPY", volume="4000000", range_score=100,
-                               net_return_bps=5, toxicity_penalty_raw=0.05),
+            "BIGVOL": _feat_v2(
+                "BIGVOL",
+                volume="10000000",
+                range_score=5,
+                net_return_bps=150,
+                toxicity_penalty_raw=0.3,
+            ),
+            "CHOPPY": _feat_v2(
+                "CHOPPY",
+                volume="4000000",
+                range_score=100,
+                net_return_bps=5,
+                toxicity_penalty_raw=0.05,
+            ),
         }
         v2_result = rank_v2(["BIGVOL", "CHOPPY"], v2_features)
         assert v2_result[0].symbol == "CHOPPY"  # V2 prefers choppy

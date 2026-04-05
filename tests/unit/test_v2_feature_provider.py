@@ -85,9 +85,17 @@ class TestComputeRangeTrendKlines:
         # Build klines
         klines = [_make_kline(close=str(c), high=str(c + 3), low=str(c - 3)) for c in closes]
         # Build MidBars
-        bars = [MidBar(bar_ts=i, open=Decimal(str(c)), high=Decimal(str(c + 3)),
-                       low=Decimal(str(c - 3)), close=Decimal(str(c)), tick_count=10)
-                for i, c in enumerate(closes)]
+        bars = [
+            MidBar(
+                bar_ts=i,
+                open=Decimal(str(c)),
+                high=Decimal(str(c + 3)),
+                low=Decimal(str(c - 3)),
+                close=Decimal(str(c)),
+                tick_count=10,
+            )
+            for i, c in enumerate(closes)
+        ]
 
         kline_result = _compute_range_trend_klines(klines, horizon=14)
         bar_result = compute_range_trend(bars, horizon=14)
