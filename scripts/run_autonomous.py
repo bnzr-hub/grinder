@@ -411,50 +411,22 @@ def _build_engine_bridge(args: argparse.Namespace) -> Any:
 
 
 def _build_v2_selector(
-    tuned_results: dict[str, Any],
+    state: Any,  # AutonomousTuningState — read at call time, not construction time
     tuning_cache: Any,
     blacklist: frozenset[str],
-    mainnet: bool,
     max_notional_per_order: str = "100",
 ) -> tuple[Any, Any]:
-    """Build V2 prefilter and ranker closures for symbol selection.
+    """Build V2 prefilter and ranker closures backed by dynamic shared state.
 
-    Prefilter uses V1 features (SelectionFeatures) — unchanged semantics.
-    Ranker uses V2 features (SelectionFeaturesV2) with range/trend/toxicity/exec_fit.
+    Closures read from AutonomousTuningState on every invocation so that
+    periodic tuning refresh is automatically visible to selector.
     """
     from decimal import Decimal as _D  # noqa: PLC0415
 
-    from grinder.selector.feature_provider import (  # noqa: PLC0415
-        fetch_selection_features,
-        fetch_selection_features_v2,
-    )
     from grinder.selector.prefilter import prefilter_v1  # noqa: PLC0415
     from grinder.selector.ranker import rank_v1, rank_v2  # noqa: PLC0415
 
     _max_notional = _D(max_notional_per_order)
-
-    # Build tuning order sizes for V2 execution_fit_score
-    tuning_order_sizes: dict[str, Decimal] = {}
-    for sym, result in tuned_results.items():
-        if result.order_size is not None:
-            tuning_order_sizes[sym] = result.order_size
-
-    symbols = list(tuned_results.keys())
-
-    # V1 features for prefilter (type: dict[str, SelectionFeatures])
-    v1_features: dict[str, Any] = {}
-    if symbols:
-        v1_features = fetch_selection_features(symbols, mainnet=mainnet)
-
-    # V2 features for ranker (type: dict[str, SelectionFeaturesV2])
-    v2_features: dict[str, Any] = {}
-    if symbols:
-        v2_features = fetch_selection_features_v2(
-            symbols,
-            tuning_order_sizes=tuning_order_sizes,
-            max_notional_per_order=_max_notional,
-            mainnet=mainnet,
-        )
 
     def prefilter(candidates: list[str]) -> list[str]:
         eligible, _skipped = prefilter_v1(
@@ -464,18 +436,17 @@ def _build_v2_selector(
                 for sym in candidates
                 if tuning_cache.get(sym) is not None
             },
-            features=v1_features,
+            features=state.v1_features,  # dynamic read
             blacklist=blacklist,
             max_notional_per_order=_max_notional,
         )
         return eligible
 
     def ranker(candidates: list[str]) -> list[str]:
-        scored = rank_v2(candidates, v2_features)
+        scored = rank_v2(candidates, state.v2_features)  # dynamic read
         if scored:
             return [s.symbol for s in scored]
-        # Fail-open: fall back to V1 ranking if V2 features are unavailable
-        scored_v1 = rank_v1(candidates, v1_features)
+        scored_v1 = rank_v1(candidates, state.v1_features)  # dynamic fallback
         if scored_v1:
             logger.warning(
                 "SELECTOR_V2_FALLBACK_TO_V1 candidates=%d reason=no_v2_features",
@@ -507,6 +478,77 @@ def _propagate_tuning_to_bridge(
         natr_val = natr_map.get(sym)
         if natr_val is not None:
             bridge.set_symbol_spacing(sym, compute_adaptive_spacing_bps(natr_val))
+
+
+def _build_tuning_state_and_selector(
+    tuned_results: dict[str, Any],
+    tuned_sizes: dict[str, str],
+    natr_map: dict[str, Decimal],
+    symbols_override: frozenset[str],
+    mainnet: bool,
+    args: Any,
+    tuning_cache: Any,
+    blacklist: frozenset[str],
+    bridge: Any,
+    registry: Any,
+) -> tuple[Any, Any, Any, Any]:
+    """Build shared tuning state, refresher, and selector closures (ADR-162)."""
+    from grinder.tuning.autonomous_state import AutonomousTuningState  # noqa: PLC0415
+    from grinder.tuning.refresher import TuningRefresher  # noqa: PLC0415
+
+    candidates = list(tuned_results.keys()) or (
+        sorted(symbols_override) if symbols_override else []
+    )
+    v1_features, v2_features = _fetch_initial_selector_features(
+        tuned_results, mainnet, args.max_notional_per_order
+    )
+
+    state = AutonomousTuningState(
+        candidates=candidates,
+        tuned_results=tuned_results,
+        tuned_sizes=tuned_sizes,
+        natr_map=natr_map,
+        v1_features=v1_features,
+        v2_features=v2_features,
+    )
+
+    prefilter, ranker = _build_v2_selector(
+        state, tuning_cache, blacklist, max_notional_per_order=args.max_notional_per_order
+    )
+
+    refresher = TuningRefresher(
+        state=state, cache=tuning_cache, bridge=bridge, registry=registry, args=args
+    )
+
+    return state, refresher, prefilter, ranker
+
+
+def _fetch_initial_selector_features(
+    tuned_results: dict[str, Any],
+    mainnet: bool,
+    max_notional_per_order: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Fetch initial V1+V2 selector features for bootstrap tuned symbols."""
+    from grinder.selector.feature_provider import (  # noqa: PLC0415
+        fetch_selection_features,
+        fetch_selection_features_v2,
+    )
+
+    symbols = list(tuned_results.keys())
+    if not symbols:
+        return {}, {}
+    v1_features = fetch_selection_features(symbols, mainnet=mainnet)
+    order_sizes: dict[str, Decimal] = {}
+    for sym, result in tuned_results.items():
+        if result.order_size is not None:
+            order_sizes[sym] = result.order_size
+    v2_features = fetch_selection_features_v2(
+        symbols,
+        tuning_order_sizes=order_sizes,
+        max_notional_per_order=Decimal(max_notional_per_order),
+        mainnet=mainnet,
+    )
+    return v1_features, v2_features
 
 
 def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
@@ -623,13 +665,10 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
         deactivate_fn=host.finalize_deactivation,
     )
 
-    # V2 selector (ADR-154): range/trend/toxicity/execution_fit scoring
-    _prefilter, _ranker = _build_v2_selector(
-        _tuned_results,
-        tuning_cache,
-        blacklist,
-        getattr(args, "mainnet", False),
-        max_notional_per_order=args.max_notional_per_order,
+    # Shared tuning/selector state + refresher (ADR-162)
+    _tuning_state, refresher, _prefilter, _ranker = _build_tuning_state_and_selector(
+        _tuned_results, _tuned_sizes, _natr_map,
+        symbols_override, mainnet, args, tuning_cache, blacklist, bridge, registry,
     )
 
     # Assemble autonomous loop with execution integration
@@ -655,6 +694,7 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
         "coordinator": coordinator,
         "tuning_cache": tuning_cache,
         "universe_provider": universe_provider,
+        "refresher": refresher,
     }
 
 
@@ -694,6 +734,11 @@ def main() -> None:
     runtime = build_runtime(args)
     loop = runtime["loop"]
     host = runtime["host"]
+    refresher = runtime.get("refresher")
+
+    # Start tuning refresher (ADR-162)
+    if refresher is not None:
+        refresher.start()
 
     # Signal handling
     def handle_stop(*_: object) -> None:
@@ -716,6 +761,9 @@ def main() -> None:
         logger.error("AUTONOMOUS_SYSTEM_FATAL error=%s", e)
         sys.exit(1)
     finally:
+        # Stop tuning refresher
+        if refresher is not None:
+            refresher.stop()
         # Shutdown all host-owned engines safely
         if host.live_symbols:
             logger.info("HOST_SHUTDOWN_START live_symbols=%s", sorted(host.live_symbols))
