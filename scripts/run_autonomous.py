@@ -91,6 +91,46 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
+def _fetch_account_equity(testnet: bool = True) -> Decimal | None:
+    """Fetch total margin balance (equity) from Binance Futures REST API.
+
+    Uses authenticated /fapi/v2/balance endpoint. Returns totalMarginBalance
+    which equals wallet balance + unrealized PnL — the correct equity figure
+    for day risk tracking.
+    """
+    import hashlib  # noqa: PLC0415
+    import hmac  # noqa: PLC0415
+
+    api_key = os.environ.get("BINANCE_API_KEY", "").strip()
+    api_secret = os.environ.get("BINANCE_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        return None
+
+    base = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
+    ts = int(time.time() * 1000)
+    query = f"timestamp={ts}&recvWindow=10000"
+    sig = hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+    url = f"{base}/fapi/v2/balance?{query}&signature={sig}"
+
+    try:
+        req = urllib.request.Request(url, headers={"X-MBX-APIKEY": api_key})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            for asset in data:
+                if asset.get("asset") == "USDT":
+                    return Decimal(str(asset.get("marginBalance", "0")))
+        return None
+    except Exception:
+        return None
+
+
+def _current_utc_session_key() -> str:
+    """Return current UTC date as session key for day rollover."""
+    import datetime  # noqa: PLC0415
+
+    return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
+
+
 def _fetch_price_rest(symbol: str, testnet: bool = True) -> Decimal | None:
     """Fetch current price from Binance Futures REST API (no auth needed)."""
     from decimal import Decimal  # noqa: PLC0415
@@ -523,6 +563,13 @@ def _build_tuning_state_and_selector(
     return state, refresher, prefilter, ranker
 
 
+def _build_day_risk_manager() -> Any:
+    """Build DayRiskManager with default config."""
+    from grinder.risk.day_risk_manager import DayRiskManager  # noqa: PLC0415
+
+    return DayRiskManager()
+
+
 def _fetch_initial_selector_features(
     tuned_results: dict[str, Any],
     mainnet: bool,
@@ -703,6 +750,7 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
         "tuning_cache": tuning_cache,
         "universe_provider": universe_provider,
         "refresher": refresher,
+        "day_risk_manager": _build_day_risk_manager(),
     }
 
 
@@ -757,9 +805,26 @@ def main() -> None:
 
     print("\nGRINDER AUTONOMOUS SYSTEM running. Press Ctrl+C to stop.\n")
 
+    # Day risk manager — shadow update each cycle
+    day_risk_manager = runtime.get("day_risk_manager")
+    testnet = not getattr(args, "mainnet", False)
+
+    def _cycle_facts() -> None:
+        """Per-cycle hook: update DayRiskManager from account equity."""
+        if day_risk_manager is None:
+            return
+        try:
+            equity = _fetch_account_equity(testnet=testnet)
+            if equity is not None and equity > 0:
+                session_key = _current_utc_session_key()
+                day_risk_manager.update(equity, session_key=session_key)
+        except Exception:
+            pass  # fail-open: never block the loop
+
     # Run
     try:
         reports = loop.run_forever(
+            facts_fn=_cycle_facts,
             clock=time.monotonic,
             sleep_fn=time.sleep,
             max_cycles=args.max_cycles,
