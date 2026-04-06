@@ -97,9 +97,12 @@ class PortfolioBudgetAllocator:
         }.get(inp.market_regime, cfg.risk_pct_neutral)
 
         # Day mode modifier
-        if inp.day_mode == DayRiskMode.STOP_FOR_DAY:
+        if inp.day_mode in (DayRiskMode.STOP_FOR_DAY, DayRiskMode.FORCE_REDUCE):
             effective_risk_pct = _ZERO
-            reasons.append("STOP_FOR_DAY")
+            reasons.append(inp.day_mode.value)
+        elif inp.day_mode == DayRiskMode.STOP_NEW_RISK:
+            effective_risk_pct = _ZERO
+            reasons.append("STOP_NEW_RISK")
         elif inp.day_mode == DayRiskMode.DEFENSIVE:
             effective_risk_pct = base_risk_pct * cfg.defensive_multiplier
         else:
@@ -118,10 +121,12 @@ class PortfolioBudgetAllocator:
         # Admission decision
         new_entries_allowed = True
 
-        if inp.day_mode == DayRiskMode.STOP_FOR_DAY:
+        if inp.day_mode in (
+            DayRiskMode.STOP_FOR_DAY,
+            DayRiskMode.FORCE_REDUCE,
+            DayRiskMode.STOP_NEW_RISK,
+        ):
             new_entries_allowed = False
-            if "STOP_FOR_DAY" not in reasons:
-                reasons.append("STOP_FOR_DAY")
 
         if remaining_slots <= 0:
             new_entries_allowed = False
