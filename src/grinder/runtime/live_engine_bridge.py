@@ -106,21 +106,16 @@ class LiveEngineBridge:
 
     @property
     def last_known_equity(self) -> Decimal | None:
-        """Read last-known equity (non-blocking, may be stale or None)."""
+        """Read last-known equity (non-blocking, may be stale or None).
+
+        Updated by TuningRefresher alongside tuning refresh — same REST
+        cadence, no per-tick cost, no engine risk-base gate dependency.
+        """
         return self._last_known_equity
 
-    def update_equity_from_engine(self, engine: Any) -> None:
-        """Update cached equity from engine's risk base snapshot (thread-safe).
-
-        Called after engine sync completes. Reads the same total_margin_balance
-        used by engine's own risk gating — no duplicate REST calls.
-        """
-        try:
-            snap = getattr(engine, "_risk_base_snapshot", None)
-            if snap is not None and snap.value is not None:
-                self._last_known_equity = snap.value
-        except Exception:
-            pass
+    def update_equity(self, equity: Decimal) -> None:
+        """Set last-known equity (thread-safe, called by refresher)."""
+        self._last_known_equity = equity
 
     def set_symbol_spacing(self, symbol: str, spacing_bps: Decimal) -> None:
         """Register tuning-resolved adaptive spacing for a symbol."""
@@ -503,10 +498,6 @@ class LiveEngineBridge:
 
         with self._engine_construction_lock:
             saved_env = {k: os.environ.get(k) for k in self._GRID_V2_ENV_KEYS}
-            # Enable risk base for equity tracking (day risk manager)
-            saved_env["GRINDER_RISK_BASE_ENABLED"] = os.environ.get("GRINDER_RISK_BASE_ENABLED")
-            if cfg.exchange_port == "futures":
-                os.environ["GRINDER_RISK_BASE_ENABLED"] = "true"
             self._propagate_grid_v2_env(symbol, effective_size, cfg)
             try:
                 paper = PaperEngine(
@@ -590,8 +581,6 @@ class LiveEngineBridge:
                 if shutdown_event.is_set():
                     break
                 engine.process_snapshot(snapshot)
-                # Push equity to bridge for day risk (non-blocking, best-effort)
-                self.update_equity_from_engine(engine)
         except Exception as e:
             logger.error("BRIDGE_ENGINE_LOOP_ERROR symbol=%s error=%s", symbol, e)
         finally:
