@@ -181,8 +181,8 @@ class TestSessionRollover:
         assert m.mode == DayRiskMode.STOP_FOR_DAY
 
         m.reset_for_new_day(equity_start=Decimal("92"))
-        assert m.mode == DayRiskMode.NORMAL
         state = m.update(Decimal("92"))
+        assert state.mode == DayRiskMode.NORMAL
         assert state.equity_day_start == Decimal("92")
 
     def test_rollover_allows_new_transitions(self) -> None:

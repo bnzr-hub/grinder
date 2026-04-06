@@ -66,7 +66,10 @@ class DayRiskManager:
 
     def __init__(self, config: DayRiskConfig | None = None) -> None:
         self._config = config or DayRiskConfig()
-        self._reset_state()
+        self._mode: DayRiskMode = DayRiskMode.NORMAL
+        self._equity_day_start: Decimal | None = None
+        self._equity_day_peak: Decimal = _ZERO
+        self._profit_lock_armed: bool = False
         self._session_key: str = ""
 
     @property
@@ -168,8 +171,8 @@ class DayRiskManager:
     def _reset_state(self) -> None:
         """Reset all day state to initial values."""
         self._mode = DayRiskMode.NORMAL
-        self._equity_day_start: Decimal | None = None
-        self._equity_day_peak: Decimal = _ZERO
+        self._equity_day_start = None
+        self._equity_day_peak = _ZERO
         self._profit_lock_armed = False
 
     def _transition(self, new_mode: DayRiskMode, **kwargs: object) -> None:
