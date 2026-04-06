@@ -45,6 +45,8 @@ class TestAdmissibleCase:
         assert r.reason == "OK"
         assert r.order_qty_rounded > Decimal("0")
         assert r.max_position_notional_usd > Decimal("0")
+        assert r.actual_order_notional_usd > Decimal("0")
+        assert r.actual_order_notional_usd == r.order_qty_rounded * Decimal("100")
 
     def test_adverse_move_pct(self) -> None:
         """adverse_move = step_pct * (levels + 1)."""
