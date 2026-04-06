@@ -46,6 +46,7 @@ from typing import Any
 logger = logging.getLogger("autonomous")
 
 _CONSTRAINT_CACHE_TTL_HOURLY_S = 3600
+_ZERO = Decimal("0")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -544,6 +545,28 @@ def _build_day_risk_manager() -> Any:
     return DayRiskManager()
 
 
+def _build_grid_risk_sizer() -> Any:
+    """Build GridRiskSizer with default config."""
+    from grinder.risk.grid_risk_sizer import GridRiskSizer  # noqa: PLC0415
+
+    return GridRiskSizer()
+
+
+def _build_risk_admission_gate(
+    day_risk_manager: Any,
+    portfolio_allocator: Any,
+    grid_sizer: Any,
+) -> Any:
+    """Build RiskAdmissionGate combining all risk planners."""
+    from grinder.risk.risk_admission import RiskAdmissionGate  # noqa: PLC0415
+
+    return RiskAdmissionGate(
+        day_risk_manager=day_risk_manager,
+        portfolio_allocator=portfolio_allocator,
+        grid_sizer=grid_sizer,
+    )
+
+
 def _fetch_initial_selector_features(
     tuned_results: dict[str, Any],
     mainnet: bool,
@@ -572,7 +595,7 @@ def _fetch_initial_selector_features(
     return v1_features, v2_features
 
 
-def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
+def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  # noqa: PLR0915
     """Assemble the full autonomous runtime graph."""
     from grinder.execution_plane.coordinator import ExecutionCoordinator  # noqa: PLC0415
     from grinder.execution_plane.operator import OperatorControls  # noqa: PLC0415
@@ -588,6 +611,7 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
     )
     from grinder.rotation.controller import RotationConfig, RotationController  # noqa: PLC0415
     from grinder.runtime.autonomous_host import AutonomousEngineHost  # noqa: PLC0415
+    from grinder.runtime.live_engine_bridge import BridgeConfig  # noqa: PLC0415
     from grinder.tuning.cache import TuningCache  # noqa: PLC0415
 
     # Parse symbols/blacklist
@@ -700,13 +724,94 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
         registry,
     )
 
+    # Risk admission gate — filters ranked candidates before orchestrator
+    day_risk_manager = _build_day_risk_manager()
+    portfolio_allocator = _build_portfolio_allocator()
+    grid_sizer = _build_grid_risk_sizer()
+    admission_gate = _build_risk_admission_gate(day_risk_manager, portfolio_allocator, grid_sizer)
+    # Mutable dict for sharing cycle-level risk state between facts_fn and ranker
+    _risk_state: dict[str, Any] = {}
+
+    # Build constraint provider for admission gate (same config as bootstrap)
+    from grinder.execution.constraint_provider import (  # noqa: PLC0415
+        ConstraintProvider,
+        ConstraintProviderConfig,
+    )
+    from scripts.http_measured_client import RequestsHttpClient  # noqa: PLC0415
+
+    _exchange_info_url = (
+        "https://testnet.binancefuture.com/fapi/v1/exchangeInfo"
+        if not mainnet
+        else "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    )
+    _constraint_provider = ConstraintProvider(
+        http_client=RequestsHttpClient(port_name="admission_constraints"),
+        config=ConstraintProviderConfig(
+            cache_ttl_seconds=_CONSTRAINT_CACHE_TTL_HOURLY_S,
+            allow_fetch=True,
+            exchange_info_url=_exchange_info_url,
+        ),
+    )
+
+    _bridge_cfg = BridgeConfig()
+    _default_entry_levels = _bridge_cfg.levels
+
+    def _admission_ranker(candidates: list[str]) -> list[str]:
+        """Rank candidates via V2 ranker, then filter through risk admission."""
+        ranked = _ranker(candidates)
+
+        # If risk state not yet populated (first cycle before facts_fn),
+        # fall through without filtering — fail-open.
+        day_state = _risk_state.get("day_state")
+        portfolio_snap = _risk_state.get("portfolio_snapshot")
+        equity = _risk_state.get("equity")
+        if day_state is None or portfolio_snap is None or equity is None:
+            return ranked
+
+        # Build price + step_pct + constraint maps from tuning state
+        prices: dict[str, Decimal] = {}
+        step_pcts: dict[str, Decimal] = {}
+        natr_map = _tuning_state.natr_map
+        for sym in ranked:
+            # Price from selector features (mid of best bid/ask)
+            feat = _tuning_state.v1_features.get(sym)
+            if feat is not None and hasattr(feat, "mid_price"):
+                mid = feat.mid_price
+                if mid > _ZERO:
+                    prices[sym] = mid
+            # Step pct from NATR-driven adaptive spacing
+            natr_val = natr_map.get(sym)
+            if natr_val is not None:
+                from grinder.selector.spacing import (  # noqa: PLC0415
+                    compute_adaptive_spacing_bps,
+                )
+
+                step_pcts[sym] = compute_adaptive_spacing_bps(natr_val) / Decimal("10000")
+
+        # Constraints from provider (cached, hourly refresh)
+        try:
+            constraint_map = _constraint_provider.get_constraints()
+        except Exception:
+            constraint_map = {}
+
+        admitted, _decisions = admission_gate.filter_candidates(
+            ranked,
+            prices=prices,
+            step_pcts=step_pcts,
+            entry_levels=_default_entry_levels,
+            constraints=constraint_map,
+            day_state=day_state,
+            portfolio_snapshot=portfolio_snap,
+        )
+        return admitted
+
     # Assemble autonomous loop with execution integration
     loop = AutonomousLoop(
         universe_provider=universe_provider,
         orchestrator=orchestrator,
         config=loop_config,
         prefilter_fn=_prefilter,
-        ranker_fn=_ranker,
+        ranker_fn=_admission_ranker,
         execution_coordinator=coordinator,
         execution_registry=registry,
         execution_operator=operator_controls,
@@ -724,17 +829,26 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
         "tuning_cache": tuning_cache,
         "universe_provider": universe_provider,
         "refresher": refresher,
-        "day_risk_manager": _build_day_risk_manager(),
-        "portfolio_allocator": _build_portfolio_allocator(),
+        "day_risk_manager": day_risk_manager,
+        "portfolio_allocator": portfolio_allocator,
+        "grid_sizer": grid_sizer,
+        "admission_gate": admission_gate,
+        "tuning_state": _tuning_state,
+        "risk_state": _risk_state,
     }
 
 
 def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
-    """Build per-cycle hook for DayRiskManager + PortfolioBudgetAllocator."""
+    """Build per-cycle hook for DayRiskManager + PortfolioBudgetAllocator.
+
+    Stores latest day_state and portfolio_snapshot into runtime["risk_state"]
+    so the admission gate can read current risk state each cycle.
+    """
     day_risk_manager = runtime.get("day_risk_manager")
     portfolio_allocator = runtime.get("portfolio_allocator")
     bridge = runtime["bridge"]
     host = runtime["host"]
+    risk_state = runtime.get("risk_state", {})
 
     def _cycle_facts() -> None:
         if day_risk_manager is None:
@@ -745,6 +859,8 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
                 return
             session_key = _current_utc_session_key()
             day_state = day_risk_manager.update(equity, session_key=session_key)
+            risk_state["day_state"] = day_state
+            risk_state["equity"] = equity
 
             if portfolio_allocator is not None:
                 from grinder.risk.portfolio_budget_allocator import (  # noqa: PLC0415
@@ -761,6 +877,7 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
                     gross_exposure_used_usd=Decimal("0"),
                 )
                 budget = portfolio_allocator.compute(inp)
+                risk_state["portfolio_snapshot"] = budget
                 logger.debug(
                     "PORTFOLIO_BUDGET_STATUS mode=%s regime=%s equity=%s active=%d "
                     "slots_free=%d risk_pct=%s risk_usd=%s entries_allowed=%s",
