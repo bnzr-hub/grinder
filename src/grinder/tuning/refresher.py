@@ -256,11 +256,14 @@ class TuningRefresher:
                 self._bridge.set_symbol_spacing(sym, compute_adaptive_spacing_bps(natr_val))
 
     def _update_equity(self) -> None:
-        """Fetch account equity and push to bridge. Fail-open."""
+        """Fetch account equity and gross exposure, push to bridge. Fail-open."""
         testnet = not getattr(self._args, "mainnet", False)
         equity = self._fetch_equity(testnet)
         if equity is not None and equity > 0:
             self._bridge.update_equity(equity)
+        gross = self._fetch_gross_exposure(testnet)
+        if gross is not None:
+            self._bridge.update_gross_exposure(gross)
 
     @staticmethod
     def _fetch_equity(testnet: bool) -> Decimal | None:
@@ -293,6 +296,46 @@ class TuningRefresher:
                         wallet = Decimal(str(asset.get("crossWalletBalance", "0")))
                         upnl = Decimal(str(asset.get("crossUnPnl", "0")))
                         return wallet + upnl
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _fetch_gross_exposure(testnet: bool) -> Decimal | None:
+        """Fetch gross position exposure from REST. Fail-open.
+
+        Returns sum(abs(notional)) across all open positions.
+        Uses /fapi/v2/positionRisk — same auth as equity fetch.
+        """
+        import hashlib  # noqa: PLC0415
+        import hmac  # noqa: PLC0415
+        import json  # noqa: PLC0415
+        import os  # noqa: PLC0415
+        import time  # noqa: PLC0415
+        import urllib.request  # noqa: PLC0415
+
+        api_key = os.environ.get("BINANCE_API_KEY", "").strip()
+        api_secret = os.environ.get("BINANCE_API_SECRET", "").strip()
+        if not api_key or not api_secret:
+            return None
+
+        base = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
+        ts = int(time.time() * 1000)
+        query = f"timestamp={ts}&recvWindow=10000"
+        sig = hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+        url = f"{base}/fapi/v2/positionRisk?{query}&signature={sig}"
+        try:
+            req = urllib.request.Request(url, headers={"X-MBX-APIKEY": api_key})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+                gross = Decimal("0")
+                for pos in data:
+                    notional = pos.get("notional", "0")
+                    try:
+                        gross += abs(Decimal(str(notional)))
+                    except Exception:
+                        continue
+                return gross
         except Exception:
             pass
         return None

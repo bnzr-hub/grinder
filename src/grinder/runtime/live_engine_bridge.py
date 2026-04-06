@@ -98,6 +98,7 @@ class LiveEngineBridge:
         # Thread-safe last-known equity from engine account sync.
         # Updated by engine thread, read by main loop for day risk.
         self._last_known_equity: Decimal | None = None
+        self._last_known_gross_exposure: Decimal | None = None
 
     def set_symbol_size(self, symbol: str, order_size: str) -> None:
         """Register tuning-resolved order size for a symbol."""
@@ -116,6 +117,15 @@ class LiveEngineBridge:
     def update_equity(self, equity: Decimal) -> None:
         """Set last-known equity (thread-safe, called by refresher)."""
         self._last_known_equity = equity
+
+    @property
+    def last_known_gross_exposure(self) -> Decimal | None:
+        """Read last-known gross exposure (non-blocking, may be stale or None)."""
+        return self._last_known_gross_exposure
+
+    def update_gross_exposure(self, gross_exposure: Decimal) -> None:
+        """Set last-known gross exposure (thread-safe, called by refresher)."""
+        self._last_known_gross_exposure = gross_exposure
 
     def set_symbol_spacing(self, symbol: str, spacing_bps: Decimal) -> None:
         """Register tuning-resolved adaptive spacing for a symbol."""

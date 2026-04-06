@@ -855,6 +855,9 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
 
     Stores latest day_state and portfolio_snapshot into runtime["risk_state"]
     so the admission gate can read current risk state each cycle.
+
+    Uses real gross exposure from refresher. Market regime stays NEUTRAL until
+    a real shared regime source is wired (existing classifier is per-symbol only).
     """
     day_risk_manager = runtime.get("day_risk_manager")
     portfolio_allocator = runtime.get("portfolio_allocator")
@@ -881,18 +884,28 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
                 )
 
                 active_count = len(host.live_symbols) if hasattr(host, "live_symbols") else 0
+
+                # Market regime: NEUTRAL until real shared regime source is wired.
+                # The codebase has a per-symbol classifier (controller/regime.py)
+                # but no portfolio-level aggregation yet.
+                regime = MarketRegime.NEUTRAL
+
+                # Real gross exposure from refresher (fail-open to 0)
+                gross_exposure = bridge.last_known_gross_exposure or _ZERO
+
                 inp = PortfolioBudgetInput(
                     equity=equity,
                     day_mode=day_state.mode,
-                    market_regime=MarketRegime.NEUTRAL,
+                    market_regime=regime,
                     active_symbol_count=active_count,
-                    gross_exposure_used_usd=Decimal("0"),
+                    gross_exposure_used_usd=gross_exposure,
                 )
                 budget = portfolio_allocator.compute(inp)
                 risk_state["portfolio_snapshot"] = budget
                 logger.debug(
                     "PORTFOLIO_BUDGET_STATUS mode=%s regime=%s equity=%s active=%d "
-                    "slots_free=%d risk_pct=%s risk_usd=%s entries_allowed=%s",
+                    "slots_free=%d risk_pct=%s risk_usd=%s entries_allowed=%s "
+                    "gross_used_usd=%s gross_free_usd=%s",
                     budget.day_mode.value,
                     budget.market_regime.value,
                     budget.equity,
@@ -901,6 +914,8 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
                     budget.effective_risk_pct,
                     budget.per_symbol_risk_budget_usd,
                     budget.new_entries_allowed,
+                    budget.gross_exposure_used_usd,
+                    budget.gross_exposure_free_usd,
                 )
         except Exception:
             pass
