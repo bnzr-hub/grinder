@@ -762,7 +762,7 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
         Already-live symbols bypass admission (active engines unaffected).
         Only new candidates are filtered through risk gates.
         """
-        ranked = _ranker(candidates)
+        ranked: list[str] = _ranker(candidates)
 
         # If risk state not yet populated (first cycle before facts_fn),
         # fall through without filtering — fail-open.

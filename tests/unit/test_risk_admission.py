@@ -312,15 +312,23 @@ class TestFilterCandidates:
 class TestDeterminism:
     def test_same_input_same_output(self) -> None:
         gate = _gate()
-        kwargs = {
-            "prices": {"TESTUSDT": Decimal("100")},
-            "step_pcts": {"TESTUSDT": Decimal("0.01")},
-            "entry_levels": 5,
-            "constraints": {"TESTUSDT": _FakeConstraint()},
-            "day_state": _day_state(),
-            "portfolio_snapshot": _portfolio_snap(),
-        }
-        a1, d1 = gate.filter_candidates(["TESTUSDT"], **kwargs)
-        a2, d2 = gate.filter_candidates(["TESTUSDT"], **kwargs)
+        a1, d1 = gate.filter_candidates(
+            ["TESTUSDT"],
+            prices={"TESTUSDT": Decimal("100")},
+            step_pcts={"TESTUSDT": Decimal("0.01")},
+            entry_levels=5,
+            constraints={"TESTUSDT": _FakeConstraint()},
+            day_state=_day_state(),
+            portfolio_snapshot=_portfolio_snap(),
+        )
+        a2, d2 = gate.filter_candidates(
+            ["TESTUSDT"],
+            prices={"TESTUSDT": Decimal("100")},
+            step_pcts={"TESTUSDT": Decimal("0.01")},
+            entry_levels=5,
+            constraints={"TESTUSDT": _FakeConstraint()},
+            day_state=_day_state(),
+            portfolio_snapshot=_portfolio_snap(),
+        )
         assert a1 == a2
         assert d1 == d2
