@@ -71,6 +71,11 @@ class TuningRefresher:
 
     def _run_loop(self) -> None:
         """Main refresh loop. Runs until stop event is set."""
+        # Initial equity fetch so day risk has data before first full refresh
+        import contextlib  # noqa: PLC0415
+
+        with contextlib.suppress(Exception):
+            self._update_equity()
         while not self._stop_event.is_set():
             self._stop_event.wait(timeout=self._interval_s)
             if self._stop_event.is_set():
@@ -135,6 +140,7 @@ class TuningRefresher:
         )
 
         self._update_bridge(tuned_results, tuned_sizes, natr_map)
+        self._update_equity()
 
         logger.info(
             "TUNING_REFRESH_COMPLETE tuned=%d total=%d elapsed_ms=%d version=%d",
@@ -248,6 +254,44 @@ class TuningRefresher:
             natr_val = natr_map.get(sym)
             if natr_val is not None:
                 self._bridge.set_symbol_spacing(sym, compute_adaptive_spacing_bps(natr_val))
+
+    def _update_equity(self) -> None:
+        """Fetch account equity and push to bridge. Fail-open."""
+        testnet = not getattr(self._args, "mainnet", False)
+        equity = self._fetch_equity(testnet)
+        if equity is not None and equity > 0:
+            self._bridge.update_equity(equity)
+
+    @staticmethod
+    def _fetch_equity(testnet: bool) -> Decimal | None:
+        """Fetch USDT margin balance from REST. Fail-open, no engine dependency."""
+        import hashlib  # noqa: PLC0415
+        import hmac  # noqa: PLC0415
+        import json  # noqa: PLC0415
+        import os  # noqa: PLC0415
+        import time  # noqa: PLC0415
+        import urllib.request  # noqa: PLC0415
+
+        api_key = os.environ.get("BINANCE_API_KEY", "").strip()
+        api_secret = os.environ.get("BINANCE_API_SECRET", "").strip()
+        if not api_key or not api_secret:
+            return None
+
+        base = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
+        ts = int(time.time() * 1000)
+        query = f"timestamp={ts}&recvWindow=10000"
+        sig = hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+        url = f"{base}/fapi/v2/balance?{query}&signature={sig}"
+        try:
+            req = urllib.request.Request(url, headers={"X-MBX-APIKEY": api_key})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+                for asset in data:
+                    if asset.get("asset") == "USDT":
+                        return Decimal(str(asset.get("marginBalance", "0")))
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def _fetch_price(symbol: str, testnet: bool) -> Decimal | None:
