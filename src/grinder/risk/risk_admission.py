@@ -15,6 +15,12 @@ import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from grinder.risk.grid_risk_sizer import GridRiskSizer
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +58,7 @@ class RiskAdmissionGate:
         self,
         day_risk_manager: object,
         portfolio_allocator: object,
-        grid_sizer: object,
+        grid_sizer: GridRiskSizer,
     ) -> None:
         self._day_risk = day_risk_manager
         self._portfolio = portfolio_allocator
@@ -155,7 +161,7 @@ class RiskAdmissionGate:
         prices: dict[str, Decimal],
         step_pcts: dict[str, Decimal],
         entry_levels: int,
-        constraints: dict[str, object],
+        constraints: Mapping[str, object],
         day_state: object,
         portfolio_snapshot: object,
     ) -> tuple[list[str], dict[str, AdmissionDecision]]:
