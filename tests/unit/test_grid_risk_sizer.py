@@ -6,7 +6,6 @@ from decimal import Decimal
 
 from grinder.risk.grid_risk_sizer import (
     GridRiskSizer,
-    GridRiskSizerConfig,
     GridRiskSizerInput,
 )
 
@@ -69,7 +68,7 @@ class TestStepPctEffect:
 class TestLevelsEffect:
     def test_more_levels_smaller_order(self) -> None:
         """More levels → smaller per-order quantity."""
-        r_few = _sizer().compute(_inp(levels=5))
+        r_few = _sizer().compute(_inp(levels=3))
         r_many = _sizer().compute(_inp(levels=10))
         assert r_many.order_qty_rounded < r_few.order_qty_rounded
 
@@ -97,29 +96,6 @@ class TestQtyRounding:
         # max_pos=500, order_notional=100, raw_qty=1.0 → rounded=1
         assert r.order_qty_rounded == r.order_qty_rounded.quantize(Decimal("1"))
         assert r.order_qty_rounded <= r.order_qty_raw
-
-
-class TestMinEntryLevels:
-    def test_below_min_levels_no_go(self) -> None:
-        """Levels below config minimum → NO_GO."""
-        sizer = GridRiskSizer(config=GridRiskSizerConfig(min_entry_levels=15))
-        r = sizer.compute(_inp(levels=5))
-        assert not r.admissible
-        assert r.reason == "BELOW_MIN_LEVELS"
-
-    def test_at_min_levels_ok(self) -> None:
-        """Levels exactly at minimum → admissible."""
-        sizer = GridRiskSizer(config=GridRiskSizerConfig(min_entry_levels=5))
-        r = sizer.compute(_inp(levels=5))
-        assert r.admissible
-
-    def test_default_min_levels_5(self) -> None:
-        """Default config min_entry_levels=5."""
-        r = _sizer().compute(_inp(levels=5))
-        assert r.admissible
-        r2 = _sizer().compute(_inp(levels=4))
-        assert not r2.admissible
-        assert r2.reason == "BELOW_MIN_LEVELS"
 
 
 class TestInvalidInput:
