@@ -91,39 +91,6 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
-def _fetch_account_equity(testnet: bool = True) -> Decimal | None:
-    """Fetch total margin balance (equity) from Binance Futures REST API.
-
-    Uses authenticated /fapi/v2/balance endpoint. Returns totalMarginBalance
-    which equals wallet balance + unrealized PnL — the correct equity figure
-    for day risk tracking.
-    """
-    import hashlib  # noqa: PLC0415
-    import hmac  # noqa: PLC0415
-
-    api_key = os.environ.get("BINANCE_API_KEY", "").strip()
-    api_secret = os.environ.get("BINANCE_API_SECRET", "").strip()
-    if not api_key or not api_secret:
-        return None
-
-    base = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
-    ts = int(time.time() * 1000)
-    query = f"timestamp={ts}&recvWindow=10000"
-    sig = hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-    url = f"{base}/fapi/v2/balance?{query}&signature={sig}"
-
-    try:
-        req = urllib.request.Request(url, headers={"X-MBX-APIKEY": api_key})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-            for asset in data:
-                if asset.get("asset") == "USDT":
-                    return Decimal(str(asset.get("marginBalance", "0")))
-        return None
-    except Exception:
-        return None
-
-
 def _current_utc_session_key() -> str:
     """Return current UTC date as session key for day rollover."""
     import datetime  # noqa: PLC0415
@@ -805,16 +772,16 @@ def main() -> None:
 
     print("\nGRINDER AUTONOMOUS SYSTEM running. Press Ctrl+C to stop.\n")
 
-    # Day risk manager — shadow update each cycle
+    # Day risk manager — shadow update each cycle from bridge equity cache
     day_risk_manager = runtime.get("day_risk_manager")
-    testnet = not getattr(args, "mainnet", False)
+    bridge = runtime["bridge"]
 
     def _cycle_facts() -> None:
-        """Per-cycle hook: update DayRiskManager from account equity."""
+        """Per-cycle hook: update DayRiskManager from cached equity (non-blocking)."""
         if day_risk_manager is None:
             return
         try:
-            equity = _fetch_account_equity(testnet=testnet)
+            equity = bridge.last_known_equity
             if equity is not None and equity > 0:
                 session_key = _current_utc_session_key()
                 day_risk_manager.update(equity, session_key=session_key)
