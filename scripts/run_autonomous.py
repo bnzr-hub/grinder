@@ -91,6 +91,13 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
+def _current_utc_session_key() -> str:
+    """Return current UTC date as session key for day rollover."""
+    import datetime  # noqa: PLC0415
+
+    return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
+
+
 def _fetch_price_rest(symbol: str, testnet: bool = True) -> Decimal | None:
     """Fetch current price from Binance Futures REST API (no auth needed)."""
     from decimal import Decimal  # noqa: PLC0415
@@ -523,6 +530,13 @@ def _build_tuning_state_and_selector(
     return state, refresher, prefilter, ranker
 
 
+def _build_day_risk_manager() -> Any:
+    """Build DayRiskManager with default config."""
+    from grinder.risk.day_risk_manager import DayRiskManager  # noqa: PLC0415
+
+    return DayRiskManager()
+
+
 def _fetch_initial_selector_features(
     tuned_results: dict[str, Any],
     mainnet: bool,
@@ -703,6 +717,7 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
         "tuning_cache": tuning_cache,
         "universe_provider": universe_provider,
         "refresher": refresher,
+        "day_risk_manager": _build_day_risk_manager(),
     }
 
 
@@ -757,9 +772,26 @@ def main() -> None:
 
     print("\nGRINDER AUTONOMOUS SYSTEM running. Press Ctrl+C to stop.\n")
 
+    # Day risk manager — shadow update each cycle from bridge equity cache
+    day_risk_manager = runtime.get("day_risk_manager")
+    bridge = runtime["bridge"]
+
+    def _cycle_facts() -> None:
+        """Per-cycle hook: update DayRiskManager from cached equity (non-blocking)."""
+        if day_risk_manager is None:
+            return
+        try:
+            equity = bridge.last_known_equity
+            if equity is not None and equity > 0:
+                session_key = _current_utc_session_key()
+                day_risk_manager.update(equity, session_key=session_key)
+        except Exception:
+            pass  # fail-open: never block the loop
+
     # Run
     try:
         reports = loop.run_forever(
+            facts_fn=_cycle_facts,
             clock=time.monotonic,
             sleep_fn=time.sleep,
             max_cycles=args.max_cycles,
