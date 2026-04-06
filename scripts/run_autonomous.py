@@ -667,8 +667,16 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
 
     # Shared tuning/selector state + refresher (ADR-162)
     _tuning_state, refresher, _prefilter, _ranker = _build_tuning_state_and_selector(
-        _tuned_results, _tuned_sizes, _natr_map,
-        symbols_override, mainnet, args, tuning_cache, blacklist, bridge, registry,
+        _tuned_results,
+        _tuned_sizes,
+        _natr_map,
+        symbols_override,
+        mainnet,
+        args,
+        tuning_cache,
+        blacklist,
+        bridge,
+        registry,
     )
 
     # Assemble autonomous loop with execution integration
