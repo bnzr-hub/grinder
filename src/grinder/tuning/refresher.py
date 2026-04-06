@@ -107,8 +107,8 @@ class TuningRefresher:
         v1_features = fetch_selection_features(candidates, mainnet=mainnet)
         natr_map: dict[str, Decimal] = {sym: f.natr_14_5m for sym, f in v1_features.items()}
 
-        # Retune symbols
-        tuned_results, tuned_sizes, tuning_order_sizes = self._retune_symbols(
+        # Stage tuning results (no cache writes yet)
+        tuned_results, tuned_sizes, tuning_order_sizes, all_results = self._retune_symbols(
             candidates, natr_map
         )
 
@@ -122,7 +122,10 @@ class TuningRefresher:
                 mainnet=mainnet,
             )
 
-        # Atomically replace state
+        # Commit phase: cache → state → bridge (all-or-nothing on exception)
+        for sym, result in all_results:
+            self._cache.put(sym, result)
+
         self._state.replace(
             tuned_results=tuned_results,
             tuned_sizes=tuned_sizes,
@@ -131,7 +134,6 @@ class TuningRefresher:
             v2_features=v2_features,
         )
 
-        # Update bridge for inactive symbols
         self._update_bridge(tuned_results, tuned_sizes, natr_map)
 
         logger.info(
@@ -146,8 +148,11 @@ class TuningRefresher:
         self,
         candidates: list[str],
         natr_map: dict[str, Decimal],
-    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Decimal]]:
-        """Run tuning solver for candidates. Returns (results, sizes, order_sizes)."""
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Decimal], list[tuple[str, Any]]]:
+        """Run tuning solver for candidates. Returns (results, sizes, order_sizes, all_results).
+
+        Does NOT commit to TuningCache — caller commits after full cycle succeeds.
+        """
         from grinder.execution.constraint_provider import (  # noqa: PLC0415
             ConstraintProvider,
             ConstraintProviderConfig,
@@ -183,6 +188,7 @@ class TuningRefresher:
         tuned_results: dict[str, Any] = {}
         tuned_sizes: dict[str, str] = {}
         tuning_order_sizes: dict[str, Decimal] = {}
+        all_results: list[tuple[str, Any]] = []
 
         for symbol in candidates:
             price = self._fetch_price(symbol, testnet)
@@ -203,14 +209,14 @@ class TuningRefresher:
                 spacing_pct=spacing_pct,
             )
             result = solve(symbol, sc, price, config)
-            self._cache.put(symbol, result)
+            all_results.append((symbol, result))
 
             if result.status == TuningStatus.TUNED:
                 tuned_sizes[symbol] = str(result.order_size)
                 tuned_results[symbol] = result
                 tuning_order_sizes[symbol] = result.order_size
 
-        return tuned_results, tuned_sizes, tuning_order_sizes
+        return tuned_results, tuned_sizes, tuning_order_sizes, all_results
 
     def _update_bridge(
         self,
