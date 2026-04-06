@@ -283,6 +283,82 @@ def _bootstrap_tuning_cache(
     return tuned_sizes, tuned_results
 
 
+def _apply_bootstrap_prefilter(
+    coarse_symbols: list[str],
+    *,
+    limit: int = 30,
+    mainnet: bool = True,
+    blacklist: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Apply live-tradability gates to coarse bootstrap slice.
+
+    Fetches selector features for the coarse set, then filters by:
+    - rolling 12x5m volume floor ($2M)
+    - NATR(14, 5m) floor (1.0%)
+    - adaptive spacing tradability (>= 50 bps)
+    - blacklist
+
+    Returns top `limit` survivors sorted by 24h volume (from features).
+    Fail-open: returns coarse_symbols[:limit] if feature fetch fails.
+    """
+    if not coarse_symbols:
+        return []
+
+    try:
+        from grinder.selector.feature_provider import fetch_selection_features  # noqa: PLC0415
+        from grinder.selector.prefilter import (  # noqa: PLC0415
+            DEFAULT_NATR_5M_MIN,
+            DEFAULT_VOLUME_LAST_12X5M_MIN,
+        )
+        from grinder.selector.spacing import (  # noqa: PLC0415
+            DEFAULT_MIN_SPACING_BPS,
+            compute_adaptive_spacing_bps,
+        )
+
+        features = fetch_selection_features(coarse_symbols, mainnet=mainnet)
+    except Exception as e:
+        logger.warning(
+            "BOOTSTRAP_PREFILTER_FEATURE_FETCH_FAILED error=%s — using coarse slice",
+            e,
+        )
+        return coarse_symbols[:limit]
+
+    survivors: list[tuple[Decimal, str]] = []
+    skip_counts: dict[str, int] = {}
+
+    for sym in coarse_symbols:
+        if sym in blacklist:
+            skip_counts["BLACKLISTED"] = skip_counts.get("BLACKLISTED", 0) + 1
+            continue
+        feat = features.get(sym)
+        if feat is None:
+            skip_counts["NO_FEATURES"] = skip_counts.get("NO_FEATURES", 0) + 1
+            continue
+        if feat.quote_volume_last_12x5m < DEFAULT_VOLUME_LAST_12X5M_MIN:
+            skip_counts["LOW_VOLUME"] = skip_counts.get("LOW_VOLUME", 0) + 1
+            continue
+        if feat.natr_14_5m < DEFAULT_NATR_5M_MIN:
+            skip_counts["LOW_NATR"] = skip_counts.get("LOW_NATR", 0) + 1
+            continue
+        spacing = compute_adaptive_spacing_bps(feat.natr_14_5m)
+        if spacing < DEFAULT_MIN_SPACING_BPS:
+            skip_counts["LOW_SPACING"] = skip_counts.get("LOW_SPACING", 0) + 1
+            continue
+        survivors.append((feat.quote_volume_last_12x5m, sym))
+
+    # Sort by rolling volume descending, take top limit
+    survivors.sort(key=lambda t: (-t[0], t[1]))
+    result = [sym for _vol, sym in survivors[:limit]]
+
+    logger.info(
+        "BOOTSTRAP_PREFILTER eligible=%d skipped=%d skip_reasons=%s",
+        len(result),
+        sum(skip_counts.values()),
+        skip_counts or "none",
+    )
+    return result
+
+
 def _fetch_natr_map(symbols: list[str], *, mainnet: bool) -> dict[str, Decimal]:
     """Fetch NATR map from selector features for adaptive spacing. Fail-open."""
     try:
@@ -466,23 +542,33 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
             sorted(symbols_override), tuning_cache, args, natr_map=_natr_map
         )
     else:
-        # Auto-discovery mode: bootstrap tune a bounded subset of discovered universe.
-        _BOOTSTRAP_UNIVERSE_LIMIT = 30
+        # Auto-discovery mode: two-stage bootstrap selection.
+        # Stage 1: coarse slice by 24h volume (cheap, broad)
+        # Stage 2: prefilter by live tradability (volume, NATR, spacing)
+        _BOOTSTRAP_COARSE_LIMIT = 100
+        _BOOTSTRAP_TUNE_LIMIT = 30
         testnet = not mainnet
         try:
             discovered = universe_provider.get_candidates()
         except Exception:
             logger.warning("BOOTSTRAP_UNIVERSE_DISCOVERY_FAILED — continuing without bootstrap")
             discovered = []
-        bootstrap_subset = _select_bootstrap_subset(
+        coarse_subset = _select_bootstrap_subset(
             discovered,
-            _BOOTSTRAP_UNIVERSE_LIMIT,
+            _BOOTSTRAP_COARSE_LIMIT,
             testnet=testnet,
         )
+        # Stage 2: fetch features and apply bootstrap prefilter
+        bootstrap_subset = _apply_bootstrap_prefilter(
+            coarse_subset,
+            limit=_BOOTSTRAP_TUNE_LIMIT,
+            mainnet=mainnet,
+            blacklist=blacklist,
+        )
         logger.info(
-            "BOOTSTRAP_UNIVERSE_DISCOVERED count=%d limit=%d bootstrap=%d",
+            "BOOTSTRAP_UNIVERSE_DISCOVERED count=%d coarse=%d prefiltered=%d",
             len(discovered),
-            _BOOTSTRAP_UNIVERSE_LIMIT,
+            len(coarse_subset),
             len(bootstrap_subset),
         )
         if bootstrap_subset:

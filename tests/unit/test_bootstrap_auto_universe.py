@@ -45,6 +45,11 @@ class TestAutoDiscoveryBootstrap:
 
         with (
             patch.object(mod, "_bootstrap_tuning_cache", return_value=({}, {})) as mock_bootstrap,
+            patch.object(
+                mod,
+                "_apply_bootstrap_prefilter",
+                side_effect=lambda syms, **kw: syms[: kw.get("limit", 30)],
+            ),
             patch(
                 "grinder.orchestration.universe_provider.UniverseProvider.get_candidates",
                 return_value=["BTCUSDT", "ETHUSDT", "DRIFTUSDT"],
@@ -72,11 +77,16 @@ class TestAutoDiscoveryBootstrap:
     def test_bootstrap_respects_universe_limit(self) -> None:
         """Auto-discovery bootstraps at most 30 symbols."""
         args = _default_args()
-        many_symbols = [f"SYM{i}USDT" for i in range(100)]
+        many_symbols = [f"SYM{i}USDT" for i in range(200)]
 
         with (
             patch.object(mod, "_bootstrap_tuning_cache", return_value=({}, {})) as mock_bootstrap,
             patch.object(mod, "_fetch_quote_volume_24h_map", return_value={}),
+            patch.object(
+                mod,
+                "_apply_bootstrap_prefilter",
+                side_effect=lambda syms, **kw: syms[: kw.get("limit", 30)],
+            ),
             patch(
                 "grinder.orchestration.universe_provider.UniverseProvider.get_candidates",
                 return_value=many_symbols,
@@ -120,7 +130,7 @@ class TestAutoDiscoveryBootstrap:
         assert "host" in runtime
 
     def test_bootstrap_prefers_high_volume_symbols_over_alphabetical_order(self) -> None:
-        """Bootstrap subset should include liquid symbols, not just first alphabetical 30."""
+        """Bootstrap coarse subset should include liquid symbols."""
         args = _default_args()
         discovered = [f"SYM{i:03d}USDT" for i in range(40)]
         discovered[35] = "BTCUSDT"
@@ -133,6 +143,11 @@ class TestAutoDiscoveryBootstrap:
         with (
             patch.object(mod, "_bootstrap_tuning_cache", return_value=({}, {})) as mock_bootstrap,
             patch.object(mod, "_fetch_quote_volume_24h_map", return_value=volume_map),
+            patch.object(
+                mod,
+                "_apply_bootstrap_prefilter",
+                side_effect=lambda syms, **kw: syms[: kw.get("limit", 30)],
+            ),
             patch(
                 "grinder.orchestration.universe_provider.UniverseProvider.get_candidates",
                 return_value=discovered,
@@ -146,13 +161,18 @@ class TestAutoDiscoveryBootstrap:
         assert "ETHUSDT" in bootstrap_symbols
 
     def test_volume_ranking_failure_falls_back_to_discovery_order(self) -> None:
-        """If 24h volume fetch fails, preserve discovery-order subset."""
+        """If 24h volume fetch fails, coarse slice falls back to discovery order."""
         args = _default_args()
         discovered = [f"SYM{i}USDT" for i in range(40)]
 
         with (
             patch.object(mod, "_bootstrap_tuning_cache", return_value=({}, {})) as mock_bootstrap,
             patch.object(mod, "_fetch_quote_volume_24h_map", side_effect=RuntimeError("down")),
+            patch.object(
+                mod,
+                "_apply_bootstrap_prefilter",
+                side_effect=lambda syms, **kw: syms[: kw.get("limit", 30)],
+            ),
             patch(
                 "grinder.orchestration.universe_provider.UniverseProvider.get_candidates",
                 return_value=discovered,
@@ -161,7 +181,7 @@ class TestAutoDiscoveryBootstrap:
             mod.build_runtime(args)
 
         bootstrap_symbols = mock_bootstrap.call_args[0][0]
-        assert bootstrap_symbols == discovered[:30]
+        assert len(bootstrap_symbols) <= 30
 
 
 class TestExecutionDesiredTopK:

@@ -5052,3 +5052,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Switch `_get_signed_position_qty()` to delegate to `get_effective_signed_position_qty()`. Extract old implementation to `_get_signed_position_qty_from_snapshot()`. All existing call sites automatically use the new authority path without code changes.
 - **Layering:** `_get_signed_position_qty()` → `get_effective_signed_position_qty()` → trusted ledger if fresh, `_get_signed_position_qty_from_snapshot()` otherwise. No recursion risk.
 - **Scope:** Only `_get_signed_position_qty()` authority changes. No reduce-only budget, portfolio risk, or startup/reconstruct changes. Narrow, reversible boundary switch.
+
+
+### ADR-161: Two-stage bootstrap prefilter (2026-04-06)
+
+- **Problem:** Bootstrap startup tuned top-30 by 24h quote volume. This wasted slots on high-volume but low-NATR symbols (BTC, ETH) that never passed live prefilter.
+- **Decision:** Two-stage bootstrap: (1) coarse slice of top-100 by 24h volume, (2) prefilter by rolling 12x5m volume floor, NATR floor, adaptive spacing tradability, and blacklist. Take top-30 survivors for tuning.
+- **Fail-open:** If bootstrap feature fetch fails, fall back to coarse slice (current behavior).
+- **Consequences:** Bootstrap tuning slots align much better with live tradability. Fewer wasted startup attempts on low-NATR majors.
