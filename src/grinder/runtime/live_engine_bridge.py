@@ -503,6 +503,10 @@ class LiveEngineBridge:
 
         with self._engine_construction_lock:
             saved_env = {k: os.environ.get(k) for k in self._GRID_V2_ENV_KEYS}
+            # Enable risk base for equity tracking (day risk manager)
+            saved_env["GRINDER_RISK_BASE_ENABLED"] = os.environ.get("GRINDER_RISK_BASE_ENABLED")
+            if cfg.exchange_port == "futures":
+                os.environ["GRINDER_RISK_BASE_ENABLED"] = "true"
             self._propagate_grid_v2_env(symbol, effective_size, cfg)
             try:
                 paper = PaperEngine(
