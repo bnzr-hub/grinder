@@ -288,12 +288,12 @@ class TuningRefresher:
                 data = json.loads(resp.read())
                 for asset in data:
                     if asset.get("asset") == "USDT":
-                        # Prefer marginBalance (includes unrealized PnL),
-                        # fall back to balance (wallet only)
-                        mb = asset.get("marginBalance")
-                        if mb is not None:
-                            return Decimal(str(mb))
-                        return Decimal(str(asset.get("balance", "0")))
+                        # Equity = crossWalletBalance + crossUnPnl
+                        # Matches totalMarginBalance semantics without
+                        # requiring /fapi/v2/account endpoint.
+                        wallet = Decimal(str(asset.get("crossWalletBalance", "0")))
+                        upnl = Decimal(str(asset.get("crossUnPnl", "0")))
+                        return wallet + upnl
         except Exception:
             pass
         return None
