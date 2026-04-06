@@ -120,6 +120,40 @@ class TestDayStopBlocks:
         assert not dec.admitted
         assert dec.block_reason == AdmissionBlockReason.DAY_STOP
 
+    def test_stop_new_risk(self) -> None:
+        """STOP_NEW_RISK → blocked with DAY_STOP reason."""
+        gate = _gate()
+        dec = gate.evaluate(
+            "TESTUSDT",
+            price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            entry_levels=5,
+            exchange_min_qty=Decimal("0.001"),
+            exchange_min_notional=Decimal("5"),
+            qty_step=Decimal("0.001"),
+            day_state=_day_state(mode=DayRiskMode.STOP_NEW_RISK),
+            portfolio_snapshot=_portfolio_snap(),
+        )
+        assert not dec.admitted
+        assert dec.block_reason == AdmissionBlockReason.DAY_STOP
+
+    def test_force_reduce(self) -> None:
+        """FORCE_REDUCE → blocked with DAY_STOP reason."""
+        gate = _gate()
+        dec = gate.evaluate(
+            "TESTUSDT",
+            price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            entry_levels=5,
+            exchange_min_qty=Decimal("0.001"),
+            exchange_min_notional=Decimal("5"),
+            qty_step=Decimal("0.001"),
+            day_state=_day_state(mode=DayRiskMode.FORCE_REDUCE),
+            portfolio_snapshot=_portfolio_snap(),
+        )
+        assert not dec.admitted
+        assert dec.block_reason == AdmissionBlockReason.DAY_STOP
+
 
 class TestPortfolioBlocks:
     def test_no_entries_allowed(self) -> None:

@@ -89,9 +89,13 @@ class RiskAdmissionGate:
         """
         from grinder.risk.day_risk_manager import DayRiskMode  # noqa: PLC0415
 
-        # Gate 1: Day risk — STOP_FOR_DAY blocks all new risk
+        # Gate 1: Day risk — stop modes block all new risk
         mode = getattr(day_state, "mode", None)
-        if mode == DayRiskMode.STOP_FOR_DAY:
+        if mode in (
+            DayRiskMode.STOP_FOR_DAY,
+            DayRiskMode.STOP_NEW_RISK,
+            DayRiskMode.FORCE_REDUCE,
+        ):
             return AdmissionDecision(
                 symbol=symbol,
                 admitted=False,

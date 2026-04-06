@@ -82,7 +82,7 @@ class PortfolioBudgetAllocator:
     def __init__(self, config: PortfolioBudgetConfig | None = None) -> None:
         self._config = config or PortfolioBudgetConfig()
 
-    def compute(self, inp: PortfolioBudgetInput) -> PortfolioBudgetSnapshot:
+    def compute(self, inp: PortfolioBudgetInput) -> PortfolioBudgetSnapshot:  # noqa: PLR0912
         """Compute portfolio budget snapshot from current inputs."""
         from grinder.risk.day_risk_manager import DayRiskMode  # noqa: PLC0415
 
@@ -100,6 +100,12 @@ class PortfolioBudgetAllocator:
         if inp.day_mode == DayRiskMode.STOP_FOR_DAY:
             effective_risk_pct = _ZERO
             reasons.append("STOP_FOR_DAY")
+        elif inp.day_mode == DayRiskMode.FORCE_REDUCE:
+            effective_risk_pct = _ZERO
+            reasons.append("FORCE_REDUCE")
+        elif inp.day_mode == DayRiskMode.STOP_NEW_RISK:
+            effective_risk_pct = _ZERO
+            reasons.append("STOP_NEW_RISK")
         elif inp.day_mode == DayRiskMode.DEFENSIVE:
             effective_risk_pct = base_risk_pct * cfg.defensive_multiplier
         else:
@@ -122,6 +128,16 @@ class PortfolioBudgetAllocator:
             new_entries_allowed = False
             if "STOP_FOR_DAY" not in reasons:
                 reasons.append("STOP_FOR_DAY")
+
+        if inp.day_mode == DayRiskMode.STOP_NEW_RISK:
+            new_entries_allowed = False
+            if "STOP_NEW_RISK" not in reasons:
+                reasons.append("STOP_NEW_RISK")
+
+        if inp.day_mode == DayRiskMode.FORCE_REDUCE:
+            new_entries_allowed = False
+            if "FORCE_REDUCE" not in reasons:
+                reasons.append("FORCE_REDUCE")
 
         if remaining_slots <= 0:
             new_entries_allowed = False

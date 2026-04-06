@@ -52,20 +52,30 @@ class TestBaseRiskByRegime:
 
 class TestDayModeModifier:
     def test_defensive_halves_risk(self) -> None:
-        snap = _alloc().compute(
-            _inp(regime=MarketRegime.GOOD, day_mode=DayRiskMode.DEFENSIVE)
-        )
+        snap = _alloc().compute(_inp(regime=MarketRegime.GOOD, day_mode=DayRiskMode.DEFENSIVE))
         assert snap.effective_risk_pct == Decimal("1.5")
         assert snap.per_symbol_risk_budget_usd == Decimal("15.0")
 
     def test_stop_for_day_zero_risk(self) -> None:
-        snap = _alloc().compute(
-            _inp(day_mode=DayRiskMode.STOP_FOR_DAY)
-        )
+        snap = _alloc().compute(_inp(day_mode=DayRiskMode.STOP_FOR_DAY))
         assert snap.effective_risk_pct == Decimal("0")
         assert snap.per_symbol_risk_budget_usd == Decimal("0")
         assert not snap.new_entries_allowed
         assert "STOP_FOR_DAY" in snap.reasons
+
+    def test_stop_new_risk_zero_risk_no_entries(self) -> None:
+        snap = _alloc().compute(_inp(day_mode=DayRiskMode.STOP_NEW_RISK))
+        assert snap.effective_risk_pct == Decimal("0")
+        assert snap.per_symbol_risk_budget_usd == Decimal("0")
+        assert not snap.new_entries_allowed
+        assert "STOP_NEW_RISK" in snap.reasons
+
+    def test_force_reduce_zero_risk_no_entries(self) -> None:
+        snap = _alloc().compute(_inp(day_mode=DayRiskMode.FORCE_REDUCE))
+        assert snap.effective_risk_pct == Decimal("0")
+        assert snap.per_symbol_risk_budget_usd == Decimal("0")
+        assert not snap.new_entries_allowed
+        assert "FORCE_REDUCE" in snap.reasons
 
 
 class TestSymbolSlots:

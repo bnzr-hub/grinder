@@ -70,7 +70,7 @@ class GridRiskSizer:
     def __init__(self, config: GridRiskSizerConfig | None = None) -> None:
         self._config = config or GridRiskSizerConfig()
 
-    def compute(self, inp: GridRiskSizerInput) -> GridRiskSizerResult:
+    def compute(self, inp: GridRiskSizerInput) -> GridRiskSizerResult:  # noqa: PLR0911
         """Compute grid sizing from risk budget. Returns admissibility + sizing."""
         # Input validation
         if inp.price <= _ZERO or inp.step_pct <= _ZERO or inp.symbol_risk_budget_usd <= _ZERO:
@@ -78,6 +78,9 @@ class GridRiskSizer:
 
         if inp.entry_levels < 1:
             return self._no_go(inp, "NO_LEVELS")
+
+        if inp.entry_levels < self._config.min_entry_levels:
+            return self._no_go(inp, "BELOW_MIN_LEVELS")
 
         # Adverse move: all levels fill + one extra step
         adverse_move_pct = inp.step_pct * Decimal(str(inp.entry_levels + 1))

@@ -757,7 +757,11 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
     _default_entry_levels = _bridge_cfg.levels
 
     def _admission_ranker(candidates: list[str]) -> list[str]:
-        """Rank candidates via V2 ranker, then filter through risk admission."""
+        """Rank candidates via V2 ranker, then filter through risk admission.
+
+        Already-live symbols bypass admission (active engines unaffected).
+        Only new candidates are filtered through risk gates.
+        """
         ranked = _ranker(candidates)
 
         # If risk state not yet populated (first cycle before facts_fn),
@@ -768,18 +772,23 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
         if day_state is None or portfolio_snap is None or equity is None:
             return ranked
 
-        # Build price + step_pct + constraint maps from tuning state
+        # Split: already-live symbols pass through, new candidates go through gate
+        live = host.live_symbols
+        new_candidates = [s for s in ranked if s not in live]
+
+        if not new_candidates:
+            return ranked  # all live — nothing to gate
+
+        # Build price + step_pct maps for new candidates only
         prices: dict[str, Decimal] = {}
         step_pcts: dict[str, Decimal] = {}
         natr_map = _tuning_state.natr_map
-        for sym in ranked:
-            # Price from selector features (mid of best bid/ask)
+        for sym in new_candidates:
             feat = _tuning_state.v1_features.get(sym)
             if feat is not None and hasattr(feat, "mid_price"):
                 mid = feat.mid_price
                 if mid > _ZERO:
                     prices[sym] = mid
-            # Step pct from NATR-driven adaptive spacing
             natr_val = natr_map.get(sym)
             if natr_val is not None:
                 from grinder.selector.spacing import (  # noqa: PLC0415
@@ -794,8 +803,8 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
         except Exception:
             constraint_map = {}
 
-        admitted, _decisions = admission_gate.filter_candidates(
-            ranked,
+        admitted_new, _decisions = admission_gate.filter_candidates(
+            new_candidates,
             prices=prices,
             step_pcts=step_pcts,
             entry_levels=_default_entry_levels,
@@ -803,7 +812,10 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
             day_state=day_state,
             portfolio_snapshot=portfolio_snap,
         )
-        return admitted
+
+        # Reconstruct ranked list: live symbols keep position, new filtered
+        admitted_set = set(admitted_new)
+        return [s for s in ranked if s in live or s in admitted_set]
 
     # Assemble autonomous loop with execution integration
     loop = AutonomousLoop(
