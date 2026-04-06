@@ -288,7 +288,11 @@ class TuningRefresher:
                 data = json.loads(resp.read())
                 for asset in data:
                     if asset.get("asset") == "USDT":
-                        return Decimal(str(asset.get("marginBalance", "0")))
+                        # Compute equity from wallet + unrealized PnL,
+                        # matching totalMarginBalance semantics.
+                        wallet = Decimal(str(asset.get("crossWalletBalance", "0")))
+                        upnl = Decimal(str(asset.get("crossUnPnl", "0")))
+                        return wallet + upnl
         except Exception:
             pass
         return None
