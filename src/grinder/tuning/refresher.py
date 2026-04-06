@@ -288,9 +288,8 @@ class TuningRefresher:
                 data = json.loads(resp.read())
                 for asset in data:
                     if asset.get("asset") == "USDT":
-                        # Equity = crossWalletBalance + crossUnPnl
-                        # Matches totalMarginBalance semantics without
-                        # requiring /fapi/v2/account endpoint.
+                        # Compute equity from wallet + unrealized PnL,
+                        # matching totalMarginBalance semantics.
                         wallet = Decimal(str(asset.get("crossWalletBalance", "0")))
                         upnl = Decimal(str(asset.get("crossUnPnl", "0")))
                         return wallet + upnl
