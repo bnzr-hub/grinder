@@ -530,6 +530,13 @@ def _build_tuning_state_and_selector(
     return state, refresher, prefilter, ranker
 
 
+def _build_portfolio_allocator() -> Any:
+    """Build PortfolioBudgetAllocator with default config."""
+    from grinder.risk.portfolio_budget_allocator import PortfolioBudgetAllocator  # noqa: PLC0415
+
+    return PortfolioBudgetAllocator()
+
+
 def _build_day_risk_manager() -> Any:
     """Build DayRiskManager with default config."""
     from grinder.risk.day_risk_manager import DayRiskManager  # noqa: PLC0415
@@ -718,7 +725,58 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]
         "universe_provider": universe_provider,
         "refresher": refresher,
         "day_risk_manager": _build_day_risk_manager(),
+        "portfolio_allocator": _build_portfolio_allocator(),
     }
+
+
+def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
+    """Build per-cycle hook for DayRiskManager + PortfolioBudgetAllocator."""
+    day_risk_manager = runtime.get("day_risk_manager")
+    portfolio_allocator = runtime.get("portfolio_allocator")
+    bridge = runtime["bridge"]
+    host = runtime["host"]
+
+    def _cycle_facts() -> None:
+        if day_risk_manager is None:
+            return
+        try:
+            equity = bridge.last_known_equity
+            if equity is None or equity <= 0:
+                return
+            session_key = _current_utc_session_key()
+            day_state = day_risk_manager.update(equity, session_key=session_key)
+
+            if portfolio_allocator is not None:
+                from grinder.risk.portfolio_budget_allocator import (  # noqa: PLC0415
+                    MarketRegime,
+                    PortfolioBudgetInput,
+                )
+
+                active_count = len(host.live_symbols) if hasattr(host, "live_symbols") else 0
+                inp = PortfolioBudgetInput(
+                    equity=equity,
+                    day_mode=day_state.mode,
+                    market_regime=MarketRegime.NEUTRAL,
+                    active_symbol_count=active_count,
+                    gross_exposure_used_usd=Decimal("0"),
+                )
+                budget = portfolio_allocator.compute(inp)
+                logger.debug(
+                    "PORTFOLIO_BUDGET_STATUS mode=%s regime=%s equity=%s active=%d "
+                    "slots_free=%d risk_pct=%s risk_usd=%s entries_allowed=%s",
+                    budget.day_mode.value,
+                    budget.market_regime.value,
+                    budget.equity,
+                    budget.active_symbol_count,
+                    budget.remaining_symbol_slots,
+                    budget.effective_risk_pct,
+                    budget.per_symbol_risk_budget_usd,
+                    budget.new_entries_allowed,
+                )
+        except Exception:
+            pass
+
+    return _cycle_facts
 
 
 def main() -> None:
@@ -772,21 +830,8 @@ def main() -> None:
 
     print("\nGRINDER AUTONOMOUS SYSTEM running. Press Ctrl+C to stop.\n")
 
-    # Day risk manager — shadow update each cycle from bridge equity cache
-    day_risk_manager = runtime.get("day_risk_manager")
-    bridge = runtime["bridge"]
-
-    def _cycle_facts() -> None:
-        """Per-cycle hook: update DayRiskManager from cached equity (non-blocking)."""
-        if day_risk_manager is None:
-            return
-        try:
-            equity = bridge.last_known_equity
-            if equity is not None and equity > 0:
-                session_key = _current_utc_session_key()
-                day_risk_manager.update(equity, session_key=session_key)
-        except Exception:
-            pass  # fail-open: never block the loop
+    # Day risk + portfolio budget — shadow update each cycle
+    _cycle_facts = _build_cycle_facts(runtime)
 
     # Run
     try:
