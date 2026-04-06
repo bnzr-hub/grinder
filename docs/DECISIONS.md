@@ -5060,3 +5060,10 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Two-stage bootstrap: (1) coarse slice of top-100 by 24h volume, (2) prefilter by rolling 12x5m volume floor, NATR floor, adaptive spacing tradability, and blacklist. Take top-30 survivors for tuning.
 - **Fail-open:** If bootstrap feature fetch fails, fall back to coarse slice (current behavior).
 - **Consequences:** Bootstrap tuning slots align much better with live tradability. Fewer wasted startup attempts on low-NATR majors.
+
+### ADR-162: Bounded tuning refresh after startup (2026-04-06)
+
+- **Problem:** Bootstrap tuning was one-shot at startup. TuningCache TTL (300s) caused the tuned set to collapse to zero after ~5 minutes. Loop degraded to CACHE_MISS/NOT_TUNED for all symbols.
+- **Decision:** Add `AutonomousTuningState` (shared thread-safe state for tuned results + selector features) and `TuningRefresher` (background daemon thread, default 240s interval). Selector closures read from dynamic state at invocation time. Refresher periodically retunes bounded bootstrap candidate set, atomically replaces state, and updates bridge config for future activations.
+- **Contract:** Refresh does NOT hot-swap geometry of already-running engines. Bridge updates apply only to inactive symbols. Refresh failures are fail-open (logged, swallowed). Existing cache entries remain valid until TTL expiry.
+- **Consequences:** TuningCache no longer decays after bootstrap. Selector sees refreshed features. Long runs maintain operational tuned universe.
