@@ -288,7 +288,12 @@ class TuningRefresher:
                 data = json.loads(resp.read())
                 for asset in data:
                     if asset.get("asset") == "USDT":
-                        return Decimal(str(asset.get("marginBalance", "0")))
+                        # Prefer marginBalance (includes unrealized PnL),
+                        # fall back to balance (wallet only)
+                        mb = asset.get("marginBalance")
+                        if mb is not None:
+                            return Decimal(str(mb))
+                        return Decimal(str(asset.get("balance", "0")))
         except Exception:
             pass
         return None
