@@ -356,6 +356,15 @@ def _apply_bootstrap_prefilter(
         sum(skip_counts.values()),
         skip_counts or "none",
     )
+
+    # Fail-open: if zero survivors, fall back to coarse slice
+    if not result:
+        logger.warning(
+            "BOOTSTRAP_PREFILTER_EMPTY_FALLBACK count=%d reason=no_survivors",
+            min(limit, len(coarse_symbols)),
+        )
+        return coarse_symbols[:limit]
+
     return result
 
 
