@@ -332,3 +332,98 @@ class TestDeterminism:
         )
         assert a1 == a2
         assert d1 == d2
+
+
+class TestDetailFormatting:
+    """Detail strings contain expected diagnostic fields."""
+
+    def test_grid_below_min_notional_detail(self) -> None:
+        gate = _gate()
+        dec = gate.evaluate(
+            "TESTUSDT",
+            price=Decimal("0.01"),
+            step_pct=Decimal("0.01"),
+            entry_levels=5,
+            exchange_min_qty=Decimal("0.001"),
+            exchange_min_notional=Decimal("100"),
+            qty_step=Decimal("0.001"),
+            day_state=_day_state(),
+            portfolio_snapshot=_portfolio_snap(risk_budget="1"),
+        )
+        assert not dec.admitted
+        assert "reason=BELOW_MIN_NOTIONAL" in dec.detail
+        assert "risk_usd=" in dec.detail
+        assert "actual_notional_usd=" in dec.detail
+        assert "min_notional_usd=" in dec.detail
+        assert "adverse_pct=" in dec.detail
+
+    def test_grid_below_min_qty_detail(self) -> None:
+        gate = _gate()
+        dec = gate.evaluate(
+            "TESTUSDT",
+            price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            entry_levels=5,
+            exchange_min_qty=Decimal("10"),
+            exchange_min_notional=Decimal("5"),
+            qty_step=Decimal("0.001"),
+            day_state=_day_state(),
+            portfolio_snapshot=_portfolio_snap(risk_budget="1"),
+        )
+        assert not dec.admitted
+        assert "reason=BELOW_MIN_QTY" in dec.detail
+        assert "qty=" in dec.detail
+        assert "min_qty=" in dec.detail
+
+    def test_portfolio_block_detail(self) -> None:
+        gate = _gate()
+        dec = gate.evaluate(
+            "TESTUSDT",
+            price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            entry_levels=5,
+            exchange_min_qty=Decimal("0.001"),
+            exchange_min_notional=Decimal("5"),
+            qty_step=Decimal("0.001"),
+            day_state=_day_state(),
+            portfolio_snapshot=_portfolio_snap(
+                new_entries_allowed=False, reasons=("MAX_SYMBOLS_REACHED",)
+            ),
+        )
+        assert "reasons=MAX_SYMBOLS_REACHED" in dec.detail
+        assert "slots_free=" in dec.detail
+        assert "gross_free_usd=" in dec.detail
+
+    def test_day_stop_detail(self) -> None:
+        gate = _gate()
+        dec = gate.evaluate(
+            "TESTUSDT",
+            price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            entry_levels=5,
+            exchange_min_qty=Decimal("0.001"),
+            exchange_min_notional=Decimal("5"),
+            qty_step=Decimal("0.001"),
+            day_state=_day_state(mode=DayRiskMode.STOP_FOR_DAY),
+            portfolio_snapshot=_portfolio_snap(),
+        )
+        assert "day_mode=STOP_FOR_DAY" in dec.detail
+        assert "pnl_pct=" in dec.detail
+
+    def test_admitted_has_detail(self) -> None:
+        gate = _gate()
+        dec = gate.evaluate(
+            "TESTUSDT",
+            price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            entry_levels=5,
+            exchange_min_qty=Decimal("0.001"),
+            exchange_min_notional=Decimal("5"),
+            qty_step=Decimal("0.001"),
+            day_state=_day_state(),
+            portfolio_snapshot=_portfolio_snap(),
+        )
+        assert dec.admitted
+        assert "risk_usd=" in dec.detail
+        assert "qty=" in dec.detail
+        assert "actual_notional_usd=" in dec.detail

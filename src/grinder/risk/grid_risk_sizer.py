@@ -57,6 +57,7 @@ class GridRiskSizerResult:
     order_notional_usd: Decimal
     order_qty_raw: Decimal
     order_qty_rounded: Decimal
+    actual_order_notional_usd: Decimal
     exchange_min_qty: Decimal
     exchange_min_notional: Decimal
 
@@ -152,6 +153,7 @@ class GridRiskSizer:
             order_notional_usd=_ZERO,
             order_qty_raw=_ZERO,
             order_qty_rounded=_ZERO,
+            actual_order_notional_usd=_ZERO,
             exchange_min_qty=inp.exchange_min_qty,
             exchange_min_notional=inp.exchange_min_notional,
         )
@@ -168,6 +170,7 @@ class GridRiskSizer:
         order_qty_raw: Decimal,
         order_qty_rounded: Decimal,
     ) -> GridRiskSizerResult:
+        actual_notional = order_qty_rounded * inp.price if order_qty_rounded > _ZERO else _ZERO
         return GridRiskSizerResult(
             symbol=inp.symbol,
             admissible=admissible,
@@ -180,6 +183,7 @@ class GridRiskSizer:
             order_notional_usd=order_notional,
             order_qty_raw=order_qty_raw,
             order_qty_rounded=order_qty_rounded,
+            actual_order_notional_usd=actual_notional,
             exchange_min_qty=inp.exchange_min_qty,
             exchange_min_notional=inp.exchange_min_notional,
         )

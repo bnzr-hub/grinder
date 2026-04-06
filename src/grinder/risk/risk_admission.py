@@ -102,21 +102,27 @@ class RiskAdmissionGate:
             DayRiskMode.STOP_NEW_RISK,
             DayRiskMode.FORCE_REDUCE,
         ):
+            pnl = getattr(day_state, "day_pnl_pct", "?")
+            floor = getattr(day_state, "profit_lock_floor_pct", "?")
             return AdmissionDecision(
                 symbol=symbol,
                 admitted=False,
                 block_reason=AdmissionBlockReason.DAY_STOP,
-                detail=f"day_mode={mode.value}",
+                detail=f"day_mode={mode.value} pnl_pct={pnl} floor_pct={floor}",
             )
 
         # Gate 2: Portfolio — new entries allowed?
         if not getattr(portfolio_snapshot, "new_entries_allowed", True):
             reasons = getattr(portfolio_snapshot, "reasons", ())
+            slots = getattr(portfolio_snapshot, "remaining_symbol_slots", "?")
+            gross_free = getattr(portfolio_snapshot, "gross_exposure_free_usd", "?")
             return AdmissionDecision(
                 symbol=symbol,
                 admitted=False,
                 block_reason=AdmissionBlockReason.PORTFOLIO_NO_ENTRIES,
-                detail=f"reasons={','.join(reasons)}",
+                detail=(
+                    f"reasons={','.join(reasons)} slots_free={slots} gross_free_usd={gross_free}"
+                ),
             )
 
         # Gate 3: Grid risk sizer — admissible?
@@ -144,15 +150,37 @@ class RiskAdmissionGate:
         sizer_result = self._grid_sizer.compute(sizer_input)
 
         if not sizer_result.admissible:
+            r = sizer_result
             return AdmissionDecision(
                 symbol=symbol,
                 admitted=False,
                 block_reason=AdmissionBlockReason.GRID_NO_GO,
-                detail=f"reason={sizer_result.reason}",
+                detail=(
+                    f"reason={r.reason}"
+                    f" risk_usd={r.symbol_risk_budget_usd:.2f}"
+                    f" step_pct={r.step_pct}"
+                    f" adverse_pct={r.adverse_move_pct}"
+                    f" max_pos_usd={r.max_position_notional_usd:.2f}"
+                    f" order_notional_usd={r.order_notional_usd:.2f}"
+                    f" qty={r.order_qty_rounded}"
+                    f" actual_notional_usd={r.actual_order_notional_usd:.2f}"
+                    f" min_qty={r.exchange_min_qty}"
+                    f" min_notional_usd={r.exchange_min_notional}"
+                ),
             )
 
         # All gates passed
-        return AdmissionDecision(symbol=symbol, admitted=True)
+        r = sizer_result
+        return AdmissionDecision(
+            symbol=symbol,
+            admitted=True,
+            detail=(
+                f"risk_usd={r.symbol_risk_budget_usd:.2f}"
+                f" levels={r.entry_levels}"
+                f" qty={r.order_qty_rounded}"
+                f" actual_notional_usd={r.actual_order_notional_usd:.2f}"
+            ),
+        )
 
     def filter_candidates(
         self,
@@ -215,6 +243,11 @@ class RiskAdmissionGate:
 
             if dec.admitted:
                 admitted.append(symbol)
+                logger.debug(
+                    "RISK_ADMISSION_ALLOWED symbol=%s detail=%s",
+                    symbol,
+                    dec.detail,
+                )
             else:
                 logger.info(
                     "RISK_ADMISSION_BLOCKED symbol=%s reason=%s detail=%s",
