@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 from unittest.mock import MagicMock
 
 from scripts.run_autonomous import _build_v2_selector
@@ -52,8 +53,8 @@ def _v2_feat(
 
 
 def _state(
-    v1: dict | None = None,
-    v2: dict | None = None,
+    v1: dict[str, Any] | None = None,
+    v2: dict[str, Any] | None = None,
 ) -> AutonomousTuningState:
     return AutonomousTuningState(
         v1_features=v1 or {},

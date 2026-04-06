@@ -211,7 +211,7 @@ class TuningRefresher:
             result = solve(symbol, sc, price, config)
             all_results.append((symbol, result))
 
-            if result.status == TuningStatus.TUNED:
+            if result.status == TuningStatus.TUNED and result.order_size is not None:
                 tuned_sizes[symbol] = str(result.order_size)
                 tuned_results[symbol] = result
                 tuning_order_sizes[symbol] = result.order_size
