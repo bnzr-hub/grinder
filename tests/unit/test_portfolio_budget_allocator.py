@@ -63,15 +63,17 @@ class TestDayModeModifier:
         assert not snap.new_entries_allowed
         assert "STOP_FOR_DAY" in snap.reasons
 
-    def test_stop_new_risk_blocks_entries(self) -> None:
+    def test_stop_new_risk_zero_risk_no_entries(self) -> None:
         snap = _alloc().compute(_inp(day_mode=DayRiskMode.STOP_NEW_RISK))
         assert snap.effective_risk_pct == Decimal("0")
+        assert snap.per_symbol_risk_budget_usd == Decimal("0")
         assert not snap.new_entries_allowed
         assert "STOP_NEW_RISK" in snap.reasons
 
-    def test_force_reduce_blocks_entries(self) -> None:
+    def test_force_reduce_zero_risk_no_entries(self) -> None:
         snap = _alloc().compute(_inp(day_mode=DayRiskMode.FORCE_REDUCE))
         assert snap.effective_risk_pct == Decimal("0")
+        assert snap.per_symbol_risk_budget_usd == Decimal("0")
         assert not snap.new_entries_allowed
         assert "FORCE_REDUCE" in snap.reasons
 

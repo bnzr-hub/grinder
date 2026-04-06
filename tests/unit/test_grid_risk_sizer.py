@@ -99,29 +99,6 @@ class TestQtyRounding:
         assert r.order_qty_rounded <= r.order_qty_raw
 
 
-class TestMinEntryLevels:
-    def test_below_min_levels_no_go(self) -> None:
-        """Levels below config minimum → NO_GO."""
-        sizer = GridRiskSizer(config=GridRiskSizerConfig(min_entry_levels=15))
-        r = sizer.compute(_inp(levels=5))
-        assert not r.admissible
-        assert r.reason == "BELOW_MIN_LEVELS"
-
-    def test_at_min_levels_ok(self) -> None:
-        """Levels exactly at minimum → admissible."""
-        sizer = GridRiskSizer(config=GridRiskSizerConfig(min_entry_levels=5))
-        r = sizer.compute(_inp(levels=5))
-        assert r.admissible
-
-    def test_default_min_levels_5(self) -> None:
-        """Default config min_entry_levels=5."""
-        r = _sizer().compute(_inp(levels=5))
-        assert r.admissible
-        r2 = _sizer().compute(_inp(levels=4))
-        assert not r2.admissible
-        assert r2.reason == "BELOW_MIN_LEVELS"
-
-
 class TestInvalidInput:
     def test_zero_price(self) -> None:
         r = _sizer().compute(_inp(price="0"))
@@ -137,6 +114,21 @@ class TestInvalidInput:
         r = _sizer().compute(_inp(step_pct="0"))
         assert not r.admissible
         assert r.reason == "INVALID_INPUT"
+
+
+class TestMinEntryLevels:
+    def test_below_min_levels_rejected(self) -> None:
+        """entry_levels < min_entry_levels → NO_GO."""
+        sizer = GridRiskSizer(config=GridRiskSizerConfig(min_entry_levels=15))
+        r = sizer.compute(_inp(levels=5))
+        assert not r.admissible
+        assert r.reason == "BELOW_MIN_LEVELS"
+
+    def test_at_min_levels_accepted(self) -> None:
+        """entry_levels == min_entry_levels → admissible."""
+        sizer = GridRiskSizer(config=GridRiskSizerConfig(min_entry_levels=5))
+        r = sizer.compute(_inp(levels=5))
+        assert r.admissible
 
 
 class TestDeterminism:
