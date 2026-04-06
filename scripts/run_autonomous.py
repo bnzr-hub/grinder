@@ -531,6 +531,37 @@ def _build_tuning_state_and_selector(
     return state, refresher, prefilter, ranker
 
 
+def _derive_market_regime(
+    natr_map: dict[str, Decimal],
+    *,
+    toxic_threshold: Decimal = Decimal("3.0"),
+    good_threshold: Decimal = Decimal("1.0"),
+) -> Any:
+    """Derive portfolio-level market regime from median NATR of active candidates.
+
+    Uses selector NATR (% units, e.g. 1.5 = 1.5%) as a coarse volatility proxy:
+    - median NATR >= toxic_threshold → TOXIC (volatile, reduce risk)
+    - median NATR <= good_threshold → GOOD (calm, full risk)
+    - else → NEUTRAL
+
+    Fail-open: returns NEUTRAL if no data.
+    """
+    from grinder.risk.portfolio_budget_allocator import MarketRegime  # noqa: PLC0415
+
+    if not natr_map:
+        return MarketRegime.NEUTRAL
+
+    values = sorted(natr_map.values())
+    mid = len(values) // 2
+    median_natr = values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+    if median_natr >= toxic_threshold:
+        return MarketRegime.TOXIC
+    if median_natr <= good_threshold:
+        return MarketRegime.GOOD
+    return MarketRegime.NEUTRAL
+
+
 def _build_portfolio_allocator() -> Any:
     """Build PortfolioBudgetAllocator with default config."""
     from grinder.risk.portfolio_budget_allocator import PortfolioBudgetAllocator  # noqa: PLC0415
@@ -855,12 +886,15 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
 
     Stores latest day_state and portfolio_snapshot into runtime["risk_state"]
     so the admission gate can read current risk state each cycle.
+
+    Uses real market regime (from NATR) and real gross exposure (from refresher).
     """
     day_risk_manager = runtime.get("day_risk_manager")
     portfolio_allocator = runtime.get("portfolio_allocator")
     bridge = runtime["bridge"]
     host = runtime["host"]
     risk_state = runtime.get("risk_state", {})
+    tuning_state = runtime.get("tuning_state")
 
     def _cycle_facts() -> None:
         if day_risk_manager is None:
@@ -876,23 +910,31 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
 
             if portfolio_allocator is not None:
                 from grinder.risk.portfolio_budget_allocator import (  # noqa: PLC0415
-                    MarketRegime,
                     PortfolioBudgetInput,
                 )
 
                 active_count = len(host.live_symbols) if hasattr(host, "live_symbols") else 0
+
+                # Real market regime from NATR (fail-open to NEUTRAL)
+                natr_map = tuning_state.natr_map if tuning_state is not None else {}
+                regime = _derive_market_regime(natr_map)
+
+                # Real gross exposure from refresher (fail-open to 0)
+                gross_exposure = bridge.last_known_gross_exposure or _ZERO
+
                 inp = PortfolioBudgetInput(
                     equity=equity,
                     day_mode=day_state.mode,
-                    market_regime=MarketRegime.NEUTRAL,
+                    market_regime=regime,
                     active_symbol_count=active_count,
-                    gross_exposure_used_usd=Decimal("0"),
+                    gross_exposure_used_usd=gross_exposure,
                 )
                 budget = portfolio_allocator.compute(inp)
                 risk_state["portfolio_snapshot"] = budget
-                logger.debug(
+                logger.info(
                     "PORTFOLIO_BUDGET_STATUS mode=%s regime=%s equity=%s active=%d "
-                    "slots_free=%d risk_pct=%s risk_usd=%s entries_allowed=%s",
+                    "slots_free=%d risk_pct=%s risk_usd=%s entries_allowed=%s "
+                    "gross_used_usd=%s gross_free_usd=%s",
                     budget.day_mode.value,
                     budget.market_regime.value,
                     budget.equity,
@@ -901,6 +943,8 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
                     budget.effective_risk_pct,
                     budget.per_symbol_risk_budget_usd,
                     budget.new_entries_allowed,
+                    budget.gross_exposure_used_usd,
+                    budget.gross_exposure_free_usd,
                 )
         except Exception:
             pass
