@@ -3063,19 +3063,21 @@ class LiveEngineV0:
             self._toxicity_gate.record_price(snapshot.ts, snapshot.symbol, snapshot.mid_price)
 
         # Publish regime to shared registry for portfolio-level aggregation.
-        # Uses same inputs as AdaptiveGridPolicy's classify_regime() call.
+        # Uses classify_regime() with available inputs. When FeatureEngine is
+        # present, uses full feature snapshot; otherwise passes features=None
+        # which yields RANGE/WARMUP (still the real classifier, limited input).
         # Registry deduplicates unchanged regime (no per-tick log spam).
-        if self._regime_registry is not None and self._last_feature_snapshot is not None:
+        if self._regime_registry is not None:
             from grinder.controller.regime import classify_regime  # noqa: PLC0415
 
             fs = self._last_feature_snapshot
-            toxicity_result = (
-                self._toxicity_gate.check(fs.ts, fs.symbol, float(fs.spread_bps), fs.mid_price)
-                if self._toxicity_gate is not None
-                else None
-            )
+            toxicity_result = None
+            if fs is not None and self._toxicity_gate is not None:
+                toxicity_result = self._toxicity_gate.check(
+                    fs.ts, fs.symbol, float(fs.spread_bps), fs.mid_price
+                )
             rd = classify_regime(
-                features=self._last_feature_snapshot,
+                features=fs,
                 kill_switch_active=self._config.kill_switch_active,
                 toxicity_result=toxicity_result,
             )
