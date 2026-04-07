@@ -6380,25 +6380,36 @@ class LiveEngineV0:
                     self._symbol_unload.activate(sym)
 
         # Force-reduce: cancel grid exits to free reduce-only budget, then unload.
+        # Sequence: cancel → verify gone from snapshot → activate unload.
         if self._force_reduce_requested:
             for sym in tracked:
                 _notional, _qty = pos_by_sym.get(sym, (0.0, 0.0))
-                if _qty > 0:
-                    # Cancel grid reduce-only exits to free budget for unload
-                    if not self._force_reduce_exits_cleared:
-                        cancelled = self._cancel_grid_exits_for_force_reduce(sym, acct)
-                        if cancelled > 0:
-                            logger.info(
-                                "FORCE_REDUCE_EXIT_ORDERS_CANCELLED symbol=%s count=%d",
-                                sym,
-                                cancelled,
-                            )
-                        self._force_reduce_exits_cleared = True
+                if _qty <= 0:
+                    continue
 
-                    # Activate unload after exits cleared
-                    if self._symbol_unload.get_status(sym).value == "INACTIVE":
-                        self._symbol_unload.activate(sym, force=True)
-                        logger.info("ENGINE_FORCE_REDUCE_UNLOAD_STARTED symbol=%s", sym)
+                if not self._force_reduce_exits_cleared:
+                    # Check if grid exits still present in snapshot
+                    remaining_grid_exits = self._count_grid_exits(sym, acct)
+
+                    if remaining_grid_exits > 0:
+                        # Send cancels (retry each cycle until gone)
+                        cancelled = self._cancel_grid_exits_for_force_reduce(sym, acct)
+                        logger.info(
+                            "FORCE_REDUCE_EXIT_ORDERS_WAITING symbol=%s remaining=%d cancelled=%d",
+                            sym,
+                            remaining_grid_exits,
+                            cancelled,
+                        )
+                        continue  # don't unload until exits confirmed gone
+
+                    # All grid exits gone from snapshot — budget is free
+                    logger.info("FORCE_REDUCE_EXIT_ORDERS_CLEARED symbol=%s", sym)
+                    self._force_reduce_exits_cleared = True
+
+                # Activate unload after exits confirmed cleared
+                if self._symbol_unload.get_status(sym).value == "INACTIVE":
+                    self._symbol_unload.activate(sym, force=True)
+                    logger.info("ENGINE_FORCE_REDUCE_UNLOAD_STARTED symbol=%s", sym)
 
         # Try unload steps for active symbols (force-reduce overrides enabled gate)
         if self._symbol_unload.config.enabled or self._force_reduce_requested:
@@ -6468,16 +6479,51 @@ class LiveEngineV0:
                     result.block_reason.value if result.block_reason else "EXECUTION_ERROR",
                 )
 
-    def _cancel_grid_exits_for_force_reduce(self, symbol: str, acct: AccountSnapshot) -> int:
-        """Cancel open reduce-only orders to free budget for unload steps.
+    def _count_grid_exits(self, symbol: str, acct: AccountSnapshot) -> int:
+        """Count grid-owned reduce-only exit orders still on exchange."""
+        grid_exit_ids = self._get_grid_exit_order_ids()
+        count = 0
+        for order in acct.open_orders:
+            if (
+                order.symbol == symbol
+                and order.reduce_only
+                and order.order_id in grid_exit_ids
+                and order.qty - order.filled_qty > 0
+            ):
+                count += 1
+        return count
 
-        Only cancels orders for the given symbol that are reduce_only.
+    def _get_grid_exit_order_ids(self) -> set[str]:
+        """Get exchange order IDs of all grid-owned exit orders."""
+        bridge = self._grid_v2_bridge
+        if bridge is None or bridge.adapter is None:
+            return set()
+        ids: set[str] = set()
+        for cid in bridge.adapter.all_exit_cids():
+            reg = bridge.adapter.lookup_exit(cid)
+            if reg is not None:
+                ids.add(reg.exit_order_id)
+        return ids
+
+    def _cancel_grid_exits_for_force_reduce(self, symbol: str, acct: AccountSnapshot) -> int:
+        """Cancel grid-owned reduce-only exit orders to free budget for unload.
+
+        Only cancels orders that are:
+        - for the given symbol
+        - reduce_only
+        - owned by the grid v2 adapter (matched by exchange order_id)
+
+        Does NOT cancel unrelated/manual/external reduce-only orders.
         Returns count of cancel actions dispatched.
         """
+        grid_exit_ids = self._get_grid_exit_order_ids()
+
         cancelled = 0
         ts = int(time.time() * 1000)
         for order in acct.open_orders:
             if order.symbol != symbol or not order.reduce_only:
+                continue
+            if order.order_id not in grid_exit_ids:
                 continue
             remaining = order.qty - order.filled_qty
             if remaining <= 0:
@@ -6485,7 +6531,7 @@ class LiveEngineV0:
             cancel_action = ExecutionAction(
                 action_type=ActionType.CANCEL,
                 symbol=order.symbol,
-                order_id=getattr(order, "order_id", None) or getattr(order, "client_order_id", ""),
+                order_id=order.order_id,
                 reason="FORCE_REDUCE_BUDGET_CLEAR",
             )
             result = self._process_action(cancel_action, ts)
