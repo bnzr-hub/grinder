@@ -82,6 +82,15 @@ class LiveSymbolDegradationController:
         Returns:
             List of symbols newly degraded this cycle (for logging/testing).
         """
+        # Prune symbols no longer live (deactivated/re-activatable)
+        stale = self._degraded - live_symbols
+        if stale:
+            self._degraded -= stale
+            logger.debug(
+                "LIVE_SYMBOL_DEGRADATION_PRUNED symbols=%s",
+                ",".join(sorted(stale)),
+            )
+
         reason = _day_mode_to_reason(day_mode)
         if reason is None:
             return []
@@ -91,16 +100,25 @@ class LiveSymbolDegradationController:
             if symbol in self._degraded:
                 continue
 
-            # Request graceful exit via host
+            # Request graceful exit via host — only latch on success
             try:
                 result = graceful_exit_fn(symbol)  # type: ignore[operator]
+                result_val = result.value if hasattr(result, "value") else str(result)
                 logger.info(
                     "LIVE_SYMBOL_DEGRADED symbol=%s target=GRACEFUL_EXIT_ONLY"
                     " reason=%s exit_result=%s",
                     symbol,
                     reason.value,
-                    result.value if hasattr(result, "value") else str(result),
+                    result_val,
                 )
+                # Only latch if exit was accepted (SUCCESS or NOT_APPLICABLE)
+                # FAILED → leave out of _degraded so next cycle retries
+                if hasattr(result, "value") and result.value == "FAILED":
+                    logger.warning(
+                        "LIVE_SYMBOL_DEGRADATION_RETRY symbol=%s reason=exit_failed",
+                        symbol,
+                    )
+                    continue
             except Exception as e:
                 logger.error(
                     "LIVE_SYMBOL_DEGRADATION_FAILED symbol=%s reason=%s error=%s",
@@ -108,6 +126,7 @@ class LiveSymbolDegradationController:
                     reason.value,
                     e,
                 )
+                continue  # don't latch — retry next cycle
 
             self._degraded.add(symbol)
             newly_degraded.append(symbol)
