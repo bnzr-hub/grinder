@@ -11,6 +11,7 @@ If bridge stops injecting FeatureEngine, these tests fail.
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 
 from grinder.contracts import Snapshot
 from grinder.controller.regime import Regime, RegimeReason
@@ -35,7 +36,7 @@ def _make_snapshot(symbol: str, ts_ms: int, price: Decimal) -> Snapshot:
 
 def _build_bridge_and_engine(
     symbol: str, registry: SharedRegimeRegistry
-) -> tuple[LiveEngineBridge, object]:
+) -> tuple[LiveEngineBridge, Any]:
     """Build engine through the real bridge construction path."""
     bridge = LiveEngineBridge(config=BridgeConfig())
     bridge.set_regime_registry(registry)
