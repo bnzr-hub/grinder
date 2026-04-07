@@ -6454,10 +6454,20 @@ class LiveEngineV0:
                     sym,
                 )
                 continue
-            # Quantize price and qty to exchange constraints
+            # Quantize price and qty to exchange constraints.
+            # Fail-closed: skip if constraints unavailable — do not guess.
             side = OrderSide.BUY if step.side == "BUY" else OrderSide.SELL
-            tick = self._tick_size_cache.get(sym, Decimal("0.01"))
-            lot = self._step_size_cache.get(sym, Decimal("0.001"))
+            tick = self._tick_size_cache.get(sym)
+            lot = self._step_size_cache.get(sym)
+            if not tick or tick <= 0 or not lot or lot <= 0:
+                logger.warning(
+                    "SYMBOL_UNLOAD_STEP_SKIPPED symbol=%s reason=constraints_unavailable"
+                    " tick=%s lot=%s",
+                    sym,
+                    tick,
+                    lot,
+                )
+                continue
             # Price: BUY rounds UP (aggressive), SELL rounds DOWN (aggressive)
             if side == OrderSide.BUY:
                 price = ((mark / tick).to_integral_value(rounding=ROUND_UP)) * tick
