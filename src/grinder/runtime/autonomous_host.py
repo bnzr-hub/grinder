@@ -204,7 +204,7 @@ class AutonomousEngineHost:
             return False
 
         try:
-            ok = self.force_reduce_fn(symbol, engine_ref)
+            ok: bool = self.force_reduce_fn(symbol, engine_ref)
             logger.info("HOST_FORCE_REDUCE symbol=%s newly_set=%s", symbol, ok)
             return ok
         except Exception as e:

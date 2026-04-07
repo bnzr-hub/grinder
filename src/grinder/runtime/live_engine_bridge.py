@@ -322,7 +322,7 @@ class LiveEngineBridge:
             logger.warning("BRIDGE_FORCE_REDUCE_NO_ENGINE symbol=%s", symbol)
             return False
         try:
-            ok = engine.request_force_reduce(reason="DAY_FORCE_REDUCE")
+            ok: bool = engine.request_force_reduce(reason="DAY_FORCE_REDUCE")
             logger.info("BRIDGE_FORCE_REDUCE symbol=%s newly_set=%s", symbol, ok)
             return ok
         except Exception as e:
