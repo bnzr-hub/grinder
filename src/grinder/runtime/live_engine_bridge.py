@@ -500,13 +500,12 @@ class LiveEngineBridge:
         logger.info("BRIDGE_USER_DATA_LOOP_STARTED symbol=%s", symbol)
         return user_data_task, shutdown_bridge_task
 
-    def _build_engine_and_connector(self, symbol: str) -> tuple[Any, Any, Any, float]:
-        """Build engine + connector for a symbol. Returns (engine, port, connector, engine_ms)."""
-        from grinder.connectors.live_connector import (  # noqa: PLC0415
-            LiveConnectorConfig,
-            LiveConnectorV0,
-            SafeMode,
-        )
+    def _build_engine(self, symbol: str) -> tuple[Any, Any, float]:
+        """Build engine + port for a symbol. Returns (engine, port, engine_ms).
+
+        Shared by _build_engine_and_connector() and build_engine_only().
+        """
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
         from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
         from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
         from grinder.observability.latency_telemetry import PhaseTimer  # noqa: PLC0415
@@ -555,8 +554,30 @@ class LiveEngineBridge:
                 )
             finally:
                 self._restore_grid_v2_env(saved_env)
-        engine_ms = startup_timer.elapsed_ms()
+        return engine, port, startup_timer.elapsed_ms()
 
+    def build_engine_only(self, symbol: str) -> tuple[Any, Any]:
+        """Build engine + port for a symbol without connector. For testing.
+
+        Returns (engine, port). Uses the same construction path as
+        _build_engine_and_connector() — same FeatureEngine injection,
+        same regime_registry wiring.
+        """
+        engine, port, _ms = self._build_engine(symbol)
+        return engine, port
+
+    def _build_engine_and_connector(self, symbol: str) -> tuple[Any, Any, Any, float]:
+        """Build engine + connector for a symbol. Returns (engine, port, connector, engine_ms)."""
+        from grinder.connectors.live_connector import (  # noqa: PLC0415
+            LiveConnectorConfig,
+            LiveConnectorV0,
+            SafeMode,
+        )
+
+        engine, port, engine_ms = self._build_engine(symbol)
+
+        cfg = self._config
+        mode = SafeMode(cfg.mode)
         ws_url = (
             (
                 "wss://stream.binancefuture.com/ws"

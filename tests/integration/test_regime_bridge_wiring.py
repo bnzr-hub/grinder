@@ -1,10 +1,11 @@
 """Integration test: bridge-wired regime publication through real engine path.
 
-Proves the full wiring: FeatureEngine → classify_regime → SharedRegimeRegistry
-through the real LiveEngineV0.process_snapshot() path, then cleanup removes
-the symbol from the registry.
+Proves the full wiring: bridge constructs engine with FeatureEngine →
+engine.process_snapshot() → classify_regime() → SharedRegimeRegistry,
+then bridge cleanup removes the symbol from the registry.
 
-Uses a short bar_interval to avoid needing 15+ minutes of synthetic data.
+Uses bridge.build_engine_only() — the same construction path as production.
+If bridge stops injecting FeatureEngine, these tests fail.
 """
 
 from __future__ import annotations
@@ -13,10 +14,6 @@ from decimal import Decimal
 
 from grinder.contracts import Snapshot
 from grinder.controller.regime import Regime, RegimeReason
-from grinder.features.engine import FeatureEngine, FeatureEngineConfig
-from grinder.live.config import LiveEngineConfig
-from grinder.live.engine import LiveEngineV0
-from grinder.paper.engine import PaperEngine
 from grinder.risk.regime_registry import SharedRegimeRegistry
 from grinder.runtime.live_engine_bridge import BridgeConfig, EngineHandle, LiveEngineBridge
 
@@ -36,60 +33,31 @@ def _make_snapshot(symbol: str, ts_ms: int, price: Decimal) -> Snapshot:
     )
 
 
-def _build_engine_with_regime(
-    symbol: str,
-    registry: SharedRegimeRegistry,
-    bar_interval_ms: int = 1000,
-    atr_period: int = 3,
-) -> LiveEngineV0:
-    """Build a real LiveEngineV0 with FeatureEngine and regime registry.
-
-    Uses short bar_interval and small ATR period for fast warmup in tests.
-    Mirrors the bridge construction path from _build_engine_and_connector().
-    """
-    from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
-
-    paper = PaperEngine(spacing_bps=10.0, levels=5, size_per_level=Decimal("0.001"))
-    config = LiveEngineConfig(armed=False, mode=SafeMode.READ_ONLY)
-    feature_engine = FeatureEngine(
-        FeatureEngineConfig(
-            bar_interval_ms=bar_interval_ms,
-            atr_period=atr_period,
-            range_horizon=atr_period,
-        )
-    )
-    return LiveEngineV0(
-        paper_engine=paper,
-        exchange_port=_noop_port(),
-        config=config,
-        operator_symbols=[symbol],
-        feature_engine=feature_engine,
-        regime_registry=registry,
-    )
-
-
-def _noop_port() -> object:
-    """Build a NoOp exchange port."""
-    from grinder.execution.port import NoOpExchangePort  # noqa: PLC0415
-
-    return NoOpExchangePort()
+def _build_bridge_and_engine(
+    symbol: str, registry: SharedRegimeRegistry
+) -> tuple[LiveEngineBridge, object]:
+    """Build engine through the real bridge construction path."""
+    bridge = LiveEngineBridge(config=BridgeConfig())
+    bridge.set_regime_registry(registry)
+    engine, _port = bridge.build_engine_only(symbol)
+    return bridge, engine
 
 
 class TestRegimeBridgeWiring:
     def test_engine_publishes_regime_after_warmup(self) -> None:
-        """Engine with FeatureEngine publishes real regime after warmup bars."""
+        """Bridge-constructed engine publishes real regime after FeatureEngine warmup."""
         symbol = "TESTUSDT"
         registry = SharedRegimeRegistry()
-        engine = _build_engine_with_regime(symbol, registry, bar_interval_ms=1000, atr_period=3)
+        _bridge, engine = _build_bridge_and_engine(symbol, registry)
 
         assert len(registry) == 0
 
-        # Feed enough snapshots to warm up FeatureEngine:
-        # atr_period=3 needs 4+ bars, bar_interval=1000ms, so ~5 ticks at 1s apart
+        # Feed enough snapshots to warm up FeatureEngine (default: 60s bars, ATR period 14).
+        # Need 15+ bars → 15 ticks at 60s intervals.
         base_ts = 1_000_000_000
         price = Decimal("100.00")
-        for i in range(8):
-            snap = _make_snapshot(symbol, base_ts + i * 1000, price + Decimal(str(i * 0.1)))
+        for i in range(20):
+            snap = _make_snapshot(symbol, base_ts + i * 60_000, price + Decimal(str(i * 0.1)))
             engine.process_snapshot(snap)
 
         # After warmup, regime should be published
@@ -101,7 +69,7 @@ class TestRegimeBridgeWiring:
         assert entry.confidence > 0
 
     def test_cleanup_removes_regime_from_registry(self) -> None:
-        """Bridge cleanup removes symbol from registry regardless of port type."""
+        """Bridge cleanup removes symbol from registry (noop port path)."""
         symbol = "TESTUSDT"
         registry = SharedRegimeRegistry()
         bridge = LiveEngineBridge(config=BridgeConfig())
@@ -109,42 +77,66 @@ class TestRegimeBridgeWiring:
 
         # Manually publish a regime (simulating what engine would do)
         registry.publish(symbol, Regime.RANGE, RegimeReason.DEFAULT, 80)
-
         assert len(registry) == 1
 
-        # Create minimal handle for cleanup
+        # Cleanup with noop handle — regime should still be removed
         handle = EngineHandle(
             symbol=symbol,
             thread=None,  # type: ignore[arg-type]
             shutdown_event=None,  # type: ignore[arg-type]
         )
-
         bridge.cleanup(symbol, handle)
         assert len(registry) == 0, "Cleanup should remove symbol from registry"
 
     def test_full_lifecycle_publish_then_cleanup(self) -> None:
-        """Full lifecycle: engine warmup → regime publish → bridge cleanup → registry empty."""
+        """Full lifecycle: bridge build → warmup → regime publish → cleanup → empty."""
         symbol = "TESTUSDT"
         registry = SharedRegimeRegistry()
-        engine = _build_engine_with_regime(symbol, registry, bar_interval_ms=1000, atr_period=3)
+        bridge, engine = _build_bridge_and_engine(symbol, registry)
 
         # Warmup
         base_ts = 1_000_000_000
         price = Decimal("100.00")
-        for i in range(8):
-            snap = _make_snapshot(symbol, base_ts + i * 1000, price + Decimal(str(i * 0.1)))
+        for i in range(20):
+            snap = _make_snapshot(symbol, base_ts + i * 60_000, price + Decimal(str(i * 0.1)))
             engine.process_snapshot(snap)
 
         assert len(registry) > 0
 
         # Cleanup via bridge
-        bridge = LiveEngineBridge(config=BridgeConfig())
-        bridge.set_regime_registry(registry)
         handle = EngineHandle(
             symbol=symbol,
             thread=None,  # type: ignore[arg-type]
             shutdown_event=None,  # type: ignore[arg-type]
         )
         bridge.cleanup(symbol, handle)
-
         assert len(registry) == 0
+
+    def test_no_regime_without_feature_engine(self) -> None:
+        """Engine without FeatureEngine never publishes regime — regression guard."""
+        from grinder.connectors.live_connector import SafeMode  # noqa: PLC0415
+        from grinder.execution.port import NoOpExchangePort  # noqa: PLC0415
+        from grinder.live.config import LiveEngineConfig  # noqa: PLC0415
+        from grinder.live.engine import LiveEngineV0  # noqa: PLC0415
+        from grinder.paper.engine import PaperEngine  # noqa: PLC0415
+
+        symbol = "TESTUSDT"
+        registry = SharedRegimeRegistry()
+
+        # Construct engine WITHOUT FeatureEngine — like old bridge before #615
+        engine = LiveEngineV0(
+            paper_engine=PaperEngine(spacing_bps=10.0, levels=5, size_per_level=Decimal("0.001")),
+            exchange_port=NoOpExchangePort(),
+            config=LiveEngineConfig(armed=False, mode=SafeMode.READ_ONLY),
+            operator_symbols=[symbol],
+            regime_registry=registry,
+            # NO feature_engine — intentionally omitted
+        )
+
+        base_ts = 1_000_000_000
+        price = Decimal("100.00")
+        for i in range(20):
+            snap = _make_snapshot(symbol, base_ts + i * 60_000, price)
+            engine.process_snapshot(snap)
+
+        assert len(registry) == 0, "Without FeatureEngine, regime should never publish"
