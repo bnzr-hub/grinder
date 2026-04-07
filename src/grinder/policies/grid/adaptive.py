@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from grinder.controller.regime import Regime, RegimeConfig, classify_regime
+from grinder.controller.regime import Regime, RegimeConfig, RegimeDecision, classify_regime
 from grinder.core import GridMode, MarketRegime, ResetAction
 from grinder.policies.base import GridPlan, GridPolicy
 from grinder.sizing import AutoSizer, AutoSizerConfig, GridShape
@@ -335,6 +335,12 @@ class AdaptiveGridPolicy(GridPolicy):
             config: Adaptive grid configuration (uses defaults if None)
         """
         self.config = config or AdaptiveGridConfig()
+        self._last_regime_decision: RegimeDecision | None = None
+
+    @property
+    def last_regime_decision(self) -> RegimeDecision | None:
+        """Last computed RegimeDecision from classify_regime(). Updated on each plan()."""
+        return self._last_regime_decision
 
     def evaluate(
         self,
@@ -391,6 +397,7 @@ class AdaptiveGridPolicy(GridPolicy):
             toxicity_result=toxicity_result,
             config=self.config.regime_config,
         )
+        self._last_regime_decision = regime_decision
 
         # Handle pause conditions
         if regime_decision.regime in (Regime.EMERGENCY, Regime.TOXIC, Regime.PAUSED):

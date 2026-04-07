@@ -523,6 +523,7 @@ class LiveEngineV0:
         shadow_selector: ShadowSelector | None = None,
         active_selector: ActiveSelector | None = None,
         operator_symbols: list[str] | None = None,
+        regime_registry: object | None = None,
     ) -> None:
         """Initialize LiveEngineV0.
 
@@ -565,6 +566,8 @@ class LiveEngineV0:
         # Doc-36 Phase 2: active selector (controlled activation)
         self._active_selector = active_selector
         self._operator_symbols = operator_symbols or []
+        # Shared regime registry for portfolio-level regime aggregation
+        self._regime_registry = regime_registry
         # Min-notional cache: symbol → Decimal. Loaded from constraint provider at init.
         # Used by pre-send notional gate to block sub-minimum orders before HTTP.
         # Only loaded when operator_symbols are set (autonomous/production path).
@@ -4353,6 +4356,14 @@ class LiveEngineV0:
             suppress_increase=suppress_increase,
             rolling_mode=rolling_mode,
         )
+
+        # Publish regime to shared registry (if available)
+        if self._regime_registry is not None:
+            rd = getattr(planner, "last_regime_decision", None)
+            if rd is not None:
+                self._regime_registry.publish(
+                    snapshot.symbol, rd.regime, rd.reason, rd.confidence
+                )
 
         if plan_result.actions:
             # Reset steady-state counter when actions resume

@@ -99,6 +99,7 @@ class LiveEngineBridge:
         # Updated by engine thread, read by main loop for day risk.
         self._last_known_equity: Decimal | None = None
         self._last_known_gross_exposure: Decimal | None = None
+        self._regime_registry: object | None = None
 
     def set_symbol_size(self, symbol: str, order_size: str) -> None:
         """Register tuning-resolved order size for a symbol."""
@@ -126,6 +127,15 @@ class LiveEngineBridge:
     def update_gross_exposure(self, gross_exposure: Decimal) -> None:
         """Set last-known gross exposure (thread-safe, called by refresher)."""
         self._last_known_gross_exposure = gross_exposure
+
+    @property
+    def regime_registry(self) -> object | None:
+        """Shared regime registry for portfolio-level aggregation."""
+        return self._regime_registry
+
+    def set_regime_registry(self, registry: object) -> None:
+        """Inject shared regime registry (called once at runtime setup)."""
+        self._regime_registry = registry
 
     def set_symbol_spacing(self, symbol: str, spacing_bps: Decimal) -> None:
         """Register tuning-resolved adaptive spacing for a symbol."""
@@ -357,6 +367,11 @@ class LiveEngineBridge:
         close_ms = close_timer.elapsed_ms()
 
         log_shutdown(symbol, cancel_ms, close_ms, cleanup_timer.elapsed_ms())
+
+        # Remove symbol from shared regime registry on cleanup
+        if self._regime_registry is not None and hasattr(self._regime_registry, "remove"):
+            self._regime_registry.remove(symbol)
+
         logger.info("BRIDGE_ENGINE_CLEANUP symbol=%s ok=%s", symbol, ok)
         return ok
 
@@ -524,6 +539,7 @@ class LiveEngineBridge:
                     config=engine_config,
                     operator_symbols=[symbol],
                     account_syncer=account_syncer,
+                    regime_registry=self._regime_registry,
                 )
             finally:
                 self._restore_grid_v2_env(saved_env)
