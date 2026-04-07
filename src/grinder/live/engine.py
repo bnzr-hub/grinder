@@ -4378,12 +4378,6 @@ class LiveEngineV0:
             rolling_mode=rolling_mode,
         )
 
-        # Publish regime to shared registry (if available)
-        if self._regime_registry is not None:
-            rd = getattr(planner, "last_regime_decision", None)
-            if rd is not None:
-                self._regime_registry.publish(snapshot.symbol, rd.regime, rd.reason, rd.confidence)
-
         if plan_result.actions:
             # Reset steady-state counter when actions resume
             self._rolling_steady_state_count.pop(snapshot.symbol, None)
