@@ -865,14 +865,15 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
     Stores latest day_state and portfolio_snapshot into runtime["risk_state"]
     so the admission gate can read current risk state each cycle.
 
-    Uses real gross exposure from refresher. Market regime stays NEUTRAL until
-    live engines expose their controller/regime.py RegimeDecision upstream.
+    Uses real gross exposure from refresher and real portfolio-level regime
+    aggregated from live engine RegimeDecisions via SharedRegimeRegistry.
     """
     day_risk_manager = runtime.get("day_risk_manager")
     portfolio_allocator = runtime.get("portfolio_allocator")
     bridge = runtime["bridge"]
     host = runtime["host"]
     risk_state = runtime.get("risk_state", {})
+    regime_registry = runtime.get("regime_registry")
 
     def _cycle_facts() -> None:
         if day_risk_manager is None:
@@ -891,14 +892,25 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
                     MarketRegime,
                     PortfolioBudgetInput,
                 )
+                from grinder.risk.regime_aggregation import (  # noqa: PLC0415
+                    aggregate_portfolio_regime,
+                )
 
                 active_count = len(host.live_symbols) if hasattr(host, "live_symbols") else 0
 
-                # Market regime: NEUTRAL until live engines expose their
-                # controller/regime.py RegimeDecision upstream. The existing
-                # per-symbol classifier is correct but currently lives inside
-                # engine threads — no shared portfolio-level aggregation path yet.
+                # Portfolio regime from live engine RegimeDecisions.
+                # Registry only contains symbols with active engines (cleanup
+                # removes on shutdown), so all entries are relevant.
                 regime = MarketRegime.NEUTRAL
+                if regime_registry is not None and len(regime_registry) > 0:
+                    snap = regime_registry.snapshot()
+                    regime = aggregate_portfolio_regime(e.regime for e in snap.values())
+                    logger.debug(
+                        "PORTFOLIO_REGIME_STATUS regime=%s sources=%d symbols=%s",
+                        regime.value,
+                        len(snap),
+                        ",".join(sorted(snap)),
+                    )
 
                 # Real gross exposure from refresher (fail-open to 0)
                 gross_exposure = bridge.last_known_gross_exposure or _ZERO
