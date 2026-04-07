@@ -6813,12 +6813,19 @@ class LiveEngineV0:
                 intent=intent,
             )
         # Uses reservation model: open_remaining + batch_reserved + new_qty <= position.
+        # Force-reduce unload steps bypass this gate — the unload controller
+        # already computes safe qty from position truth, and grid exits may be
+        # consuming the entire budget. Without this bypass, unload is starved.
+        _is_force_reduce_unload = (
+            self._force_reduce_requested and getattr(action, "reason", "") == "SYMBOL_UNLOAD_STEP"
+        )
         if (
             action.action_type == ActionType.PLACE
             and action.reduce_only
             and action.quantity is not None
             and action.symbol
             and action.side is not None
+            and not _is_force_reduce_unload
         ):
             from grinder.live.reduce_only_budget import (  # noqa: PLC0415
                 BudgetCheckResult,
