@@ -567,6 +567,15 @@ def _build_risk_admission_gate(
     )
 
 
+def _build_degradation_controller() -> Any:
+    """Build LiveSymbolDegradationController."""
+    from grinder.risk.live_symbol_degradation import (  # noqa: PLC0415
+        LiveSymbolDegradationController,
+    )
+
+    return LiveSymbolDegradationController()
+
+
 def _fetch_initial_selector_features(
     tuned_results: dict[str, Any],
     mainnet: bool,
@@ -856,6 +865,7 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
         "tuning_state": _tuning_state,
         "risk_state": _risk_state,
         "regime_registry": regime_registry,
+        "degradation_controller": _build_degradation_controller(),
     }
 
 
@@ -874,6 +884,7 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
     host = runtime["host"]
     risk_state = runtime.get("risk_state", {})
     regime_registry = runtime.get("regime_registry")
+    degradation = runtime.get("degradation_controller")
 
     def _cycle_facts() -> None:
         if day_risk_manager is None:
@@ -886,6 +897,12 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
             day_state = day_risk_manager.update(equity, session_key=session_key)
             risk_state["day_state"] = day_state
             risk_state["equity"] = equity
+
+            # Degrade already-live symbols when day mode hardens
+            if degradation is not None:
+                live = host.live_symbols if hasattr(host, "live_symbols") else frozenset()
+                if live:
+                    degradation.evaluate(live, day_state.mode, host.request_graceful_exit)
 
             if portfolio_allocator is not None:
                 from grinder.risk.portfolio_budget_allocator import (  # noqa: PLC0415
