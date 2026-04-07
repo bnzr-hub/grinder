@@ -718,6 +718,7 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
         engine_stop_fn=bridge.stop,
         engine_cleanup_fn=bridge.cleanup,
         graceful_exit_fn=bridge.graceful_exit,
+        force_reduce_fn=bridge.force_reduce,
     )
 
     # Coordinator with real host bindings
@@ -909,7 +910,12 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
             # Degrade already-live symbols when day mode hardens
             if degradation is not None:
                 live = host.live_symbols if hasattr(host, "live_symbols") else frozenset()
-                degradation.evaluate(live, day_state.mode, host.request_graceful_exit)
+                degradation.evaluate(
+                    live,
+                    day_state.mode,
+                    host.request_graceful_exit,
+                    force_reduce_fn=host.request_force_reduce,
+                )
 
             if portfolio_allocator is not None:
                 from grinder.risk.portfolio_budget_allocator import (  # noqa: PLC0415

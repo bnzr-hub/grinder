@@ -1,13 +1,16 @@
 """LiveSymbolDegradationController — degrade already-live symbols on risk state change.
 
 Evaluates active symbols against current day risk state and applies
-graceful-exit-only when conditions degrade:
+a degradation ladder:
 
   STOP_NEW_RISK  → graceful-exit-only
   STOP_FOR_DAY   → graceful-exit-only
-  FORCE_REDUCE   → graceful-exit-only (staged unload requires engine-level integration)
+  FORCE_REDUCE   → graceful-exit-only + engine force-reduce signal
 
-Idempotent: tracks degraded symbols to avoid repeated requests.
+Force-reduce signal sets an engine-side flag (PR 1). PR 2 will connect
+that flag to SymbolUnloadController for actual staged reduction.
+
+Idempotent: tracks degraded and force-reduced symbols separately.
 Prunes symbols no longer live. Resets on day-session rollover.
 """
 
@@ -31,108 +34,189 @@ class DegradationReason(Enum):
     DAY_STOP_FOR_DAY = "DAY_STOP_FOR_DAY"
 
 
-def _day_mode_to_reason(mode: DayRiskMode) -> DegradationReason | None:
-    """Map DayRiskMode to degradation reason. Returns None if no degradation needed."""
+class DegradationAction(Enum):
+    """Target action for degradation."""
+
+    GRACEFUL_EXIT_ONLY = "GRACEFUL_EXIT_ONLY"
+    FORCE_REDUCE = "FORCE_REDUCE"
+
+
+def _day_mode_to_action(mode: DayRiskMode) -> tuple[DegradationAction, DegradationReason] | None:
+    """Map DayRiskMode to (action, reason). Returns None if no degradation needed."""
     from grinder.risk.day_risk_manager import DayRiskMode as M  # noqa: PLC0415
 
-    _MAP: dict[M, DegradationReason] = {
-        M.STOP_NEW_RISK: DegradationReason.DAY_STOP_NEW_RISK,
-        M.STOP_FOR_DAY: DegradationReason.DAY_STOP_FOR_DAY,
-        M.FORCE_REDUCE: DegradationReason.DAY_FORCE_REDUCE,
+    _MAP: dict[M, tuple[DegradationAction, DegradationReason]] = {
+        M.STOP_NEW_RISK: (
+            DegradationAction.GRACEFUL_EXIT_ONLY,
+            DegradationReason.DAY_STOP_NEW_RISK,
+        ),
+        M.STOP_FOR_DAY: (
+            DegradationAction.GRACEFUL_EXIT_ONLY,
+            DegradationReason.DAY_STOP_FOR_DAY,
+        ),
+        M.FORCE_REDUCE: (
+            DegradationAction.FORCE_REDUCE,
+            DegradationReason.DAY_FORCE_REDUCE,
+        ),
     }
     return _MAP.get(mode)
 
 
 class LiveSymbolDegradationController:
-    """Manages graceful-exit-only transitions for already-live symbols.
+    """Manages degradation transitions for already-live symbols.
 
-    All degradation triggers currently map to graceful-exit-only.
-    Staged unload for FORCE_REDUCE requires engine-level SymbolUnloadController
-    integration — deferred to a later PR.
+    Ladder:
+    - GRACEFUL_EXIT_ONLY: no new entries, wait for natural exit
+    - FORCE_REDUCE: graceful-exit + engine force-reduce signal
 
-    Delegates to existing host.request_graceful_exit() — no direct engine control.
+    Escalation is sequential: force-reduce only attempted after
+    graceful-exit is latched. Separate tracking for each level.
     """
 
     def __init__(self) -> None:
         self._degraded: set[str] = set()
+        self._force_reduced: set[str] = set()
 
     @property
     def degraded_symbols(self) -> frozenset[str]:
         """Symbols with graceful-exit-only requested."""
         return frozenset(self._degraded)
 
+    @property
+    def force_reduced_symbols(self) -> frozenset[str]:
+        """Symbols with force-reduce signal sent."""
+        return frozenset(self._force_reduced)
+
     def evaluate(
         self,
         live_symbols: frozenset[str],
         day_mode: DayRiskMode,
         graceful_exit_fn: object,
+        force_reduce_fn: object | None = None,
     ) -> list[str]:
-        """Evaluate live symbols and degrade if day mode requires it.
+        """Evaluate live symbols and apply degradation ladder.
 
         Args:
             live_symbols: Currently active engine symbols.
             day_mode: Current DayRiskMode from DayRiskManager.
             graceful_exit_fn: Callable(symbol) → GracefulExitResult.
+            force_reduce_fn: Callable(symbol) → bool. For FORCE_REDUCE signal.
 
         Returns:
-            List of symbols newly degraded this cycle.
+            List of symbols newly acted on this cycle.
         """
-        # Prune symbols no longer live (deactivated/re-activatable)
+        # Prune symbols no longer live
         stale = self._degraded - live_symbols
+        stale_fr = self._force_reduced - live_symbols
         if stale:
             self._degraded -= stale
+        if stale_fr:
+            self._force_reduced -= stale_fr
+        if stale or stale_fr:
             logger.debug(
-                "LIVE_SYMBOL_DEGRADATION_PRUNED symbols=%s",
-                ",".join(sorted(stale)),
+                "LIVE_SYMBOL_DEGRADATION_PRUNED degraded=%s force_reduced=%s",
+                ",".join(sorted(stale)) or "none",
+                ",".join(sorted(stale_fr)) or "none",
             )
 
-        reason = _day_mode_to_reason(day_mode)
-        if reason is None:
+        action_pair = _day_mode_to_action(day_mode)
+        if action_pair is None:
             return []
 
-        newly_degraded: list[str] = []
+        action, reason = action_pair
+        newly_acted: list[str] = []
+
         for symbol in sorted(live_symbols):
-            if symbol in self._degraded:
-                continue
+            if action == DegradationAction.GRACEFUL_EXIT_ONLY:
+                if symbol not in self._degraded and self._request_graceful_exit(
+                    symbol, reason, graceful_exit_fn
+                ):
+                    newly_acted.append(symbol)
 
-            # Request graceful exit via host — only latch on success
-            try:
-                result = graceful_exit_fn(symbol)  # type: ignore[operator]
-                result_val = result.value if hasattr(result, "value") else str(result)
-                logger.info(
-                    "LIVE_SYMBOL_DEGRADED symbol=%s target=GRACEFUL_EXIT_ONLY"
-                    " reason=%s exit_result=%s",
+            elif action == DegradationAction.FORCE_REDUCE:
+                # Step 1: ensure graceful-exit is latched first
+                if symbol not in self._degraded and not self._request_graceful_exit(
+                    symbol, reason, graceful_exit_fn
+                ):
+                    continue  # retry graceful-exit next cycle, don't escalate
+
+                # Step 2: send force-reduce signal (only if graceful-exit latched)
+                if symbol not in self._force_reduced and self._request_force_reduce(
+                    symbol, reason, force_reduce_fn
+                ):
+                    newly_acted.append(symbol)
+
+        return newly_acted
+
+    def _request_graceful_exit(self, symbol: str, reason: DegradationReason, fn: object) -> bool:
+        """Request graceful exit. Returns True if latched."""
+        try:
+            result = fn(symbol)  # type: ignore[operator]
+            result_val = result.value if hasattr(result, "value") else str(result)
+            logger.info(
+                "LIVE_SYMBOL_DEGRADED symbol=%s target=GRACEFUL_EXIT_ONLY reason=%s exit_result=%s",
+                symbol,
+                reason.value,
+                result_val,
+            )
+            if hasattr(result, "value") and result.value == "FAILED":
+                logger.warning(
+                    "LIVE_SYMBOL_DEGRADATION_RETRY symbol=%s reason=exit_failed",
                     symbol,
-                    reason.value,
-                    result_val,
                 )
-                # Only latch if exit was accepted (SUCCESS or NOT_APPLICABLE)
-                # FAILED → leave out of _degraded so next cycle retries
-                if hasattr(result, "value") and result.value == "FAILED":
-                    logger.warning(
-                        "LIVE_SYMBOL_DEGRADATION_RETRY symbol=%s reason=exit_failed",
-                        symbol,
-                    )
-                    continue
-            except Exception as e:
-                logger.error(
-                    "LIVE_SYMBOL_DEGRADATION_FAILED symbol=%s reason=%s error=%s",
-                    symbol,
-                    reason.value,
-                    e,
-                )
-                continue  # don't latch — retry next cycle
+                return False
+        except Exception as e:
+            logger.error(
+                "LIVE_SYMBOL_DEGRADATION_FAILED symbol=%s reason=%s error=%s",
+                symbol,
+                reason.value,
+                e,
+            )
+            return False
 
-            self._degraded.add(symbol)
-            newly_degraded.append(symbol)
+        self._degraded.add(symbol)
+        return True
 
-        return newly_degraded
+    def _request_force_reduce(
+        self, symbol: str, reason: DegradationReason, fn: object | None
+    ) -> bool:
+        """Send force-reduce signal to engine. Returns True if latched."""
+        if fn is None:
+            logger.warning(
+                "LIVE_SYMBOL_FORCE_REDUCE_SKIPPED symbol=%s reason=no_force_reduce_fn",
+                symbol,
+            )
+            return False
+
+        try:
+            ok = fn(symbol)  # type: ignore[operator]
+            logger.info(
+                "LIVE_SYMBOL_FORCE_REDUCE symbol=%s reason=%s ok=%s",
+                symbol,
+                reason.value,
+                ok,
+            )
+            # ok=True means newly set, ok=False means already set (idempotent)
+            # Both are acceptable — latch in either case
+        except Exception as e:
+            logger.error(
+                "LIVE_SYMBOL_FORCE_REDUCE_FAILED symbol=%s reason=%s error=%s",
+                symbol,
+                reason.value,
+                e,
+            )
+            return False
+
+        self._force_reduced.add(symbol)
+        return True
 
     def reset(self) -> None:
         """Reset degradation state (e.g. on new day session)."""
-        if self._degraded:
+        if self._degraded or self._force_reduced:
             logger.info(
-                "LIVE_SYMBOL_DEGRADATION_RESET previously_degraded=%s",
-                ",".join(sorted(self._degraded)),
+                "LIVE_SYMBOL_DEGRADATION_RESET degraded=%s force_reduced=%s",
+                ",".join(sorted(self._degraded)) or "none",
+                ",".join(sorted(self._force_reduced)) or "none",
             )
         self._degraded.clear()
+        self._force_reduced.clear()
