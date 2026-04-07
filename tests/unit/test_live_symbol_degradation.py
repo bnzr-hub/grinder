@@ -1,4 +1,4 @@
-"""Tests for LiveSymbolDegradationController — day-mode degradation ladder."""
+"""Tests for LiveSymbolDegradationController — day-mode-driven graceful-exit."""
 
 from __future__ import annotations
 
@@ -21,186 +21,73 @@ class _MockGracefulExit:
         return self._result
 
 
-class _MockDeactivate:
-    """Records finalize-deactivation calls."""
-
-    def __init__(self, ok: bool = True) -> None:
-        self.calls: list[str] = []
-        self._ok = ok
-
-    def __call__(self, symbol: str) -> bool:
-        self.calls.append(symbol)
-        return self._ok
-
-
-class TestGracefulExitTriggers:
-    def test_stop_new_risk_graceful_exit(self) -> None:
+class TestDegradeTriggers:
+    def test_stop_new_risk_degrades(self) -> None:
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
         newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_NEW_RISK, mock)
         assert newly == ["BTCUSDT"]
         assert "BTCUSDT" in mock.calls
-        assert "BTCUSDT" in ctrl.degraded_symbols
-        assert "BTCUSDT" not in ctrl.force_reduced_symbols
 
-    def test_stop_for_day_graceful_exit(self) -> None:
+    def test_stop_for_day_degrades(self) -> None:
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
         newly = ctrl.evaluate(frozenset({"ETHUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
         assert newly == ["ETHUSDT"]
-        assert "ETHUSDT" in ctrl.degraded_symbols
-        assert "ETHUSDT" not in ctrl.force_reduced_symbols
 
-    def test_stop_new_risk_does_not_deactivate(self) -> None:
-        """STOP_NEW_RISK should NOT call deactivate."""
+    def test_force_reduce_degrades(self) -> None:
+        """FORCE_REDUCE → graceful-exit-only (staged unload deferred)."""
         ctrl = LiveSymbolDegradationController()
-        ge = _MockGracefulExit()
-        da = _MockDeactivate()
-        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_NEW_RISK, ge, da)
-        assert da.calls == []
+        mock = _MockGracefulExit()
+        newly = ctrl.evaluate(frozenset({"SOLUSDT"}), DayRiskMode.FORCE_REDUCE, mock)
+        assert newly == ["SOLUSDT"]
+        assert "SOLUSDT" in mock.calls
 
-
-class TestForceReduce:
-    def test_force_reduce_graceful_exit_plus_deactivation(self) -> None:
-        """FORCE_REDUCE triggers both graceful exit AND finalize deactivation."""
+    def test_multiple_symbols_all_degraded(self) -> None:
         ctrl = LiveSymbolDegradationController()
-        ge = _MockGracefulExit()
-        da = _MockDeactivate()
-        newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.FORCE_REDUCE, ge, da)
-        assert newly == ["BTCUSDT"]
-        assert "BTCUSDT" in ge.calls
-        assert "BTCUSDT" in da.calls
-        assert "BTCUSDT" in ctrl.degraded_symbols
-        assert "BTCUSDT" in ctrl.force_reduced_symbols
-
-    def test_force_reduce_multiple_symbols(self) -> None:
-        ctrl = LiveSymbolDegradationController()
-        ge = _MockGracefulExit()
-        da = _MockDeactivate()
-        live = frozenset({"AAAUSDT", "BBBUSDT"})
-        newly = ctrl.evaluate(live, DayRiskMode.FORCE_REDUCE, ge, da)
-        assert sorted(newly) == ["AAAUSDT", "BBBUSDT"]
-        assert sorted(ge.calls) == ["AAAUSDT", "BBBUSDT"]
-        assert sorted(da.calls) == ["AAAUSDT", "BBBUSDT"]
-
-    def test_force_reduce_no_deactivate_fn_skips(self) -> None:
-        """Without deactivate_fn, force-reduce only does graceful exit."""
-        ctrl = LiveSymbolDegradationController()
-        ge = _MockGracefulExit()
-        newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.FORCE_REDUCE, ge, None)
-        assert newly == []  # force-reduce not latched
-        assert "BTCUSDT" in ctrl.degraded_symbols  # graceful exit happened
-        assert "BTCUSDT" not in ctrl.force_reduced_symbols
-
-    def test_force_reduce_deactivation_failed_retries(self) -> None:
-        """Failed deactivation not latched — retries next cycle."""
-        ctrl = LiveSymbolDegradationController()
-        ge = _MockGracefulExit()
-        da_fail = _MockDeactivate(ok=False)
-        da_ok = _MockDeactivate(ok=True)
-
-        newly1 = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.FORCE_REDUCE, ge, da_fail)
-        assert newly1 == []
-        assert "BTCUSDT" not in ctrl.force_reduced_symbols
-
-        newly2 = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.FORCE_REDUCE, ge, da_ok)
-        assert newly2 == ["BTCUSDT"]
-        assert "BTCUSDT" in ctrl.force_reduced_symbols
+        mock = _MockGracefulExit()
+        live = frozenset({"AAAUSDT", "BBBUSDT", "CCCUSDT"})
+        newly = ctrl.evaluate(live, DayRiskMode.STOP_FOR_DAY, mock)
+        assert sorted(newly) == ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
 
 
 class TestNoDegradation:
     def test_normal_mode(self) -> None:
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
-        newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.NORMAL, mock)
-        assert newly == []
+        assert ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.NORMAL, mock) == []
+        assert mock.calls == []
 
     def test_defensive_mode(self) -> None:
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
-        newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.DEFENSIVE, mock)
-        assert newly == []
+        assert ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.DEFENSIVE, mock) == []
 
     def test_empty_live(self) -> None:
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
-        newly = ctrl.evaluate(frozenset(), DayRiskMode.STOP_FOR_DAY, mock)
-        assert newly == []
+        assert ctrl.evaluate(frozenset(), DayRiskMode.STOP_FOR_DAY, mock) == []
 
 
 class TestIdempotency:
-    def test_graceful_exit_no_repeat(self) -> None:
+    def test_no_repeat(self) -> None:
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
         ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_NEW_RISK, mock)
         ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_NEW_RISK, mock)
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_NEW_RISK, mock)
         assert mock.calls == ["BTCUSDT"]
 
-    def test_force_reduce_no_repeat(self) -> None:
+    def test_new_symbol_later(self) -> None:
         ctrl = LiveSymbolDegradationController()
-        ge = _MockGracefulExit()
-        da = _MockDeactivate()
-        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.FORCE_REDUCE, ge, da)
-        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.FORCE_REDUCE, ge, da)
-        assert ge.calls == ["BTCUSDT"]
-        assert da.calls == ["BTCUSDT"]
-
-    def test_escalation_from_graceful_to_force(self) -> None:
-        """Symbol already graceful-exit → FORCE_REDUCE escalates to deactivation."""
-        ctrl = LiveSymbolDegradationController()
-        ge = _MockGracefulExit()
-        da = _MockDeactivate()
-
-        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_NEW_RISK, ge)
-        assert "BTCUSDT" in ctrl.degraded_symbols
-        assert "BTCUSDT" not in ctrl.force_reduced_symbols
-
-        newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.FORCE_REDUCE, ge, da)
-        assert newly == ["BTCUSDT"]
-        assert ge.calls == ["BTCUSDT"]  # no second graceful exit
-        assert da.calls == ["BTCUSDT"]  # but deactivation called
-        assert "BTCUSDT" in ctrl.force_reduced_symbols
-
-
-class TestPruning:
-    def test_deactivated_symbol_pruned(self) -> None:
-        ctrl = LiveSymbolDegradationController()
-        ge = _MockGracefulExit()
-        da = _MockDeactivate()
-
-        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.FORCE_REDUCE, ge, da)
-        assert "BTCUSDT" in ctrl.force_reduced_symbols
-
-        ctrl.evaluate(frozenset(), DayRiskMode.NORMAL, ge)
-        assert "BTCUSDT" not in ctrl.degraded_symbols
-        assert "BTCUSDT" not in ctrl.force_reduced_symbols
-
-    def test_pruned_symbol_can_be_force_reduced_again(self) -> None:
-        ctrl = LiveSymbolDegradationController()
-        ge = _MockGracefulExit()
-        da = _MockDeactivate()
-
-        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.FORCE_REDUCE, ge, da)
-        ctrl.evaluate(frozenset(), DayRiskMode.NORMAL, ge)
-        newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.FORCE_REDUCE, ge, da)
-        assert newly == ["BTCUSDT"]
-        assert da.calls == ["BTCUSDT", "BTCUSDT"]
-
-
-class TestReset:
-    def test_reset_clears_both(self) -> None:
-        ctrl = LiveSymbolDegradationController()
-        ge = _MockGracefulExit()
-        da = _MockDeactivate()
-
-        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.FORCE_REDUCE, ge, da)
-        ctrl.reset()
-        assert ctrl.degraded_symbols == frozenset()
-        assert ctrl.force_reduced_symbols == frozenset()
+        mock = _MockGracefulExit()
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
+        newly = ctrl.evaluate(frozenset({"BTCUSDT", "ETHUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
+        assert newly == ["ETHUSDT"]
 
 
 class TestRetryOnFailure:
-    def test_graceful_exit_failed_retries(self) -> None:
+    def test_failed_retries_next_cycle(self) -> None:
         ctrl = LiveSymbolDegradationController()
         fail = _MockGracefulExit(result=GracefulExitResult.FAILED)
         ok = _MockGracefulExit(result=GracefulExitResult.SUCCESS)
@@ -211,7 +98,7 @@ class TestRetryOnFailure:
         ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, ok)
         assert "BTCUSDT" in ctrl.degraded_symbols
 
-    def test_graceful_exit_exception_retries(self) -> None:
+    def test_exception_retries(self) -> None:
         ctrl = LiveSymbolDegradationController()
 
         def _raise(symbol: str) -> None:
@@ -219,3 +106,48 @@ class TestRetryOnFailure:
 
         ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, _raise)
         assert "BTCUSDT" not in ctrl.degraded_symbols
+
+    def test_not_applicable_still_latched(self) -> None:
+        ctrl = LiveSymbolDegradationController()
+        mock = _MockGracefulExit(result=GracefulExitResult.NOT_APPLICABLE)
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
+        assert "BTCUSDT" in ctrl.degraded_symbols
+
+
+class TestPruning:
+    def test_deactivated_pruned(self) -> None:
+        ctrl = LiveSymbolDegradationController()
+        mock = _MockGracefulExit()
+
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
+        assert "BTCUSDT" in ctrl.degraded_symbols
+
+        ctrl.evaluate(frozenset(), DayRiskMode.NORMAL, mock)
+        assert "BTCUSDT" not in ctrl.degraded_symbols
+
+    def test_pruned_can_degrade_again(self) -> None:
+        ctrl = LiveSymbolDegradationController()
+        mock = _MockGracefulExit()
+
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
+        ctrl.evaluate(frozenset(), DayRiskMode.NORMAL, mock)  # pruned
+        newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
+        assert newly == ["BTCUSDT"]
+        assert mock.calls == ["BTCUSDT", "BTCUSDT"]
+
+
+class TestReset:
+    def test_reset_clears(self) -> None:
+        ctrl = LiveSymbolDegradationController()
+        mock = _MockGracefulExit()
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
+        ctrl.reset()
+        assert ctrl.degraded_symbols == frozenset()
+
+    def test_after_reset_can_degrade_again(self) -> None:
+        ctrl = LiveSymbolDegradationController()
+        mock = _MockGracefulExit()
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
+        ctrl.reset()
+        newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
+        assert newly == ["BTCUSDT"]
