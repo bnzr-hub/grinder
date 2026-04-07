@@ -569,6 +569,10 @@ class LiveEngineV0:
         self._operator_symbols = operator_symbols or []
         # Shared regime registry for portfolio-level regime aggregation
         self._regime_registry = regime_registry
+        # Force-reduce: set by orchestration when day mode requires active risk reduction.
+        # PR 2 will connect this to SymbolUnloadController activation.
+        self._force_reduce_requested: bool = False
+        self._force_reduce_reason: str = ""
         # Min-notional cache: symbol → Decimal. Loaded from constraint provider at init.
         # Used by pre-send notional gate to block sub-minimum orders before HTTP.
         # Only loaded when operator_symbols are set (autonomous/production path).
@@ -3942,6 +3946,28 @@ class LiveEngineV0:
         if self._active_selector is None:
             return True
         return self._active_selector.is_dispatch_allowed(symbol)
+
+    @property
+    def force_reduce_requested(self) -> bool:
+        """Whether force-reduce has been requested for this engine."""
+        return self._force_reduce_requested
+
+    def request_force_reduce(self, reason: str = "") -> bool:
+        """Request force-reduce mode. Idempotent — returns True on first request.
+
+        Sets engine-side flag that PR 2 will connect to SymbolUnloadController.
+        Does NOT stop engine, does NOT flatten — just sets the mode.
+        """
+        if self._force_reduce_requested:
+            return False
+        self._force_reduce_requested = True
+        self._force_reduce_reason = reason
+        logger.info(
+            "ENGINE_FORCE_REDUCE_REQUESTED symbols=%s reason=%s",
+            self._operator_symbols,
+            reason or "unspecified",
+        )
+        return True
 
     def force_graceful_exit(self, symbol: str) -> bool:
         """Force a symbol into graceful-exit-only mode (operator/ceremony use).

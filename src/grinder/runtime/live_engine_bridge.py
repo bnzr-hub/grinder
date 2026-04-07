@@ -311,6 +311,24 @@ class LiveEngineBridge:
             logger.error("BRIDGE_GRACEFUL_EXIT_ERROR symbol=%s error=%s", symbol, e)
             return GracefulExitResult.FAILED
 
+    def force_reduce(self, symbol: str, engine_ref: Any) -> bool:
+        """Request force-reduce on a running engine. Idempotent.
+
+        Returns True if newly requested, False if already set or failed.
+        """
+        handle: EngineHandle = engine_ref
+        engine = handle.engine_ref
+        if engine is None:
+            logger.warning("BRIDGE_FORCE_REDUCE_NO_ENGINE symbol=%s", symbol)
+            return False
+        try:
+            ok: bool = engine.request_force_reduce(reason="DAY_FORCE_REDUCE")
+            logger.info("BRIDGE_FORCE_REDUCE symbol=%s newly_set=%s", symbol, ok)
+            return ok
+        except Exception as e:
+            logger.error("BRIDGE_FORCE_REDUCE_ERROR symbol=%s error=%s", symbol, e)
+            return False
+
     def cleanup(self, symbol: str, engine_ref: Any) -> bool:
         """Cancel all open orders and close any position for symbol.
 
