@@ -3062,6 +3062,24 @@ class LiveEngineV0:
         if self._toxicity_gate is not None:
             self._toxicity_gate.record_price(snapshot.ts, snapshot.symbol, snapshot.mid_price)
 
+        # Publish regime to shared registry for portfolio-level aggregation.
+        # Uses same inputs as AdaptiveGridPolicy's classify_regime() call.
+        # Registry deduplicates unchanged regime (no per-tick log spam).
+        if self._regime_registry is not None and self._last_feature_snapshot is not None:
+            from grinder.controller.regime import classify_regime  # noqa: PLC0415
+
+            toxicity_result = (
+                self._toxicity_gate.check(snapshot.symbol)
+                if self._toxicity_gate is not None
+                else None
+            )
+            rd = classify_regime(
+                features=self._last_feature_snapshot,
+                kill_switch_active=self._config.kill_switch_active,
+                toxicity_result=toxicity_result,
+            )
+            self._regime_registry.publish(snapshot.symbol, rd.regime, rd.reason, rd.confidence)
+
         # PR-338: Defer paper engine during FSM startup states (INIT/READY).
         # Paper engine mutates internal state via NoOp port; if run before ACTIVE,
         # ghost orders freeze reconciliation after ACTIVE transition.
