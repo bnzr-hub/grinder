@@ -36,7 +36,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -579,6 +579,8 @@ class LiveEngineV0:
         # Used by pre-send notional gate to block sub-minimum orders before HTTP.
         # Only loaded when operator_symbols are set (autonomous/production path).
         self._min_notional_cache: dict[str, Decimal] = {}
+        self._tick_size_cache: dict[str, Decimal] = {}
+        self._step_size_cache: dict[str, Decimal] = {}
         if operator_symbols:
             self._load_min_notional_cache()
         # Read GRINDER_LIVE_PLANNER_ENABLED once at init (PR-L2)
@@ -5305,6 +5307,10 @@ class LiveEngineV0:
                 for sym, sc in constraints.items():
                     if sc.min_notional > 0:
                         self._min_notional_cache[sym] = sc.min_notional
+                    if sc.tick_size > 0:
+                        self._tick_size_cache[sym] = sc.tick_size
+                    if sc.step_size > 0:
+                        self._step_size_cache[sym] = sc.step_size
                 logger.info("MIN_NOTIONAL_CACHE_LOADED symbols=%d", len(self._min_notional_cache))
         except Exception as e:
             logger.warning("MIN_NOTIONAL_CACHE_FAILED error=%s", e)
@@ -6448,14 +6454,31 @@ class LiveEngineV0:
                     sym,
                 )
                 continue
-            # Use mark price for limit order (aggressive fill expected)
+            # Quantize price and qty to exchange constraints
             side = OrderSide.BUY if step.side == "BUY" else OrderSide.SELL
+            tick = self._tick_size_cache.get(sym, Decimal("0.01"))
+            lot = self._step_size_cache.get(sym, Decimal("0.001"))
+            # Price: BUY rounds UP (aggressive), SELL rounds DOWN (aggressive)
+            if side == OrderSide.BUY:
+                price = ((mark / tick).to_integral_value(rounding=ROUND_UP)) * tick
+            else:
+                price = ((mark / tick).to_integral_value(rounding=ROUND_DOWN)) * tick
+            qty = ((Decimal(str(step.qty)) / lot).to_integral_value(rounding=ROUND_DOWN)) * lot
+            if qty <= 0:
+                logger.warning(
+                    "SYMBOL_UNLOAD_STEP_SKIPPED symbol=%s reason=qty_rounds_to_zero"
+                    " raw_qty=%s lot=%s",
+                    sym,
+                    step.qty,
+                    lot,
+                )
+                continue
             action = ExecutionAction(
                 action_type=ActionType.PLACE,
                 symbol=step.symbol,
                 side=side,
-                price=mark,
-                quantity=Decimal(str(step.qty)),
+                price=price,
+                quantity=qty,
                 reduce_only=True,
                 reason="SYMBOL_UNLOAD_STEP",
             )
