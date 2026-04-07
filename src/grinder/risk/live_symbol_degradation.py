@@ -1,15 +1,14 @@
 """LiveSymbolDegradationController — degrade already-live symbols on risk state change.
 
-Evaluates active symbols against current day risk state and requests
-graceful-exit-only when conditions degrade. Does NOT force-close, does NOT
-modify engine geometry, does NOT trigger staged unload (that's PR 2).
+Evaluates active symbols against current day risk state and applies
+graceful-exit-only when conditions degrade:
 
-Day-mode-driven triggers (PR 1):
-- STOP_NEW_RISK  → graceful-exit-only
-- FORCE_REDUCE   → graceful-exit-only (unload wiring deferred)
-- STOP_FOR_DAY   → graceful-exit-only
+  STOP_NEW_RISK  → graceful-exit-only
+  STOP_FOR_DAY   → graceful-exit-only
+  FORCE_REDUCE   → graceful-exit-only (staged unload requires engine-level integration)
 
-Idempotent: tracks already-degraded symbols to avoid repeated requests/logs.
+Idempotent: tracks degraded symbols to avoid repeated requests.
+Prunes symbols no longer live. Resets on day-session rollover.
 """
 
 from __future__ import annotations
@@ -23,15 +22,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Day modes that require degradation of already-live symbols
-_DEGRADE_MODES: frozenset[str] = frozenset(
-    {
-        "STOP_NEW_RISK",
-        "FORCE_REDUCE",
-        "STOP_FOR_DAY",
-    }
-)
-
 
 class DegradationReason(Enum):
     """Why a live symbol was degraded."""
@@ -43,19 +33,24 @@ class DegradationReason(Enum):
 
 def _day_mode_to_reason(mode: DayRiskMode) -> DegradationReason | None:
     """Map DayRiskMode to degradation reason. Returns None if no degradation needed."""
-    _MAP = {
-        "STOP_NEW_RISK": DegradationReason.DAY_STOP_NEW_RISK,
-        "FORCE_REDUCE": DegradationReason.DAY_FORCE_REDUCE,
-        "STOP_FOR_DAY": DegradationReason.DAY_STOP_FOR_DAY,
+    from grinder.risk.day_risk_manager import DayRiskMode as M  # noqa: PLC0415
+
+    _MAP: dict[M, DegradationReason] = {
+        M.STOP_NEW_RISK: DegradationReason.DAY_STOP_NEW_RISK,
+        M.STOP_FOR_DAY: DegradationReason.DAY_STOP_FOR_DAY,
+        M.FORCE_REDUCE: DegradationReason.DAY_FORCE_REDUCE,
     }
-    return _MAP.get(mode.value)
+    return _MAP.get(mode)
 
 
 class LiveSymbolDegradationController:
     """Manages graceful-exit-only transitions for already-live symbols.
 
-    Pure orchestration — delegates actual exit to host.request_graceful_exit().
-    Tracks degraded symbols for idempotency (no repeated requests/logs).
+    All degradation triggers currently map to graceful-exit-only.
+    Staged unload for FORCE_REDUCE requires engine-level SymbolUnloadController
+    integration — deferred to a later PR.
+
+    Delegates to existing host.request_graceful_exit() — no direct engine control.
     """
 
     def __init__(self) -> None:
@@ -63,7 +58,7 @@ class LiveSymbolDegradationController:
 
     @property
     def degraded_symbols(self) -> frozenset[str]:
-        """Currently degraded symbols (for observability)."""
+        """Symbols with graceful-exit-only requested."""
         return frozenset(self._degraded)
 
     def evaluate(
@@ -80,7 +75,7 @@ class LiveSymbolDegradationController:
             graceful_exit_fn: Callable(symbol) → GracefulExitResult.
 
         Returns:
-            List of symbols newly degraded this cycle (for logging/testing).
+            List of symbols newly degraded this cycle.
         """
         # Prune symbols no longer live (deactivated/re-activatable)
         stale = self._degraded - live_symbols

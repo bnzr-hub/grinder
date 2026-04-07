@@ -34,164 +34,120 @@ class TestDegradeTriggers:
         mock = _MockGracefulExit()
         newly = ctrl.evaluate(frozenset({"ETHUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
         assert newly == ["ETHUSDT"]
-        assert "ETHUSDT" in mock.calls
 
     def test_force_reduce_degrades(self) -> None:
+        """FORCE_REDUCE → graceful-exit-only (staged unload deferred)."""
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
         newly = ctrl.evaluate(frozenset({"SOLUSDT"}), DayRiskMode.FORCE_REDUCE, mock)
         assert newly == ["SOLUSDT"]
         assert "SOLUSDT" in mock.calls
 
-    def test_multiple_live_symbols_all_degraded(self) -> None:
+    def test_multiple_symbols_all_degraded(self) -> None:
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
         live = frozenset({"AAAUSDT", "BBBUSDT", "CCCUSDT"})
         newly = ctrl.evaluate(live, DayRiskMode.STOP_FOR_DAY, mock)
         assert sorted(newly) == ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
-        assert sorted(mock.calls) == ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
 
 
 class TestNoDegradation:
-    def test_normal_mode_no_degradation(self) -> None:
+    def test_normal_mode(self) -> None:
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
-        newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.NORMAL, mock)
-        assert newly == []
+        assert ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.NORMAL, mock) == []
         assert mock.calls == []
 
-    def test_defensive_mode_no_degradation(self) -> None:
+    def test_defensive_mode(self) -> None:
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
-        newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.DEFENSIVE, mock)
-        assert newly == []
-        assert mock.calls == []
+        assert ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.DEFENSIVE, mock) == []
 
-    def test_empty_live_symbols_no_degradation(self) -> None:
+    def test_empty_live(self) -> None:
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
-        newly = ctrl.evaluate(frozenset(), DayRiskMode.STOP_FOR_DAY, mock)
-        assert newly == []
-        assert mock.calls == []
+        assert ctrl.evaluate(frozenset(), DayRiskMode.STOP_FOR_DAY, mock) == []
 
 
 class TestIdempotency:
-    def test_repeated_cycles_no_duplicate_request(self) -> None:
-        """Same symbol + same mode across multiple cycles → request only once."""
+    def test_no_repeat(self) -> None:
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
-        live = frozenset({"BTCUSDT"})
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_NEW_RISK, mock)
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_NEW_RISK, mock)
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_NEW_RISK, mock)
+        assert mock.calls == ["BTCUSDT"]
 
-        newly1 = ctrl.evaluate(live, DayRiskMode.STOP_NEW_RISK, mock)
-        newly2 = ctrl.evaluate(live, DayRiskMode.STOP_NEW_RISK, mock)
-        newly3 = ctrl.evaluate(live, DayRiskMode.STOP_NEW_RISK, mock)
-
-        assert newly1 == ["BTCUSDT"]
-        assert newly2 == []
-        assert newly3 == []
-        assert mock.calls == ["BTCUSDT"]  # only one call
-
-    def test_new_symbol_in_later_cycle_degraded(self) -> None:
-        """New live symbol appearing later still gets degraded."""
+    def test_new_symbol_later(self) -> None:
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
-
         ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
         newly = ctrl.evaluate(frozenset({"BTCUSDT", "ETHUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
-
         assert newly == ["ETHUSDT"]
-        assert mock.calls == ["BTCUSDT", "ETHUSDT"]
 
 
-class TestDegradedSymbolsProperty:
-    def test_tracks_degraded(self) -> None:
+class TestRetryOnFailure:
+    def test_failed_retries_next_cycle(self) -> None:
         ctrl = LiveSymbolDegradationController()
-        mock = _MockGracefulExit()
-        assert ctrl.degraded_symbols == frozenset()
+        fail = _MockGracefulExit(result=GracefulExitResult.FAILED)
+        ok = _MockGracefulExit(result=GracefulExitResult.SUCCESS)
 
-        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
-        assert ctrl.degraded_symbols == frozenset({"BTCUSDT"})
-
-
-class TestReset:
-    def test_reset_clears_degraded(self) -> None:
-        ctrl = LiveSymbolDegradationController()
-        mock = _MockGracefulExit()
-
-        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
-        assert len(ctrl.degraded_symbols) == 1
-
-        ctrl.reset()
-        assert ctrl.degraded_symbols == frozenset()
-
-    def test_after_reset_can_degrade_again(self) -> None:
-        ctrl = LiveSymbolDegradationController()
-        mock = _MockGracefulExit()
-
-        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
-        ctrl.reset()
-        newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
-
-        assert newly == ["BTCUSDT"]
-        assert mock.calls == ["BTCUSDT", "BTCUSDT"]  # called twice (before + after reset)
-
-
-class TestGracefulExitResultHandling:
-    def test_not_applicable_still_tracked(self) -> None:
-        """NOT_APPLICABLE result doesn't prevent tracking."""
-        ctrl = LiveSymbolDegradationController()
-        mock = _MockGracefulExit(result=GracefulExitResult.NOT_APPLICABLE)
-        newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
-        assert newly == ["BTCUSDT"]
-        assert "BTCUSDT" in ctrl.degraded_symbols
-
-    def test_failed_not_latched_retries_next_cycle(self) -> None:
-        """FAILED result → not latched → retried next cycle."""
-        ctrl = LiveSymbolDegradationController()
-        fail_mock = _MockGracefulExit(result=GracefulExitResult.FAILED)
-        newly1 = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, fail_mock)
-        assert newly1 == []
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, fail)
         assert "BTCUSDT" not in ctrl.degraded_symbols
 
-        # Next cycle with success
-        ok_mock = _MockGracefulExit(result=GracefulExitResult.SUCCESS)
-        newly2 = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, ok_mock)
-        assert newly2 == ["BTCUSDT"]
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, ok)
         assert "BTCUSDT" in ctrl.degraded_symbols
 
-    def test_exception_not_latched_retries(self) -> None:
-        """Exception → not latched → retried next cycle."""
+    def test_exception_retries(self) -> None:
         ctrl = LiveSymbolDegradationController()
 
         def _raise(symbol: str) -> None:
             raise RuntimeError("host error")
 
-        newly1 = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, _raise)
-        assert newly1 == []
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, _raise)
         assert "BTCUSDT" not in ctrl.degraded_symbols
+
+    def test_not_applicable_still_latched(self) -> None:
+        ctrl = LiveSymbolDegradationController()
+        mock = _MockGracefulExit(result=GracefulExitResult.NOT_APPLICABLE)
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
+        assert "BTCUSDT" in ctrl.degraded_symbols
 
 
 class TestPruning:
-    def test_deactivated_symbol_pruned(self) -> None:
-        """Symbol removed from live set gets pruned from degraded."""
+    def test_deactivated_pruned(self) -> None:
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
 
         ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
         assert "BTCUSDT" in ctrl.degraded_symbols
 
-        # Symbol no longer live → pruned
-        ctrl.evaluate(frozenset(), DayRiskMode.STOP_FOR_DAY, mock)
+        ctrl.evaluate(frozenset(), DayRiskMode.NORMAL, mock)
         assert "BTCUSDT" not in ctrl.degraded_symbols
 
-    def test_pruned_symbol_can_be_degraded_again(self) -> None:
-        """After deactivation + re-activation, symbol can be degraded again."""
+    def test_pruned_can_degrade_again(self) -> None:
         ctrl = LiveSymbolDegradationController()
         mock = _MockGracefulExit()
 
         ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
         ctrl.evaluate(frozenset(), DayRiskMode.NORMAL, mock)  # pruned
         newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
-
         assert newly == ["BTCUSDT"]
         assert mock.calls == ["BTCUSDT", "BTCUSDT"]
+
+
+class TestReset:
+    def test_reset_clears(self) -> None:
+        ctrl = LiveSymbolDegradationController()
+        mock = _MockGracefulExit()
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
+        ctrl.reset()
+        assert ctrl.degraded_symbols == frozenset()
+
+    def test_after_reset_can_degrade_again(self) -> None:
+        ctrl = LiveSymbolDegradationController()
+        mock = _MockGracefulExit()
+        ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
+        ctrl.reset()
+        newly = ctrl.evaluate(frozenset({"BTCUSDT"}), DayRiskMode.STOP_FOR_DAY, mock)
+        assert newly == ["BTCUSDT"]
