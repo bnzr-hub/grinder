@@ -4361,9 +4361,7 @@ class LiveEngineV0:
         if self._regime_registry is not None:
             rd = getattr(planner, "last_regime_decision", None)
             if rd is not None:
-                self._regime_registry.publish(
-                    snapshot.symbol, rd.regime, rd.reason, rd.confidence
-                )
+                self._regime_registry.publish(snapshot.symbol, rd.regime, rd.reason, rd.confidence)
 
         if plan_result.actions:
             # Reset steady-state counter when actions resume
