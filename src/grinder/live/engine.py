@@ -574,6 +574,7 @@ class LiveEngineV0:
         self._force_reduce_requested: bool = False
         self._force_reduce_reason: str = ""
         self._force_reduce_flat_logged: bool = False
+        self._force_reduce_exits_cleared: bool = False
         # Min-notional cache: symbol → Decimal. Loaded from constraint provider at init.
         # Used by pre-send notional gate to block sub-minimum orders before HTTP.
         # Only loaded when operator_symbols are set (autonomous/production path).
@@ -6378,15 +6379,26 @@ class LiveEngineV0:
                 ):
                     self._symbol_unload.activate(sym)
 
-        # Force-reduce: activate unload for all tracked symbols when requested.
-        # Overrides the GRINDER_SYMBOL_UNLOAD_ENABLED gate — force-reduce is
-        # an explicit risk management decision, not a config flag.
+        # Force-reduce: cancel grid exits to free reduce-only budget, then unload.
         if self._force_reduce_requested:
             for sym in tracked:
                 _notional, _qty = pos_by_sym.get(sym, (0.0, 0.0))
-                if _qty > 0 and self._symbol_unload.get_status(sym).value == "INACTIVE":
-                    self._symbol_unload.activate(sym, force=True)
-                    logger.info("ENGINE_FORCE_REDUCE_UNLOAD_STARTED symbol=%s", sym)
+                if _qty > 0:
+                    # Cancel grid reduce-only exits to free budget for unload
+                    if not self._force_reduce_exits_cleared:
+                        cancelled = self._cancel_grid_exits_for_force_reduce(sym, acct)
+                        if cancelled > 0:
+                            logger.info(
+                                "FORCE_REDUCE_EXIT_ORDERS_CANCELLED symbol=%s count=%d",
+                                sym,
+                                cancelled,
+                            )
+                        self._force_reduce_exits_cleared = True
+
+                    # Activate unload after exits cleared
+                    if self._symbol_unload.get_status(sym).value == "INACTIVE":
+                        self._symbol_unload.activate(sym, force=True)
+                        logger.info("ENGINE_FORCE_REDUCE_UNLOAD_STARTED symbol=%s", sym)
 
         # Try unload steps for active symbols (force-reduce overrides enabled gate)
         if self._symbol_unload.config.enabled or self._force_reduce_requested:
@@ -6455,6 +6467,31 @@ class LiveEngineV0:
                     step.qty,
                     result.block_reason.value if result.block_reason else "EXECUTION_ERROR",
                 )
+
+    def _cancel_grid_exits_for_force_reduce(self, symbol: str, acct: AccountSnapshot) -> int:
+        """Cancel open reduce-only orders to free budget for unload steps.
+
+        Only cancels orders for the given symbol that are reduce_only.
+        Returns count of cancel actions dispatched.
+        """
+        cancelled = 0
+        ts = int(time.time() * 1000)
+        for order in acct.open_orders:
+            if order.symbol != symbol or not order.reduce_only:
+                continue
+            remaining = order.qty - order.filled_qty
+            if remaining <= 0:
+                continue
+            cancel_action = ExecutionAction(
+                action_type=ActionType.CANCEL,
+                symbol=order.symbol,
+                order_id=getattr(order, "order_id", None) or getattr(order, "client_order_id", ""),
+                reason="FORCE_REDUCE_BUDGET_CLEAR",
+            )
+            result = self._process_action(cancel_action, ts)
+            if result.status == LiveActionStatus.EXECUTED:
+                cancelled += 1
+        return cancelled
 
     def _record_grid_v2_lot_closed(
         self, symbol: str, entry_price: Decimal, exit_price: Decimal, side: str
@@ -6788,6 +6825,26 @@ class LiveEngineV0:
 
         intent = classify_intent(action, pos_sign=pos_sign)
 
+        # Force-reduce exit suppression: block new grid reduce-only exits
+        # while unload owns the reduce-only budget. Only SYMBOL_UNLOAD_STEP
+        # actions are allowed through.
+        if (
+            self._force_reduce_requested
+            and action.action_type == ActionType.PLACE
+            and action.reduce_only
+            and getattr(action, "reason", "") != "SYMBOL_UNLOAD_STEP"
+        ):
+            logger.debug(
+                "FORCE_REDUCE_EXIT_SUPPRESSED symbol=%s reason=unload_owns_budget",
+                action.symbol,
+            )
+            return LiveAction(
+                action=action,
+                status=LiveActionStatus.BLOCKED,
+                block_reason=BlockReason.REDUCE_ONLY_BUDGET_EXCEEDED,
+                intent=intent,
+            )
+
         # Gate 0: Reduce-only budget guard v2 (ADR-104)
         # Block further reduce-only exits when pending repair (after -2022 reject).
         # Direction-scoped: only blocks the affected (symbol, side).
@@ -6813,19 +6870,12 @@ class LiveEngineV0:
                 intent=intent,
             )
         # Uses reservation model: open_remaining + batch_reserved + new_qty <= position.
-        # Force-reduce unload steps bypass this gate — the unload controller
-        # already computes safe qty from position truth, and grid exits may be
-        # consuming the entire budget. Without this bypass, unload is starved.
-        _is_force_reduce_unload = (
-            self._force_reduce_requested and getattr(action, "reason", "") == "SYMBOL_UNLOAD_STEP"
-        )
         if (
             action.action_type == ActionType.PLACE
             and action.reduce_only
             and action.quantity is not None
             and action.symbol
             and action.side is not None
-            and not _is_force_reduce_unload
         ):
             from grinder.live.reduce_only_budget import (  # noqa: PLC0415
                 BudgetCheckResult,
