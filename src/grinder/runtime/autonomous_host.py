@@ -189,6 +189,10 @@ class AutonomousEngineHost:
         logger.info("HOST_GRACEFUL_EXIT_OK symbol=%s", symbol)
         return GracefulExitResult.SUCCESS
 
+    def get_engine_ref(self, symbol: str) -> Any:
+        """Get engine handle for a live symbol. Returns None if not live."""
+        return self._live_engines.get(symbol)
+
     def request_force_reduce(self, symbol: str) -> bool:
         """Request force-reduce on a live engine. Idempotent.
 
