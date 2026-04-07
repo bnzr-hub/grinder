@@ -76,3 +76,18 @@ class TestAggregatePortfolioRegime:
         r1 = aggregate_portfolio_regime(regimes)
         r2 = aggregate_portfolio_regime(regimes)
         assert r1 == r2 == MarketRegime.NEUTRAL
+
+
+class TestExhaustiveMapping:
+    def test_all_regime_values_mapped(self) -> None:
+        """Every Regime enum value must have an explicit mapping."""
+        for regime in Regime:
+            result = map_engine_regime(regime)
+            assert isinstance(result, MarketRegime), f"{regime} not mapped"
+
+    def test_unknown_regime_raises(self) -> None:
+        """Unmapped value raises ValueError, not silent fallback."""
+        import pytest  # noqa: PLC0415
+
+        with pytest.raises(ValueError, match="Unmapped Regime"):
+            map_engine_regime("FAKE_REGIME")  # type: ignore[arg-type]

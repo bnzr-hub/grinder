@@ -46,7 +46,10 @@ def map_engine_regime(regime: Regime) -> MarketRegime:
         R.PAUSED: MR.TOXIC,
         R.EMERGENCY: MR.TOXIC,
     }
-    return _MAP.get(regime, MR.NEUTRAL)
+    try:
+        return _MAP[regime]
+    except KeyError:
+        raise ValueError(f"Unmapped Regime value: {regime!r}. Update _MAP.") from None
 
 
 def aggregate_portfolio_regime(regimes: Iterable[Regime]) -> MarketRegime:
