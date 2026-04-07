@@ -318,7 +318,8 @@ class LiveEngineBridge:
         if engine is None:
             return Decimal("0")
         try:
-            return engine.get_effective_signed_position_qty(symbol)
+            result: Decimal = engine.get_effective_signed_position_qty(symbol)
+            return result
         except Exception:
             return Decimal("0")
 
