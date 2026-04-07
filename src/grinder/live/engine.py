@@ -574,6 +574,7 @@ class LiveEngineV0:
         self._force_reduce_requested: bool = False
         self._force_reduce_reason: str = ""
         self._force_reduce_flat_logged: bool = False
+        self._force_reduce_exits_cleared: bool = False
         # Min-notional cache: symbol → Decimal. Loaded from constraint provider at init.
         # Used by pre-send notional gate to block sub-minimum orders before HTTP.
         # Only loaded when operator_symbols are set (autonomous/production path).
@@ -6378,13 +6379,35 @@ class LiveEngineV0:
                 ):
                     self._symbol_unload.activate(sym)
 
-        # Force-reduce: activate unload for all tracked symbols when requested.
-        # Overrides the GRINDER_SYMBOL_UNLOAD_ENABLED gate — force-reduce is
-        # an explicit risk management decision, not a config flag.
+        # Force-reduce: cancel grid exits to free reduce-only budget, then unload.
+        # Sequence: cancel → verify gone from snapshot → activate unload.
         if self._force_reduce_requested:
             for sym in tracked:
                 _notional, _qty = pos_by_sym.get(sym, (0.0, 0.0))
-                if _qty > 0 and self._symbol_unload.get_status(sym).value == "INACTIVE":
+                if _qty <= 0:
+                    continue
+
+                if not self._force_reduce_exits_cleared:
+                    # Check if grid exits still present in snapshot
+                    remaining_grid_exits = self._count_grid_exits(sym, acct)
+
+                    if remaining_grid_exits > 0:
+                        # Send cancels (retry each cycle until gone)
+                        cancelled = self._cancel_grid_exits_for_force_reduce(sym, acct)
+                        logger.info(
+                            "FORCE_REDUCE_EXIT_ORDERS_WAITING symbol=%s remaining=%d cancelled=%d",
+                            sym,
+                            remaining_grid_exits,
+                            cancelled,
+                        )
+                        continue  # don't unload until exits confirmed gone
+
+                    # All grid exits gone from snapshot — budget is free
+                    logger.info("FORCE_REDUCE_EXIT_ORDERS_CLEARED symbol=%s", sym)
+                    self._force_reduce_exits_cleared = True
+
+                # Activate unload after exits confirmed cleared
+                if self._symbol_unload.get_status(sym).value == "INACTIVE":
                     self._symbol_unload.activate(sym, force=True)
                     logger.info("ENGINE_FORCE_REDUCE_UNLOAD_STARTED symbol=%s", sym)
 
@@ -6455,6 +6478,67 @@ class LiveEngineV0:
                     step.qty,
                     result.block_reason.value if result.block_reason else "EXECUTION_ERROR",
                 )
+
+    def _count_grid_exits(self, symbol: str, acct: AccountSnapshot) -> int:
+        """Count grid-owned reduce-only exit orders still on exchange."""
+        grid_exit_ids = self._get_grid_exit_order_ids()
+        count = 0
+        for order in acct.open_orders:
+            if (
+                order.symbol == symbol
+                and order.reduce_only
+                and order.order_id in grid_exit_ids
+                and order.qty - order.filled_qty > 0
+            ):
+                count += 1
+        return count
+
+    def _get_grid_exit_order_ids(self) -> set[str]:
+        """Get exchange order IDs of all grid-owned exit orders."""
+        bridge = self._grid_v2_bridge
+        if bridge is None or bridge.adapter is None:
+            return set()
+        registry = bridge.adapter.registry
+        ids: set[str] = set()
+        for cid in registry.all_exit_cids:
+            reg = registry.lookup_exit(cid)
+            if reg is not None:
+                ids.add(reg.exit_order_id)
+        return ids
+
+    def _cancel_grid_exits_for_force_reduce(self, symbol: str, acct: AccountSnapshot) -> int:
+        """Cancel grid-owned reduce-only exit orders to free budget for unload.
+
+        Only cancels orders that are:
+        - for the given symbol
+        - reduce_only
+        - owned by the grid v2 adapter (matched by exchange order_id)
+
+        Does NOT cancel unrelated/manual/external reduce-only orders.
+        Returns count of cancel actions dispatched.
+        """
+        grid_exit_ids = self._get_grid_exit_order_ids()
+
+        cancelled = 0
+        ts = int(time.time() * 1000)
+        for order in acct.open_orders:
+            if order.symbol != symbol or not order.reduce_only:
+                continue
+            if order.order_id not in grid_exit_ids:
+                continue
+            remaining = order.qty - order.filled_qty
+            if remaining <= 0:
+                continue
+            cancel_action = ExecutionAction(
+                action_type=ActionType.CANCEL,
+                symbol=order.symbol,
+                order_id=order.order_id,
+                reason="FORCE_REDUCE_BUDGET_CLEAR",
+            )
+            result = self._process_action(cancel_action, ts)
+            if result.status == LiveActionStatus.EXECUTED:
+                cancelled += 1
+        return cancelled
 
     def _record_grid_v2_lot_closed(
         self, symbol: str, entry_price: Decimal, exit_price: Decimal, side: str
@@ -6787,6 +6871,26 @@ class LiveEngineV0:
         self._enforce_reduce_only(action, pos_sign)
 
         intent = classify_intent(action, pos_sign=pos_sign)
+
+        # Force-reduce exit suppression: block new grid reduce-only exits
+        # while unload owns the reduce-only budget. Only SYMBOL_UNLOAD_STEP
+        # actions are allowed through.
+        if (
+            self._force_reduce_requested
+            and action.action_type == ActionType.PLACE
+            and action.reduce_only
+            and getattr(action, "reason", "") != "SYMBOL_UNLOAD_STEP"
+        ):
+            logger.debug(
+                "FORCE_REDUCE_EXIT_SUPPRESSED symbol=%s reason=unload_owns_budget",
+                action.symbol,
+            )
+            return LiveAction(
+                action=action,
+                status=LiveActionStatus.BLOCKED,
+                block_reason=BlockReason.REDUCE_ONLY_BUDGET_EXCEEDED,
+                intent=intent,
+            )
 
         # Gate 0: Reduce-only budget guard v2 (ADR-104)
         # Block further reduce-only exits when pending repair (after -2022 reject).
