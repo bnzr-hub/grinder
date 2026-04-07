@@ -19,6 +19,22 @@ logger = logging.getLogger(__name__)
 _DEFAULT_REFRESH_INTERVAL_S = 240.0
 
 
+def compute_gross_exposure_from_positions(positions: list[dict[str, Any]]) -> Decimal:
+    """Compute gross exposure from positionRisk payload.
+
+    Returns sum(abs(notional)) across all positions.
+    Malformed rows are skipped (fail-open). Zero-notional rows contribute 0.
+    """
+    gross = Decimal("0")
+    for pos in positions:
+        notional = pos.get("notional", "0")
+        try:
+            gross += abs(Decimal(str(notional)))
+        except Exception:
+            continue
+    return gross
+
+
 class TuningRefresher:
     """Background tuning refresh daemon thread.
 
@@ -328,14 +344,7 @@ class TuningRefresher:
             req = urllib.request.Request(url, headers={"X-MBX-APIKEY": api_key})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read())
-                gross = Decimal("0")
-                for pos in data:
-                    notional = pos.get("notional", "0")
-                    try:
-                        gross += abs(Decimal(str(notional)))
-                    except Exception:
-                        continue
-                return gross
+                return compute_gross_exposure_from_positions(data)
         except Exception:
             pass
         return None
