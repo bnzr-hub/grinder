@@ -6383,7 +6383,7 @@ class LiveEngineV0:
             for sym in tracked:
                 _notional, _qty = pos_by_sym.get(sym, (0.0, 0.0))
                 if _qty > 0 and self._symbol_unload.get_status(sym).value == "INACTIVE":
-                    self._symbol_unload.activate(sym)
+                    self._symbol_unload.activate(sym, force=True)
                     logger.info("ENGINE_FORCE_REDUCE_UNLOAD_STARTED symbol=%s", sym)
 
         # Try unload steps for active symbols (force-reduce overrides enabled gate)
@@ -6413,7 +6413,7 @@ class LiveEngineV0:
             if self._symbol_unload.get_status(sym).value not in ("ACTIVE",):
                 continue
             signed_qty = signed_by_sym.get(sym, 0.0)
-            step = self._symbol_unload.try_step(sym, signed_qty)
+            step = self._symbol_unload.try_step(sym, signed_qty, force=self._force_reduce_requested)
             if step is None:
                 continue
             mark = mark_by_sym.get(sym)

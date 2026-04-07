@@ -106,9 +106,14 @@ class SymbolUnloadController:
         """Return set of symbols with active unload tracking."""
         return set(self._states.keys())
 
-    def activate(self, symbol: str, now: float | None = None) -> None:
-        """Start unload for symbol (called when entering EXIT_ONLY)."""
-        if not self._config.enabled:
+    def activate(self, symbol: str, now: float | None = None, *, force: bool = False) -> None:
+        """Start unload for symbol (called when entering EXIT_ONLY).
+
+        Args:
+            force: If True, bypass the config.enabled gate. Used by force-reduce
+                   which is an explicit risk management decision, not a config flag.
+        """
+        if not force and not self._config.enabled:
             return
         if now is None:
             now = time.monotonic()
@@ -127,16 +132,19 @@ class SymbolUnloadController:
         symbol: str,
         signed_qty: float,
         now: float | None = None,
+        *,
+        force: bool = False,
     ) -> UnloadStep | None:
         """Evaluate whether to produce an unload step.
 
         Args:
             signed_qty: Positive = LONG, negative = SHORT, zero = flat.
+            force: If True, bypass config.enabled gate. Used by force-reduce.
 
         Returns:
             UnloadStep if action needed, None otherwise.
         """
-        if not self._config.enabled:
+        if not force and not self._config.enabled:
             return None
         if now is None:
             now = time.monotonic()
