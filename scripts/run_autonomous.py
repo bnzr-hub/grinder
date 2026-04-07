@@ -909,7 +909,12 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
             # Degrade already-live symbols when day mode hardens
             if degradation is not None:
                 live = host.live_symbols if hasattr(host, "live_symbols") else frozenset()
-                degradation.evaluate(live, day_state.mode, host.request_graceful_exit)
+                degradation.evaluate(
+                    live,
+                    day_state.mode,
+                    host.request_graceful_exit,
+                    deactivate_fn=host.finalize_deactivation,
+                )
 
             if portfolio_allocator is not None:
                 from grinder.risk.portfolio_budget_allocator import (  # noqa: PLC0415
