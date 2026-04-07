@@ -857,7 +857,7 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
     so the admission gate can read current risk state each cycle.
 
     Uses real gross exposure from refresher. Market regime stays NEUTRAL until
-    a real shared regime source is wired (existing classifier is per-symbol only).
+    live engines expose their controller/regime.py RegimeDecision upstream.
     """
     day_risk_manager = runtime.get("day_risk_manager")
     portfolio_allocator = runtime.get("portfolio_allocator")
@@ -885,9 +885,10 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
 
                 active_count = len(host.live_symbols) if hasattr(host, "live_symbols") else 0
 
-                # Market regime: NEUTRAL until real shared regime source is wired.
-                # The codebase has a per-symbol classifier (controller/regime.py)
-                # but no portfolio-level aggregation yet.
+                # Market regime: NEUTRAL until live engines expose their
+                # controller/regime.py RegimeDecision upstream. The existing
+                # per-symbol classifier is correct but currently lives inside
+                # engine threads — no shared portfolio-level aggregation path yet.
                 regime = MarketRegime.NEUTRAL
 
                 # Real gross exposure from refresher (fail-open to 0)
