@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 
 from grinder.runtime.live_engine_bridge import BridgeConfig, LiveEngineBridge
 from grinder.tuning.refresher import compute_gross_exposure_from_positions
@@ -56,7 +57,7 @@ class TestComputeGrossExposure:
 
     def test_none_notional_skipped(self) -> None:
         """None notional value skipped (fail-open)."""
-        positions = [
+        positions: list[dict[str, Any]] = [
             {"symbol": "BTCUSDT", "notional": None},
             {"symbol": "ETHUSDT", "notional": "300"},
         ]
