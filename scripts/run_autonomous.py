@@ -975,7 +975,7 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
     return _cycle_facts
 
 
-def main() -> None:
+def main() -> None:  # noqa: PLR0915
     args = build_parser().parse_args()
 
     logging.basicConfig(
@@ -1029,10 +1029,64 @@ def main() -> None:
     # Day risk + portfolio budget — shadow update each cycle
     _cycle_facts = _build_cycle_facts(runtime)
 
+    # Canary: env-gated force-reduce trigger for staged unload validation.
+    # Disabled by default. Set GRINDER_CANARY_FORCE_REDUCE_CYCLE=N to trigger.
+    _canary_fr_cycle = int(os.environ.get("GRINDER_CANARY_FORCE_REDUCE_CYCLE", "0"))
+    _canary_fr_symbol = os.environ.get("GRINDER_CANARY_FORCE_REDUCE_SYMBOL", "").strip().upper()
+    _canary_fr_triggered = False
+
+    if _canary_fr_cycle > 0:
+        logger.info(
+            "CANARY_FORCE_REDUCE_ENABLED trigger_cycle=%d symbol=%s",
+            _canary_fr_cycle,
+            _canary_fr_symbol or "first_live",
+        )
+
+    def _canary_force_reduce_hook() -> None:
+        nonlocal _canary_fr_triggered
+        if _canary_fr_cycle <= 0 or _canary_fr_triggered:
+            return
+        if loop.cycle < _canary_fr_cycle:
+            return
+
+        live = host.live_symbols
+        if not live:
+            logger.info(
+                "CANARY_FORCE_REDUCE_SKIPPED cycle=%d reason=no_live_symbols",
+                loop.cycle,
+            )
+            _canary_fr_triggered = True
+            return
+
+        target = _canary_fr_symbol if _canary_fr_symbol in live else sorted(live)[0]
+        if _canary_fr_symbol and _canary_fr_symbol not in live:
+            logger.info(
+                "CANARY_FORCE_REDUCE_FALLBACK cycle=%d requested=%s actual=%s",
+                loop.cycle,
+                _canary_fr_symbol,
+                target,
+            )
+
+        logger.info("CANARY_TRIGGERING_FORCE_REDUCE cycle=%d symbol=%s", loop.cycle, target)
+        # Ensure graceful exit first
+        host.request_graceful_exit(target)
+        result = host.request_force_reduce(target)
+        logger.info(
+            "CANARY_FORCE_REDUCE_RESULT cycle=%d symbol=%s requested=%s",
+            loop.cycle,
+            target,
+            result,
+        )
+        _canary_fr_triggered = True
+
+    def _combined_facts() -> None:
+        _cycle_facts()
+        _canary_force_reduce_hook()
+
     # Run
     try:
         reports = loop.run_forever(
-            facts_fn=_cycle_facts,
+            facts_fn=_combined_facts,
             clock=time.monotonic,
             sleep_fn=time.sleep,
             max_cycles=args.max_cycles,
