@@ -1011,6 +1011,7 @@ def main() -> None:  # noqa: PLR0915
     runtime = build_runtime(args)
     loop = runtime["loop"]
     host = runtime["host"]
+    bridge = runtime["bridge"]
     refresher = runtime.get("refresher")
 
     # Start tuning refresher (ADR-162)
@@ -1030,49 +1031,78 @@ def main() -> None:  # noqa: PLR0915
     _cycle_facts = _build_cycle_facts(runtime)
 
     # Canary: env-gated force-reduce trigger for staged unload validation.
-    # Disabled by default. Set GRINDER_CANARY_FORCE_REDUCE_CYCLE=N to trigger.
+    # Two modes:
+    #   GRINDER_CANARY_FORCE_REDUCE_ON_POSITION=1 — trigger on first non-flat position
+    #   GRINDER_CANARY_FORCE_REDUCE_CYCLE=N — trigger on cycle N (fallback)
+    # Both disabled by default. Optional: GRINDER_CANARY_FORCE_REDUCE_SYMBOL
+    _canary_fr_on_pos = os.environ.get("GRINDER_CANARY_FORCE_REDUCE_ON_POSITION", "") == "1"
     _canary_fr_cycle = int(os.environ.get("GRINDER_CANARY_FORCE_REDUCE_CYCLE", "0"))
     _canary_fr_symbol = os.environ.get("GRINDER_CANARY_FORCE_REDUCE_SYMBOL", "").strip().upper()
     _canary_fr_triggered = False
+    _canary_fr_enabled = _canary_fr_on_pos or _canary_fr_cycle > 0
 
-    if _canary_fr_cycle > 0:
+    if _canary_fr_enabled:
+        mode = "on_position" if _canary_fr_on_pos else f"cycle={_canary_fr_cycle}"
         logger.info(
-            "CANARY_FORCE_REDUCE_ENABLED trigger_cycle=%d symbol=%s",
-            _canary_fr_cycle,
+            "CANARY_FORCE_REDUCE_ENABLED mode=%s symbol=%s",
+            mode,
             _canary_fr_symbol or "first_live",
         )
 
-    def _canary_force_reduce_hook() -> None:
+    def _canary_force_reduce_hook() -> None:  # noqa: PLR0912
         nonlocal _canary_fr_triggered
-        if _canary_fr_cycle <= 0 or _canary_fr_triggered:
-            return
-        if loop.cycle < _canary_fr_cycle:
+        if not _canary_fr_enabled or _canary_fr_triggered:
             return
 
         live = host.live_symbols
         if not live:
-            logger.info(
-                "CANARY_FORCE_REDUCE_SKIPPED cycle=%d reason=no_live_symbols",
-                loop.cycle,
-            )
-            _canary_fr_triggered = True
             return
 
-        # P1 fix: specific symbol not live → skip, no fallback to different symbol
-        if _canary_fr_symbol and _canary_fr_symbol not in live:
-            logger.info(
-                "CANARY_FORCE_REDUCE_SKIPPED cycle=%d symbol=%s reason=not_live",
-                loop.cycle,
-                _canary_fr_symbol,
-            )
-            _canary_fr_triggered = True
-            return
+        # Find eligible target
+        target: str | None = None
+        target_qty = _ZERO
 
-        target = _canary_fr_symbol if _canary_fr_symbol else sorted(live)[0]
+        if _canary_fr_on_pos:
+            # Position-aware: wait for first non-flat live symbol
+            candidates = [_canary_fr_symbol] if _canary_fr_symbol else sorted(live)
+            for sym in candidates:
+                if sym not in live:
+                    continue
+                engine_ref = host.get_engine_ref(sym)
+                if engine_ref is None:
+                    continue
+                qty = bridge.get_signed_position_qty(sym, engine_ref)
+                if qty != _ZERO:
+                    target = sym
+                    target_qty = qty
+                    break
+            if target is None:
+                return  # still waiting for fills — retry next cycle
+        else:
+            # Cycle-based: trigger at specific cycle
+            if loop.cycle < _canary_fr_cycle:
+                return
+            if _canary_fr_symbol:
+                if _canary_fr_symbol not in live:
+                    logger.info(
+                        "CANARY_FORCE_REDUCE_SKIPPED cycle=%d symbol=%s reason=not_live",
+                        loop.cycle,
+                        _canary_fr_symbol,
+                    )
+                    _canary_fr_triggered = True
+                    return
+                target = _canary_fr_symbol
+            else:
+                target = sorted(live)[0]
 
+        logger.info(
+            "CANARY_FORCE_REDUCE_POSITION_DETECTED symbol=%s qty=%s cycle=%d",
+            target,
+            target_qty,
+            loop.cycle,
+        )
         logger.info("CANARY_TRIGGERING_FORCE_REDUCE cycle=%d symbol=%s", loop.cycle, target)
 
-        # P1 fix: respect ladder sequencing — only escalate if graceful-exit latches
         from grinder.runtime.autonomous_host import GracefulExitResult  # noqa: PLC0415
 
         ge_result = host.request_graceful_exit(target)

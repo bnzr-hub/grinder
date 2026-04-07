@@ -311,6 +311,17 @@ class LiveEngineBridge:
             logger.error("BRIDGE_GRACEFUL_EXIT_ERROR symbol=%s error=%s", symbol, e)
             return GracefulExitResult.FAILED
 
+    def get_signed_position_qty(self, symbol: str, engine_ref: Any) -> Decimal:
+        """Get signed position qty from a live engine. Returns 0 on failure."""
+        handle: EngineHandle = engine_ref
+        engine = handle.engine_ref
+        if engine is None:
+            return Decimal("0")
+        try:
+            return engine.get_effective_signed_position_qty(symbol)
+        except Exception:
+            return Decimal("0")
+
     def force_reduce(self, symbol: str, engine_ref: Any) -> bool:
         """Request force-reduce on a running engine. Idempotent.
 
