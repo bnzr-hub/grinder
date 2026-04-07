@@ -3068,8 +3068,9 @@ class LiveEngineV0:
         if self._regime_registry is not None and self._last_feature_snapshot is not None:
             from grinder.controller.regime import classify_regime  # noqa: PLC0415
 
+            fs = self._last_feature_snapshot
             toxicity_result = (
-                self._toxicity_gate.check(snapshot.symbol)
+                self._toxicity_gate.check(fs.ts, fs.symbol, float(fs.spread_bps), fs.mid_price)
                 if self._toxicity_gate is not None
                 else None
             )
