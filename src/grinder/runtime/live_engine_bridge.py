@@ -536,12 +536,21 @@ class LiveEngineBridge:
                 port = self._build_port(symbol, mode)
                 engine_config = LiveEngineConfig(armed=cfg.armed, mode=mode)
                 account_syncer = self._build_account_syncer(symbol, port)
+                # FeatureEngine for regime classification (portfolio-level aggregation)
+                from grinder.features.engine import (  # noqa: PLC0415
+                    FeatureEngine,
+                    FeatureEngineConfig,
+                )
+
+                feature_engine = FeatureEngine(FeatureEngineConfig())
+
                 engine = LiveEngineV0(
                     paper_engine=paper,
                     exchange_port=port,
                     config=engine_config,
                     operator_symbols=[symbol],
                     account_syncer=account_syncer,
+                    feature_engine=feature_engine,
                     regime_registry=self._regime_registry,
                 )
             finally:
