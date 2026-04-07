@@ -317,6 +317,11 @@ class LiveEngineBridge:
         """
         handle: EngineHandle = engine_ref
         port = handle.port_ref
+
+        # Always remove from regime registry regardless of port type
+        if self._regime_registry is not None and hasattr(self._regime_registry, "remove"):
+            self._regime_registry.remove(symbol)
+
         if port is None or not hasattr(port, "fetch_positions_raw"):
             logger.info(
                 "BRIDGE_ENGINE_CLEANUP symbol=%s port=%s (no-op)",
@@ -367,11 +372,6 @@ class LiveEngineBridge:
         close_ms = close_timer.elapsed_ms()
 
         log_shutdown(symbol, cancel_ms, close_ms, cleanup_timer.elapsed_ms())
-
-        # Remove symbol from shared regime registry on cleanup
-        if self._regime_registry is not None and hasattr(self._regime_registry, "remove"):
-            self._regime_registry.remove(symbol)
-
         logger.info("BRIDGE_ENGINE_CLEANUP symbol=%s ok=%s", symbol, ok)
         return ok
 
