@@ -1058,24 +1058,39 @@ def main() -> None:  # noqa: PLR0915
             _canary_fr_triggered = True
             return
 
-        target = _canary_fr_symbol if _canary_fr_symbol in live else sorted(live)[0]
+        # P1 fix: specific symbol not live → skip, no fallback to different symbol
         if _canary_fr_symbol and _canary_fr_symbol not in live:
             logger.info(
-                "CANARY_FORCE_REDUCE_FALLBACK cycle=%d requested=%s actual=%s",
+                "CANARY_FORCE_REDUCE_SKIPPED cycle=%d symbol=%s reason=not_live",
                 loop.cycle,
                 _canary_fr_symbol,
-                target,
             )
+            _canary_fr_triggered = True
+            return
+
+        target = _canary_fr_symbol if _canary_fr_symbol else sorted(live)[0]
 
         logger.info("CANARY_TRIGGERING_FORCE_REDUCE cycle=%d symbol=%s", loop.cycle, target)
-        # Ensure graceful exit first
-        host.request_graceful_exit(target)
-        result = host.request_force_reduce(target)
+
+        # P1 fix: respect ladder sequencing — only escalate if graceful-exit latches
+        from grinder.runtime.autonomous_host import GracefulExitResult  # noqa: PLC0415
+
+        ge_result = host.request_graceful_exit(target)
+        if ge_result == GracefulExitResult.FAILED:
+            logger.warning(
+                "CANARY_FORCE_REDUCE_SKIPPED cycle=%d symbol=%s reason=graceful_exit_failed",
+                loop.cycle,
+                target,
+            )
+            _canary_fr_triggered = True
+            return
+
+        fr_result = host.request_force_reduce(target)
         logger.info(
             "CANARY_FORCE_REDUCE_RESULT cycle=%d symbol=%s requested=%s",
             loop.cycle,
             target,
-            result,
+            fr_result,
         )
         _canary_fr_triggered = True
 
