@@ -6500,7 +6500,7 @@ class LiveEngineV0:
             return set()
         registry = bridge.adapter.registry
         ids: set[str] = set()
-        for cid in registry.all_exit_cids():
+        for cid in registry.all_exit_cids:
             reg = registry.lookup_exit(cid)
             if reg is not None:
                 ids.add(reg.exit_order_id)
