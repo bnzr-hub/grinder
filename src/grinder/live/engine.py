@@ -570,9 +570,10 @@ class LiveEngineV0:
         # Shared regime registry for portfolio-level regime aggregation
         self._regime_registry = regime_registry
         # Force-reduce: set by orchestration when day mode requires active risk reduction.
-        # PR 2 will connect this to SymbolUnloadController activation.
+        # Connected to SymbolUnloadController in _update_risk_state().
         self._force_reduce_requested: bool = False
         self._force_reduce_reason: str = ""
+        self._force_reduce_flat_logged: bool = False
         # Min-notional cache: symbol → Decimal. Loaded from constraint provider at init.
         # Used by pre-send notional gate to block sub-minimum orders before HTTP.
         # Only loaded when operator_symbols are set (autonomous/production path).
@@ -3955,8 +3956,8 @@ class LiveEngineV0:
     def request_force_reduce(self, reason: str = "") -> bool:
         """Request force-reduce mode. Idempotent — returns True on first request.
 
-        Sets engine-side flag that PR 2 will connect to SymbolUnloadController.
-        Does NOT stop engine, does NOT flatten — just sets the mode.
+        Sets engine-side flag that activates SymbolUnloadController in _update_risk_state().
+        Staged reduction through existing unload machinery — no instant flatten.
         """
         if self._force_reduce_requested:
             return False
@@ -6321,7 +6322,9 @@ class LiveEngineV0:
                 )
         self._symbol_closed_lots_seen[symbol] = current_count
 
-    def _evaluate_symbol_risk(self, acct: AccountSnapshot) -> None:
+    def _evaluate_symbol_risk(  # noqa: PLR0912
+        self, acct: AccountSnapshot
+    ) -> None:
         """Evaluate per-symbol risk after account sync."""
         cfg = self._symbol_risk_manager.config
         if cfg.applies_to_grid_v2_only and not self._grid_v2_enabled:
@@ -6373,9 +6376,29 @@ class LiveEngineV0:
                 ):
                     self._symbol_unload.activate(sym)
 
-        # Try unload steps for active symbols
-        if self._symbol_unload.config.enabled:
+        # Force-reduce: activate unload for all tracked symbols when requested.
+        # Overrides the GRINDER_SYMBOL_UNLOAD_ENABLED gate — force-reduce is
+        # an explicit risk management decision, not a config flag.
+        if self._force_reduce_requested:
+            for sym in tracked:
+                _notional, _qty = pos_by_sym.get(sym, (0.0, 0.0))
+                if _qty > 0 and self._symbol_unload.get_status(sym).value == "INACTIVE":
+                    self._symbol_unload.activate(sym, force=True)
+                    logger.info("ENGINE_FORCE_REDUCE_UNLOAD_STARTED symbol=%s", sym)
+
+        # Try unload steps for active symbols (force-reduce overrides enabled gate)
+        if self._symbol_unload.config.enabled or self._force_reduce_requested:
             self._try_symbol_unload_steps(acct)
+
+        # Force-reduce completion: check if all positions are flat
+        if self._force_reduce_requested:
+            all_flat = all(pos_by_sym.get(sym, (0.0, 0.0))[1] == 0.0 for sym in tracked)
+            if all_flat and not self._force_reduce_flat_logged:
+                logger.info(
+                    "ENGINE_FORCE_REDUCE_UNLOAD_FLAT symbols=%s",
+                    ",".join(sorted(tracked)),
+                )
+                self._force_reduce_flat_logged = True
 
     def _try_symbol_unload_steps(self, acct: AccountSnapshot) -> None:
         """Attempt staged unload steps for symbols in EXIT_ONLY."""
@@ -6390,7 +6413,7 @@ class LiveEngineV0:
             if self._symbol_unload.get_status(sym).value not in ("ACTIVE",):
                 continue
             signed_qty = signed_by_sym.get(sym, 0.0)
-            step = self._symbol_unload.try_step(sym, signed_qty)
+            step = self._symbol_unload.try_step(sym, signed_qty, force=self._force_reduce_requested)
             if step is None:
                 continue
             mark = mark_by_sym.get(sym)
