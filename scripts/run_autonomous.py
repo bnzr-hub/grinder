@@ -856,15 +856,14 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
     Stores latest day_state and portfolio_snapshot into runtime["risk_state"]
     so the admission gate can read current risk state each cycle.
 
-    Uses real gross exposure from refresher and real portfolio-level regime
-    aggregated from per-symbol V2 features via controller/regime.py semantics.
+    Uses real gross exposure from refresher. Market regime stays NEUTRAL until
+    live engines expose their controller/regime.py RegimeDecision upstream.
     """
     day_risk_manager = runtime.get("day_risk_manager")
     portfolio_allocator = runtime.get("portfolio_allocator")
     bridge = runtime["bridge"]
     host = runtime["host"]
     risk_state = runtime.get("risk_state", {})
-    tuning_state = runtime.get("tuning_state")
 
     def _cycle_facts() -> None:
         if day_risk_manager is None:
@@ -883,21 +882,14 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
                     MarketRegime,
                     PortfolioBudgetInput,
                 )
-                from grinder.risk.regime_adapter import (  # noqa: PLC0415
-                    aggregate_portfolio_regime,
-                    classify_from_v2_features,
-                )
 
                 active_count = len(host.live_symbols) if hasattr(host, "live_symbols") else 0
 
-                # Portfolio regime from per-symbol V2 features (fail-open to NEUTRAL)
+                # Market regime: NEUTRAL until live engines expose their
+                # controller/regime.py RegimeDecision upstream. The existing
+                # per-symbol classifier is correct but currently lives inside
+                # engine threads — no shared portfolio-level aggregation path yet.
                 regime = MarketRegime.NEUTRAL
-                v2_feats = tuning_state.v2_features if tuning_state is not None else {}
-                if v2_feats:
-                    symbol_regimes = {
-                        sym: classify_from_v2_features(feat) for sym, feat in v2_feats.items()
-                    }
-                    regime = aggregate_portfolio_regime(symbol_regimes)
 
                 # Real gross exposure from refresher (fail-open to 0)
                 gross_exposure = bridge.last_known_gross_exposure or _ZERO
