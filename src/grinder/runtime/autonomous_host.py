@@ -87,6 +87,7 @@ class AutonomousEngineHost:
     engine_stop_fn: EngineStopFn
     engine_cleanup_fn: EngineCleanupFn | None = None
     graceful_exit_fn: GracefulExitFn | None = None
+    force_reduce_fn: Any | None = None  # Callable(symbol, engine_ref) → bool
     _clock: Any = field(default=time.monotonic)
 
     # Internal handle map — authoritative source of "what is actually running"
@@ -187,6 +188,28 @@ class AutonomousEngineHost:
 
         logger.info("HOST_GRACEFUL_EXIT_OK symbol=%s", symbol)
         return GracefulExitResult.SUCCESS
+
+    def request_force_reduce(self, symbol: str) -> bool:
+        """Request force-reduce on a live engine. Idempotent.
+
+        Returns True if newly requested, False if not live / no fn / already set.
+        """
+        engine_ref = self._live_engines.get(symbol)
+        if engine_ref is None:
+            logger.warning("HOST_FORCE_REDUCE_MISSING symbol=%s — no live engine", symbol)
+            return False
+
+        if self.force_reduce_fn is None:
+            logger.warning("HOST_FORCE_REDUCE_NO_FN symbol=%s", symbol)
+            return False
+
+        try:
+            ok = self.force_reduce_fn(symbol, engine_ref)
+            logger.info("HOST_FORCE_REDUCE symbol=%s newly_set=%s", symbol, ok)
+            return ok
+        except Exception as e:
+            logger.error("HOST_FORCE_REDUCE_ERROR symbol=%s error=%s", symbol, e)
+            return False
 
     def finalize_deactivation(self, symbol: str) -> bool:
         """Complete deactivation: stop engine, cleanup, remove from host.
