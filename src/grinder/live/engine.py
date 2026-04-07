@@ -4511,8 +4511,10 @@ class LiveEngineV0:
         # PR-A4: update position notional from confirmed snapshot
         if result.snapshot is not None:
             self._position_notional_usd = AccountSyncer.compute_position_notional(result.snapshot)
-            # Symbol risk evaluation (per-symbol, post account sync)
-            if self._symbol_risk_manager.config.enabled:
+            # Symbol risk evaluation (per-symbol, post account sync).
+            # Force-reduce overrides the enabled gate — it's an explicit
+            # risk management decision, not a config flag.
+            if self._symbol_risk_manager.config.enabled or self._force_reduce_requested:
                 self._evaluate_symbol_risk(result.snapshot)
             # PR-L2: Store full snapshot for LiveGridPlannerV1 (open_orders as exchange truth)
             self._last_account_snapshot = result.snapshot
