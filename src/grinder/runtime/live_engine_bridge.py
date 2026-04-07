@@ -18,7 +18,10 @@ import threading
 import time
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from grinder.risk.regime_registry import SharedRegimeRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +102,7 @@ class LiveEngineBridge:
         # Updated by engine thread, read by main loop for day risk.
         self._last_known_equity: Decimal | None = None
         self._last_known_gross_exposure: Decimal | None = None
-        self._regime_registry: object | None = None
+        self._regime_registry: SharedRegimeRegistry | None = None
 
     def set_symbol_size(self, symbol: str, order_size: str) -> None:
         """Register tuning-resolved order size for a symbol."""
@@ -129,11 +132,11 @@ class LiveEngineBridge:
         self._last_known_gross_exposure = gross_exposure
 
     @property
-    def regime_registry(self) -> object | None:
+    def regime_registry(self) -> SharedRegimeRegistry | None:
         """Shared regime registry for portfolio-level aggregation."""
         return self._regime_registry
 
-    def set_regime_registry(self, registry: object) -> None:
+    def set_regime_registry(self, registry: SharedRegimeRegistry) -> None:
         """Inject shared regime registry (called once at runtime setup)."""
         self._regime_registry = registry
 
@@ -319,7 +322,7 @@ class LiveEngineBridge:
         port = handle.port_ref
 
         # Always remove from regime registry regardless of port type
-        if self._regime_registry is not None and hasattr(self._regime_registry, "remove"):
+        if self._regime_registry is not None:
             self._regime_registry.remove(symbol)
 
         if port is None or not hasattr(port, "fetch_positions_raw"):
