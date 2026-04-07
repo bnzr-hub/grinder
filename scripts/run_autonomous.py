@@ -694,6 +694,14 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
 
     # Real engine host with LiveEngineBridge (ADR-147/148/149)
     bridge = _build_engine_bridge(args)
+
+    # Shared regime registry: engine threads publish RegimeDecision here,
+    # runtime reads for portfolio-level regime aggregation.
+    from grinder.risk.regime_registry import SharedRegimeRegistry  # noqa: PLC0415
+
+    regime_registry = SharedRegimeRegistry()
+    bridge.set_regime_registry(regime_registry)
+
     _propagate_tuning_to_bridge(bridge, _tuned_sizes, _tuned_results, _natr_map)
     host = AutonomousEngineHost(
         registry=registry,
@@ -847,6 +855,7 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
         "admission_gate": admission_gate,
         "tuning_state": _tuning_state,
         "risk_state": _risk_state,
+        "regime_registry": regime_registry,
     }
 
 
