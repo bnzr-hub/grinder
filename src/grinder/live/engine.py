@@ -138,6 +138,7 @@ if TYPE_CHECKING:
     from grinder.live.grid_planner import LiveGridPlannerV1
     from grinder.ml.fill_model_v0 import FillModelV0
     from grinder.paper.engine import PaperEngine
+    from grinder.risk.regime_registry import SharedRegimeRegistry
     from grinder.selection.active_selector import ActiveSelector
     from grinder.selection.shadow_selector import ShadowSelector
 
@@ -523,7 +524,7 @@ class LiveEngineV0:
         shadow_selector: ShadowSelector | None = None,
         active_selector: ActiveSelector | None = None,
         operator_symbols: list[str] | None = None,
-        regime_registry: object | None = None,
+        regime_registry: SharedRegimeRegistry | None = None,
     ) -> None:
         """Initialize LiveEngineV0.
 

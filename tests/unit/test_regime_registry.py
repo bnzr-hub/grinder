@@ -41,8 +41,10 @@ class TestPublish:
         reg.publish("BTCUSDT", Regime.RANGE, RegimeReason.DEFAULT, 80)
         reg.publish("ETHUSDT", Regime.TOXIC, RegimeReason.SPREAD_SPIKE, 100)
         assert len(reg) == 2
-        assert reg.get("BTCUSDT").regime == Regime.RANGE
-        assert reg.get("ETHUSDT").regime == Regime.TOXIC
+        btc = reg.get("BTCUSDT")
+        eth = reg.get("ETHUSDT")
+        assert btc is not None and btc.regime == Regime.RANGE
+        assert eth is not None and eth.regime == Regime.TOXIC
 
 
 class TestRemove:
@@ -95,7 +97,8 @@ class TestLifecycle:
         assert reg.get("BTCUSDT") is None
         changed = reg.publish("BTCUSDT", Regime.TOXIC, RegimeReason.SPREAD_SPIKE, 100)
         assert changed is True
-        assert reg.get("BTCUSDT").regime == Regime.TOXIC
+        snap = reg.get("BTCUSDT")
+        assert snap is not None and snap.regime == Regime.TOXIC
 
 
 class TestDeterminism:
