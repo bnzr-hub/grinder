@@ -155,6 +155,7 @@ class TestRefresherRiskTruth:
     def test_refresher_uses_bridge_truth_for_solver_budget(self) -> None:
         bridge = LiveEngineBridge()
         bridge.update_equity(Decimal("1000"))
+        bridge.update_risk_base(Decimal("20"))
         bridge.update_gross_exposure(Decimal("200"))
         state = AutonomousTuningState(candidates=["BTCUSDT"])
         registry = EngineRegistry()
@@ -199,3 +200,29 @@ class TestRefresherRiskTruth:
             refresher._retune_symbols(["BTCUSDT"], {"BTCUSDT": Decimal("2.0")}, Decimal("20"))
 
         assert captured["max_position_usd"] == Decimal("20")
+
+    def test_refresher_keeps_equity_and_risk_base_separate(self) -> None:
+        bridge = LiveEngineBridge()
+        refresher = TuningRefresher(
+            state=AutonomousTuningState(candidates=["BTCUSDT"]),
+            cache=MagicMock(),
+            bridge=bridge,
+            registry=EngineRegistry(),
+            args=_args(),
+        )
+
+        with (
+            patch("grinder.runtime.account_truth.fetch_futures_equity", return_value=Decimal("1000")),
+            patch(
+                "grinder.runtime.account_truth.fetch_futures_risk_base",
+                return_value=Decimal("900"),
+            ),
+            patch(
+                "grinder.runtime.account_truth.fetch_futures_gross_exposure",
+                return_value=Decimal("200"),
+            ),
+        ):
+            refresher._update_equity()
+
+        assert bridge.last_known_equity == Decimal("1000")
+        assert bridge.last_known_risk_base == Decimal("900")

@@ -104,6 +104,8 @@ class LiveEngineBridge:
         # Thread-safe last-known equity from engine account sync.
         # Updated by engine thread, read by main loop for day risk.
         self._last_known_equity: Decimal | None = None
+        # Thread-safe last-known risk base for autonomous sizing.
+        self._last_known_risk_base: Decimal | None = None
         self._last_known_gross_exposure: Decimal | None = None
         self._regime_registry: SharedRegimeRegistry | None = None
 
@@ -124,6 +126,15 @@ class LiveEngineBridge:
     def update_equity(self, equity: Decimal) -> None:
         """Set last-known equity (thread-safe, called by refresher)."""
         self._last_known_equity = equity
+
+    @property
+    def last_known_risk_base(self) -> Decimal | None:
+        """Read last-known autonomous sizing risk base (may be stale or None)."""
+        return self._last_known_risk_base
+
+    def update_risk_base(self, risk_base: Decimal) -> None:
+        """Set last-known autonomous sizing risk base (thread-safe)."""
+        self._last_known_risk_base = risk_base
 
     @property
     def last_known_gross_exposure(self) -> Decimal | None:

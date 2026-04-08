@@ -70,6 +70,23 @@ def _risk_base_config_from_env() -> RiskBaseConfig:
     )
 
 
+def fetch_futures_equity(*, testnet: bool) -> Decimal | None:
+    """Fetch canonical equity for day/session risk semantics.
+
+    This remains true equity (`totalMarginBalance`) even when the configured
+    autonomous sizing risk base uses a different mode.
+    """
+    try:
+        data = _signed_get("/fapi/v2/account", testnet=testnet)
+        if not isinstance(data, dict):
+            return None
+        equity = Decimal(str(data.get("totalMarginBalance", "0")))
+        return equity if equity > 0 else None
+    except Exception:
+        return None
+    return None
+
+
 def fetch_futures_risk_base(*, testnet: bool) -> Decimal | None:
     """Fetch canonical futures risk base from Binance REST.
 
@@ -98,11 +115,6 @@ def fetch_futures_risk_base(*, testnet: bool) -> Decimal | None:
     except Exception:
         return None
     return None
-
-
-def fetch_futures_equity(*, testnet: bool) -> Decimal | None:
-    """Backward-compatible alias for canonical autonomous risk base fetch."""
-    return fetch_futures_risk_base(testnet=testnet)
 
 
 def fetch_futures_gross_exposure(*, testnet: bool) -> Decimal | None:

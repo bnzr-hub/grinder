@@ -274,16 +274,20 @@ class TuningRefresher:
                 self._bridge.set_symbol_spacing(sym, compute_adaptive_spacing_bps(natr_val))
 
     def _update_equity(self) -> None:
-        """Fetch canonical risk base and gross exposure, push to bridge. Fail-open."""
+        """Fetch equity, risk base, and gross exposure, push to bridge. Fail-open."""
         from grinder.runtime.account_truth import (  # noqa: PLC0415
+            fetch_futures_equity,
             fetch_futures_risk_base,
             fetch_futures_gross_exposure,
         )
 
         testnet = not getattr(self._args, "mainnet", False)
-        equity = fetch_futures_risk_base(testnet=testnet)
+        equity = fetch_futures_equity(testnet=testnet)
         if equity is not None and equity > 0:
             self._bridge.update_equity(equity)
+        risk_base = fetch_futures_risk_base(testnet=testnet)
+        if risk_base is not None and risk_base > 0:
+            self._bridge.update_risk_base(risk_base)
         gross = fetch_futures_gross_exposure(testnet=testnet)
         if gross is not None:
             self._bridge.update_gross_exposure(gross)
@@ -292,22 +296,22 @@ class TuningRefresher:
         """Derive current autonomous symbol risk budget from real bridge facts."""
         from grinder.risk.autonomous_risk_budget import derive_autonomous_portfolio_snapshot  # noqa: PLC0415
 
-        equity = self._bridge.last_known_equity
+        risk_base = self._bridge.last_known_risk_base
         gross = self._bridge.last_known_gross_exposure
-        if equity is None or equity <= Decimal("0") or gross is None:
+        if risk_base is None or risk_base <= Decimal("0") or gross is None:
             return None
         active_count = len(self._registry.list_present())
         snapshot = derive_autonomous_portfolio_snapshot(
-            equity=equity,
+            equity=risk_base,
             gross_exposure_used_usd=gross,
             active_symbol_count=active_count,
         )
         if snapshot.per_symbol_risk_budget_usd <= Decimal("0"):
             return None
         logger.info(
-            "TUNING_REFRESH_RISK_BASE equity=%s gross_exposure=%s active=%d "
+            "TUNING_REFRESH_RISK_BASE risk_base=%s gross_exposure=%s active=%d "
             "per_symbol_risk_budget_usd=%s",
-            equity,
+            risk_base,
             gross,
             active_count,
             snapshot.per_symbol_risk_budget_usd,

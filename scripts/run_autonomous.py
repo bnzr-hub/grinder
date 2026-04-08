@@ -57,25 +57,25 @@ def _derive_bootstrap_symbol_risk_budget(*, testnet: bool) -> Decimal | None:
         fetch_futures_gross_exposure,
     )
 
-    equity = fetch_futures_risk_base(testnet=testnet)
+    risk_base = fetch_futures_risk_base(testnet=testnet)
     gross_exposure = fetch_futures_gross_exposure(testnet=testnet)
-    if equity is None or equity <= _ZERO or gross_exposure is None:
+    if risk_base is None or risk_base <= _ZERO or gross_exposure is None:
         logger.warning(
-            "AUTONOMOUS_SIZING_NO_RISK_BASE equity=%s gross_exposure=%s testnet=%s",
-            equity,
+            "AUTONOMOUS_SIZING_NO_RISK_BASE risk_base=%s gross_exposure=%s testnet=%s",
+            risk_base,
             gross_exposure,
             testnet,
         )
         return None
     snapshot = derive_autonomous_portfolio_snapshot(
-        equity=equity,
+        equity=risk_base,
         gross_exposure_used_usd=gross_exposure,
         active_symbol_count=0,
     )
     logger.info(
-        "AUTONOMOUS_SIZING_RISK_BASE equity=%s gross_exposure=%s "
+        "AUTONOMOUS_SIZING_RISK_BASE risk_base=%s gross_exposure=%s "
         "per_symbol_risk_budget_usd=%s",
-        equity,
+        risk_base,
         gross_exposure,
         snapshot.per_symbol_risk_budget_usd,
     )
