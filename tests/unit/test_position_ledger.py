@@ -237,6 +237,106 @@ class TestPositionLedgerTrustState:
         assert ledger.trust_revoked
 
 
+class TestPositionLedgerHydration:
+    """hydrate_from_snapshot bootstraps ledger from REST snapshot."""
+
+    def test_hydrate_populates_empty_ledger(self) -> None:
+        ledger = PositionLedger()
+        snap = _snap(positions=[_pos_snap(signed_qty="0.001")], ts=2000)
+        hydrated = ledger.hydrate_from_snapshot(snap)
+        assert hydrated == 1
+        assert ledger.positions()[("BTCUSDT", "BOTH")].position_amt == Decimal("0.001")
+        assert ledger._bootstrapped
+
+    def test_hydrate_skips_flat_positions(self) -> None:
+        ledger = PositionLedger()
+        snap = _snap(positions=[_pos_snap(signed_qty="0")], ts=2000)
+        hydrated = ledger.hydrate_from_snapshot(snap)
+        assert hydrated == 0
+        assert not ledger._bootstrapped
+
+    def test_hydrate_does_not_overwrite_newer_event(self) -> None:
+        """WS event with newer ts takes precedence over older pos.ts."""
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(ts=3000, position_amt="0.005"))
+        # pos.ts=1000 (from _pos_snap default), WS event ts=3000 is newer
+        snap = _snap(positions=[_pos_snap(signed_qty="0.001")], ts=5000)
+        hydrated = ledger.hydrate_from_snapshot(snap)
+        assert hydrated == 0
+        assert ledger.positions()[("BTCUSDT", "BOTH")].position_amt == Decimal("0.005")
+
+    def test_hydrate_overwrites_older_event(self) -> None:
+        """Position with newer pos.ts updates stale ledger entry."""
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(ts=500, position_amt="0.001"))
+        # pos.ts=1000 > event.ts=500 → overwrite
+        snap = _snap(positions=[_pos_snap(signed_qty="0.003")], ts=2000)
+        hydrated = ledger.hydrate_from_snapshot(snap)
+        assert hydrated == 1
+        assert ledger.positions()[("BTCUSDT", "BOTH")].position_amt == Decimal("0.003")
+
+    def test_hydrate_idempotent(self) -> None:
+        """Repeated hydration with same snapshot does not double-count."""
+        ledger = PositionLedger()
+        snap = _snap(positions=[_pos_snap(signed_qty="0.001")], ts=2000)
+        assert ledger.hydrate_from_snapshot(snap) == 1
+        assert ledger.hydrate_from_snapshot(snap) == 0  # same pos.ts, no overwrite
+
+    def test_hydrate_uses_pos_ts_not_snapshot_ts(self) -> None:
+        """Freshness must use pos.ts, not snapshot.ts (which includes order ts).
+
+        Scenario: pos.ts=1000, snapshot.ts=2000, WS event at ts=1500.
+        The WS event is newer than the position snapshot and must not be suppressed.
+        """
+        ledger = PositionLedger()
+        # Hydrate: pos.ts=1000, snapshot.ts=2000
+        snap = _snap(positions=[_pos_snap(signed_qty="0.001")], ts=2000)
+        ledger.hydrate_from_snapshot(snap)
+        # Ledger entry should have last_event_ts=1000 (pos.ts), not 2000
+        assert ledger.positions()[("BTCUSDT", "BOTH")].last_event_ts == 1000
+
+        # WS event at ts=1500 is newer than pos.ts=1000 → must apply
+        ledger.apply_position_event(_pos_event(ts=1500, position_amt="0.002"))
+        assert ledger.positions()[("BTCUSDT", "BOTH")].position_amt == Decimal("0.002")
+
+    def test_hydrate_then_compare_converges(self) -> None:
+        """The core fix: hydrate from snapshot, then compare → converged."""
+        ledger = PositionLedger()
+        snap = _snap(positions=[_pos_snap(signed_qty="0.001")], ts=2000)
+        ledger.hydrate_from_snapshot(snap)
+        result = ledger.compare_with_snapshot(snap)
+        assert result.is_converged
+
+    def test_hydrate_prevents_persistent_missing_in_ledger(self) -> None:
+        """Without hydration, empty ledger diverges forever. With it, first sync converges."""
+        ledger = PositionLedger()
+        snap = _snap(positions=[_pos_snap(signed_qty="0.001")], ts=2000)
+
+        # Simulate the fixed sync path: hydrate then compare
+        ledger.hydrate_from_snapshot(snap)
+        cmp = ledger.compare_with_snapshot(snap)
+        ledger.record_comparison_result(cmp.is_converged)
+
+        assert cmp.is_converged
+        assert ledger._bootstrapped
+        assert ledger.is_trusted
+
+    def test_hydrate_multi_symbol(self) -> None:
+        """Multiple positions hydrated correctly."""
+        ledger = PositionLedger()
+        snap = _snap(
+            positions=[
+                _pos_snap(symbol="BTCUSDT", signed_qty="0.001"),
+                _pos_snap(symbol="ETHUSDT", signed_qty="-0.5"),
+            ],
+            ts=2000,
+        )
+        hydrated = ledger.hydrate_from_snapshot(snap)
+        assert hydrated == 2
+        assert ledger.positions()[("BTCUSDT", "BOTH")].position_amt == Decimal("0.001")
+        assert ledger.positions()[("ETHUSDT", "BOTH")].position_amt == Decimal("-0.5")
+
+
 class TestPositionLedgerGetSignedQty:
     def test_returns_zero_when_missing(self) -> None:
         ledger = PositionLedger()

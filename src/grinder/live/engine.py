@@ -4737,8 +4737,18 @@ class LiveEngineV0:
                         shadow.ledger_open_orders,
                         shadow.snapshot_open_orders,
                     )
-            # ADR-109 Phase 3: PositionLedger comparison + trust decision
+            # ADR-109 Phase 3: PositionLedger hydration + comparison + trust decision
             try:
+                pos_hydrated = self._position_ledger.hydrate_from_snapshot(result.snapshot)
+                if pos_hydrated > 0:
+                    logger.info(
+                        "POSITION_LEDGER_HYDRATED positions=%d snapshot_ts=%d "
+                        "bootstrapped=%s trusted=%s",
+                        pos_hydrated,
+                        result.snapshot.ts,
+                        self._position_ledger._bootstrapped,
+                        self._position_ledger.is_trusted,
+                    )
                 pos_cmp = self._position_ledger.compare_with_snapshot(result.snapshot)
                 self._position_ledger.record_comparison_result(pos_cmp.is_converged)
                 logger.debug(

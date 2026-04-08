@@ -139,6 +139,44 @@ class PositionLedger:
             return Decimal("0")
         return lp.position_amt
 
+    def hydrate_from_snapshot(self, snapshot: AccountSnapshot) -> int:
+        """Bootstrap/refresh ledger from snapshot positions.
+
+        Populates the ledger with non-zero positions from the snapshot
+        that are not already present. Idempotent — existing entries with
+        a newer event_ts are not overwritten.
+
+        Sets _bootstrapped = True once at least one non-zero position is
+        present (from hydration or from WS events).
+
+        Called on every sync cycle (mirrors EventLedger pattern).
+        Returns the number of positions hydrated.
+        """
+        hydrated = 0
+        for pos in snapshot.positions:
+            qty = pos.signed_qty if pos.signed_qty is not None else pos.qty
+            if qty == 0:
+                continue
+            key = (pos.symbol, pos.side)
+            existing = self._positions.get(key)
+            # Don't overwrite if ledger already has same or newer event.
+            # Use pos.ts (per-position fetch time), not snapshot.ts which is
+            # max(positions_ts, orders_ts) and can falsely suppress WS events.
+            if existing is not None and existing.last_event_ts >= pos.ts:
+                continue
+            self._positions[key] = LedgerPosition(
+                symbol=pos.symbol,
+                position_side=pos.side,
+                position_amt=qty,
+                entry_price=pos.entry_price,
+                unrealized_pnl=pos.unrealized_pnl,
+                last_event_ts=pos.ts,
+            )
+            hydrated += 1
+        if hydrated > 0 and not self._bootstrapped:
+            self._bootstrapped = True
+        return hydrated
+
     def compare_with_snapshot(self, snapshot: AccountSnapshot) -> PositionComparisonResult:
         """Compare ledger positions against snapshot positions.
 

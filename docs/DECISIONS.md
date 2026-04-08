@@ -5083,3 +5083,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Wrap execution callbacks at the wiring site to call the matching controller lifecycle method on ceremony success: `apply_activation` after successful activate, `apply_graceful_exit` after `GracefulExitResult.SUCCESS`, `apply_deactivation` after successful finalize. No optimistic transitions on failure.
 - **Invariant:** Controller lifecycle reflects actual executed host outcomes, not planned action intents. Failed ceremonies leave controller state unchanged.
 - **Consequences:** ADR-163 orphan fix becomes effective in live runtime. Controller ownership set accurately reflects live engine state.
+
+### ADR-165: Position ledger hydration from snapshot (2026-04-08)
+
+- **Problem:** Live multi-symbol canary showed persistent `POSITION_MISSING_IN_LEDGER` on every sync cycle for the entire run. PositionLedger had no `hydrate_from_snapshot()` method — it only populated from WebSocket ACCOUNT_UPDATE events. If the first REST snapshot arrived before the first WS position update, the ledger stayed empty forever, producing permanent divergence and untrusted position state. This cascaded into exit topology repair `BLOCKED` (reduce-only budget guard computed from stale/empty position data).
+- **Root cause:** EventLedger had `hydrate_from_snapshot()` called on every sync (added in ADR-109 Phase 2). PositionLedger had no equivalent — a gap from Phase 3 implementation.
+- **Decision:** Add `hydrate_from_snapshot()` to PositionLedger (same pattern as EventLedger) and call it in the engine sync path before comparison. Idempotent: existing entries with newer WS event_ts are not overwritten.
+- **Invariant:** Position truth converges on first sync cycle when snapshot has non-zero positions. Repeated syncs are idempotent. WS events with newer timestamps always take precedence.
+- **Consequences:** `POSITION_MISSING_IN_LEDGER` no longer persists. Position trust bootstraps from snapshot. Exit topology repair gets correct budget data. Grid reconstruction continues after fills.
