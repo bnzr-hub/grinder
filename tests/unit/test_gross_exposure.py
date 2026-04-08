@@ -5,8 +5,8 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
+from grinder.runtime.account_truth import compute_gross_exposure_from_positions
 from grinder.runtime.live_engine_bridge import BridgeConfig, LiveEngineBridge
-from grinder.tuning.refresher import compute_gross_exposure_from_positions
 
 
 class TestComputeGrossExposure:

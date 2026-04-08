@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 from decimal import Decimal
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from scripts import run_autonomous as run_autonomous_mod
@@ -69,7 +70,7 @@ class TestBootstrapRiskTruth:
         captured: dict[str, Decimal] = {}
 
         def _fake_solve(
-            symbol: str, sc: SymbolConstraints, price: Decimal, config: object
+            symbol: str, sc: SymbolConstraints, price: Decimal, config: Any
         ) -> TuningResult:
             captured["max_position_usd"] = config.max_position_usd
             return fake_result
@@ -172,7 +173,7 @@ class TestRefresherRiskTruth:
         captured: dict[str, Decimal] = {}
 
         def _fake_solve(
-            symbol: str, sc: SymbolConstraints, price: Decimal, config: object
+            symbol: str, sc: SymbolConstraints, price: Decimal, config: Any
         ) -> TuningResult:
             captured["max_position_usd"] = config.max_position_usd
             return TuningResult(
