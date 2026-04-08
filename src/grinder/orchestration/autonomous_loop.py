@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from grinder.orchestration.symbol_orchestrator import SymbolOrchestrator
     from grinder.orchestration.universe_provider import UniverseProvider
-    from grinder.rotation.controller import RotationAction, RotationActionKind, SymbolFacts
+    from grinder.rotation.controller import RotationAction, SymbolFacts
 
 logger = logging.getLogger(__name__)
 
