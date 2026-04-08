@@ -103,7 +103,8 @@ class TestBridgeFuturesPort:
         captured: dict[str, object] = {}
 
         class _FakePort:
-            def __init__(self, _http_client: object, config: object) -> None:
+            def __init__(self, **kwargs: object) -> None:
+                config = kwargs["config"]
                 captured["config"] = config
 
         monkeypatch.setenv("BINANCE_API_KEY", "k")
