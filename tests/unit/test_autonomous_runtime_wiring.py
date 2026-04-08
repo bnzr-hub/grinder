@@ -63,15 +63,14 @@ class TestBuildRuntime:
         assert isinstance(runtime["host"], AutonomousEngineHost)
         assert "bridge" in runtime
 
-    def test_coordinator_bindings_use_host_methods(self) -> None:
-        """Coordinator ceremony fns are bound to host lifecycle methods."""
+    def test_coordinator_bindings_are_callable(self) -> None:
+        """Coordinator ceremony fns are wired (wrapped with lifecycle callbacks)."""
         args = _default_args()
         runtime = run_autonomous_mod.build_runtime(args)
         coordinator = runtime["coordinator"]
-        host = runtime["host"]
-        assert coordinator.activate_fn == host.activate
-        assert coordinator.graceful_exit_fn == host.request_graceful_exit
-        assert coordinator.deactivate_fn == host.finalize_deactivation
+        assert callable(coordinator.activate_fn)
+        assert callable(coordinator.graceful_exit_fn)
+        assert callable(coordinator.deactivate_fn)
 
 
 class TestShadowMode:

@@ -598,6 +598,81 @@ class TestOrphanFixRankingChurn:
         assert "safety_block" not in (report.execution_report.skipped_reason or "")
 
 
+class TestLifecycleCallbackWiring:
+    """Verify that execution callbacks update controller lifecycle."""
+
+    def test_activate_callback_updates_controller(self) -> None:
+        """activate_fn that calls apply_activation makes controller own the symbol.
+
+        After ranking churn, controller-owned symbol stays in desired → no orphan.
+        """
+        from grinder.execution_plane.coordinator import ExecutionCoordinator  # noqa: PLC0415
+        from grinder.execution_plane.operator import OperatorControls  # noqa: PLC0415
+        from grinder.execution_plane.registry import EngineRegistry, EngineState  # noqa: PLC0415
+        from grinder.rotation.controller import SymbolFacts as SF  # noqa: PLC0415
+
+        cache = TuningCache(ttl_s=300.0)
+        for s in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
+            cache.put(s, _tuned(s))
+
+        reg = EngineRegistry()
+        loop = _make_loop(cache=cache, top_k=1, max_changes=1)
+        ctrl = loop.orchestrator.controller
+
+        def activate_with_lifecycle(symbol: str) -> bool:
+            reg.register(symbol, engine_ref=f"e_{symbol}")
+            reg.transition(symbol, EngineState.ACTIVE)
+            ctrl.apply_activation(symbol)
+            return True
+
+        coord = ExecutionCoordinator(activate_fn=activate_with_lifecycle)
+        loop.execution_coordinator = coord
+        loop.execution_registry = reg
+        loop.execution_operator = OperatorControls()
+        loop.execution_enabled = True
+        loop.execution_acknowledged = True
+
+        # Cycle 1: BTCUSDT activated via callback that updates controller
+        report1 = loop.run_cycle()
+        assert "BTCUSDT" in report1.admitted
+        assert "BTCUSDT" in loop.orchestrator.controller.get_active_symbols()
+
+        # Cycle 2: ranker prefers ETHUSDT, BTCUSDT is non-flat
+        loop.ranker_fn = lambda syms: sorted(syms, key=lambda s: s != "ETHUSDT")
+        report2 = loop.run_cycle(facts={"BTCUSDT": SF(is_flat=False)})
+
+        # BTCUSDT is still controller-owned (ACTIVE — graceful exit not yet executed)
+        # so it's in desired set → no orphan → no safety block
+        assert "BTCUSDT" in loop.orchestrator.controller.get_active_symbols()
+        assert report2.execution_report is not None
+        assert "safety_block" not in (report2.execution_report.skipped_reason or "")
+
+    def test_failed_activate_does_not_update_controller(self) -> None:
+        """If activate_fn returns False, controller stays unchanged."""
+        from grinder.execution_plane.coordinator import ExecutionCoordinator  # noqa: PLC0415
+        from grinder.execution_plane.operator import OperatorControls  # noqa: PLC0415
+        from grinder.execution_plane.registry import EngineRegistry  # noqa: PLC0415
+
+        cache = TuningCache(ttl_s=300.0)
+        cache.put("BTCUSDT", _tuned("BTCUSDT"))
+
+        def failing_activate(_symbol: str) -> bool:
+            return False
+
+        coord = ExecutionCoordinator(activate_fn=failing_activate)
+        reg = EngineRegistry()
+
+        loop = _make_loop(cache=cache, top_k=1, max_changes=1)
+        loop.execution_coordinator = coord
+        loop.execution_registry = reg
+        loop.execution_operator = OperatorControls()
+        loop.execution_enabled = True
+        loop.execution_acknowledged = True
+
+        loop.run_cycle()
+        assert loop.orchestrator.controller.get_active_symbols() == []
+
+
 class TestOrphanFixGenuineOrphan:
     """True unowned engines must still trigger STL_E3."""
 
