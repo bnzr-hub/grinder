@@ -3092,7 +3092,8 @@ class LiveEngineV0:
 
         # Adverse grid level trigger: FORCE_REDUCE at 16th adverse level
         if (
-            self._grid_v2_bridge is not None
+            self._grid_v2_started
+            and self._grid_v2_bridge is not None
             and not self._force_reduce_requested
             and self._grid_v2_bridge.state_machine is not None
         ):
