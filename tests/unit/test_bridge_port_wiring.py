@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import os
+from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from scripts import run_autonomous as run_autonomous_mod
@@ -87,6 +89,39 @@ class TestBridgeFuturesPort:
         assert cfg.use_testnet is False
         assert cfg.mode == "live_trade"
 
+    def test_build_port_passes_target_leverage_from_portfolio_policy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Autonomous futures port gets target leverage from shared portfolio policy."""
+        cfg = BridgeConfig(exchange_port="futures", mode="live_trade", armed=True, use_testnet=True)
+        bridge = LiveEngineBridge(config=cfg)
+        bridge.set_symbol_risk_caps(
+            "BTCUSDT",
+            max_inventory_notional_usd=Decimal("1000"),
+            max_order_notional_usd=Decimal("100"),
+        )
+        captured: dict[str, object] = {}
+
+        class _FakePort:
+            def __init__(self, http_client: object, config: object) -> None:
+                captured["config"] = config
+
+        monkeypatch.setenv("BINANCE_API_KEY", "k")
+        monkeypatch.setenv("BINANCE_API_SECRET", "s")
+        monkeypatch.setattr(
+            "grinder.execution.binance_futures_port.BinanceFuturesPort",
+            _FakePort,
+        )
+        monkeypatch.setattr(
+            "scripts.http_measured_client.RequestsHttpClient",
+            lambda port_name: object(),
+        )
+
+        bridge._build_port("BTCUSDT", mode=SimpleNamespace(value="live_trade"))
+
+        config = captured["config"]
+        assert getattr(config, "target_leverage") == 5
+
 
 class TestBridgePortConstructionFailure:
     def test_port_construction_failure_fails_closed(self) -> None:
@@ -114,6 +149,31 @@ class TestBridgePortConstructionFailure:
             for k, v in env_backup.items():
                 if v is not None:
                     os.environ[k] = v
+
+
+class TestBridgeLeverageEnforcement:
+    def test_enforce_futures_leverage_accepts_matching_actual(self) -> None:
+        bridge = LiveEngineBridge()
+        port = SimpleNamespace(set_leverage=lambda symbol, leverage: leverage)
+        bridge._enforce_futures_leverage("BTCUSDT", port)
+
+    def test_enforce_futures_leverage_blocks_mismatch(self) -> None:
+        bridge = LiveEngineBridge()
+        port = SimpleNamespace(set_leverage=lambda symbol, leverage: 3)
+
+        with pytest.raises(RuntimeError, match="reason=leverage_verify_failed"):
+            bridge._enforce_futures_leverage("BTCUSDT", port)
+
+    def test_enforce_futures_leverage_blocks_set_failure(self) -> None:
+        bridge = LiveEngineBridge()
+
+        def _boom(symbol: str, leverage: int) -> int:
+            raise RuntimeError("boom")
+
+        port = SimpleNamespace(set_leverage=_boom)
+
+        with pytest.raises(RuntimeError, match="reason=leverage_set_failed"):
+            bridge._enforce_futures_leverage("BTCUSDT", port)
 
 
 class TestRunAutonomousPortBanner:

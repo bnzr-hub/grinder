@@ -480,6 +480,9 @@ class LiveEngineBridge:
                 BinanceFuturesPort,
                 BinanceFuturesPortConfig,
             )
+            from grinder.risk.portfolio_budget_allocator import (  # noqa: PLC0415
+                DEFAULT_PORTFOLIO_BUDGET_CONFIG,
+            )
 
             api_key = os.environ.get("BINANCE_API_KEY", "").strip()
             api_secret = os.environ.get("BINANCE_API_SECRET", "").strip()
@@ -508,6 +511,7 @@ class LiveEngineBridge:
                 allow_mainnet=not cfg.use_testnet,
                 max_notional_per_order=max_notional,
                 max_orders_per_run=cfg.max_orders_per_run,
+                target_leverage=DEFAULT_PORTFOLIO_BUDGET_CONFIG.max_leverage,
             )
             # Use the scripts-level HTTP client factory (same as run_trading.py)
             from scripts.http_measured_client import RequestsHttpClient  # noqa: PLC0415
@@ -515,16 +519,39 @@ class LiveEngineBridge:
             http_client = RequestsHttpClient(port_name=f"bridge-{symbol}")
             logger.info(
                 "BRIDGE_PORT_FUTURES symbol=%s testnet=%s armed=%s max_notional_source=%s "
-                "max_notional=%s",
+                "max_notional=%s target_leverage=%s",
                 symbol,
                 cfg.use_testnet,
                 cfg.armed,
                 "derived" if symbol in self._symbol_max_order_notionals else "config",
                 max_notional,
+                DEFAULT_PORTFOLIO_BUDGET_CONFIG.max_leverage,
             )
             return BinanceFuturesPort(http_client=http_client, config=port_config)
 
         raise RuntimeError(f"Unknown exchange_port={cfg.exchange_port!r}")
+
+    def _enforce_futures_leverage(self, symbol: str, port: Any) -> None:
+        """Set and verify autonomous futures leverage before live processing starts."""
+        from grinder.risk.portfolio_budget_allocator import (  # noqa: PLC0415
+            DEFAULT_PORTFOLIO_BUDGET_CONFIG,
+        )
+
+        target = DEFAULT_PORTFOLIO_BUDGET_CONFIG.max_leverage
+        logger.info("BRIDGE_LEVERAGE_ENFORCE_START symbol=%s target=%sx", symbol, target)
+        try:
+            actual = int(port.set_leverage(symbol, target))
+        except Exception as exc:
+            raise RuntimeError(
+                f"BRIDGE_ENGINE_BLOCKED symbol={symbol} reason=leverage_set_failed "
+                f"target={target} error={exc}"
+            ) from exc
+        if actual != target:
+            raise RuntimeError(
+                f"BRIDGE_ENGINE_BLOCKED symbol={symbol} reason=leverage_verify_failed "
+                f"actual={actual} expected={target}"
+            )
+        logger.info("BRIDGE_LEVERAGE_ENFORCED symbol=%s actual=%sx", symbol, actual)
 
     def _run_engine_thread(
         self,
@@ -721,6 +748,8 @@ class LiveEngineBridge:
         shutdown_bridge_task: asyncio.Task[None] | None = None
 
         try:
+            if cfg.exchange_port == "futures" and cfg.mode == "live_trade":
+                self._enforce_futures_leverage(symbol, port)
             await connector.connect()
             logger.info("BRIDGE_ENGINE_CONNECTED symbol=%s mode=%s", symbol, cfg.mode)
             log_engine_startup(symbol, int(engine_ms), 0, int(engine_ms))
