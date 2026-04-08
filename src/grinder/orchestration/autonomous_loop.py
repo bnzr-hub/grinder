@@ -243,11 +243,20 @@ class AutonomousLoop:
         )
 
         # Stage 8: Optional execution-plane integration
-        # Limit execution desired set to top_k — the rotation controller's
-        # actual activation target. Without this, the reconciler sees all
-        # admitted symbols as "desired" and triggers STL_E5_MISMATCH_THRESHOLD.
-        top_k = self.orchestrator.controller.config.top_k
-        execution_desired = decision.admitted[:top_k]
+        # Execution desired = controller-owned symbols (ACTIVE + GRACEFUL_EXIT)
+        # plus symbols the controller explicitly chose to ACTIVATE this cycle.
+        # This prevents ranking churn from orphaning live engines (STL_E3 deadlock)
+        # while respecting controller's top_k / max_changes / min_hold boundaries.
+        controller = self.orchestrator.controller
+        controller_owned = set(controller.get_active_symbols()) | set(
+            controller.get_graceful_exit_symbols()
+        )
+        from grinder.rotation.controller import RotationActionKind  # noqa: PLC0415
+
+        activate_intent = {
+            a.symbol for a in decision.actions if a.kind == RotationActionKind.ACTIVATE
+        }
+        execution_desired = list(controller_owned | activate_intent)
         exec_report = self._run_execution_phase(execution_desired, facts)
         if exec_report is not None:
             # Attach execution report to cycle report

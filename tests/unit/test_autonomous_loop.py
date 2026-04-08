@@ -494,3 +494,134 @@ class TestStage8NoExecutionDeps:
         loop = _make_loop(cache=cache)
         report = loop.run_cycle()
         assert report.execution_report is None
+
+
+# --- Tests: Orphan-engine deadlock fix (execution desired set preserves controller-owned symbols) ---
+
+
+class TestOrphanFixRankingChurn:
+    """Live symbols must stay in execution desired set even if ranking drops them."""
+
+    def test_ranking_churn_does_not_produce_orphan(self) -> None:
+        """Activate BTCUSDT on cycle 1, then ranker drops it on cycle 2.
+
+        Without fix: reconciler sees BTCUSDT as orphan → STL_E3 blocks.
+        With fix: controller-owned BTCUSDT stays in desired → no orphan.
+        Must NOT spuriously activate ETHUSDT (controller hasn't approved it).
+        """
+        from grinder.execution_plane.coordinator import ExecutionCoordinator  # noqa: PLC0415
+        from grinder.execution_plane.operator import OperatorControls  # noqa: PLC0415
+        from grinder.execution_plane.registry import EngineRegistry, EngineState  # noqa: PLC0415
+
+        cache = TuningCache(ttl_s=300.0)
+        for s in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
+            cache.put(s, _tuned(s))
+
+        activated: list[str] = []
+        coord = ExecutionCoordinator(
+            activate_fn=lambda s: activated.append(s) or True,  # type: ignore[func-returns-value]
+        )
+        reg = EngineRegistry()
+
+        loop = _make_loop(cache=cache, top_k=1, max_changes=1)
+        loop.execution_coordinator = coord
+        loop.execution_registry = reg
+        loop.execution_operator = OperatorControls()
+        loop.execution_enabled = True
+        loop.execution_acknowledged = True
+
+        # Cycle 1: BTCUSDT admitted and activated
+        report1 = loop.run_cycle()
+        assert "BTCUSDT" in report1.admitted
+        # Simulate engine start: register in execution registry + apply activation
+        # in controller (as the host would do after real engine startup)
+        reg.register("BTCUSDT", engine_ref="e1")
+        reg.transition("BTCUSDT", EngineState.ACTIVE)
+        loop.orchestrator.controller.apply_activation("BTCUSDT")
+        activated.clear()
+
+        # Cycle 2: ranker now prefers ETHUSDT only.
+        # BTCUSDT is non-flat so controller keeps it in GRACEFUL_EXIT_ONLY
+        # (not fully deactivated in one cycle).
+        from grinder.rotation.controller import SymbolFacts as SF  # noqa: PLC0415
+
+        loop.ranker_fn = lambda syms: sorted(syms, key=lambda s: s != "ETHUSDT")
+        report2 = loop.run_cycle(facts={"BTCUSDT": SF(is_flat=False)})
+
+        # No safety_block from orphan — BTCUSDT stays controller-owned
+        assert report2.execution_report is not None
+        assert "safety_block" not in (report2.execution_report.skipped_reason or "")
+
+        # Critical: no spurious activation of ETHUSDT — controller owns
+        # top_k/max_changes/min_hold boundaries, not the execution plane
+        assert "ETHUSDT" not in activated
+
+    def test_graceful_exit_symbol_stays_in_desired(self) -> None:
+        """Symbol in GRACEFUL_EXIT_ONLY must remain in desired, not become orphan."""
+        from grinder.execution_plane.coordinator import ExecutionCoordinator  # noqa: PLC0415
+        from grinder.execution_plane.operator import OperatorControls  # noqa: PLC0415
+        from grinder.execution_plane.registry import EngineRegistry, EngineState  # noqa: PLC0415
+        from grinder.rotation.state_machine import SymbolState, TransitionReason  # noqa: PLC0415
+
+        cache = TuningCache(ttl_s=300.0)
+        for s in ["BTCUSDT", "ETHUSDT"]:
+            cache.put(s, _tuned(s))
+
+        coord = ExecutionCoordinator(
+            activate_fn=lambda _s: True,
+        )
+        reg = EngineRegistry()
+
+        loop = _make_loop(cache=cache, top_k=2, max_changes=2)
+        loop.execution_coordinator = coord
+        loop.execution_registry = reg
+        loop.execution_operator = OperatorControls()
+        loop.execution_enabled = True
+        loop.execution_acknowledged = True
+
+        # Cycle 1: activate both
+        loop.run_cycle()
+        reg.register("BTCUSDT", engine_ref="e1")
+        reg.transition("BTCUSDT", EngineState.ACTIVE)
+
+        # Move BTCUSDT through ACTIVE → GRACEFUL_EXIT_ONLY in controller
+        ctrl = loop.orchestrator.controller
+        lc = ctrl.get_lifecycle("BTCUSDT")
+        lc.transition(SymbolState.ACTIVE, TransitionReason.SELECTED_INTO_TOP_K)
+        lc.transition(SymbolState.GRACEFUL_EXIT_ONLY, TransitionReason.DROPPED_FROM_TOP_K)
+
+        assert "BTCUSDT" in ctrl.get_graceful_exit_symbols()
+
+        # Cycle 2: BTCUSDT not in admitted, but in graceful exit
+        report = loop.run_cycle()
+        assert report.execution_report is not None
+        assert "safety_block" not in (report.execution_report.skipped_reason or "")
+
+
+class TestOrphanFixGenuineOrphan:
+    """True unowned engines must still trigger STL_E3."""
+
+    def test_unowned_engine_still_produces_orphan(self) -> None:
+        """Engine in registry with no controller lifecycle → genuine orphan → STL_E3."""
+        from grinder.execution_plane.coordinator import ExecutionCoordinator  # noqa: PLC0415
+        from grinder.execution_plane.operator import OperatorControls  # noqa: PLC0415
+        from grinder.execution_plane.registry import EngineRegistry, EngineState  # noqa: PLC0415
+
+        cache = TuningCache(ttl_s=300.0)
+        cache.put("BTCUSDT", _tuned("BTCUSDT"))
+
+        reg = EngineRegistry()
+        # Inject orphan: XYZUSDT in registry but never went through controller
+        reg.register("XYZUSDT", engine_ref="ghost")
+        reg.transition("XYZUSDT", EngineState.ACTIVE)
+
+        loop = _make_loop(cache=cache, top_k=1, max_changes=1)
+        loop.execution_coordinator = ExecutionCoordinator()
+        loop.execution_registry = reg
+        loop.execution_operator = OperatorControls()
+        loop.execution_enabled = True
+        loop.execution_acknowledged = True
+
+        report = loop.run_cycle()
+        assert report.execution_report is not None
+        assert "safety_block" in (report.execution_report.skipped_reason or "")
