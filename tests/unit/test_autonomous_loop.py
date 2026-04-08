@@ -164,8 +164,8 @@ class TestPrefilterStage:
         loop = _make_loop(cache=cache, prefilter_fn=exploding_filter)
         report = loop.run_cycle()
 
-        # Fail-open: prefilter skipped, discovered passed through
-        assert report.eligible == report.discovered
+        # Fail-closed: prefilter failure preserves previous admitted (empty on first cycle)
+        assert report.eligible == []
         assert report.error is None
 
 
