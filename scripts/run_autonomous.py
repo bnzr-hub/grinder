@@ -75,8 +75,7 @@ def _derive_bootstrap_symbol_risk_budget(*, testnet: bool) -> Decimal | None:
         active_symbol_count=0,
     )
     logger.info(
-        "AUTONOMOUS_SIZING_RISK_BASE risk_base=%s gross_exposure=%s "
-        "per_symbol_risk_budget_usd=%s",
+        "AUTONOMOUS_SIZING_RISK_BASE risk_base=%s gross_exposure=%s per_symbol_risk_budget_usd=%s",
         risk_base,
         gross_exposure,
         snapshot.per_symbol_risk_budget_usd,
@@ -554,9 +553,7 @@ def _build_tuning_state_and_selector(
     candidates = list(tuned_results.keys()) or (
         sorted(symbols_override) if symbols_override else []
     )
-    v1_features, v2_features = _fetch_initial_selector_features(
-        tuned_results, mainnet
-    )
+    v1_features, v2_features = _fetch_initial_selector_features(tuned_results, mainnet)
 
     state = AutonomousTuningState(
         candidates=candidates,
@@ -567,9 +564,7 @@ def _build_tuning_state_and_selector(
         v2_features=v2_features,
     )
 
-    prefilter, ranker = _build_v2_selector(
-        state, tuning_cache, blacklist
-    )
+    prefilter, ranker = _build_v2_selector(state, tuning_cache, blacklist)
 
     refresher = TuningRefresher(
         state=state, cache=tuning_cache, bridge=bridge, registry=registry, args=args

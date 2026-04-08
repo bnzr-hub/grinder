@@ -68,7 +68,9 @@ class TestBootstrapRiskTruth:
         )
         captured: dict[str, Decimal] = {}
 
-        def _fake_solve(symbol: str, sc: SymbolConstraints, price: Decimal, config: object) -> TuningResult:
+        def _fake_solve(
+            symbol: str, sc: SymbolConstraints, price: Decimal, config: object
+        ) -> TuningResult:
             captured["max_position_usd"] = config.max_position_usd
             return fake_result
 
@@ -143,7 +145,9 @@ class TestSelectorManualCapRemoval:
         state = AutonomousTuningState(v1_features={}, v2_features={})
         cache = MagicMock()
 
-        with patch("grinder.selector.prefilter.prefilter_v1", return_value=([], {})) as prefilter_v1:
+        with patch(
+            "grinder.selector.prefilter.prefilter_v1", return_value=([], {})
+        ) as prefilter_v1:
             prefilter, _ = run_autonomous_mod._build_v2_selector(state, cache, frozenset())
             prefilter(["BTCUSDT"])
 
@@ -167,7 +171,9 @@ class TestRefresherRiskTruth:
         )
         captured: dict[str, Decimal] = {}
 
-        def _fake_solve(symbol: str, sc: SymbolConstraints, price: Decimal, config: object) -> TuningResult:
+        def _fake_solve(
+            symbol: str, sc: SymbolConstraints, price: Decimal, config: object
+        ) -> TuningResult:
             captured["max_position_usd"] = config.max_position_usd
             return TuningResult(
                 symbol=symbol,
@@ -211,7 +217,9 @@ class TestRefresherRiskTruth:
         )
 
         with (
-            patch("grinder.runtime.account_truth.fetch_futures_equity", return_value=Decimal("1000")),
+            patch(
+                "grinder.runtime.account_truth.fetch_futures_equity", return_value=Decimal("1000")
+            ),
             patch(
                 "grinder.runtime.account_truth.fetch_futures_risk_base",
                 return_value=Decimal("900"),
