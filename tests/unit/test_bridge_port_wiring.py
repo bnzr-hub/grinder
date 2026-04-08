@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Any
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from scripts import run_autonomous as run_autonomous_mod
