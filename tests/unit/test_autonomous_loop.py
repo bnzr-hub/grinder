@@ -616,18 +616,16 @@ class TestLifecycleCallbackWiring:
             cache.put(s, _tuned(s))
 
         reg = EngineRegistry()
-        ctrl_ref = [None]  # capture controller reference
+        loop = _make_loop(cache=cache, top_k=1, max_changes=1)
+        ctrl = loop.orchestrator.controller
 
         def activate_with_lifecycle(symbol: str) -> bool:
             reg.register(symbol, engine_ref=f"e_{symbol}")
             reg.transition(symbol, EngineState.ACTIVE)
-            ctrl_ref[0].apply_activation(symbol)
+            ctrl.apply_activation(symbol)
             return True
 
         coord = ExecutionCoordinator(activate_fn=activate_with_lifecycle)
-
-        loop = _make_loop(cache=cache, top_k=1, max_changes=1)
-        ctrl_ref[0] = loop.orchestrator.controller
         loop.execution_coordinator = coord
         loop.execution_registry = reg
         loop.execution_operator = OperatorControls()
