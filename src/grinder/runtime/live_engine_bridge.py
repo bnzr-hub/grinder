@@ -175,6 +175,7 @@ class LiveEngineBridge:
         "GRINDER_GRID_V2_STEP_PCT",
         "GRINDER_GRID_V2_ENTRY_LEVELS",
         "GRINDER_GRID_V2_TICK_SIZE",
+        "GRINDER_GRID_V2_MAX_INV_LEVELS",
         "GRINDER_ACCOUNT_SYNC_ENABLED",
     )
 
@@ -201,6 +202,10 @@ class LiveEngineBridge:
         spacing_pct = effective_spacing_bps / Decimal("10000")
         os.environ["GRINDER_GRID_V2_STEP_PCT"] = str(spacing_pct)
         os.environ["GRINDER_GRID_V2_ENTRY_LEVELS"] = str(cfg.levels)
+        # Max inventory from shared grid policy
+        from grinder.risk.grid_policy import DEFAULT_GRID_POLICY  # noqa: PLC0415
+
+        os.environ["GRINDER_GRID_V2_MAX_INV_LEVELS"] = str(DEFAULT_GRID_POLICY.max_inventory_levels)
         # Tick size from tuning result (required by engine)
         grid_cfg = self._symbol_grid_config.get(symbol)
         if grid_cfg:

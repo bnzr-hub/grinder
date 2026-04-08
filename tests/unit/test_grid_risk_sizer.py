@@ -49,15 +49,16 @@ class TestAdmissibleCase:
         assert r.actual_order_notional_usd == r.order_qty_rounded * Decimal("100")
 
     def test_adverse_move_pct(self) -> None:
-        """adverse_move = step_pct * (levels + 1)."""
+        """adverse_move = step_pct * (adverse_depth + 1)."""
         r = _sizer().compute(_inp(step_pct="0.01", levels=5))
-        assert r.adverse_move_pct == Decimal("0.06")  # 1% * 6
+        # Default adverse_depth=20: 1% * 21 = 0.21
+        assert r.adverse_move_pct == Decimal("0.21")
 
     def test_max_position_notional(self) -> None:
         """max_position = risk_budget / adverse_move."""
         r = _sizer().compute(_inp(risk_budget="30", step_pct="0.01", levels=5))
-        # adverse = 0.06, max_position = 30 / 0.06 = 500
-        assert r.max_position_notional_usd == Decimal("500")
+        # adverse = 0.21, max_position = 30 / 0.21 = 142.857...
+        assert r.max_position_notional_usd == Decimal("30") / Decimal("0.21")
 
 
 class TestStepPctEffect:
@@ -69,11 +70,16 @@ class TestStepPctEffect:
 
 
 class TestLevelsEffect:
-    def test_more_levels_smaller_order(self) -> None:
-        """More levels → smaller per-order quantity."""
+    def test_more_levels_does_not_change_order_size(self) -> None:
+        """entry_levels only gates min_entry_levels, not order sizing.
+
+        Order size is driven by adverse_depth (20) and max_inventory (15),
+        not by visible entry_levels.
+        """
         r_few = _sizer().compute(_inp(levels=5))
         r_many = _sizer().compute(_inp(levels=10))
-        assert r_many.order_qty_rounded < r_few.order_qty_rounded
+        # Same adverse_depth and max_inventory → same order size
+        assert r_many.order_qty_rounded == r_few.order_qty_rounded
 
 
 class TestNoGoMinQty:

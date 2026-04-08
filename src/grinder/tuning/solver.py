@@ -71,8 +71,9 @@ class TuningSolverConfig:
     """
 
     max_position_usd: Decimal = Decimal("1000")
-    max_inventory_levels: int = 5
+    max_inventory_levels: int = 15
     entry_levels_per_side: int = 5
+    adverse_depth_levels: int = 20
     spacing_pct: Decimal = Decimal("0.0025")
     blacklist: frozenset[str] = frozenset()
 
@@ -100,7 +101,7 @@ def _no_go(symbol: str, reason: NoGoReason) -> TuningResult:
     return TuningResult(symbol=symbol, status=TuningStatus.NO_GO, reason=reason)
 
 
-def solve(
+def solve(  # noqa: PLR0911
     symbol: str,
     constraints: SymbolConstraints,
     price: Decimal,
@@ -158,28 +159,36 @@ def solve(
     if worst_case_price <= 0:
         worst_case_price = tick  # one tick minimum
 
-    # --- Compute minimum legal quantity (at worst-case deep price) ---
+    # --- Risk-driven order sizing ---
+    # Derive order_size from risk budget using adverse depth, not from
+    # exchange minimums. Exchange mins are a fail-closed gate, not a target.
 
-    notional_driven = False
-    order_size = constraints.min_qty
+    # Adverse move: full depth to forced-flat level
+    adverse_move_pct = config.spacing_pct * Decimal(str(config.adverse_depth_levels + 1))
+    if adverse_move_pct <= 0:
+        return _no_go(symbol, NoGoReason.POSITION_EXCEEDS_CAP)
 
-    if constraints.min_notional > 0:
-        raw_qty_for_notional = constraints.min_notional / worst_case_price
-        min_qty_for_notional = ceil_to_step(raw_qty_for_notional, constraints.step_size)
-        if min_qty_for_notional > order_size:
-            notional_driven = True
-            order_size = min_qty_for_notional
+    # Max position from budget / adverse move
+    max_position_notional = config.max_position_usd / adverse_move_pct
+    # Per-order notional spread across max inventory depth
+    order_notional = max_position_notional / Decimal(str(config.max_inventory_levels))
+    # Convert to qty and round DOWN (never inflate risk)
+    order_qty_raw = order_notional / price
+    order_size = (order_qty_raw / constraints.step_size).quantize(
+        Decimal("1"), rounding=ROUND_DOWN
+    ) * constraints.step_size
 
-    # Ensure step-aligned (min_qty may already be, but be explicit)
-    order_size = ceil_to_step(order_size, constraints.step_size)
+    if order_size <= 0:
+        return _no_go(symbol, NoGoReason.POSITION_EXCEEDS_CAP)
 
-    # --- Check worst-case inventory budget ---
+    # --- Exchange minimum gate (fail-closed, not a target) ---
 
-    worst_case_usd = order_size * price * config.max_inventory_levels
-    if worst_case_usd > config.max_position_usd:
-        # Distinguish root cause: exchange notional floor vs risk cap
-        reason = NoGoReason.NOTIONAL_TOO_LOW if notional_driven else NoGoReason.POSITION_EXCEEDS_CAP
-        return _no_go(symbol, reason)
+    if order_size < constraints.min_qty:
+        return _no_go(symbol, NoGoReason.POSITION_EXCEEDS_CAP)
+
+    actual_notional = order_size * worst_case_price
+    if constraints.min_notional > 0 and actual_notional < constraints.min_notional:
+        return _no_go(symbol, NoGoReason.NOTIONAL_TOO_LOW)
 
     # --- All checks passed ---
 

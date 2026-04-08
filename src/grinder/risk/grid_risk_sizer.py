@@ -36,10 +36,12 @@ class GridRiskSizerInput:
     price: Decimal
     step_pct: Decimal  # e.g. 0.01 = 1%
     symbol_risk_budget_usd: Decimal
-    entry_levels: int
-    exchange_min_qty: Decimal
-    exchange_min_notional: Decimal
-    qty_step: Decimal
+    entry_levels: int  # live entry levels per side (for min_entry_levels check)
+    adverse_depth_levels: int = 20  # worst-case depth for risk sizing
+    max_inventory_levels: int = 15  # max accumulated lots for per-order sizing
+    exchange_min_qty: Decimal = Decimal("0")
+    exchange_min_notional: Decimal = Decimal("0")
+    qty_step: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -83,16 +85,16 @@ class GridRiskSizer:
         if inp.entry_levels < self._config.min_entry_levels:
             return self._no_go(inp, "BELOW_MIN_LEVELS")
 
-        # Adverse move: all levels fill + one extra step
-        adverse_move_pct = inp.step_pct * Decimal(str(inp.entry_levels + 1))
+        # Adverse move: full depth to forced-flat level
+        adverse_move_pct = inp.step_pct * Decimal(str(inp.adverse_depth_levels + 1))
         if adverse_move_pct <= _ZERO:
             return self._no_go(inp, "ZERO_ADVERSE_MOVE")
 
         # Max position notional from risk budget
         max_position_notional = inp.symbol_risk_budget_usd / adverse_move_pct
 
-        # Per-order sizing
-        order_notional = max_position_notional / Decimal(str(inp.entry_levels))
+        # Per-order sizing spread across max inventory depth
+        order_notional = max_position_notional / Decimal(str(inp.max_inventory_levels))
         order_qty_raw = order_notional / inp.price
 
         # Round DOWN to exchange qty step (never up — preserve risk discipline)

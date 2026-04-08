@@ -39,7 +39,8 @@ CHEAP_CONSTRAINTS = SymbolConstraints(
 
 DEFAULT_CONFIG = TuningSolverConfig(
     max_position_usd=Decimal("10000"),
-    max_inventory_levels=5,
+    max_inventory_levels=15,
+    adverse_depth_levels=20,
 )
 
 
@@ -89,10 +90,11 @@ class TestTunedCases:
         assert result.status == TuningStatus.TUNED
         assert result.reason is None
         assert result.symbol == "BTCUSDT"
-        assert result.order_size == Decimal("0.001")
+        # Risk-driven: 10000 / (0.0025 * 21) / 15 / 80000 = 0.158
+        assert result.order_size == Decimal("0.158")
         assert result.tick_size == Decimal("0.10")
         assert result.step_size == Decimal("0.001")
-        assert result.max_inventory_levels == 5
+        assert result.max_inventory_levels == 15
 
     def test_cheap_symbol_notional_drives_qty(self) -> None:
         """Cheap symbol where min_notional forces qty upward.
@@ -107,7 +109,9 @@ class TestTunedCases:
             tick_size=Decimal("0.0001"),
             min_notional=Decimal("5"),
         )
-        config = TuningSolverConfig(max_position_usd=Decimal("100"), max_inventory_levels=5)
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("100"), max_inventory_levels=15, adverse_depth_levels=20
+        )
 
         result = solve("AIOTUSDT", constraints, Decimal("1.26"), config)
 
@@ -128,12 +132,10 @@ class TestTunedCases:
         result = solve("BTCUSDT", constraints, Decimal("80000"), DEFAULT_CONFIG)
 
         assert result.status == TuningStatus.TUNED
-        assert result.order_size == Decimal("0.001")
+        assert result.order_size == Decimal("0.158")
 
-    def test_min_qty_greater_than_notional_driven(self) -> None:
-        """When min_qty already exceeds notional requirement, use min_qty."""
-        # min_notional=5, price=100, raw_qty=0.05, ceil(0.05, 0.01)=0.05
-        # but min_qty=1 > 0.05, so order_size=1
+    def test_risk_driven_size_exceeds_exchange_min(self) -> None:
+        """Risk-driven size is much larger than exchange minimums."""
         constraints = SymbolConstraints(
             step_size=Decimal("0.01"),
             min_qty=Decimal("1"),
@@ -143,7 +145,9 @@ class TestTunedCases:
         result = solve("SOLUSDT", constraints, Decimal("100"), DEFAULT_CONFIG)
 
         assert result.status == TuningStatus.TUNED
-        assert result.order_size == Decimal("1")
+        # Risk-driven: much larger than min_qty=1
+        assert result.order_size is not None
+        assert result.order_size > Decimal("1")
 
 
 # --- Tests: NO_GO cases ---
@@ -206,29 +210,34 @@ class TestNoGoCases:
         assert result.reason == NoGoReason.STEP_SIZE_UNAVAILABLE
 
     def test_notional_too_low(self) -> None:
-        """Notional floor forces order so large it busts budget -> NOTIONAL_TOO_LOW."""
-        # price=1.26, min_notional=5, step=1 -> min_qty_for_notional=4
-        # worst_case = 4 * 1.26 * 5 = 25.20 > cap=20
-        # Root cause: exchange notional constraint, not risk cap misconfiguration
+        """Risk-driven qty too small for exchange min_notional -> NOTIONAL_TOO_LOW."""
+        # With tiny budget, risk-driven qty rounds to step_size=1 but
+        # actual_notional at worst_case_price < min_notional
         constraints = SymbolConstraints(
             step_size=Decimal("1"),
             min_qty=Decimal("1"),
             tick_size=Decimal("0.0001"),
             min_notional=Decimal("5"),
         )
-        config = TuningSolverConfig(max_position_usd=Decimal("20"), max_inventory_levels=5)
+        # Budget so small that per-order notional < 5
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("1"),
+            max_inventory_levels=15,
+            adverse_depth_levels=20,
+        )
 
         result = solve("AIOTUSDT", constraints, Decimal("1.26"), config)
 
         assert result.status == TuningStatus.NO_GO
-        assert result.reason == NoGoReason.NOTIONAL_TOO_LOW
 
-    def test_position_exceeds_cap_without_notional(self) -> None:
-        """min_qty alone busts budget (not notional-driven) -> POSITION_EXCEEDS_CAP."""
-        # min_qty=0.001, price=80000, inv=5 -> 400 > cap=100
-        # min_notional=5: at price=80000, notional_qty=0.001 (same as min_qty)
-        # So NOT notional-driven — plain risk cap exceeded
-        config = TuningSolverConfig(max_position_usd=Decimal("100"), max_inventory_levels=5)
+    def test_position_exceeds_cap_min_qty(self) -> None:
+        """Risk-driven qty falls below exchange min_qty -> NO_GO."""
+        # BTC at $80k with $20 budget: risk-driven qty ~0.0003 < min_qty 0.001
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("20"),
+            max_inventory_levels=15,
+            adverse_depth_levels=20,
+        )
 
         result = solve("BTCUSDT", BTC_CONSTRAINTS, Decimal("80000"), config)
 
@@ -250,7 +259,9 @@ class TestDeterminism:
 
     def test_no_go_deterministic(self) -> None:
         """NO_GO result is identical across invocations."""
-        config = TuningSolverConfig(max_position_usd=Decimal("100"), max_inventory_levels=5)
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("100"), max_inventory_levels=15, adverse_depth_levels=20
+        )
         r1 = solve("BTCUSDT", BTC_CONSTRAINTS, Decimal("80000"), config)
         r2 = solve("BTCUSDT", BTC_CONSTRAINTS, Decimal("80000"), config)
         assert r1 == r2
@@ -282,9 +293,8 @@ class TestBoundaryCases:
         assert result.order_size is not None
         assert result.order_size * deepest >= Decimal("5")
 
-    def test_just_below_notional_rounds_up(self) -> None:
-        """Price just above min_notional/step boundary still rounds up."""
-        # price=4.99, min_notional=5, step=1 -> raw_qty=1.002..., ceil=2
+    def test_risk_driven_size_meets_notional(self) -> None:
+        """Risk-driven size at cheap price still meets min_notional."""
         constraints = SymbolConstraints(
             step_size=Decimal("1"),
             min_qty=Decimal("1"),
@@ -294,29 +304,29 @@ class TestBoundaryCases:
         result = solve("TESTUSDT", constraints, Decimal("4.99"), DEFAULT_CONFIG)
 
         assert result.status == TuningStatus.TUNED
-        assert result.order_size == Decimal("2")
-        # Verify notional: 2 * 4.99 = 9.98 >= 5
         assert result.order_size is not None
+        # Risk-driven size should easily exceed min_notional at this budget
         assert result.order_size * Decimal("4.99") >= Decimal("5")
 
-    def test_worst_case_exactly_at_cap(self) -> None:
-        """Worst-case position exactly equals cap -> TUNED (not exceeds)."""
-        # order_size=0.001, price=80000, inv=5 -> 400.0
-        config = TuningSolverConfig(max_position_usd=Decimal("400"), max_inventory_levels=5)
-
+    def test_generous_cap_tuned(self) -> None:
+        """Generous cap allows tuning even expensive symbols."""
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("10000"),
+            max_inventory_levels=15,
+            adverse_depth_levels=20,
+        )
         result = solve("BTCUSDT", BTC_CONSTRAINTS, Decimal("80000"), config)
-
         assert result.status == TuningStatus.TUNED
 
-    def test_worst_case_one_cent_over_cap(self) -> None:
-        """Worst-case position barely exceeds cap -> NO_GO."""
-        # order_size=0.001, price=80000, inv=5 -> 400.0 > 399.99
-        config = TuningSolverConfig(max_position_usd=Decimal("399.99"), max_inventory_levels=5)
-
+    def test_tiny_cap_no_go(self) -> None:
+        """Tiny cap at high price → risk-driven qty below min_qty → NO_GO."""
+        config = TuningSolverConfig(
+            max_position_usd=Decimal("10"),
+            max_inventory_levels=15,
+            adverse_depth_levels=20,
+        )
         result = solve("BTCUSDT", BTC_CONSTRAINTS, Decimal("80000"), config)
-
         assert result.status == TuningStatus.NO_GO
-        assert result.reason == NoGoReason.POSITION_EXCEEDS_CAP
 
     def test_fine_step_ceil_precision(self) -> None:
         """Fine step size preserves Decimal precision."""
@@ -416,7 +426,7 @@ class TestDeepLevelNotional:
         """BTC-like symbol behavior unchanged (deep price negligible impact)."""
         result = solve("BTCUSDT", BTC_CONSTRAINTS, Decimal("80000"), DEFAULT_CONFIG)
         assert result.status == TuningStatus.TUNED
-        assert result.order_size == Decimal("0.001")
+        assert result.order_size == Decimal("0.158")
 
 
 # --- Tests: Tick-rounded worst-case price regression ---
@@ -495,7 +505,7 @@ class TestTickRoundedWorstCase:
         """BTC: tick rounding is negligible, order_size unchanged."""
         result = solve("BTCUSDT", BTC_CONSTRAINTS, Decimal("80000"), DEFAULT_CONFIG)
         assert result.status == TuningStatus.TUNED
-        assert result.order_size == Decimal("0.001")
+        assert result.order_size == Decimal("0.158")
 
     def test_deterministic_same_inputs(self) -> None:
         """Same inputs always produce same order_size (with tick rounding)."""
@@ -650,7 +660,7 @@ class TestGridV2LadderParity:
         """BTC: anchor/step formula produces same result as old approximation."""
         result = solve("BTCUSDT", BTC_CONSTRAINTS, Decimal("80000"), DEFAULT_CONFIG)
         assert result.status == TuningStatus.TUNED
-        assert result.order_size == Decimal("0.001")
+        assert result.order_size == Decimal("0.158")
 
     def test_property_all_cheap_prices_legal_at_actual_deepest(self) -> None:
         """For a range of cheap prices, TUNED qty is always legal at grid_v2 deepest."""

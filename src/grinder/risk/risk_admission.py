@@ -135,6 +135,7 @@ class RiskAdmissionGate:
                 detail="risk_budget=0",
             )
 
+        from grinder.risk.grid_policy import DEFAULT_GRID_POLICY  # noqa: PLC0415
         from grinder.risk.grid_risk_sizer import GridRiskSizerInput  # noqa: PLC0415
 
         sizer_input = GridRiskSizerInput(
@@ -143,6 +144,8 @@ class RiskAdmissionGate:
             step_pct=step_pct,
             symbol_risk_budget_usd=risk_budget,
             entry_levels=entry_levels,
+            adverse_depth_levels=DEFAULT_GRID_POLICY.adverse_depth_levels,
+            max_inventory_levels=DEFAULT_GRID_POLICY.max_inventory_levels,
             exchange_min_qty=exchange_min_qty,
             exchange_min_notional=exchange_min_notional,
             qty_step=qty_step,
