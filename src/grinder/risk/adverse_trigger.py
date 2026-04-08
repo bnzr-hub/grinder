@@ -22,7 +22,7 @@ def compute_adverse_threshold(
 
     Uses the same geometry as grid_v2 state machine:
     - anchor = round(reference_price / tick, ROUND_HALF_UP) * tick
-    - step_price = ceil(anchor * step_pct / tick) * tick (min 1 tick)
+    - step_price = ceil(reference_price * step_pct / tick) * tick (min 1 tick)
     - threshold = anchor ± step_price * adverse_level
 
     Args:
