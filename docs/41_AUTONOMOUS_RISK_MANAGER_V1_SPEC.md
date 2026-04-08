@@ -496,7 +496,7 @@ Each symbol receives:
 
 where:
 
-- `regime_symbol_cap_pct` is `1% / 2% / 3%` by market regime
+- `regime_symbol_cap_pct` is `2% / 4% / 6%` by market regime (TOXIC / NEUTRAL / GOOD)
 - `residual_portfolio_risk_pct_adjusted` accounts for:
   - already allocated live risk
   - number of remaining symbol slots
