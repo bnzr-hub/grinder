@@ -656,7 +656,10 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
         UniverseProviderConfig,
     )
     from grinder.rotation.controller import RotationConfig, RotationController  # noqa: PLC0415
-    from grinder.runtime.autonomous_host import AutonomousEngineHost  # noqa: PLC0415
+    from grinder.runtime.autonomous_host import (  # noqa: PLC0415
+        AutonomousEngineHost,
+        GracefulExitResult,
+    )
     from grinder.tuning.cache import TuningCache  # noqa: PLC0415
 
     # Parse symbols/blacklist
@@ -757,11 +760,31 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
         force_reduce_fn=bridge.force_reduce,
     )
 
-    # Coordinator with real host bindings
+    # Coordinator with real host bindings + controller lifecycle callbacks.
+    # Controller must learn about actual execution outcomes so its ownership
+    # set stays coherent with the registry (required by #640 orphan fix).
+    def _activate_with_lifecycle(symbol: str) -> bool:
+        ok = host.activate(symbol)
+        if ok:
+            rotation_controller.apply_activation(symbol)
+        return ok
+
+    def _graceful_exit_with_lifecycle(symbol: str) -> GracefulExitResult:
+        result = host.request_graceful_exit(symbol)
+        if result == GracefulExitResult.SUCCESS:
+            rotation_controller.apply_graceful_exit(symbol)
+        return result
+
+    def _deactivate_with_lifecycle(symbol: str) -> bool:
+        ok = host.finalize_deactivation(symbol)
+        if ok:
+            rotation_controller.apply_deactivation(symbol)
+        return ok
+
     coordinator = ExecutionCoordinator(
-        activate_fn=host.activate,
-        graceful_exit_fn=host.request_graceful_exit,
-        deactivate_fn=host.finalize_deactivation,
+        activate_fn=_activate_with_lifecycle,
+        graceful_exit_fn=_graceful_exit_with_lifecycle,
+        deactivate_fn=_deactivate_with_lifecycle,
     )
 
     # Shared tuning/selector state + refresher (ADR-162)

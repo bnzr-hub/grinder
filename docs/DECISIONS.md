@@ -5075,3 +5075,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Build execution desired set from `controller.get_active_symbols()` + `controller.get_graceful_exit_symbols()` + symbols with explicit `ACTIVATE` action from the current cycle's `decision.actions`. Do NOT include the full `admitted[:top_k]` — that would bypass controller's `top_k` / `max_changes_per_cycle` / `min_hold_cycles` boundaries and cause spurious activations.
 - **Invariant:** STL_E3_ORPHAN_ENGINE remains active for genuine anomalies — engines in the registry with no controller lifecycle ownership. The fix is in desired-set semantics, not safety-rule suppression. Controller remains sole authority for activation decisions.
 - **Consequences:** Multi-symbol orchestration survives ranking churn without deadlocking. Coordinator can apply rotation/deactivation actions even when admitted set shifts. No spurious activations bypass controller boundaries.
+
+### ADR-164: Wire controller lifecycle callbacks after real host execution (2026-04-08)
+
+- **Problem:** ADR-163 built execution desired set from controller ownership, but `apply_activation()` / `apply_graceful_exit()` / `apply_deactivation()` were never called in the runtime. Controller stayed in TUNED after real engine activation, so ownership set was always empty and the orphan fix was ineffective in live.
+- **Root cause:** `run_autonomous.py` wired `host.activate` directly as `activate_fn` without updating controller lifecycle on success. Same gap for graceful exit and deactivation.
+- **Decision:** Wrap execution callbacks at the wiring site to call the matching controller lifecycle method on ceremony success: `apply_activation` after successful activate, `apply_graceful_exit` after `GracefulExitResult.SUCCESS`, `apply_deactivation` after successful finalize. No optimistic transitions on failure.
+- **Invariant:** Controller lifecycle reflects actual executed host outcomes, not planned action intents. Failed ceremonies leave controller state unchanged.
+- **Consequences:** ADR-163 orphan fix becomes effective in live runtime. Controller ownership set accurately reflects live engine state.
