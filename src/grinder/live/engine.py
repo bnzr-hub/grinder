@@ -3090,6 +3090,15 @@ class LiveEngineV0:
             )
             self._regime_registry.publish(snapshot.symbol, rd.regime, rd.reason, rd.confidence)
 
+        # Adverse grid level trigger: FORCE_REDUCE at 16th adverse level
+        if (
+            self._grid_v2_started
+            and self._grid_v2_bridge is not None
+            and not self._force_reduce_requested
+            and self._grid_v2_bridge.state_machine is not None
+        ):
+            self._check_adverse_level_trigger(snapshot)
+
         # PR-338: Defer paper engine during FSM startup states (INIT/READY).
         # Paper engine mutates internal state via NoOp port; if run before ACTIVE,
         # ghost orders freeze reconciliation after ACTIVE transition.
@@ -3972,6 +3981,63 @@ class LiveEngineV0:
             reason or "unspecified",
         )
         return True
+
+    def _check_adverse_level_trigger(self, snapshot: Snapshot) -> None:
+        """Check if price has breached the force-reduce adverse level.
+
+        Uses live grid geometry to compute the 16th adverse level threshold.
+        Triggers force-reduce if breached. Idempotent. Fail-open on errors.
+        """
+        import contextlib  # noqa: PLC0415
+
+        with contextlib.suppress(Exception):
+            self._check_adverse_level_trigger_inner(snapshot)
+
+    def _check_adverse_level_trigger_inner(self, snapshot: Snapshot) -> None:
+        from grinder.grid_v2.state import BranchMode  # noqa: PLC0415
+        from grinder.risk.adverse_trigger import (  # noqa: PLC0415
+            compute_adverse_threshold,
+            is_adverse_level_breached,
+        )
+        from grinder.risk.grid_policy import DEFAULT_GRID_POLICY  # noqa: PLC0415
+
+        bridge = self._grid_v2_bridge
+        if bridge is None or bridge.state_machine is None:
+            return
+
+        sm = bridge.state_machine
+        mode = sm.mode
+
+        if mode == BranchMode.FLAT:
+            return  # no adverse direction when flat
+
+        side = "LONG" if mode == BranchMode.LONG_BRANCH else "SHORT"
+        ref_price = sm.snapshot.entry_window.reference_price
+        step_pct = bridge._config.grid_step_pct
+        tick = bridge._config.price_tick_size
+
+        threshold = compute_adverse_threshold(
+            ref_price,
+            step_pct,
+            tick,
+            adverse_level=DEFAULT_GRID_POLICY.force_reduce_trigger_level,
+            side=side,
+        )
+        if threshold is None:
+            return
+
+        if is_adverse_level_breached(snapshot.mid_price, threshold, side):
+            logger.warning(
+                "GRID_ADVERSE_LEVEL_BREACHED symbol=%s level=%d price=%s threshold=%s side=%s",
+                snapshot.symbol,
+                DEFAULT_GRID_POLICY.force_reduce_trigger_level,
+                snapshot.mid_price,
+                threshold,
+                side,
+            )
+            # Graceful exit first, then force-reduce
+            self.force_graceful_exit(snapshot.symbol)
+            self.request_force_reduce(reason="ADVERSE_LEVEL_16")
 
     def force_graceful_exit(self, symbol: str) -> bool:
         """Force a symbol into graceful-exit-only mode (operator/ceremony use).
