@@ -120,6 +120,7 @@ class TestConstructionLock:
             max_inventory_notional_usd=Decimal("250"),
             max_order_notional_usd=Decimal("250"),
         )
+        bridge.set_symbol_spacing("ETHUSDT", Decimal("100"))
 
         observed_symbols: list[str] = []
 
