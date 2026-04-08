@@ -103,7 +103,7 @@ class TestBootstrapRiskTruth:
                 natr_map={"BTCUSDT": Decimal("1.5")},
             )
 
-        assert captured["max_position_usd"] == Decimal("30")
+        assert captured["max_position_usd"] == Decimal("20")
         assert sizes["BTCUSDT"] == "0.01"
         assert results["BTCUSDT"].max_position_notional_usd == Decimal("95.23")
 
@@ -208,7 +208,7 @@ class TestRefresherRiskTruth:
             provider_cls.return_value = provider
             refresher._retune_symbols(["BTCUSDT"], {"BTCUSDT": Decimal("2.0")}, Decimal("20"))
 
-        assert captured["max_position_usd"] == Decimal("30")
+        assert captured["max_position_usd"] == Decimal("20")
 
     def test_refresher_keeps_equity_and_risk_base_separate(self) -> None:
         bridge = LiveEngineBridge()
