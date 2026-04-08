@@ -53,8 +53,8 @@ class TestBootstrapRiskTruth:
         ):
             budget = run_autonomous_mod._derive_bootstrap_symbol_risk_budget(testnet=True)
 
-        # PortfolioBudgetAllocator default NEUTRAL risk_pct = 3%
-        assert budget == Decimal("30")
+        # PortfolioBudgetAllocator default NEUTRAL risk_pct = 4%
+        assert budget == Decimal("40")
 
     def test_bootstrap_passes_real_risk_budget_to_solver(self) -> None:
         fake_result = TuningResult(

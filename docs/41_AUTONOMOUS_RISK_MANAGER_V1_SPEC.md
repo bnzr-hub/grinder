@@ -195,7 +195,7 @@ They do not require full live hot-reconfiguration of existing engine geometry.
 
 - `max_active_symbols = 5`
 - `max_leverage = 5`
-- `daily_loss_limit_pct = 10%`
+- `daily_loss_limit_pct = 12%`
 - `daily_profit_lock_trigger_pct = 3%`
 - `daily_profit_giveback_pct = 1%`
 - `min_entry_levels = 15`
@@ -216,13 +216,13 @@ They do not require full live hot-reconfiguration of existing engine geometry.
 Recommended v1 defaults:
 
 - `symbol_risk_pct_good = 6%`
-- `symbol_risk_pct_neutral = 3%`
+- `symbol_risk_pct_neutral = 4%`
 - `symbol_risk_pct_toxic = 2%`
 - `portfolio_live_risk_cap_pct = 6%`
 
 Note:
 
-- `daily_loss_limit_pct = 10%` is a **hard circuit breaker**
+- `daily_loss_limit_pct = 12%` is a **hard circuit breaker**
 - `portfolio_live_risk_cap_pct = 6%` is the **maximum simultaneous deployed risk**
 - the live deployed risk cap should remain below the daily hard stop
 
@@ -389,7 +389,7 @@ Example:
 
 Enter when:
 
-- `day_pnl_pct <= -10%`
+- `day_pnl_pct <= -12%`
 
 #### FORCE_REDUCE
 
@@ -481,7 +481,7 @@ Behavior:
 
 Define:
 
-- `daily_loss_limit_pct = 10%`
+- `daily_loss_limit_pct = 12%`
 - `portfolio_live_risk_cap_pct = 6%`
 
 The live deployed risk cap is the maximum simultaneous risk that may be allocated across active symbols.
