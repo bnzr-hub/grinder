@@ -545,7 +545,7 @@ class TestOrphanFixRankingChurn:
         # (not fully deactivated in one cycle).
         from grinder.rotation.controller import SymbolFacts as SF  # noqa: PLC0415
 
-        loop.ranker_fn = lambda syms: sorted(syms, key=lambda s: s != "ETHUSDT")  # type: ignore[assignment]
+        loop.ranker_fn = lambda syms: sorted(syms, key=lambda s: s != "ETHUSDT")
         report2 = loop.run_cycle(facts={"BTCUSDT": SF(is_flat=False)})
 
         # No safety_block from orphan — BTCUSDT stays controller-owned
