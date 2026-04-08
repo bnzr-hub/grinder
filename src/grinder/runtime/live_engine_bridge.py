@@ -487,9 +487,12 @@ class LiveEngineBridge:
                 if cfg.use_testnet
                 else "https://fapi.binance.com"
             )
-            max_notional = self._symbol_max_order_notionals.get(
-                symbol, Decimal(cfg.max_notional_per_order)
-            )
+            if symbol not in self._symbol_max_order_notionals:
+                raise RuntimeError(
+                    f"BRIDGE_ENGINE_BLOCKED symbol={symbol} reason=no_derived_dispatch_cap — "
+                    "autonomous activation requires derived max_order_notional"
+                )
+            max_notional = self._symbol_max_order_notionals[symbol]
             port_config = BinanceFuturesPortConfig(
                 mode=mode,
                 base_url=base_url,

@@ -935,6 +935,10 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
         try:
             equity = bridge.last_known_equity
             if equity is None or equity <= 0:
+                # Clear stale state so admission fails closed
+                risk_state.pop("equity", None)
+                risk_state.pop("day_state", None)
+                risk_state.pop("portfolio_snapshot", None)
                 return
             session_key = _current_utc_session_key()
 
@@ -987,6 +991,7 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
                 gross_exposure = bridge.last_known_gross_exposure
                 if gross_exposure is None:
                     logger.debug("PORTFOLIO_BUDGET_SKIPPED reason=gross_exposure_unavailable")
+                    risk_state.pop("portfolio_snapshot", None)
                     return  # no portfolio snapshot → admission stays blocked
 
                 inp = PortfolioBudgetInput(

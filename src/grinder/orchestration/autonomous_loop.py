@@ -174,11 +174,14 @@ class AutonomousLoop:
             discovered = [s for s in discovered if s in override]
 
         # Stage 3: Hard prefilter
+        # Fail-closed for new activation but preserve existing active set
+        # so rotation controller doesn't drain live symbols.
+        _previous_admitted = self._last_report.admitted if self._last_report else []
         try:
             eligible = self.prefilter_fn(discovered)
         except Exception as e:
             logger.warning("AUTONOMOUS_LOOP_PREFILTER_FAILED cycle=%d error=%s", self._cycle, e)
-            eligible = []  # fail-closed: no unscreened activation
+            eligible = list(_previous_admitted)  # preserve active, block new
 
         # Stage 4: Tuning admission (before ranking — doc 37 invariant)
         # Only TUNED symbols enter ranking. Cache miss / NO_GO / expired = skipped.
@@ -202,7 +205,7 @@ class AutonomousLoop:
             selected = self.ranker_fn(tuned)
         except Exception as e:
             logger.warning("AUTONOMOUS_LOOP_RANKING_FAILED cycle=%d error=%s", self._cycle, e)
-            selected = []  # fail-closed: no unranked activation
+            selected = list(_previous_admitted)  # preserve active, block new
 
         # Stage 6: Orchestrator reconcile (TuningCache re-check + rotation controller)
         # Orchestrator will re-validate tuning (defense in depth) and run controller.
