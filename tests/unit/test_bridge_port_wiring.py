@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from typing import Any
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -100,7 +101,7 @@ class TestBridgeFuturesPort:
             max_inventory_notional_usd=Decimal("1000"),
             max_order_notional_usd=Decimal("100"),
         )
-        captured: dict[str, object] = {}
+        captured: dict[str, Any] = {}
 
         class _FakePort:
             def __init__(self, **kwargs: object) -> None:
