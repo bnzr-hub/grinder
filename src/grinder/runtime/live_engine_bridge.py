@@ -242,9 +242,12 @@ class LiveEngineBridge:
             )
         spacing_pct = self._symbol_spacings[symbol] / Decimal("10000")
         os.environ["GRINDER_GRID_V2_STEP_PCT"] = str(spacing_pct)
-        os.environ["GRINDER_GRID_V2_ENTRY_LEVELS"] = str(cfg.levels)
-        # Max inventory from shared grid policy
+        # Entry levels + max inventory from shared grid policy (not BridgeConfig)
         from grinder.risk.grid_policy import DEFAULT_GRID_POLICY  # noqa: PLC0415
+
+        os.environ["GRINDER_GRID_V2_ENTRY_LEVELS"] = str(
+            DEFAULT_GRID_POLICY.live_entry_levels_per_side
+        )
 
         os.environ["GRINDER_GRID_V2_MAX_INV_LEVELS"] = str(DEFAULT_GRID_POLICY.max_inventory_levels)
         os.environ["GRINDER_GRID_V2_MAX_INV_NOTIONAL"] = str(
@@ -618,7 +621,8 @@ class LiveEngineBridge:
                 from grinder.risk.grid_policy import DEFAULT_GRID_POLICY as _policy  # noqa: PLC0415
 
                 # Use per-symbol tuned spacing and policy levels (not bridge config defaults)
-                _sym_spacing = float(self._symbol_spacings.get(symbol, Decimal("10")))
+                # _propagate_grid_v2_env already verified symbol is in _symbol_spacings
+                _sym_spacing = float(self._symbol_spacings[symbol])
                 paper = PaperEngine(
                     spacing_bps=_sym_spacing,
                     levels=_policy.live_entry_levels_per_side,
