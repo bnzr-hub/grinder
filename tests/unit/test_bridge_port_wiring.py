@@ -114,7 +114,7 @@ class TestBridgeFuturesPort:
         )
         monkeypatch.setattr(
             "scripts.http_measured_client.RequestsHttpClient",
-            lambda _port_name: object(),
+            lambda **_kwargs: object(),
         )
 
         bridge._build_port("BTCUSDT", mode=SimpleNamespace(value="live_trade"))
