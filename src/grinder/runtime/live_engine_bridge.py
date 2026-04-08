@@ -93,6 +93,9 @@ class LiveEngineBridge:
         self._symbol_grid_config: dict[str, dict[str, str]] = {}
         # Per-symbol adaptive spacing in bps (from NATR via compute_adaptive_spacing_bps).
         self._symbol_spacings: dict[str, Decimal] = {}
+        # Per-symbol derived risk caps from tuning/runtime risk model.
+        self._symbol_max_inventory_notionals: dict[str, Decimal] = {}
+        self._symbol_max_order_notionals: dict[str, Decimal] = {}
         # Serialize engine construction so env propagation is thread-safe.
         # grid_v2 config is passed via process-global os.environ; this lock
         # prevents overlapping engine __init__ calls from reading each other's
@@ -163,6 +166,24 @@ class LiveEngineBridge:
             step_size,
         )
 
+    def set_symbol_risk_caps(
+        self,
+        symbol: str,
+        *,
+        max_inventory_notional_usd: Decimal,
+        max_order_notional_usd: Decimal,
+    ) -> None:
+        """Register derived per-symbol runtime and dispatch caps."""
+        self._symbol_max_inventory_notionals[symbol] = max_inventory_notional_usd
+        self._symbol_max_order_notionals[symbol] = max_order_notional_usd
+        logger.info(
+            "BRIDGE_SYMBOL_RISK_CAPS symbol=%s max_inventory_notional_usd=%s "
+            "max_order_notional_usd=%s",
+            symbol,
+            max_inventory_notional_usd,
+            max_order_notional_usd,
+        )
+
     # Env vars set by _propagate_grid_v2_env (for save/restore)
     _GRID_V2_ENV_KEYS: tuple[str, ...] = (
         "GRINDER_GRID_V2_ENABLED",
@@ -176,6 +197,7 @@ class LiveEngineBridge:
         "GRINDER_GRID_V2_ENTRY_LEVELS",
         "GRINDER_GRID_V2_TICK_SIZE",
         "GRINDER_GRID_V2_MAX_INV_LEVELS",
+        "GRINDER_GRID_V2_MAX_INV_NOTIONAL",
         "GRINDER_ACCOUNT_SYNC_ENABLED",
     )
 
@@ -187,6 +209,10 @@ class LiveEngineBridge:
         """
         if symbol not in self._symbol_sizes:
             return
+        if symbol not in self._symbol_max_inventory_notionals:
+            raise RuntimeError(
+                f"Missing derived max inventory notional for tuned autonomous symbol={symbol}"
+            )
 
         os.environ["GRINDER_GRID_V2_ENABLED"] = "1"
         os.environ["GRINDER_GRID_V2_SYMBOL"] = symbol
@@ -206,17 +232,21 @@ class LiveEngineBridge:
         from grinder.risk.grid_policy import DEFAULT_GRID_POLICY  # noqa: PLC0415
 
         os.environ["GRINDER_GRID_V2_MAX_INV_LEVELS"] = str(DEFAULT_GRID_POLICY.max_inventory_levels)
+        os.environ["GRINDER_GRID_V2_MAX_INV_NOTIONAL"] = str(
+            self._symbol_max_inventory_notionals[symbol]
+        )
         # Tick size from tuning result (required by engine)
         grid_cfg = self._symbol_grid_config.get(symbol)
         if grid_cfg:
             os.environ["GRINDER_GRID_V2_TICK_SIZE"] = grid_cfg["tick_size"]
         logger.info(
             "BRIDGE_GRID_V2_ENV symbol=%s enabled=1 order_size=%s "
-            "step_pct=%s levels=%s tick_size=%s",
+            "step_pct=%s levels=%s max_inv_notional=%s tick_size=%s",
             symbol,
             effective_size,
             spacing_pct,
             cfg.levels,
+            self._symbol_max_inventory_notionals[symbol],
             grid_cfg["tick_size"] if grid_cfg else "NOT_SET",
         )
 
@@ -446,6 +476,9 @@ class LiveEngineBridge:
                 if cfg.use_testnet
                 else "https://fapi.binance.com"
             )
+            max_notional = self._symbol_max_order_notionals.get(
+                symbol, Decimal(cfg.max_notional_per_order)
+            )
             port_config = BinanceFuturesPortConfig(
                 mode=mode,
                 base_url=base_url,
@@ -453,7 +486,7 @@ class LiveEngineBridge:
                 api_secret=api_secret,
                 symbol_whitelist=[symbol],
                 allow_mainnet=not cfg.use_testnet,
-                max_notional_per_order=Decimal(cfg.max_notional_per_order),
+                max_notional_per_order=max_notional,
                 max_orders_per_run=cfg.max_orders_per_run,
             )
             # Use the scripts-level HTTP client factory (same as run_trading.py)
@@ -461,10 +494,13 @@ class LiveEngineBridge:
 
             http_client = RequestsHttpClient(port_name=f"bridge-{symbol}")
             logger.info(
-                "BRIDGE_PORT_FUTURES symbol=%s testnet=%s armed=%s",
+                "BRIDGE_PORT_FUTURES symbol=%s testnet=%s armed=%s max_notional_source=%s "
+                "max_notional=%s",
                 symbol,
                 cfg.use_testnet,
                 cfg.armed,
+                "derived" if symbol in self._symbol_max_order_notionals else "config",
+                max_notional,
             )
             return BinanceFuturesPort(http_client=http_client, config=port_config)
 
