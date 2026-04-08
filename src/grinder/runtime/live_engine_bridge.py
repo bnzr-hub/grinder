@@ -487,9 +487,11 @@ class LiveEngineBridge:
                 if cfg.use_testnet
                 else "https://fapi.binance.com"
             )
-            max_notional = self._symbol_max_order_notionals.get(
-                symbol, Decimal(cfg.max_notional_per_order)
-            )
+            if symbol not in self._symbol_max_order_notionals:
+                raise RuntimeError(
+                    f"BRIDGE_ENGINE_BLOCKED symbol={symbol} reason=no_derived_dispatch_cap"
+                )
+            max_notional = self._symbol_max_order_notionals[symbol]
             port_config = BinanceFuturesPortConfig(
                 mode=mode,
                 base_url=base_url,
@@ -597,13 +599,13 @@ class LiveEngineBridge:
         cfg = self._config
         mode = SafeMode(cfg.mode)
 
-        effective_size = self._symbol_sizes.get(symbol, cfg.size_per_level)
-        logger.info(
-            "BRIDGE_ENGINE_SIZE symbol=%s size=%s source=%s",
-            symbol,
-            effective_size,
-            "tuning" if symbol in self._symbol_sizes else "default",
-        )
+        if symbol not in self._symbol_sizes:
+            raise RuntimeError(
+                f"BRIDGE_ENGINE_BLOCKED symbol={symbol} reason=no_tuned_size — "
+                "autonomous activation requires tuned order_size"
+            )
+        effective_size = self._symbol_sizes[symbol]
+        logger.info("BRIDGE_ENGINE_SIZE symbol=%s size=%s source=tuning", symbol, effective_size)
 
         with self._engine_construction_lock:
             saved_env = {k: os.environ.get(k) for k in self._GRID_V2_ENV_KEYS}

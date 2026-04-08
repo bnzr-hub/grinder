@@ -24,7 +24,16 @@ class TestBridgeDefaultPort:
 
     def test_bridge_default_factory_creates_noop_engine(self) -> None:
         """Default bridge creates engine with NoOpExchangePort."""
+        from decimal import Decimal  # noqa: PLC0415
+
         bridge = LiveEngineBridge(config=BridgeConfig(ws_transport=FakeWsTransport(messages=[])))
+        bridge.set_symbol_size("BTCUSDT", "0.001")
+        bridge.set_symbol_risk_caps(
+            "BTCUSDT",
+            max_inventory_notional_usd=Decimal("1000"),
+            max_order_notional_usd=Decimal("100"),
+        )
+        bridge.set_symbol_grid_config("BTCUSDT", tick_size="0.01", step_size="0.001")
         handle = bridge.factory("BTCUSDT")
         try:
             assert handle.engine_ref is not None

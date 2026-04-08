@@ -40,6 +40,13 @@ def _build_bridge_and_engine(
     """Build engine through the real bridge construction path."""
     bridge = LiveEngineBridge(config=BridgeConfig())
     bridge.set_regime_registry(registry)
+    bridge.set_symbol_size(symbol, "0.001")
+    bridge.set_symbol_risk_caps(
+        symbol,
+        max_inventory_notional_usd=Decimal("1000"),
+        max_order_notional_usd=Decimal("100"),
+    )
+    bridge.set_symbol_grid_config(symbol, tick_size="0.01", step_size="0.001")
     engine, _port = bridge.build_engine_only(symbol)
     return bridge, engine
 

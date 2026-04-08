@@ -39,6 +39,20 @@ def _default_args(**overrides: object) -> argparse.Namespace:
     return argparse.Namespace(**defaults)
 
 
+def _register_tuned_symbols(bridge: object, *symbols: str) -> None:
+    """Register tuned size + risk caps so bridge allows autonomous activation."""
+    from decimal import Decimal  # noqa: PLC0415
+
+    for sym in symbols:
+        bridge.set_symbol_size(sym, "0.001")  # type: ignore[attr-defined]
+        bridge.set_symbol_risk_caps(  # type: ignore[attr-defined]
+            sym,
+            max_inventory_notional_usd=Decimal("1000"),
+            max_order_notional_usd=Decimal("100"),
+        )
+        bridge.set_symbol_grid_config(sym, tick_size="0.10", step_size="0.001")  # type: ignore[attr-defined]
+
+
 class TestBuildRuntime:
     def test_run_autonomous_builds_real_host(self) -> None:
         """build_runtime returns a dict with a real AutonomousEngineHost."""
@@ -77,6 +91,7 @@ class TestHostLifecycleIntegration:
         runtime = run_autonomous_mod.build_runtime(args)
         host = runtime["host"]
         registry = runtime["registry"]
+        _register_tuned_symbols(runtime["bridge"], "BTCUSDT")
 
         try:
             ok = host.activate("BTCUSDT")
@@ -94,6 +109,7 @@ class TestRegistryCoherence:
         runtime = run_autonomous_mod.build_runtime(args)
         host = runtime["host"]
         registry = runtime["registry"]
+        _register_tuned_symbols(runtime["bridge"], "ETHUSDT")
         try:
             host.activate("ETHUSDT")
             assert host.is_live("ETHUSDT")
@@ -111,6 +127,7 @@ class TestFailureSurfacing:
         args = _default_args(execution_enabled=True, execution_ack=True)
         runtime = run_autonomous_mod.build_runtime(args)
         host = runtime["host"]
+        _register_tuned_symbols(runtime["bridge"], "BTCUSDT")
 
         try:
             host.activate("BTCUSDT")
