@@ -42,6 +42,9 @@ class PortfolioBudgetConfig:
     defensive_multiplier: Decimal = Decimal("0.5")
 
 
+DEFAULT_PORTFOLIO_BUDGET_CONFIG = PortfolioBudgetConfig()
+
+
 @dataclass(frozen=True)
 class PortfolioBudgetInput:
     """Inputs for one budget computation cycle."""
@@ -80,7 +83,7 @@ class PortfolioBudgetAllocator:
     """
 
     def __init__(self, config: PortfolioBudgetConfig | None = None) -> None:
-        self._config = config or PortfolioBudgetConfig()
+        self._config = config or DEFAULT_PORTFOLIO_BUDGET_CONFIG
 
     def compute(self, inp: PortfolioBudgetInput) -> PortfolioBudgetSnapshot:  # noqa: PLR0912
         """Compute portfolio budget snapshot from current inputs."""
