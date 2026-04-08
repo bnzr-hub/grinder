@@ -10,6 +10,7 @@ from scripts import run_autonomous as run_autonomous_mod
 
 from grinder.execution.engine import SymbolConstraints
 from grinder.execution_plane.registry import EngineRegistry
+from grinder.runtime.account_truth import fetch_futures_risk_base
 from grinder.runtime.live_engine_bridge import LiveEngineBridge
 from grinder.tuning.autonomous_state import AutonomousTuningState
 from grinder.tuning.refresher import TuningRefresher
@@ -101,8 +102,6 @@ class TestBootstrapRiskTruth:
         assert results["BTCUSDT"].max_position_notional_usd == Decimal("95.23")
 
     def test_fetch_futures_risk_base_honors_wallet_balance_mode(self) -> None:
-        from grinder.runtime.account_truth import fetch_futures_risk_base
-
         payload = {
             "totalMarginBalance": "1000",
             "totalWalletBalance": "900",

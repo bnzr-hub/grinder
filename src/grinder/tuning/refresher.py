@@ -277,8 +277,8 @@ class TuningRefresher:
         """Fetch equity, risk base, and gross exposure, push to bridge. Fail-open."""
         from grinder.runtime.account_truth import (  # noqa: PLC0415
             fetch_futures_equity,
-            fetch_futures_risk_base,
             fetch_futures_gross_exposure,
+            fetch_futures_risk_base,
         )
 
         testnet = not getattr(self._args, "mainnet", False)
@@ -294,7 +294,9 @@ class TuningRefresher:
 
     def _derive_symbol_risk_budget(self) -> Decimal | None:
         """Derive current autonomous symbol risk budget from real bridge facts."""
-        from grinder.risk.autonomous_risk_budget import derive_autonomous_portfolio_snapshot  # noqa: PLC0415
+        from grinder.risk.autonomous_risk_budget import (  # noqa: PLC0415
+            derive_autonomous_portfolio_snapshot,
+        )
 
         risk_base = self._bridge.last_known_risk_base
         gross = self._bridge.last_known_gross_exposure

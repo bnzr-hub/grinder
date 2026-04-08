@@ -51,10 +51,12 @@ _ZERO = Decimal("0")
 
 def _derive_bootstrap_symbol_risk_budget(*, testnet: bool) -> Decimal | None:
     """Derive bootstrap/refresher symbol risk budget from real exchange truth."""
-    from grinder.risk.autonomous_risk_budget import derive_autonomous_portfolio_snapshot  # noqa: PLC0415
+    from grinder.risk.autonomous_risk_budget import (  # noqa: PLC0415
+        derive_autonomous_portfolio_snapshot,
+    )
     from grinder.runtime.account_truth import (  # noqa: PLC0415
-        fetch_futures_risk_base,
         fetch_futures_gross_exposure,
+        fetch_futures_risk_base,
     )
 
     risk_base = fetch_futures_risk_base(testnet=testnet)
@@ -217,7 +219,7 @@ def _select_bootstrap_subset(
     return subset
 
 
-def _bootstrap_tuning_cache(
+def _bootstrap_tuning_cache(  # noqa: PLR0915
     symbols: list[str],
     cache: Any,
     args: argparse.Namespace,
