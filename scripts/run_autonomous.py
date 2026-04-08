@@ -229,11 +229,13 @@ def _bootstrap_tuning_cache(
     if not constraints:
         logger.warning("BOOTSTRAP_TUNING_NO_CONSTRAINTS — solver will use zero constraints")
 
-    # Wire solver config from bridge/runtime ladder geometry (same SSOT)
+    # Wire solver config from shared grid policy SSOT
+    from grinder.risk.grid_policy import DEFAULT_GRID_POLICY  # noqa: PLC0415
     from grinder.runtime.live_engine_bridge import BridgeConfig  # noqa: PLC0415
     from grinder.selector.spacing import compute_adaptive_spacing_bps  # noqa: PLC0415
 
-    bridge_cfg = BridgeConfig()  # defaults match what bridge actually uses
+    policy = DEFAULT_GRID_POLICY
+    bridge_cfg = BridgeConfig()
     _static_spacing_pct = Decimal(str(bridge_cfg.spacing_bps)) / Decimal("10000")
     _natr = natr_map or {}
     tuned_sizes: dict[str, str] = {}
@@ -259,7 +261,9 @@ def _bootstrap_tuning_cache(
             spacing_pct = _static_spacing_pct
 
         config = TuningSolverConfig(
-            entry_levels_per_side=bridge_cfg.levels,
+            entry_levels_per_side=policy.live_entry_levels_per_side,
+            max_inventory_levels=policy.max_inventory_levels,
+            adverse_depth_levels=policy.adverse_depth_levels,
             spacing_pct=spacing_pct,
         )
         result = solve(symbol, sc, price, config)
@@ -620,7 +624,6 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
     )
     from grinder.rotation.controller import RotationConfig, RotationController  # noqa: PLC0415
     from grinder.runtime.autonomous_host import AutonomousEngineHost  # noqa: PLC0415
-    from grinder.runtime.live_engine_bridge import BridgeConfig  # noqa: PLC0415
     from grinder.tuning.cache import TuningCache  # noqa: PLC0415
 
     # Parse symbols/blacklist
@@ -771,8 +774,9 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
         ),
     )
 
-    _bridge_cfg = BridgeConfig()
-    _default_entry_levels = _bridge_cfg.levels
+    from grinder.risk.grid_policy import DEFAULT_GRID_POLICY as _admission_policy  # noqa: PLC0415
+
+    _default_entry_levels = _admission_policy.live_entry_levels_per_side
 
     def _admission_ranker(candidates: list[str]) -> list[str]:
         """Rank candidates via V2 ranker, then filter through risk admission.
