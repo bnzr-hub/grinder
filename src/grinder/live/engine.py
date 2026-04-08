@@ -3107,9 +3107,18 @@ class LiveEngineV0:
         ):
             self._check_adverse_level_trigger(snapshot)
 
-        # Execute forced-flat if requested (symbol-scoped emergency close)
-        if self._forced_flat_requested and not self._forced_flat_executed:
-            self._execute_forced_flat(snapshot)
+        # Execute forced-flat if requested (symbol-scoped emergency close).
+        # Short-circuit: suppress all normal action generation after forced-flat.
+        if self._forced_flat_requested:
+            if not self._forced_flat_executed:
+                self._execute_forced_flat(snapshot)
+            return LiveEngineOutput(
+                paper_output=_DeferredPaperOutput(ts=snapshot.ts, symbol=snapshot.symbol),
+                live_actions=[],
+                armed=self._config.armed,
+                mode=self._config.mode,
+                kill_switch_active=self._config.kill_switch_active,
+            )
 
         # PR-338: Defer paper engine during FSM startup states (INIT/READY).
         # Paper engine mutates internal state via NoOp port; if run before ACTIVE,
