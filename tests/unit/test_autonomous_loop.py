@@ -195,8 +195,8 @@ class TestRankerStage:
         loop = _make_loop(cache=cache, ranker_fn=exploding_ranker)
         report = loop.run_cycle()
 
-        # Fail-open: ranking skipped, tuned set passed through as selected
-        assert report.selected == report.tuned
+        # Fail-closed: ranking failure preserves previous admitted set (empty on first cycle)
+        assert report.selected == []
         assert report.error is None
 
 
