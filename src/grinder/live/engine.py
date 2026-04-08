@@ -753,15 +753,19 @@ class LiveEngineV0:
         self._unreconciled_place_count: dict[str, dict[str, int]] = {}
         # INV-10 (ADR-088): ANCHOR_RESET_BLOCKED throttle (log once per reason)
         self._anchor_reset_blocked_logged: set[str] = set()  # "{symbol}:{reason}"
+        # Emergency exit executor: used for both global emergency and forced-flat.
+        # Created whenever port supports it, regardless of GRINDER_EMERGENCY_EXIT_ENABLED.
+        port = self._exchange_port
+        _port_supports_emergency = (
+            hasattr(port, "cancel_all_orders")
+            and hasattr(port, "place_market_order")
+            and hasattr(port, "get_positions")
+        )
+        if _port_supports_emergency:
+            self._emergency_exit_executor = EmergencyExitExecutor(port)  # type: ignore[arg-type]
+
         if self._emergency_exit_enabled:
-            # Duck-type check: port must have cancel_all_orders + place_market_order + get_positions
-            port = self._exchange_port
-            if (
-                hasattr(port, "cancel_all_orders")
-                and hasattr(port, "place_market_order")
-                and hasattr(port, "get_positions")
-            ):
-                self._emergency_exit_executor = EmergencyExitExecutor(port)  # type: ignore[arg-type]
+            if _port_supports_emergency:
                 logger.info("RISK-EE-1: EmergencyExitExecutor enabled")
             else:
                 logger.warning(
@@ -4030,8 +4034,8 @@ class LiveEngineV0:
             reason="ADVERSE_LEVEL_20_FORCED_FLAT",
             symbols=[symbol],
         )
-        self._forced_flat_executed = True
         if result.success:
+            self._forced_flat_executed = True
             logger.info(
                 "FORCED_FLAT_CONFIRMED symbol=%s cancelled=%d closed=%d",
                 symbol,
@@ -4040,7 +4044,7 @@ class LiveEngineV0:
             )
         else:
             logger.error(
-                "FORCED_FLAT_PARTIAL symbol=%s remaining=%d",
+                "FORCED_FLAT_PARTIAL symbol=%s remaining=%d — will retry next tick",
                 symbol,
                 result.positions_remaining,
             )
