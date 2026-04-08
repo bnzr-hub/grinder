@@ -20,9 +20,13 @@ def _fake_transport() -> FakeWsTransport:
     return FakeWsTransport(messages=[])
 
 
-def _bridge(*, shutdown_timeout_s: float = 5.0) -> LiveEngineBridge:
-    """Build a bridge with safe test defaults and fake WS transport."""
-    return LiveEngineBridge(
+def _bridge(
+    *, shutdown_timeout_s: float = 5.0, symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT")
+) -> LiveEngineBridge:
+    """Build a bridge with safe test defaults, fake WS transport, and tuned symbols."""
+    from decimal import Decimal  # noqa: PLC0415
+
+    b = LiveEngineBridge(
         config=BridgeConfig(
             mode="read_only",
             armed=False,
@@ -31,6 +35,15 @@ def _bridge(*, shutdown_timeout_s: float = 5.0) -> LiveEngineBridge:
             ws_transport=_fake_transport(),
         )
     )
+    for sym in symbols:
+        b.set_symbol_size(sym, "0.001")
+        b.set_symbol_risk_caps(
+            sym,
+            max_inventory_notional_usd=Decimal("1000"),
+            max_order_notional_usd=Decimal("100"),
+        )
+        b.set_symbol_grid_config(sym, tick_size="0.01", step_size="0.001")
+    return b
 
 
 class TestBridgeFactory:
