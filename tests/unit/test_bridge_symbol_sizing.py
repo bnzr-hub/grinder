@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from grinder.runtime.live_engine_bridge import BridgeConfig, LiveEngineBridge
 
 
@@ -34,3 +36,13 @@ class TestSymbolSizing:
         b1.set_symbol_size("X", "42")
         b2.set_symbol_size("X", "42")
         assert b1._symbol_sizes == b2._symbol_sizes
+
+    def test_set_symbol_risk_caps_stored(self) -> None:
+        bridge = LiveEngineBridge(config=BridgeConfig())
+        bridge.set_symbol_risk_caps(
+            "DRIFTUSDT",
+            max_inventory_notional_usd=Decimal("250"),
+            max_order_notional_usd=Decimal("250"),
+        )
+        assert bridge._symbol_max_inventory_notionals["DRIFTUSDT"] == Decimal("250")
+        assert bridge._symbol_max_order_notionals["DRIFTUSDT"] == Decimal("250")

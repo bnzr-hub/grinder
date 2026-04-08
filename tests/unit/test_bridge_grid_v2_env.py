@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import threading
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 from grinder.account.syncer import AccountSyncer
@@ -26,6 +27,11 @@ def _bridge_with_tuned_symbol(
     bridge = LiveEngineBridge(config=BridgeConfig())
     bridge.set_symbol_size(symbol, order_size)
     bridge.set_symbol_grid_config(symbol, tick_size=tick_size, step_size="1")
+    bridge.set_symbol_risk_caps(
+        symbol,
+        max_inventory_notional_usd=Decimal("250"),
+        max_order_notional_usd=Decimal("250"),
+    )
     return bridge
 
 
@@ -42,6 +48,7 @@ class TestEnvPropagation:
             assert os.environ.get("GRINDER_GRID_V2_SYMBOL") == "DRIFTUSDT"
             assert os.environ.get("GRINDER_GRID_V2_ORDER_SIZE") == "120"
             assert os.environ.get("GRINDER_GRID_V2_TICK_SIZE") == "0.0001"
+            assert os.environ.get("GRINDER_GRID_V2_MAX_INV_NOTIONAL") == "250"
             assert os.environ.get("GRINDER_ACCOUNT_SYNC_ENABLED") == "1"
         finally:
             bridge._restore_grid_v2_env(saved)
@@ -107,6 +114,11 @@ class TestConstructionLock:
         bridge = _bridge_with_tuned_symbol("DRIFTUSDT", "120")
         bridge.set_symbol_size("ETHUSDT", "50")
         bridge.set_symbol_grid_config("ETHUSDT", tick_size="0.01", step_size="0.1")
+        bridge.set_symbol_risk_caps(
+            "ETHUSDT",
+            max_inventory_notional_usd=Decimal("250"),
+            max_order_notional_usd=Decimal("250"),
+        )
 
         observed_symbols: list[str] = []
 

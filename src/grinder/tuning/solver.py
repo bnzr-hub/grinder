@@ -56,6 +56,8 @@ class TuningResult:
     tick_size: Decimal | None = None
     step_size: Decimal | None = None
     max_inventory_levels: int | None = None
+    max_position_notional_usd: Decimal | None = None
+    actual_order_notional_usd: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -70,7 +72,7 @@ class TuningSolverConfig:
         blacklist: Symbols that must be rejected unconditionally.
     """
 
-    max_position_usd: Decimal = Decimal("1000")
+    max_position_usd: Decimal = Decimal("0")
     max_inventory_levels: int = 15
     entry_levels_per_side: int = 5
     adverse_depth_levels: int = 20
@@ -199,4 +201,6 @@ def solve(  # noqa: PLR0911
         tick_size=constraints.tick_size,
         step_size=constraints.step_size,
         max_inventory_levels=config.max_inventory_levels,
+        max_position_notional_usd=max_position_notional,
+        actual_order_notional_usd=actual_notional,
     )

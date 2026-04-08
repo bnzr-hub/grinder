@@ -215,6 +215,7 @@ class TestBootstrapConstraintRefresh:
         args = _default_args(mainnet=True)
 
         with (
+            patch.object(mod, "_derive_bootstrap_symbol_risk_budget", return_value=Decimal("20")),
             patch("grinder.execution.constraint_provider.ConstraintProvider") as mock_provider_cls,
             patch("scripts.http_measured_client.RequestsHttpClient") as mock_http_cls,
         ):

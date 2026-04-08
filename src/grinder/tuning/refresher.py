@@ -19,22 +19,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_REFRESH_INTERVAL_S = 240.0
 
 
-def compute_gross_exposure_from_positions(positions: list[dict[str, Any]]) -> Decimal:
-    """Compute gross exposure from positionRisk payload.
-
-    Returns sum(abs(notional)) across all positions.
-    Malformed rows are skipped (fail-open). Zero-notional rows contribute 0.
-    """
-    gross = Decimal("0")
-    for pos in positions:
-        notional = pos.get("notional", "0")
-        try:
-            gross += abs(Decimal(str(notional)))
-        except Exception:
-            continue
-    return gross
-
-
 class TuningRefresher:
     """Background tuning refresh daemon thread.
 
@@ -120,7 +104,13 @@ class TuningRefresher:
 
         timer = PhaseTimer()
         mainnet = getattr(self._args, "mainnet", False)
-        max_notional = Decimal(str(self._args.max_notional_per_order))
+
+        # Refresh exchange truth first so retuning uses current capital base.
+        self._update_equity()
+        symbol_risk_budget = self._derive_symbol_risk_budget()
+        if symbol_risk_budget is None or symbol_risk_budget <= Decimal("0"):
+            logger.warning("TUNING_REFRESH_ABORT reason=no_real_risk_budget")
+            return
 
         logger.info("TUNING_REFRESH_START candidates=%d", len(candidates))
 
@@ -130,7 +120,7 @@ class TuningRefresher:
 
         # Stage tuning results (no cache writes yet)
         tuned_results, tuned_sizes, tuning_order_sizes, all_results = self._retune_symbols(
-            candidates, natr_map
+            candidates, natr_map, symbol_risk_budget
         )
 
         # Fetch V2 features with real order sizes
@@ -139,7 +129,7 @@ class TuningRefresher:
             v2_features = fetch_selection_features_v2(
                 list(tuned_sizes.keys()),
                 tuning_order_sizes=tuning_order_sizes,
-                max_notional_per_order=max_notional,
+                max_notional_per_order=None,
                 mainnet=mainnet,
             )
 
@@ -170,6 +160,7 @@ class TuningRefresher:
         self,
         candidates: list[str],
         natr_map: dict[str, Decimal],
+        symbol_risk_budget: Decimal,
     ) -> tuple[dict[str, Any], dict[str, str], dict[str, Decimal], list[tuple[str, Any]]]:
         """Run tuning solver for candidates. Returns (results, sizes, order_sizes, all_results).
 
@@ -179,6 +170,7 @@ class TuningRefresher:
             ConstraintProvider,
             ConstraintProviderConfig,
         )
+        from grinder.risk.grid_policy import DEFAULT_GRID_POLICY  # noqa: PLC0415
         from grinder.runtime.live_engine_bridge import BridgeConfig  # noqa: PLC0415
         from grinder.selector.spacing import compute_adaptive_spacing_bps  # noqa: PLC0415
         from grinder.tuning.solver import TuningSolverConfig, TuningStatus, solve  # noqa: PLC0415
@@ -206,6 +198,7 @@ class TuningRefresher:
 
         bridge_cfg = BridgeConfig()
         static_spacing_pct = Decimal(str(bridge_cfg.spacing_bps)) / Decimal("10000")
+        policy = DEFAULT_GRID_POLICY
 
         tuned_results: dict[str, Any] = {}
         tuned_sizes: dict[str, str] = {}
@@ -227,7 +220,10 @@ class TuningRefresher:
                 spacing_pct = static_spacing_pct
 
             config = TuningSolverConfig(
-                entry_levels_per_side=bridge_cfg.levels,
+                max_position_usd=symbol_risk_budget,
+                entry_levels_per_side=policy.live_entry_levels_per_side,
+                max_inventory_levels=policy.max_inventory_levels,
+                adverse_depth_levels=policy.adverse_depth_levels,
                 spacing_pct=spacing_pct,
             )
             result = solve(symbol, sc, price, config)
@@ -267,87 +263,62 @@ class TuningRefresher:
                     tick_size=str(result.tick_size),
                     step_size=str(result.step_size),
                 )
+            if result and result.max_position_notional_usd is not None:
+                self._bridge.set_symbol_risk_caps(
+                    sym,
+                    max_inventory_notional_usd=result.max_position_notional_usd,
+                    max_order_notional_usd=result.max_position_notional_usd,
+                )
             natr_val = natr_map.get(sym)
             if natr_val is not None:
                 self._bridge.set_symbol_spacing(sym, compute_adaptive_spacing_bps(natr_val))
 
     def _update_equity(self) -> None:
-        """Fetch account equity and gross exposure, push to bridge. Fail-open."""
+        """Fetch equity, risk base, and gross exposure, push to bridge. Fail-open."""
+        from grinder.runtime.account_truth import (  # noqa: PLC0415
+            fetch_futures_equity,
+            fetch_futures_gross_exposure,
+            fetch_futures_risk_base,
+        )
+
         testnet = not getattr(self._args, "mainnet", False)
-        equity = self._fetch_equity(testnet)
+        equity = fetch_futures_equity(testnet=testnet)
         if equity is not None and equity > 0:
             self._bridge.update_equity(equity)
-        gross = self._fetch_gross_exposure(testnet)
+        risk_base = fetch_futures_risk_base(testnet=testnet)
+        if risk_base is not None and risk_base > 0:
+            self._bridge.update_risk_base(risk_base)
+        gross = fetch_futures_gross_exposure(testnet=testnet)
         if gross is not None:
             self._bridge.update_gross_exposure(gross)
 
-    @staticmethod
-    def _fetch_equity(testnet: bool) -> Decimal | None:
-        """Fetch USDT margin balance from REST. Fail-open, no engine dependency."""
-        import hashlib  # noqa: PLC0415
-        import hmac  # noqa: PLC0415
-        import json  # noqa: PLC0415
-        import os  # noqa: PLC0415
-        import time  # noqa: PLC0415
-        import urllib.request  # noqa: PLC0415
+    def _derive_symbol_risk_budget(self) -> Decimal | None:
+        """Derive current autonomous symbol risk budget from real bridge facts."""
+        from grinder.risk.autonomous_risk_budget import (  # noqa: PLC0415
+            derive_autonomous_portfolio_snapshot,
+        )
 
-        api_key = os.environ.get("BINANCE_API_KEY", "").strip()
-        api_secret = os.environ.get("BINANCE_API_SECRET", "").strip()
-        if not api_key or not api_secret:
+        risk_base = self._bridge.last_known_risk_base
+        gross = self._bridge.last_known_gross_exposure
+        if risk_base is None or risk_base <= Decimal("0") or gross is None:
             return None
-
-        base = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
-        ts = int(time.time() * 1000)
-        query = f"timestamp={ts}&recvWindow=10000"
-        sig = hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-        url = f"{base}/fapi/v2/balance?{query}&signature={sig}"
-        try:
-            req = urllib.request.Request(url, headers={"X-MBX-APIKEY": api_key})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read())
-                for asset in data:
-                    if asset.get("asset") == "USDT":
-                        # Compute equity from wallet + unrealized PnL,
-                        # matching totalMarginBalance semantics.
-                        wallet = Decimal(str(asset.get("crossWalletBalance", "0")))
-                        upnl = Decimal(str(asset.get("crossUnPnl", "0")))
-                        return wallet + upnl
-        except Exception:
-            pass
-        return None
-
-    @staticmethod
-    def _fetch_gross_exposure(testnet: bool) -> Decimal | None:
-        """Fetch gross position exposure from REST. Fail-open.
-
-        Returns sum(abs(notional)) across all open positions.
-        Uses /fapi/v2/positionRisk — same auth as equity fetch.
-        """
-        import hashlib  # noqa: PLC0415
-        import hmac  # noqa: PLC0415
-        import json  # noqa: PLC0415
-        import os  # noqa: PLC0415
-        import time  # noqa: PLC0415
-        import urllib.request  # noqa: PLC0415
-
-        api_key = os.environ.get("BINANCE_API_KEY", "").strip()
-        api_secret = os.environ.get("BINANCE_API_SECRET", "").strip()
-        if not api_key or not api_secret:
+        active_count = len(self._registry.list_present())
+        snapshot = derive_autonomous_portfolio_snapshot(
+            equity=risk_base,
+            gross_exposure_used_usd=gross,
+            active_symbol_count=active_count,
+        )
+        if snapshot.per_symbol_risk_budget_usd <= Decimal("0"):
             return None
-
-        base = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
-        ts = int(time.time() * 1000)
-        query = f"timestamp={ts}&recvWindow=10000"
-        sig = hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-        url = f"{base}/fapi/v2/positionRisk?{query}&signature={sig}"
-        try:
-            req = urllib.request.Request(url, headers={"X-MBX-APIKEY": api_key})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read())
-                return compute_gross_exposure_from_positions(data)
-        except Exception:
-            pass
-        return None
+        logger.info(
+            "TUNING_REFRESH_RISK_BASE risk_base=%s gross_exposure=%s active=%d "
+            "per_symbol_risk_budget_usd=%s",
+            risk_base,
+            gross,
+            active_count,
+            snapshot.per_symbol_risk_budget_usd,
+        )
+        return snapshot.per_symbol_risk_budget_usd
 
     @staticmethod
     def _fetch_price(symbol: str, testnet: bool) -> Decimal | None:

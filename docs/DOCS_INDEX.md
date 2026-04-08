@@ -77,6 +77,8 @@ If documents conflict, trust order is:
 - `docs/38_AUTONOMOUS_MULTI_SYMBOL_IMPLEMENTATION_PLAN.md` — phased implementation plan for autonomous multi-symbol orchestration (converts doc 37 into PR chain)
 - `docs/39_EXECUTION_PLANE_ARCHITECTURE_SPEC.md` — **CANDIDATE** execution-plane architecture: engine lifecycle, ceremonies, reconciliation, safety
 - `docs/40_EXECUTION_PLANE_IMPLEMENTATION_PLAN.md` — phased implementation plan for execution-plane (converts doc 39 into PR chain)
+- `docs/41_AUTONOMOUS_RISK_MANAGER_V1_SPEC.md` — candidate autonomous capital/risk manager architecture
+- `docs/42_AUTONOMOUS_RISK_REMEDIATION_SPEC.md` — active remediation contract for removing legacy/manual autonomous risk fallbacks
 
 ---
 

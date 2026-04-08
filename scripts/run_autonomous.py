@@ -49,6 +49,42 @@ _CONSTRAINT_CACHE_TTL_HOURLY_S = 3600
 _ZERO = Decimal("0")
 
 
+def _derive_bootstrap_symbol_risk_budget(*, testnet: bool) -> Decimal | None:
+    """Derive bootstrap/refresher symbol risk budget from real exchange truth."""
+    from grinder.risk.autonomous_risk_budget import (  # noqa: PLC0415
+        derive_autonomous_portfolio_snapshot,
+    )
+    from grinder.runtime.account_truth import (  # noqa: PLC0415
+        fetch_futures_gross_exposure,
+        fetch_futures_risk_base,
+    )
+
+    risk_base = fetch_futures_risk_base(testnet=testnet)
+    gross_exposure = fetch_futures_gross_exposure(testnet=testnet)
+    if risk_base is None or risk_base <= _ZERO or gross_exposure is None:
+        logger.warning(
+            "AUTONOMOUS_SIZING_NO_RISK_BASE risk_base=%s gross_exposure=%s testnet=%s",
+            risk_base,
+            gross_exposure,
+            testnet,
+        )
+        return None
+    snapshot = derive_autonomous_portfolio_snapshot(
+        equity=risk_base,
+        gross_exposure_used_usd=gross_exposure,
+        active_symbol_count=0,
+    )
+    logger.info(
+        "AUTONOMOUS_SIZING_RISK_BASE risk_base=%s gross_exposure=%s per_symbol_risk_budget_usd=%s",
+        risk_base,
+        gross_exposure,
+        snapshot.per_symbol_risk_budget_usd,
+    )
+    if snapshot.per_symbol_risk_budget_usd <= _ZERO:
+        return None
+    return snapshot.per_symbol_risk_budget_usd
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Grinder autonomous multi-symbol runtime")
     p.add_argument(
@@ -182,7 +218,7 @@ def _select_bootstrap_subset(
     return subset
 
 
-def _bootstrap_tuning_cache(
+def _bootstrap_tuning_cache(  # noqa: PLR0915
     symbols: list[str],
     cache: Any,
     args: argparse.Namespace,
@@ -208,6 +244,10 @@ def _bootstrap_tuning_cache(
     bootstrap_timer = PhaseTimer()
     testnet = not getattr(args, "mainnet", False)
     logger.info("BOOTSTRAP_TUNING_START symbols=%s testnet=%s", symbols, testnet)
+    symbol_risk_budget = _derive_bootstrap_symbol_risk_budget(testnet=testnet)
+    if symbol_risk_budget is None or symbol_risk_budget <= _ZERO:
+        logger.warning("BOOTSTRAP_TUNING_ABORT reason=no_real_risk_budget")
+        return {}, {}
 
     # Refresh constraints at most once per hour. If the cache is stale, fetch fresh
     # exchangeInfo and update the cache; if fetch fails, ConstraintProvider still
@@ -261,6 +301,7 @@ def _bootstrap_tuning_cache(
             spacing_pct = _static_spacing_pct
 
         config = TuningSolverConfig(
+            max_position_usd=symbol_risk_budget,
             entry_levels_per_side=policy.live_entry_levels_per_side,
             max_inventory_levels=policy.max_inventory_levels,
             adverse_depth_levels=policy.adverse_depth_levels,
@@ -426,19 +467,14 @@ def _build_v2_selector(
     state: Any,  # AutonomousTuningState — read at call time, not construction time
     tuning_cache: Any,
     blacklist: frozenset[str],
-    max_notional_per_order: str = "100",
 ) -> tuple[Any, Any]:
     """Build V2 prefilter and ranker closures backed by dynamic shared state.
 
     Closures read from AutonomousTuningState on every invocation so that
     periodic tuning refresh is automatically visible to selector.
     """
-    from decimal import Decimal as _D  # noqa: PLC0415
-
     from grinder.selector.prefilter import prefilter_v1  # noqa: PLC0415
     from grinder.selector.ranker import rank_v1, rank_v2  # noqa: PLC0415
-
-    _max_notional = _D(max_notional_per_order)
 
     def prefilter(candidates: list[str]) -> list[str]:
         eligible, _skipped = prefilter_v1(
@@ -450,7 +486,7 @@ def _build_v2_selector(
             },
             features=state.v1_features,  # dynamic read
             blacklist=blacklist,
-            max_notional_per_order=_max_notional,
+            max_notional_per_order=None,
         )
         return eligible
 
@@ -487,6 +523,12 @@ def _propagate_tuning_to_bridge(
                 tick_size=str(result.tick_size),
                 step_size=str(result.step_size),
             )
+        if result and result.max_position_notional_usd is not None:
+            bridge.set_symbol_risk_caps(
+                sym,
+                max_inventory_notional_usd=result.max_position_notional_usd,
+                max_order_notional_usd=result.max_position_notional_usd,
+            )
         natr_val = natr_map.get(sym)
         if natr_val is not None:
             bridge.set_symbol_spacing(sym, compute_adaptive_spacing_bps(natr_val))
@@ -511,9 +553,7 @@ def _build_tuning_state_and_selector(
     candidates = list(tuned_results.keys()) or (
         sorted(symbols_override) if symbols_override else []
     )
-    v1_features, v2_features = _fetch_initial_selector_features(
-        tuned_results, mainnet, args.max_notional_per_order
-    )
+    v1_features, v2_features = _fetch_initial_selector_features(tuned_results, mainnet)
 
     state = AutonomousTuningState(
         candidates=candidates,
@@ -524,9 +564,7 @@ def _build_tuning_state_and_selector(
         v2_features=v2_features,
     )
 
-    prefilter, ranker = _build_v2_selector(
-        state, tuning_cache, blacklist, max_notional_per_order=args.max_notional_per_order
-    )
+    prefilter, ranker = _build_v2_selector(state, tuning_cache, blacklist)
 
     refresher = TuningRefresher(
         state=state, cache=tuning_cache, bridge=bridge, registry=registry, args=args
@@ -583,7 +621,6 @@ def _build_degradation_controller() -> Any:
 def _fetch_initial_selector_features(
     tuned_results: dict[str, Any],
     mainnet: bool,
-    max_notional_per_order: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Fetch initial V1+V2 selector features for bootstrap tuned symbols."""
     from grinder.selector.feature_provider import (  # noqa: PLC0415
@@ -602,7 +639,7 @@ def _fetch_initial_selector_features(
     v2_features = fetch_selection_features_v2(
         symbols,
         tuning_order_sizes=order_sizes,
-        max_notional_per_order=Decimal(max_notional_per_order),
+        max_notional_per_order=None,
         mainnet=mainnet,
     )
     return v1_features, v2_features
