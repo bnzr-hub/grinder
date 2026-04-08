@@ -31,7 +31,9 @@ BTC_CONSTRAINTS = SymbolConstraints(
 )
 
 DEFAULT_CONFIG = TuningSolverConfig(max_position_usd=Decimal("10000"), max_inventory_levels=5)
-TINY_CONFIG = TuningSolverConfig(max_position_usd=Decimal("10"), max_inventory_levels=15, adverse_depth_levels=20)
+TINY_CONFIG = TuningSolverConfig(
+    max_position_usd=Decimal("10"), max_inventory_levels=15, adverse_depth_levels=20
+)
 
 
 class TestRecordResult:
