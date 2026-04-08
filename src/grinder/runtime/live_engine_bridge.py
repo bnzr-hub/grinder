@@ -597,12 +597,16 @@ class LiveEngineBridge:
         cfg = self._config
         mode = SafeMode(cfg.mode)
 
-        effective_size = self._symbol_sizes.get(symbol, cfg.size_per_level)
+        if symbol not in self._symbol_sizes:
+            raise RuntimeError(
+                f"BRIDGE_ENGINE_BLOCKED symbol={symbol} reason=no_tuned_size — "
+                "autonomous activation requires tuned order_size"
+            )
+        effective_size = self._symbol_sizes[symbol]
         logger.info(
-            "BRIDGE_ENGINE_SIZE symbol=%s size=%s source=%s",
+            "BRIDGE_ENGINE_SIZE symbol=%s size=%s source=tuning",
             symbol,
             effective_size,
-            "tuning" if symbol in self._symbol_sizes else "default",
         )
 
         with self._engine_construction_lock:

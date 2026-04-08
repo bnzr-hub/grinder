@@ -178,7 +178,7 @@ class AutonomousLoop:
             eligible = self.prefilter_fn(discovered)
         except Exception as e:
             logger.warning("AUTONOMOUS_LOOP_PREFILTER_FAILED cycle=%d error=%s", self._cycle, e)
-            eligible = discovered  # fail-open: skip prefilter
+            eligible = []  # fail-closed: no unscreened activation
 
         # Stage 4: Tuning admission (before ranking — doc 37 invariant)
         # Only TUNED symbols enter ranking. Cache miss / NO_GO / expired = skipped.
@@ -202,7 +202,7 @@ class AutonomousLoop:
             selected = self.ranker_fn(tuned)
         except Exception as e:
             logger.warning("AUTONOMOUS_LOOP_RANKING_FAILED cycle=%d error=%s", self._cycle, e)
-            selected = tuned  # fail-open: skip ranking
+            selected = []  # fail-closed: no unranked activation
 
         # Stage 6: Orchestrator reconcile (TuningCache re-check + rotation controller)
         # Orchestrator will re-validate tuning (defense in depth) and run controller.

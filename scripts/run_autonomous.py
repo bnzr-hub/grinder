@@ -371,10 +371,10 @@ def _apply_bootstrap_prefilter(
         features = fetch_selection_features(coarse_symbols, mainnet=mainnet)
     except Exception as e:
         logger.warning(
-            "BOOTSTRAP_PREFILTER_FEATURE_FETCH_FAILED error=%s — using coarse slice",
+            "BOOTSTRAP_PREFILTER_FEATURE_FETCH_FAILED error=%s — fail-closed, no symbols",
             e,
         )
-        return coarse_symbols[:limit]
+        return []
 
     survivors: list[tuple[Decimal, str]] = []
     skip_counts: dict[str, int] = {}
@@ -410,13 +410,12 @@ def _apply_bootstrap_prefilter(
         skip_counts or "none",
     )
 
-    # Fail-open: if zero survivors, fall back to coarse slice
+    # Fail-closed: zero survivors → empty (no unscreened activation)
     if not result:
         logger.warning(
-            "BOOTSTRAP_PREFILTER_EMPTY_FALLBACK count=%d reason=no_survivors",
-            min(limit, len(coarse_symbols)),
+            "BOOTSTRAP_PREFILTER_EMPTY reason=no_survivors coarse=%d",
+            len(coarse_symbols),
         )
-        return coarse_symbols[:limit]
 
     return result
 
@@ -823,13 +822,14 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
         """
         ranked: list[str] = _ranker(candidates)
 
-        # If risk state not yet populated (first cycle before facts_fn),
-        # fall through without filtering — fail-open.
+        # If risk state not yet populated, fail-closed for new candidates:
+        # only live symbols pass through, no new activations without full facts.
         day_state = _risk_state.get("day_state")
         portfolio_snap = _risk_state.get("portfolio_snapshot")
         equity = _risk_state.get("equity")
         if day_state is None or portfolio_snap is None or equity is None:
-            return ranked
+            live = host.live_symbols
+            return [s for s in ranked if s in live]
 
         # Split: already-live symbols pass through, new candidates go through gate
         live = host.live_symbols
@@ -983,8 +983,11 @@ def _build_cycle_facts(runtime: dict) -> Any:  # type: ignore[type-arg]
                         ",".join(sorted(snap)),
                     )
 
-                # Real gross exposure from refresher (fail-open to 0)
-                gross_exposure = bridge.last_known_gross_exposure or _ZERO
+                # Real gross exposure from refresher — fail-closed for new risk
+                gross_exposure = bridge.last_known_gross_exposure
+                if gross_exposure is None:
+                    logger.debug("PORTFOLIO_BUDGET_SKIPPED reason=gross_exposure_unavailable")
+                    return  # no portfolio snapshot → admission stays blocked
 
                 inp = PortfolioBudgetInput(
                     equity=equity,
