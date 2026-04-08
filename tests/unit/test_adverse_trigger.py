@@ -74,6 +74,27 @@ class TestComputeThreshold:
             is None
         )
 
+    def test_off_tick_reference_uses_reference_for_step(self) -> None:
+        """Step uses reference_price (not anchor) — matches _grid_step_price().
+
+        reference=100.001, tick=0.01, step_pct=1%:
+        - anchor = round(100.001/0.01) * 0.01 = 100.00
+        - raw_step = 100.001 * 0.01 = 1.00001 (from reference, NOT anchor)
+        - step_ticks = ceil(1.00001/0.01) = 101
+        - step_price = 101 * 0.01 = 1.01
+        - threshold = 100.00 - 1.01 * 16 = 83.84
+        """
+        t = compute_adverse_threshold(
+            reference_price=Decimal("100.001"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            adverse_level=16,
+            side="LONG",
+        )
+        # If step were computed from anchor (100.00), step_price=1.00, threshold=84.00
+        # But step is from reference (100.001), step_price=1.01, threshold=83.84
+        assert t == Decimal("83.84")
+
     def test_deterministic(self) -> None:
         args = (Decimal("100"), Decimal("0.01"), Decimal("0.01"), 16, "LONG")
         assert compute_adverse_threshold(*args) == compute_adverse_threshold(*args)

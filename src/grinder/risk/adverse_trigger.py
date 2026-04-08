@@ -40,11 +40,13 @@ def compute_adverse_threshold(
     if reference_price <= 0 or step_pct <= 0 or tick_size <= 0 or adverse_level < 1:
         return None
 
-    # Same math as grid_v2/state.py _build_entry_window + _grid_step_price
+    # Same math as grid_v2/state.py _build_entry_window + _grid_step_price.
+    # Step price uses reference_price (not anchor) — matches _grid_step_price().
+    # Anchor rounding is only for the centerline.
     anchor = (reference_price / tick_size).quantize(
         Decimal("1"), rounding=ROUND_HALF_UP
     ) * tick_size
-    raw_step = anchor * step_pct
+    raw_step = reference_price * step_pct
     step_ticks = (raw_step / tick_size).quantize(Decimal("1"), rounding=ROUND_CEILING)
     if step_ticks < 1:
         step_ticks = Decimal("1")
