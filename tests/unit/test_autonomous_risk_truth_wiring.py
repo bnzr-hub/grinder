@@ -97,7 +97,10 @@ class TestBootstrapRiskTruth:
             }
             provider_cls.return_value = provider
             sizes, results = run_autonomous_mod._bootstrap_tuning_cache(
-                ["BTCUSDT"], MagicMock(), _args(symbols="BTCUSDT")
+                ["BTCUSDT"],
+                MagicMock(),
+                _args(symbols="BTCUSDT"),
+                natr_map={"BTCUSDT": Decimal("1.5")},
             )
 
         assert captured["max_position_usd"] == Decimal("20")

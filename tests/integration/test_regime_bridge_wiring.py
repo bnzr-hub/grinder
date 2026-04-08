@@ -47,6 +47,7 @@ def _build_bridge_and_engine(
         max_order_notional_usd=Decimal("100"),
     )
     bridge.set_symbol_grid_config(symbol, tick_size="0.01", step_size="0.001")
+    bridge.set_symbol_spacing(symbol, Decimal("100"))  # 100 bps
     engine, _port = bridge.build_engine_only(symbol)
     return bridge, engine
 

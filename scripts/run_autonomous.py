@@ -218,7 +218,7 @@ def _select_bootstrap_subset(
     return subset
 
 
-def _bootstrap_tuning_cache(  # noqa: PLR0915
+def _bootstrap_tuning_cache(
     symbols: list[str],
     cache: Any,
     args: argparse.Namespace,
@@ -271,12 +271,9 @@ def _bootstrap_tuning_cache(  # noqa: PLR0915
 
     # Wire solver config from shared grid policy SSOT
     from grinder.risk.grid_policy import DEFAULT_GRID_POLICY  # noqa: PLC0415
-    from grinder.runtime.live_engine_bridge import BridgeConfig  # noqa: PLC0415
     from grinder.selector.spacing import compute_adaptive_spacing_bps  # noqa: PLC0415
 
     policy = DEFAULT_GRID_POLICY
-    bridge_cfg = BridgeConfig()
-    _static_spacing_pct = Decimal(str(bridge_cfg.spacing_bps)) / Decimal("10000")
     _natr = natr_map or {}
     tuned_sizes: dict[str, str] = {}
     tuned_results: dict[str, Any] = {}
@@ -293,12 +290,13 @@ def _bootstrap_tuning_cache(  # noqa: PLR0915
             continue
 
         # Per-symbol adaptive spacing from NATR (fall back to static if unavailable)
+        # Fail-closed: skip symbol if NATR unavailable (no static spacing fallback)
         natr_val = _natr.get(symbol)
-        if natr_val is not None:
-            adaptive_bps = compute_adaptive_spacing_bps(natr_val)
-            spacing_pct = adaptive_bps / Decimal("10000")
-        else:
-            spacing_pct = _static_spacing_pct
+        if natr_val is None:
+            logger.warning("BOOTSTRAP_TUNING_NO_NATR symbol=%s — skipped", symbol)
+            continue
+        adaptive_bps = compute_adaptive_spacing_bps(natr_val)
+        spacing_pct = adaptive_bps / Decimal("10000")
 
         config = TuningSolverConfig(
             max_position_usd=symbol_risk_budget,

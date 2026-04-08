@@ -51,6 +51,7 @@ def _register_tuned_symbols(bridge: object, *symbols: str) -> None:
             max_order_notional_usd=Decimal("100"),
         )
         bridge.set_symbol_grid_config(sym, tick_size="0.10", step_size="0.001")  # type: ignore[attr-defined]
+        bridge.set_symbol_spacing(sym, Decimal("100"))  # type: ignore[attr-defined]
 
 
 class TestBuildRuntime:

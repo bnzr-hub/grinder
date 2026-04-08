@@ -234,13 +234,20 @@ class LiveEngineBridge:
         os.environ["GRINDER_GRID_V2_SYNC_RECONCILER_SHADOW"] = "0"
         # Account sync: required for grid_v2 startup (needs _last_account_snapshot)
         os.environ["GRINDER_ACCOUNT_SYNC_ENABLED"] = "1"
-        # Spacing: per-symbol adaptive if available, else bridge config fallback
-        effective_spacing_bps = self._symbol_spacings.get(symbol, Decimal(str(cfg.spacing_bps)))
-        spacing_pct = effective_spacing_bps / Decimal("10000")
+        # Spacing: per-symbol adaptive (required for autonomous path)
+        if symbol not in self._symbol_spacings:
+            raise RuntimeError(
+                f"BRIDGE_ENGINE_BLOCKED symbol={symbol} reason=no_tuned_spacing — "
+                "autonomous activation requires adaptive spacing"
+            )
+        spacing_pct = self._symbol_spacings[symbol] / Decimal("10000")
         os.environ["GRINDER_GRID_V2_STEP_PCT"] = str(spacing_pct)
-        os.environ["GRINDER_GRID_V2_ENTRY_LEVELS"] = str(cfg.levels)
-        # Max inventory from shared grid policy
+        # Entry levels + max inventory from shared grid policy (not BridgeConfig)
         from grinder.risk.grid_policy import DEFAULT_GRID_POLICY  # noqa: PLC0415
+
+        os.environ["GRINDER_GRID_V2_ENTRY_LEVELS"] = str(
+            DEFAULT_GRID_POLICY.live_entry_levels_per_side
+        )
 
         os.environ["GRINDER_GRID_V2_MAX_INV_LEVELS"] = str(DEFAULT_GRID_POLICY.max_inventory_levels)
         os.environ["GRINDER_GRID_V2_MAX_INV_NOTIONAL"] = str(
@@ -611,9 +618,14 @@ class LiveEngineBridge:
             saved_env = {k: os.environ.get(k) for k in self._GRID_V2_ENV_KEYS}
             self._propagate_grid_v2_env(symbol, effective_size, cfg)
             try:
+                from grinder.risk.grid_policy import DEFAULT_GRID_POLICY as _policy  # noqa: PLC0415
+
+                # Use per-symbol tuned spacing and policy levels (not bridge config defaults)
+                # _propagate_grid_v2_env already verified symbol is in _symbol_spacings
+                _sym_spacing = float(self._symbol_spacings[symbol])
                 paper = PaperEngine(
-                    spacing_bps=cfg.spacing_bps,
-                    levels=cfg.levels,
+                    spacing_bps=_sym_spacing,
+                    levels=_policy.live_entry_levels_per_side,
                     size_per_level=Decimal(effective_size),
                 )
                 port = self._build_port(symbol, mode)
