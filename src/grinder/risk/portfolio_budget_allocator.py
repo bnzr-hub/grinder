@@ -36,9 +36,9 @@ class PortfolioBudgetConfig:
 
     max_active_symbols: int = 5
     max_leverage: int = 5
-    risk_pct_good: Decimal = Decimal("3.0")
-    risk_pct_neutral: Decimal = Decimal("2.0")
-    risk_pct_toxic: Decimal = Decimal("1.0")
+    risk_pct_good: Decimal = Decimal("6.0")
+    risk_pct_neutral: Decimal = Decimal("3.0")
+    risk_pct_toxic: Decimal = Decimal("2.0")
     defensive_multiplier: Decimal = Decimal("0.5")
 
 

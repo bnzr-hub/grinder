@@ -33,28 +33,28 @@ def _alloc() -> PortfolioBudgetAllocator:
 
 
 class TestBaseRiskByRegime:
-    def test_good_normal_3pct(self) -> None:
+    def test_good_normal_6pct(self) -> None:
         snap = _alloc().compute(_inp(regime=MarketRegime.GOOD))
-        assert snap.base_risk_pct == Decimal("3.0")
+        assert snap.base_risk_pct == Decimal("6.0")
+        assert snap.effective_risk_pct == Decimal("6.0")
+        assert snap.per_symbol_risk_budget_usd == Decimal("60.0")
+
+    def test_neutral_normal_3pct(self) -> None:
+        snap = _alloc().compute(_inp(regime=MarketRegime.NEUTRAL))
         assert snap.effective_risk_pct == Decimal("3.0")
         assert snap.per_symbol_risk_budget_usd == Decimal("30.0")
 
-    def test_neutral_normal_2pct(self) -> None:
-        snap = _alloc().compute(_inp(regime=MarketRegime.NEUTRAL))
+    def test_toxic_normal_2pct(self) -> None:
+        snap = _alloc().compute(_inp(regime=MarketRegime.TOXIC))
         assert snap.effective_risk_pct == Decimal("2.0")
         assert snap.per_symbol_risk_budget_usd == Decimal("20.0")
-
-    def test_toxic_normal_1pct(self) -> None:
-        snap = _alloc().compute(_inp(regime=MarketRegime.TOXIC))
-        assert snap.effective_risk_pct == Decimal("1.0")
-        assert snap.per_symbol_risk_budget_usd == Decimal("10.0")
 
 
 class TestDayModeModifier:
     def test_defensive_halves_risk(self) -> None:
         snap = _alloc().compute(_inp(regime=MarketRegime.GOOD, day_mode=DayRiskMode.DEFENSIVE))
-        assert snap.effective_risk_pct == Decimal("1.5")
-        assert snap.per_symbol_risk_budget_usd == Decimal("15.0")
+        assert snap.effective_risk_pct == Decimal("3.0")
+        assert snap.per_symbol_risk_budget_usd == Decimal("30.0")
 
     def test_stop_for_day_zero_risk(self) -> None:
         snap = _alloc().compute(_inp(day_mode=DayRiskMode.STOP_FOR_DAY))

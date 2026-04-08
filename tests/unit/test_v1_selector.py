@@ -157,23 +157,23 @@ class TestPrefilterV1:
 class TestPrefilterAdaptiveSpacing:
     def test_below_min_spacing_excluded(self) -> None:
         """Symbol with NATR producing spacing < 50 bps is rejected."""
-        # NATR=0.9% → spacing=45 bps < 50 → rejected
+        # NATR=1.5% → spacing=45 bps (1.5 * 30) < 50 → rejected
         # Must lower natr_5m_min so LOW_NATR_5M doesn't shadow the spacing gate
         eligible, _skipped = prefilter_v1(
             ["LOW"],
             {"LOW": _tuned("LOW")},
-            {"LOW": _feat("LOW", natr="0.9")},
+            {"LOW": _feat("LOW", natr="1.5")},
             natr_5m_min=Decimal("0.5"),  # lower NATR floor so spacing gate fires
         )
         assert eligible == []
         assert _skipped["LOW"] == SkipReason.GRID_SPACING_BELOW_MIN
 
-    def test_at_boundary_natr_1pct_passes(self) -> None:
-        """NATR=1.0% → spacing=50 bps → exactly at boundary → passes."""
+    def test_at_boundary_passes(self) -> None:
+        """NATR=1.67% → spacing=50.1 bps → just above boundary → passes."""
         eligible, _skipped = prefilter_v1(
             ["BOUNDARY"],
             {"BOUNDARY": _tuned("BOUNDARY")},
-            {"BOUNDARY": _feat("BOUNDARY", natr="1.0")},
+            {"BOUNDARY": _feat("BOUNDARY", natr="1.67")},
         )
         assert eligible == ["BOUNDARY"]
 
