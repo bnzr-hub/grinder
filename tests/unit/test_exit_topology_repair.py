@@ -292,7 +292,10 @@ class TestBudgetPrioritizesExchangeExits:
         actual = frozenset({"g-X-2", "g-X-3"})
 
         desired = compute_desired_exits(
-            exits, registry.get, Decimal("78.4"), actual_exit_cids=actual,
+            exits,
+            registry.get,
+            Decimal("78.4"),
+            actual_exit_cids=actual,
         )
 
         # Budget=78.4 fits exactly 2 exits. On-exchange exits (2,3) get priority.
@@ -313,7 +316,10 @@ class TestBudgetPrioritizesExchangeExits:
         actual = frozenset({"g-X-2"})
 
         desired = compute_desired_exits(
-            exits, registry.get, Decimal("78.4"), actual_exit_cids=actual,
+            exits,
+            registry.get,
+            Decimal("78.4"),
+            actual_exit_cids=actual,
         )
 
         # Budget=78.4 fits both. On-exchange exit-2 first, then exit-1.
@@ -330,7 +336,10 @@ class TestBudgetPrioritizesExchangeExits:
         actual_cids = frozenset({"g-X-2", "g-X-3"})
 
         desired = compute_desired_exits(
-            exits, registry.get, Decimal("78.4"), actual_exit_cids=actual_cids,
+            exits,
+            registry.get,
+            Decimal("78.4"),
+            actual_exit_cids=actual_cids,
         )
         result = compute_exit_topology_repair(desired, set(actual_cids))
 
@@ -348,7 +357,9 @@ class TestBudgetPrioritizesExchangeExits:
         registry = {"exit-2": "g-X-2"}
 
         desired = compute_desired_exits(
-            exits, registry.get, Decimal("78.4"),
+            exits,
+            registry.get,
+            Decimal("78.4"),
         )
 
         # Without actual_exit_cids, SM order preserved: exit-1 first

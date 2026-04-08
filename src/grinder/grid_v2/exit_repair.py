@@ -121,8 +121,12 @@ def compute_desired_exits(
         candidates.append((eo, cid))
 
     if actual_exit_cids is not None:
-        on_exchange = [(eo, cid) for eo, cid in candidates if cid is not None and cid in actual_exit_cids]
-        not_on_exchange = [(eo, cid) for eo, cid in candidates if cid is None or cid not in actual_exit_cids]
+        on_exchange = [
+            (eo, cid) for eo, cid in candidates if cid is not None and cid in actual_exit_cids
+        ]
+        not_on_exchange = [
+            (eo, cid) for eo, cid in candidates if cid is None or cid not in actual_exit_cids
+        ]
         ordered = on_exchange + not_on_exchange
     else:
         ordered = candidates

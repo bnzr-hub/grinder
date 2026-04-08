@@ -5715,11 +5715,15 @@ class LiveEngineV0:
 
         frozen_actual = frozenset(actual_exit_cids)
         desired_sell = compute_desired_exits(
-            sell_exits, bridge.adapter.registry.cid_for_exit, sell_budget,
+            sell_exits,
+            bridge.adapter.registry.cid_for_exit,
+            sell_budget,
             actual_exit_cids=frozen_actual,
         )
         desired_buy = compute_desired_exits(
-            buy_exits, bridge.adapter.registry.cid_for_exit, buy_budget,
+            buy_exits,
+            bridge.adapter.registry.cid_for_exit,
+            buy_budget,
             actual_exit_cids=frozen_actual,
         )
         desired = desired_sell + desired_buy
