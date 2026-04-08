@@ -533,16 +533,22 @@ class TestOrphanFixRankingChurn:
         # Cycle 1: BTCUSDT admitted and activated
         report1 = loop.run_cycle()
         assert "BTCUSDT" in report1.admitted
-        # Simulate engine start in registry
+        # Simulate engine start: register in execution registry + apply activation
+        # in controller (as the host would do after real engine startup)
         reg.register("BTCUSDT", engine_ref="e1")
         reg.transition("BTCUSDT", EngineState.ACTIVE)
+        loop.orchestrator.controller.apply_activation("BTCUSDT")
         activated.clear()
 
-        # Cycle 2: ranker now prefers ETHUSDT only
-        loop._ranker_fn = lambda syms: sorted(syms, key=lambda s: s != "ETHUSDT")  # type: ignore[assignment]
-        report2 = loop.run_cycle()
+        # Cycle 2: ranker now prefers ETHUSDT only.
+        # BTCUSDT is non-flat so controller keeps it in GRACEFUL_EXIT_ONLY
+        # (not fully deactivated in one cycle).
+        from grinder.rotation.controller import SymbolFacts as SF  # noqa: PLC0415
 
-        # No safety_block from orphan
+        loop.ranker_fn = lambda syms: sorted(syms, key=lambda s: s != "ETHUSDT")  # type: ignore[assignment]
+        report2 = loop.run_cycle(facts={"BTCUSDT": SF(is_flat=False)})
+
+        # No safety_block from orphan — BTCUSDT stays controller-owned
         assert report2.execution_report is not None
         assert "safety_block" not in (report2.execution_report.skipped_reason or "")
 
