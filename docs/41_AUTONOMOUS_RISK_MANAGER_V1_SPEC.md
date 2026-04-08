@@ -215,9 +215,9 @@ They do not require full live hot-reconfiguration of existing engine geometry.
 
 Recommended v1 defaults:
 
-- `symbol_risk_pct_good = 3%`
-- `symbol_risk_pct_neutral = 2%`
-- `symbol_risk_pct_toxic = 1%`
+- `symbol_risk_pct_good = 6%`
+- `symbol_risk_pct_neutral = 3%`
+- `symbol_risk_pct_toxic = 2%`
 - `portfolio_live_risk_cap_pct = 6%`
 
 Note:
