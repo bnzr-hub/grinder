@@ -575,6 +575,10 @@ class LiveEngineV0:
         self._force_reduce_reason: str = ""
         self._force_reduce_flat_logged: bool = False
         self._force_reduce_exits_cleared: bool = False
+        # Forced-flat: symbol-scoped emergency close at adverse level 20.
+        # Stronger than force-reduce — cancels orders + market-closes position.
+        self._forced_flat_requested: bool = False
+        self._forced_flat_executed: bool = False
         # Min-notional cache: symbol → Decimal. Loaded from constraint provider at init.
         # Used by pre-send notional gate to block sub-minimum orders before HTTP.
         # Only loaded when operator_symbols are set (autonomous/production path).
@@ -3090,14 +3094,18 @@ class LiveEngineV0:
             )
             self._regime_registry.publish(snapshot.symbol, rd.regime, rd.reason, rd.confidence)
 
-        # Adverse grid level trigger: FORCE_REDUCE at 16th adverse level
+        # Adverse grid level trigger: FORCE_REDUCE at 16, FORCED_FLAT at 20
         if (
             self._grid_v2_started
             and self._grid_v2_bridge is not None
-            and not self._force_reduce_requested
+            and not self._forced_flat_requested
             and self._grid_v2_bridge.state_machine is not None
         ):
             self._check_adverse_level_trigger(snapshot)
+
+        # Execute forced-flat if requested (symbol-scoped emergency close)
+        if self._forced_flat_requested and not self._forced_flat_executed:
+            self._execute_forced_flat(snapshot)
 
         # PR-338: Defer paper engine during FSM startup states (INIT/READY).
         # Paper engine mutates internal state via NoOp port; if run before ACTIVE,
@@ -3982,11 +3990,66 @@ class LiveEngineV0:
         )
         return True
 
-    def _check_adverse_level_trigger(self, snapshot: Snapshot) -> None:
-        """Check if price has breached the force-reduce adverse level.
+    def request_forced_flat(self, reason: str = "") -> bool:
+        """Request forced-flat mode. Idempotent — returns True on first request.
 
-        Uses live grid geometry to compute the 16th adverse level threshold.
-        Triggers force-reduce if breached. Idempotent. Fail-open on errors.
+        Stronger than force-reduce: cancels all symbol orders and market-closes
+        position using EmergencyExitExecutor. No staged unload — direct flatten.
+        """
+        if self._forced_flat_requested:
+            return False
+        self._forced_flat_requested = True
+        # Also ensure force-reduce is set (ladder escalation)
+        if not self._force_reduce_requested:
+            self._force_reduce_requested = True
+            self._force_reduce_reason = reason
+        logger.critical(
+            "ENGINE_FORCED_FLAT_REQUESTED symbols=%s reason=%s",
+            self._operator_symbols,
+            reason or "unspecified",
+        )
+        return True
+
+    def _execute_forced_flat(self, snapshot: Snapshot) -> None:
+        """Execute symbol-scoped forced-flat: cancel orders + market close."""
+        if self._forced_flat_executed:
+            return
+
+        symbol = snapshot.symbol
+        executor = self._emergency_exit_executor
+        if executor is None:
+            logger.error(
+                "FORCED_FLAT_NO_EXECUTOR symbol=%s reason=emergency_exit_not_configured",
+                symbol,
+            )
+            return
+
+        logger.critical("FORCED_FLAT_EXECUTING symbol=%s", symbol)
+        result = executor.execute(
+            ts_ms=snapshot.ts,
+            reason="ADVERSE_LEVEL_20_FORCED_FLAT",
+            symbols=[symbol],
+        )
+        self._forced_flat_executed = True
+        if result.success:
+            logger.info(
+                "FORCED_FLAT_CONFIRMED symbol=%s cancelled=%d closed=%d",
+                symbol,
+                result.orders_cancelled,
+                result.market_orders_placed,
+            )
+        else:
+            logger.error(
+                "FORCED_FLAT_PARTIAL symbol=%s remaining=%d",
+                symbol,
+                result.positions_remaining,
+            )
+
+    def _check_adverse_level_trigger(self, snapshot: Snapshot) -> None:
+        """Check if price has breached force-reduce (16) or forced-flat (20) adverse levels.
+
+        Uses live grid geometry. Checks level 20 first (stronger overrides softer).
+        Idempotent. Fail-open on errors.
         """
         import contextlib  # noqa: PLC0415
 
@@ -4009,35 +4072,59 @@ class LiveEngineV0:
         mode = sm.mode
 
         if mode == BranchMode.FLAT:
-            return  # no adverse direction when flat
+            return
 
         side = "LONG" if mode == BranchMode.LONG_BRANCH else "SHORT"
         ref_price = sm.snapshot.entry_window.reference_price
         step_pct = bridge._config.grid_step_pct
         tick = bridge._config.price_tick_size
 
-        threshold = compute_adverse_threshold(
-            ref_price,
-            step_pct,
-            tick,
-            adverse_level=DEFAULT_GRID_POLICY.force_reduce_trigger_level,
-            side=side,
-        )
-        if threshold is None:
-            return
-
-        if is_adverse_level_breached(snapshot.mid_price, threshold, side):
-            logger.warning(
-                "GRID_ADVERSE_LEVEL_BREACHED symbol=%s level=%d price=%s threshold=%s side=%s",
-                snapshot.symbol,
-                DEFAULT_GRID_POLICY.force_reduce_trigger_level,
-                snapshot.mid_price,
-                threshold,
-                side,
+        # Check level 20 (FORCED_FLAT) first — stronger overrides softer
+        if not self._forced_flat_requested:
+            flat_threshold = compute_adverse_threshold(
+                ref_price,
+                step_pct,
+                tick,
+                adverse_level=DEFAULT_GRID_POLICY.forced_flat_trigger_level,
+                side=side,
             )
-            # Graceful exit first, then force-reduce
-            self.force_graceful_exit(snapshot.symbol)
-            self.request_force_reduce(reason="ADVERSE_LEVEL_16")
+            if flat_threshold is not None and is_adverse_level_breached(
+                snapshot.mid_price, flat_threshold, side
+            ):
+                logger.critical(
+                    "GRID_ADVERSE_LEVEL_BREACHED symbol=%s level=%d price=%s threshold=%s side=%s",
+                    snapshot.symbol,
+                    DEFAULT_GRID_POLICY.forced_flat_trigger_level,
+                    snapshot.mid_price,
+                    flat_threshold,
+                    side,
+                )
+                self.force_graceful_exit(snapshot.symbol)
+                self.request_forced_flat(reason="ADVERSE_LEVEL_20")
+                return
+
+        # Check level 16 (FORCE_REDUCE)
+        if not self._force_reduce_requested:
+            reduce_threshold = compute_adverse_threshold(
+                ref_price,
+                step_pct,
+                tick,
+                adverse_level=DEFAULT_GRID_POLICY.force_reduce_trigger_level,
+                side=side,
+            )
+            if reduce_threshold is not None and is_adverse_level_breached(
+                snapshot.mid_price, reduce_threshold, side
+            ):
+                logger.warning(
+                    "GRID_ADVERSE_LEVEL_BREACHED symbol=%s level=%d price=%s threshold=%s side=%s",
+                    snapshot.symbol,
+                    DEFAULT_GRID_POLICY.force_reduce_trigger_level,
+                    snapshot.mid_price,
+                    reduce_threshold,
+                    side,
+                )
+                self.force_graceful_exit(snapshot.symbol)
+                self.request_force_reduce(reason="ADVERSE_LEVEL_16")
 
     def force_graceful_exit(self, symbol: str) -> bool:
         """Force a symbol into graceful-exit-only mode (operator/ceremony use).
