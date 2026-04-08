@@ -64,7 +64,6 @@ These protections are useful, but they do **not** yet form a single autonomous r
 
 Missing today:
 
-- daily profit-lock / trailing giveback stop
 - account-wide day/session modes
 - portfolio allocator for up to 5 concurrent symbols
 - formal per-symbol campaign risk budget
@@ -112,7 +111,6 @@ The following runtime primitives already exist and should be reused:
 
 The following are **not** yet first-class autonomous runtime capabilities:
 
-- day/session profit-lock manager
 - day stop / resume policy
 - portfolio-wide live risk allocator across up to 5 symbols
 - risk-budget-driven grid admissibility
@@ -196,8 +194,9 @@ They do not require full live hot-reconfiguration of existing engine geometry.
 - `max_active_symbols = 5`
 - `max_leverage = 5`
 - `daily_loss_limit_pct = 12%`
-- `daily_profit_lock_trigger_pct = 3%`
-- `daily_profit_giveback_pct = 1%`
+- `daily_profit_lock_trigger_pct = 3%` (DEFENSIVE mode)
+- `daily_profit_lock_arm_pct = 4%` (trailing lock arms)
+- `daily_profit_lock_trailing_fraction = 0.5` (floor = max(arm, peak * fraction))
 - `min_entry_levels = 15`
 
 ### 6.2 Dynamic policy inputs
@@ -368,22 +367,33 @@ Behavior:
 - reduce new symbol risk budgets
 - lower number of fresh activations if needed
 
+#### Profit lock armed
+
+Enter when:
+
+- `day_peak_pnl_pct >= +4%` (profit lock arm threshold)
+
+Note: DEFENSIVE triggers at +3%, but profit lock does not arm until +4%.
+This separates the mode transition from the trailing lock mechanism.
+
 #### STOP_FOR_DAY by profit lock
 
 Define:
 
-- `profit_lock_floor_pct = max(3%, day_peak_pnl_pct - 1%)`
+- `profit_lock_floor_pct = max(4%, day_peak_pnl_pct * 0.5)`
 
 Enter `STOP_FOR_DAY` when:
 
-- `day_peak_pnl_pct >= +3%`
+- profit lock is armed (peak reached +4%)
 - and `day_pnl_pct <= profit_lock_floor_pct`
 
-Example:
+Examples:
 
-- day reaches `+4%`
-- lock floor becomes `+3%`
-- if PnL falls back to `+3%`, stop the day
+- peak `+4%` → floor `+4%` (stop if PnL falls to +4%)
+- peak `+6%` → floor `+4%` (max(4%, 3%) = 4%)
+- peak `+8%` → floor `+4%` (max(4%, 4%) = 4%)
+- peak `+10%` → floor `+5%` (max(4%, 5%) = 5%)
+- peak `+14%` → floor `+7%` (max(4%, 7%) = 7%)
 
 #### STOP_FOR_DAY by loss
 
@@ -684,7 +694,7 @@ Responsibilities:
 
 - track day start equity
 - track day peak equity
-- compute day PnL and giveback
+- compute day PnL and trailing profit lock floor
 - emit day mode
 
 ### 15.2 `PortfolioBudgetAllocator`
@@ -852,7 +862,7 @@ The v1 autonomous risk manager is complete only when all of the following are tr
 
 1. Runtime can trade up to 5 concurrent symbols without exceeding portfolio risk or leverage caps.
 2. Daily loss hard stop works deterministically.
-3. Daily profit-lock / giveback stop works deterministically.
+3. Daily trailing profit lock stop works deterministically.
 4. Per-symbol risk budget is explicitly computed and observable.
 5. Grid order size is derived from risk budget, not independently hand-tuned notional alone.
 6. Symbols that fail exchange-minimum-vs-risk checks are rejected as `NO_GO`.
