@@ -5091,3 +5091,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Add `hydrate_from_snapshot()` to PositionLedger (same pattern as EventLedger) and call it in the engine sync path before comparison. Idempotent: existing entries with newer WS event_ts are not overwritten.
 - **Invariant:** Position truth converges on first sync cycle when snapshot has non-zero positions. Repeated syncs are idempotent. WS events with newer timestamps always take precedence.
 - **Consequences:** `POSITION_MISSING_IN_LEDGER` no longer persists. Position trust bootstraps from snapshot. Exit topology repair gets correct budget data. Grid reconstruction continues after fills.
+
+### ADR-166: Budget-prioritize exchange exits over stale deferred exits (2026-04-08)
+
+- **Problem:** Live canary showed `GRID_V2_EXIT_TOPOLOGY_REPAIR_REREGISTERED ... status=BLOCKED`. Root cause: `compute_desired_exits()` allocated budget in SM order, giving priority to an old unregistered (lost) exit over two exits already placed on exchange. The stale exit consumed budget at the topology level, then the DEFERRED re-register/re-place path hit `REDUCE_ONLY_BUDGET_EXCEEDED` at the action level because exchange exits already covered the full closeable position.
+- **Root cause:** Budget allocation in `compute_desired_exits()` was SM-order-first, not exchange-reality-first. When the oldest lot's exit was lost, it got budget priority over actually-placed exits.
+- **Decision:** Add `actual_exit_cids` parameter to `compute_desired_exits()`. When provided, two-pass budget allocation: exits already on exchange get budget first, then remaining exits. This prevents stale deferred exits from consuming budget that is already occupied by live exchange orders.
+- **Invariant:** Exits on exchange always get budget priority. Unregistered exits only get budget if room remains after on-exchange exits are accounted for. Backwards compatible: without `actual_exit_cids`, SM ordering is preserved.
+- **Consequences:** Stale DEFERRED exits are cut at topology level when budget is full, eliminating the BLOCKED re-place path. Exit maintenance converges from current exchange truth, not stale repair history.

@@ -89,6 +89,7 @@ def compute_desired_exits(
     sm_exit_orders: list[ExitOrder],
     registry_cid_lookup: Callable[[str], str | None],
     closeable_budget: Decimal | None = None,
+    actual_exit_cids: frozenset[str] | None = None,
 ) -> list[DesiredExit]:
     """Compute desired legal exit topology from SM state.
 
@@ -97,24 +98,47 @@ def compute_desired_exits(
         registry_cid_lookup: callable(exit_order_id) -> cid | None.
         closeable_budget: If set, total desired exit qty capped at this.
             Exits are kept in original order (SM determines priority).
+        actual_exit_cids: EXIT CIDs currently on exchange. When provided,
+            budget allocation prioritizes exits that are already placed
+            on exchange over unregistered/missing exits. This prevents
+            stale deferred exits from consuming budget that is already
+            occupied by live exchange orders.
 
     Returns:
         List of DesiredExit representing the legal target topology.
     """
     from grinder.grid_v2.state import ExitOrderStatus  # noqa: PLC0415
 
-    desired: list[DesiredExit] = []
-    total_qty = Decimal(0)
-
+    # Two-pass budget allocation when actual_exit_cids is provided:
+    # Pass 1: exits already on exchange (guaranteed budget)
+    # Pass 2: remaining exits (only if budget remains)
+    # Without actual_exit_cids, single-pass (backwards compatible).
+    candidates: list[tuple[ExitOrder, str | None]] = []
     for eo in sm_exit_orders:
         if eo.status != ExitOrderStatus.OPEN:
             continue
+        cid = registry_cid_lookup(eo.exit_order_id)
+        candidates.append((eo, cid))
+
+    if actual_exit_cids is not None:
+        on_exchange = [
+            (eo, cid) for eo, cid in candidates if cid is not None and cid in actual_exit_cids
+        ]
+        not_on_exchange = [
+            (eo, cid) for eo, cid in candidates if cid is None or cid not in actual_exit_cids
+        ]
+        ordered = on_exchange + not_on_exchange
+    else:
+        ordered = candidates
+
+    desired: list[DesiredExit] = []
+    total_qty = Decimal(0)
+
+    for eo, cid in ordered:
         qty = eo.qty
-        # Budget constraint: if total would exceed closeable, skip this exit
         if closeable_budget is not None and total_qty + qty > closeable_budget:
             continue
         total_qty += qty
-        cid = registry_cid_lookup(eo.exit_order_id)
         desired.append(
             DesiredExit(
                 exit_order_id=eo.exit_order_id,

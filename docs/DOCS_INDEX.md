@@ -79,6 +79,8 @@ If documents conflict, trust order is:
 - `docs/40_EXECUTION_PLANE_IMPLEMENTATION_PLAN.md` — phased implementation plan for execution-plane (converts doc 39 into PR chain)
 - `docs/41_AUTONOMOUS_RISK_MANAGER_V1_SPEC.md` — candidate autonomous capital/risk manager architecture
 - `docs/42_AUTONOMOUS_RISK_REMEDIATION_SPEC.md` — active remediation contract for removing legacy/manual autonomous risk fallbacks
+- `docs/43_GRID_RUNTIME_V2_ARCHITECTURE_AUDIT.md` — candidate architecture audit for simplifying live grid runtime into a WS-first exchange-backed desired-state model
+- `docs/44_INCREMENTAL_GRID_SIMPLIFICATION_PLAN.md` — recommended low-risk plan for simplifying live grid maintenance via exit-first diff logic, explicit inflight tracking, and staged repair cleanup
 
 ---
 
