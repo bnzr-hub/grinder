@@ -5703,15 +5703,8 @@ class LiveEngineV0:
             else None
         )
 
-        desired_sell = compute_desired_exits(
-            sell_exits, bridge.adapter.registry.cid_for_exit, sell_budget
-        )
-        desired_buy = compute_desired_exits(
-            buy_exits, bridge.adapter.registry.cid_for_exit, buy_budget
-        )
-        desired = desired_sell + desired_buy
-
-        # Compute actual exit CIDs from exchange
+        # Compute actual exit CIDs from exchange (needed before desired-exit
+        # computation so budget allocation prioritizes already-placed exits).
         actual_exit_cids: set[str] = set()
         for o in snapshot.open_orders:  # type: ignore[attr-defined]
             if o.symbol != sym:
@@ -5719,6 +5712,17 @@ class LiveEngineV0:
             parsed = bridge.adapter.parse_cid(o.order_id)
             if parsed is not None and parsed.kind.value == "EXIT":
                 actual_exit_cids.add(o.order_id)
+
+        frozen_actual = frozenset(actual_exit_cids)
+        desired_sell = compute_desired_exits(
+            sell_exits, bridge.adapter.registry.cid_for_exit, sell_budget,
+            actual_exit_cids=frozen_actual,
+        )
+        desired_buy = compute_desired_exits(
+            buy_exits, bridge.adapter.registry.cid_for_exit, buy_budget,
+            actual_exit_cids=frozen_actual,
+        )
+        desired = desired_sell + desired_buy
 
         # Determine trigger
         trigger = RepairTrigger.SYNC_DRIFT

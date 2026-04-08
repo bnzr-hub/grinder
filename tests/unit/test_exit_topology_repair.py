@@ -270,3 +270,87 @@ class TestMixedSideBudgeting:
 
         assert len(desired_sell) == 0  # SELL suppressed
         assert len(desired_buy) == 1  # BUY allowed
+
+
+class TestBudgetPrioritizesExchangeExits:
+    """Regression: budget must prioritize exits already on exchange.
+
+    Live canary showed: 3 lots (39.2 each), position=78.4, budget=78.4.
+    Oldest lot's exit was lost (unregistered). Budget was consumed by
+    the unregistered exit first (SM ordering), leaving no room for it
+    on exchange. The stale DEFERRED re-place hit BLOCKED.
+    """
+
+    def test_exchange_exits_get_budget_priority(self) -> None:
+        """On-exchange exits consume budget before unregistered ones."""
+        exits = [
+            _exit("exit-1", "lot-1", qty="39.2"),  # oldest, lost/unregistered
+            _exit("exit-2", "lot-2", qty="39.2"),  # on exchange
+            _exit("exit-3", "lot-3", qty="39.2"),  # on exchange
+        ]
+        registry = {"exit-2": "g-X-2", "exit-3": "g-X-3"}  # exit-1 not registered
+        actual = frozenset({"g-X-2", "g-X-3"})
+
+        desired = compute_desired_exits(
+            exits, registry.get, Decimal("78.4"), actual_exit_cids=actual,
+        )
+
+        # Budget=78.4 fits exactly 2 exits. On-exchange exits (2,3) get priority.
+        # Unregistered exit-1 is cut — no stale DEFERRED that would be BLOCKED.
+        assert len(desired) == 2
+        desired_eids = {d.exit_order_id for d in desired}
+        assert "exit-2" in desired_eids
+        assert "exit-3" in desired_eids
+        assert "exit-1" not in desired_eids
+
+    def test_unregistered_exit_included_when_budget_allows(self) -> None:
+        """Unregistered exit is desired when budget has room."""
+        exits = [
+            _exit("exit-1", "lot-1", qty="39.2"),  # unregistered
+            _exit("exit-2", "lot-2", qty="39.2"),  # on exchange
+        ]
+        registry = {"exit-2": "g-X-2"}
+        actual = frozenset({"g-X-2"})
+
+        desired = compute_desired_exits(
+            exits, registry.get, Decimal("78.4"), actual_exit_cids=actual,
+        )
+
+        # Budget=78.4 fits both. On-exchange exit-2 first, then exit-1.
+        assert len(desired) == 2
+
+    def test_no_deferred_when_budget_fully_covered(self) -> None:
+        """With budget-priority, the stale exit doesn't become DEFERRED."""
+        exits = [
+            _exit("exit-1", "lot-1", qty="39.2"),  # unregistered
+            _exit("exit-2", "lot-2", qty="39.2"),  # on exchange
+            _exit("exit-3", "lot-3", qty="39.2"),  # on exchange
+        ]
+        registry = {"exit-2": "g-X-2", "exit-3": "g-X-3"}
+        actual_cids = frozenset({"g-X-2", "g-X-3"})
+
+        desired = compute_desired_exits(
+            exits, registry.get, Decimal("78.4"), actual_exit_cids=actual_cids,
+        )
+        result = compute_exit_topology_repair(desired, set(actual_cids))
+
+        # No DEFERRED actions — the stale exit was cut at budget level
+        deferred = [a for a in result.actions if a.action_type == "DEFERRED"]
+        assert len(deferred) == 0
+        assert result.is_converged
+
+    def test_backwards_compatible_without_actual_cids(self) -> None:
+        """Without actual_exit_cids, SM ordering is preserved (old behavior)."""
+        exits = [
+            _exit("exit-1", "lot-1", qty="39.2"),  # unregistered, SM first
+            _exit("exit-2", "lot-2", qty="39.2"),  # registered
+        ]
+        registry = {"exit-2": "g-X-2"}
+
+        desired = compute_desired_exits(
+            exits, registry.get, Decimal("78.4"),
+        )
+
+        # Without actual_exit_cids, SM order preserved: exit-1 first
+        assert len(desired) == 2
+        assert desired[0].exit_order_id == "exit-1"
