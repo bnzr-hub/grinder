@@ -274,14 +274,14 @@ class TuningRefresher:
                 self._bridge.set_symbol_spacing(sym, compute_adaptive_spacing_bps(natr_val))
 
     def _update_equity(self) -> None:
-        """Fetch account equity and gross exposure, push to bridge. Fail-open."""
+        """Fetch canonical risk base and gross exposure, push to bridge. Fail-open."""
         from grinder.runtime.account_truth import (  # noqa: PLC0415
-            fetch_futures_equity,
+            fetch_futures_risk_base,
             fetch_futures_gross_exposure,
         )
 
         testnet = not getattr(self._args, "mainnet", False)
-        equity = fetch_futures_equity(testnet=testnet)
+        equity = fetch_futures_risk_base(testnet=testnet)
         if equity is not None and equity > 0:
             self._bridge.update_equity(equity)
         gross = fetch_futures_gross_exposure(testnet=testnet)

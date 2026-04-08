@@ -53,11 +53,11 @@ def _derive_bootstrap_symbol_risk_budget(*, testnet: bool) -> Decimal | None:
     """Derive bootstrap/refresher symbol risk budget from real exchange truth."""
     from grinder.risk.autonomous_risk_budget import derive_autonomous_portfolio_snapshot  # noqa: PLC0415
     from grinder.runtime.account_truth import (  # noqa: PLC0415
-        fetch_futures_equity,
+        fetch_futures_risk_base,
         fetch_futures_gross_exposure,
     )
 
-    equity = fetch_futures_equity(testnet=testnet)
+    equity = fetch_futures_risk_base(testnet=testnet)
     gross_exposure = fetch_futures_gross_exposure(testnet=testnet)
     if equity is None or equity <= _ZERO or gross_exposure is None:
         logger.warning(

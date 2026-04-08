@@ -1,7 +1,8 @@
 """Exchange-account truth helpers for autonomous runtime.
 
 Shared by bootstrap tuning and tuning refresher so autonomous sizing can
-derive from the same real exchange/account facts instead of legacy defaults.
+derive from the same canonical exchange/account facts instead of legacy
+defaults or ad-hoc balance semantics.
 """
 
 from __future__ import annotations
@@ -14,6 +15,13 @@ import time
 import urllib.request
 from decimal import Decimal
 from typing import Any
+
+from grinder.risk.risk_base import (
+    BalanceData,
+    RiskBaseConfig,
+    RiskBaseMode,
+    build_risk_base_snapshot,
+)
 
 
 def compute_gross_exposure_from_positions(positions: list[dict[str, Any]]) -> Decimal:
@@ -47,24 +55,54 @@ def _signed_get(path: str, *, testnet: bool) -> Any:
         return json.loads(resp.read())
 
 
-def fetch_futures_equity(*, testnet: bool) -> Decimal | None:
-    """Fetch USDT futures equity from Binance REST.
+def _risk_base_config_from_env() -> RiskBaseConfig:
+    """Read canonical risk-base mode from env with runtime-compatible defaults."""
+    mode_raw = os.environ.get("GRINDER_RISK_BASE_MODE", "total_margin_balance").strip().lower()
+    mode = RiskBaseMode(mode_raw) if mode_raw else RiskBaseMode.TOTAL_MARGIN_BALANCE
+    min_usd = float(os.environ.get("GRINDER_RISK_BASE_MIN_USD", "50"))
+    stale_ttl_s = int(os.environ.get("GRINDER_RISK_BASE_STALE_TTL_S", "30"))
+    max_age_hard_s = int(os.environ.get("GRINDER_RISK_BASE_MAX_AGE_HARD_S", "60"))
+    return RiskBaseConfig(
+        mode=mode,
+        min_usd=min_usd,
+        stale_ttl_s=stale_ttl_s,
+        max_age_hard_s=max_age_hard_s,
+    )
 
-    Returns wallet balance + unrealized PnL for USDT, matching total margin
-    balance semantics used by the autonomous risk loop.
+
+def fetch_futures_risk_base(*, testnet: bool) -> Decimal | None:
+    """Fetch canonical futures risk base from Binance REST.
+
+    Uses the same balance fields and env-driven mode contract as runtime
+    risk-base plumbing, so bootstrap/refresher sizing stays aligned with
+    live risk semantics.
     """
     try:
-        data = _signed_get("/fapi/v2/balance", testnet=testnet)
-        if not isinstance(data, list):
+        data = _signed_get("/fapi/v2/account", testnet=testnet)
+        if not isinstance(data, dict):
             return None
-        for asset in data:
-            if asset.get("asset") == "USDT":
-                wallet = Decimal(str(asset.get("crossWalletBalance", "0")))
-                upnl = Decimal(str(asset.get("crossUnPnl", "0")))
-                return wallet + upnl
+        balance = BalanceData(
+            total_margin_balance=Decimal(str(data.get("totalMarginBalance", "0"))),
+            wallet_balance=Decimal(str(data.get("totalWalletBalance", "0"))),
+            available_balance=Decimal(str(data.get("availableBalance", "0"))),
+            ts_ms=int(time.time() * 1000),
+        )
+        snapshot = build_risk_base_snapshot(
+            balance=balance,
+            config=_risk_base_config_from_env(),
+            now_ms=int(time.time() * 1000),
+        )
+        if snapshot is None:
+            return None
+        return snapshot.value_usd
     except Exception:
         return None
     return None
+
+
+def fetch_futures_equity(*, testnet: bool) -> Decimal | None:
+    """Backward-compatible alias for canonical autonomous risk base fetch."""
+    return fetch_futures_risk_base(testnet=testnet)
 
 
 def fetch_futures_gross_exposure(*, testnet: bool) -> Decimal | None:

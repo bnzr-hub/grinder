@@ -41,7 +41,7 @@ class TestBootstrapRiskTruth:
     def test_derive_bootstrap_symbol_risk_budget_uses_real_equity_and_gross(self) -> None:
         with (
             patch(
-                "grinder.runtime.account_truth.fetch_futures_equity",
+                "grinder.runtime.account_truth.fetch_futures_risk_base",
                 return_value=Decimal("1000"),
             ),
             patch(
@@ -99,6 +99,22 @@ class TestBootstrapRiskTruth:
         assert captured["max_position_usd"] == Decimal("20")
         assert sizes["BTCUSDT"] == "0.01"
         assert results["BTCUSDT"].max_position_notional_usd == Decimal("95.23")
+
+    def test_fetch_futures_risk_base_honors_wallet_balance_mode(self) -> None:
+        from grinder.runtime.account_truth import fetch_futures_risk_base
+
+        payload = {
+            "totalMarginBalance": "1000",
+            "totalWalletBalance": "900",
+            "availableBalance": "800",
+        }
+        with (
+            patch.dict("os.environ", {"GRINDER_RISK_BASE_MODE": "wallet_balance"}, clear=False),
+            patch("grinder.runtime.account_truth._signed_get", return_value=payload),
+        ):
+            risk_base = fetch_futures_risk_base(testnet=True)
+
+        assert risk_base == Decimal("900")
 
 
 class TestSelectorManualCapRemoval:
