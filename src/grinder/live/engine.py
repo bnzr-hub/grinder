@@ -3986,8 +3986,14 @@ class LiveEngineV0:
         """Check if price has breached the force-reduce adverse level.
 
         Uses live grid geometry to compute the 16th adverse level threshold.
-        Triggers force-reduce if breached. Idempotent.
+        Triggers force-reduce if breached. Idempotent. Fail-open on errors.
         """
+        import contextlib  # noqa: PLC0415
+
+        with contextlib.suppress(Exception):
+            self._check_adverse_level_trigger_inner(snapshot)
+
+    def _check_adverse_level_trigger_inner(self, snapshot: Snapshot) -> None:
         from grinder.grid_v2.state import BranchMode  # noqa: PLC0415
         from grinder.risk.adverse_trigger import (  # noqa: PLC0415
             compute_adverse_threshold,
