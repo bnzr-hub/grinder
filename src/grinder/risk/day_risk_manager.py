@@ -2,11 +2,10 @@
 
 Implements day-level PnL tracking and mode transitions per spec §9:
 - NORMAL → DEFENSIVE at +3% day PnL
-- DEFENSIVE → STOP_FOR_DAY on profit giveback breach
+- Profit lock armed at +4% day peak PnL
+- STOP_FOR_DAY when PnL falls to trailing floor = max(4%, peak * 0.5)
 - Any → STOP_FOR_DAY on -12% day loss
 - STOP_FOR_DAY is latched within a session (reset on new day)
-
-Shadow-only in PR-B: no execution behavior change.
 """
 
 from __future__ import annotations
@@ -31,10 +30,18 @@ class DayRiskMode(Enum):
 
 @dataclass(frozen=True)
 class DayRiskConfig:
-    """Day risk thresholds (spec §6.1)."""
+    """Day risk thresholds (spec §6.1).
+
+    profit_lock_trigger_pct: day PnL % that triggers DEFENSIVE mode.
+    profit_lock_arm_pct: day peak PnL % that arms the trailing profit lock.
+    profit_lock_trailing_fraction: fraction of peak PnL used for trailing floor.
+        Floor = max(profit_lock_arm_pct, day_peak_pnl_pct * trailing_fraction).
+    daily_loss_limit_pct: hard day loss stop (highest priority).
+    """
 
     profit_lock_trigger_pct: Decimal = Decimal("3.0")
-    profit_giveback_pct: Decimal = Decimal("1.0")
+    profit_lock_arm_pct: Decimal = Decimal("4.0")
+    profit_lock_trailing_fraction: Decimal = Decimal("0.5")
     daily_loss_limit_pct: Decimal = Decimal("12.0")
 
 
@@ -149,19 +156,25 @@ class DayRiskManager:
         if day_pnl_pct >= cfg.profit_lock_trigger_pct and self._mode == DayRiskMode.NORMAL:
             self._transition(DayRiskMode.DEFENSIVE, pnl=day_pnl_pct)
 
-        # Profit lock path (only after DEFENSIVE has been entered)
-        if day_peak_pnl_pct >= cfg.profit_lock_trigger_pct and self._profit_lock_armed:
-            floor = max(cfg.profit_lock_trigger_pct, day_peak_pnl_pct - cfg.profit_giveback_pct)
+        # Profit lock path (only after lock is armed)
+        if self._profit_lock_armed:
+            floor = max(
+                cfg.profit_lock_arm_pct,
+                day_peak_pnl_pct * cfg.profit_lock_trailing_fraction,
+            )
             if day_pnl_pct <= floor:
                 self._transition(
                     DayRiskMode.STOP_FOR_DAY, reason="profit_lock", pnl=day_pnl_pct, floor=floor
                 )
                 return self._snapshot(equity)
 
-        # Arm profit lock after first DEFENSIVE transition
-        if day_peak_pnl_pct >= cfg.profit_lock_trigger_pct and not self._profit_lock_armed:
+        # Arm profit lock when peak reaches arm threshold
+        if day_peak_pnl_pct >= cfg.profit_lock_arm_pct and not self._profit_lock_armed:
             self._profit_lock_armed = True
-            floor = max(cfg.profit_lock_trigger_pct, day_peak_pnl_pct - cfg.profit_giveback_pct)
+            floor = max(
+                cfg.profit_lock_arm_pct,
+                day_peak_pnl_pct * cfg.profit_lock_trailing_fraction,
+            )
             logger.info(
                 "DAY_PROFIT_LOCK_ARMED floor_pct=%s peak_pnl_pct=%s", floor, day_peak_pnl_pct
             )
@@ -203,8 +216,8 @@ class DayRiskManager:
         day_peak_pnl_pct = (self._equity_day_peak - start) / start * _HUNDRED
         cfg = self._config
         floor = (
-            max(cfg.profit_lock_trigger_pct, day_peak_pnl_pct - cfg.profit_giveback_pct)
-            if day_peak_pnl_pct >= cfg.profit_lock_trigger_pct
+            max(cfg.profit_lock_arm_pct, day_peak_pnl_pct * cfg.profit_lock_trailing_fraction)
+            if day_peak_pnl_pct >= cfg.profit_lock_arm_pct
             else _ZERO
         )
         return DayRiskState(
