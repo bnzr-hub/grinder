@@ -95,6 +95,41 @@ class TestComputeThreshold:
         # But step is from reference (100.001), step_price=1.01, threshold=83.84
         assert t == Decimal("83.84")
 
+    def test_level_20_long(self) -> None:
+        """Level 20 adverse threshold for LONG branch."""
+        t = compute_adverse_threshold(
+            reference_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            adverse_level=20,
+            side="LONG",
+        )
+        # step=1.00, threshold = 100 - 1.00*20 = 80
+        assert t == Decimal("80.00")
+
+    def test_level_20_short(self) -> None:
+        """Level 20 adverse threshold for SHORT branch."""
+        t = compute_adverse_threshold(
+            reference_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            adverse_level=20,
+            side="SHORT",
+        )
+        # step=1.00, threshold = 100 + 1.00*20 = 120
+        assert t == Decimal("120.00")
+
+    def test_level_20_deeper_than_16(self) -> None:
+        """Level 20 threshold is more extreme than level 16."""
+        t16 = compute_adverse_threshold(
+            Decimal("100"), Decimal("0.01"), Decimal("0.01"), 16, "LONG"
+        )
+        t20 = compute_adverse_threshold(
+            Decimal("100"), Decimal("0.01"), Decimal("0.01"), 20, "LONG"
+        )
+        assert t20 is not None and t16 is not None
+        assert t20 < t16  # LONG: lower = more adverse
+
     def test_deterministic(self) -> None:
         args = (Decimal("100"), Decimal("0.01"), Decimal("0.01"), 16, "LONG")
         assert compute_adverse_threshold(*args) == compute_adverse_threshold(*args)

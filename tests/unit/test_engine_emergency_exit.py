@@ -122,8 +122,12 @@ class TestEngineEmergencyExit:
         engine = _make_engine(port, dd_guard, fsm_driver)
         assert engine._emergency_exit_executor is not None
 
-    def test_executor_not_created_when_disabled(self) -> None:
-        """Default (no env var) → executor is None."""
+    def test_executor_created_even_when_flag_disabled(self) -> None:
+        """Executor is always created when port supports it (for forced-flat).
+
+        Global emergency exit behavior is still gated by _emergency_exit_enabled,
+        but the executor exists for forced-flat adverse-level use.
+        """
         port = NoOpExchangePort()
         dd_config = DrawdownGuardV1Config(portfolio_dd_limit=Decimal("0.05"))
         dd_guard = DrawdownGuardV1(dd_config)
@@ -131,7 +135,9 @@ class TestEngineEmergencyExit:
         fsm_driver = FsmDriver(fsm)
 
         engine = _make_engine(port, dd_guard, fsm_driver)
-        assert engine._emergency_exit_executor is None
+        # Executor exists (for forced-flat) but global emergency is disabled
+        assert engine._emergency_exit_executor is not None
+        assert engine._emergency_exit_enabled is False
 
     @pytest.mark.usefixtures("_enable_emergency_exit")
     def test_full_chain_dd_to_paused(self) -> None:
