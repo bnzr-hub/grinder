@@ -43,6 +43,7 @@ def _bridge(
             max_order_notional_usd=Decimal("100"),
         )
         b.set_symbol_grid_config(sym, tick_size="0.01", step_size="0.001")
+        b.set_symbol_spacing(sym, Decimal("100"))  # 100 bps
     return b
 
 

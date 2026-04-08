@@ -34,6 +34,7 @@ class TestBridgeDefaultPort:
             max_order_notional_usd=Decimal("100"),
         )
         bridge.set_symbol_grid_config("BTCUSDT", tick_size="0.01", step_size="0.001")
+        bridge.set_symbol_spacing("BTCUSDT", Decimal("100"))
         handle = bridge.factory("BTCUSDT")
         try:
             assert handle.engine_ref is not None

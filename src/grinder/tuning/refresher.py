@@ -171,7 +171,6 @@ class TuningRefresher:
             ConstraintProviderConfig,
         )
         from grinder.risk.grid_policy import DEFAULT_GRID_POLICY  # noqa: PLC0415
-        from grinder.runtime.live_engine_bridge import BridgeConfig  # noqa: PLC0415
         from grinder.selector.spacing import compute_adaptive_spacing_bps  # noqa: PLC0415
         from grinder.tuning.solver import TuningSolverConfig, TuningStatus, solve  # noqa: PLC0415
 
@@ -196,8 +195,6 @@ class TuningRefresher:
         except Exception:
             constraints = {}
 
-        bridge_cfg = BridgeConfig()
-        static_spacing_pct = Decimal(str(bridge_cfg.spacing_bps)) / Decimal("10000")
         policy = DEFAULT_GRID_POLICY
 
         tuned_results: dict[str, Any] = {}
@@ -213,11 +210,11 @@ class TuningRefresher:
             if sc is None:
                 continue
 
+            # Fail-closed: skip symbol if NATR unavailable
             natr_val = natr_map.get(symbol)
-            if natr_val is not None:
-                spacing_pct = compute_adaptive_spacing_bps(natr_val) / Decimal("10000")
-            else:
-                spacing_pct = static_spacing_pct
+            if natr_val is None:
+                continue
+            spacing_pct = compute_adaptive_spacing_bps(natr_val) / Decimal("10000")
 
             config = TuningSolverConfig(
                 max_position_usd=symbol_risk_budget,
