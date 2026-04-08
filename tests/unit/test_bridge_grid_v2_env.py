@@ -32,6 +32,7 @@ def _bridge_with_tuned_symbol(
         max_inventory_notional_usd=Decimal("250"),
         max_order_notional_usd=Decimal("250"),
     )
+    bridge.set_symbol_spacing(symbol, Decimal("100"))
     return bridge
 
 
