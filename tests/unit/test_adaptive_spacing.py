@@ -12,27 +12,29 @@ from grinder.selector.spacing import (
 
 
 class TestComputeAdaptiveSpacingBps:
-    def test_natr_1pct(self) -> None:
-        assert compute_adaptive_spacing_bps(Decimal("1.0")) == Decimal("50")
-
     def test_natr_2pct(self) -> None:
-        assert compute_adaptive_spacing_bps(Decimal("2.0")) == Decimal("100")
+        # 2.0 * 30 = 60
+        assert compute_adaptive_spacing_bps(Decimal("2.0")) == Decimal("60")
 
     def test_natr_3pct(self) -> None:
-        assert compute_adaptive_spacing_bps(Decimal("3.0")) == Decimal("150")
+        # 3.0 * 30 = 90
+        assert compute_adaptive_spacing_bps(Decimal("3.0")) == Decimal("90")
 
-    def test_natr_0_9pct(self) -> None:
-        assert compute_adaptive_spacing_bps(Decimal("0.9")) == Decimal("45")
+    def test_natr_1_67pct_boundary(self) -> None:
+        # 1.67 * 30 = 50.1 → just above min_spacing floor
+        assert compute_adaptive_spacing_bps(Decimal("1.67")) > DEFAULT_MIN_SPACING_BPS
 
-    def test_natr_1_5pct(self) -> None:
-        assert compute_adaptive_spacing_bps(Decimal("1.5")) == Decimal("75")
+    def test_natr_1_5pct_below_floor(self) -> None:
+        # 1.5 * 30 = 45 → below min_spacing floor
+        assert compute_adaptive_spacing_bps(Decimal("1.5")) < DEFAULT_MIN_SPACING_BPS
 
     def test_natr_zero(self) -> None:
         assert compute_adaptive_spacing_bps(Decimal("0")) == Decimal("0")
 
     def test_decimal_precision(self) -> None:
         result = compute_adaptive_spacing_bps(Decimal("1.33"))
-        assert result == Decimal("66.50")
+        # 1.33 * 30 = 39.90
+        assert result == Decimal("39.90")
 
 
 class TestConstants:

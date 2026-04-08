@@ -1,25 +1,30 @@
 """Adaptive grid spacing policy for symbol selection.
 
 SSOT for computing grid spacing from market volatility (NATR).
-Used by selector prefilter and (in future PR B) by tuning/bridge.
+Used by selector prefilter, tuning solver, refresher, and bridge.
 
 Formula:
-    spacing_bps = natr_percent * 50
+    spacing_bps = natr_percent * 30
 
 Tradability rule:
     spacing_bps >= 50 bps (reject, not clamp)
 
+Effective NATR gate:
+    With multiplier=30 and min_spacing=50, symbols need NATR >= 1.67%
+    to pass the spacing tradability check. This intentionally narrows
+    the universe to sufficiently volatile symbols.
+
 Examples:
-    NATR 1.0% → 50 bps  (boundary — passes)
-    NATR 2.0% → 100 bps
-    NATR 3.0% → 150 bps
+    NATR 1.67% → 50 bps  (boundary — passes)
+    NATR 2.0%  → 60 bps
+    NATR 3.0%  → 90 bps
 """
 
 from __future__ import annotations
 
 from decimal import Decimal
 
-SPACING_NATR_MULTIPLIER = Decimal("50")
+SPACING_NATR_MULTIPLIER = Decimal("30")
 
 # Minimum adaptive spacing for grid tradability
 DEFAULT_MIN_SPACING_BPS = Decimal("50")
