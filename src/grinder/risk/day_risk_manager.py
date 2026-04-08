@@ -3,7 +3,7 @@
 Implements day-level PnL tracking and mode transitions per spec §9:
 - NORMAL → DEFENSIVE at +3% day PnL
 - DEFENSIVE → STOP_FOR_DAY on profit giveback breach
-- Any → STOP_FOR_DAY on -10% day loss
+- Any → STOP_FOR_DAY on -12% day loss
 - STOP_FOR_DAY is latched within a session (reset on new day)
 
 Shadow-only in PR-B: no execution behavior change.
@@ -35,7 +35,7 @@ class DayRiskConfig:
 
     profit_lock_trigger_pct: Decimal = Decimal("3.0")
     profit_giveback_pct: Decimal = Decimal("1.0")
-    daily_loss_limit_pct: Decimal = Decimal("10.0")
+    daily_loss_limit_pct: Decimal = Decimal("12.0")
 
 
 @dataclass(frozen=True)

@@ -39,10 +39,10 @@ class TestBaseRiskByRegime:
         assert snap.effective_risk_pct == Decimal("6.0")
         assert snap.per_symbol_risk_budget_usd == Decimal("60.0")
 
-    def test_neutral_normal_3pct(self) -> None:
+    def test_neutral_normal_4pct(self) -> None:
         snap = _alloc().compute(_inp(regime=MarketRegime.NEUTRAL))
-        assert snap.effective_risk_pct == Decimal("3.0")
-        assert snap.per_symbol_risk_budget_usd == Decimal("30.0")
+        assert snap.effective_risk_pct == Decimal("4.0")
+        assert snap.per_symbol_risk_budget_usd == Decimal("40.0")
 
     def test_toxic_normal_2pct(self) -> None:
         snap = _alloc().compute(_inp(regime=MarketRegime.TOXIC))

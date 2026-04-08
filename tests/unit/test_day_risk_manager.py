@@ -11,7 +11,7 @@ from grinder.risk.day_risk_manager import (
 )
 
 
-def _mgr(trigger: str = "3.0", giveback: str = "1.0", loss: str = "10.0") -> DayRiskManager:
+def _mgr(trigger: str = "3.0", giveback: str = "1.0", loss: str = "12.0") -> DayRiskManager:
     return DayRiskManager(
         config=DayRiskConfig(
             profit_lock_trigger_pct=Decimal(trigger),
@@ -94,17 +94,24 @@ class TestProfitLock:
 
 
 class TestLossLimit:
-    def test_stop_from_normal_at_minus_10(self) -> None:
+    def test_stop_from_normal_at_minus_12(self) -> None:
         m = _mgr()
         m.update(Decimal("100"))
-        state = m.update(Decimal("90"))
+        state = m.update(Decimal("88"))  # -12%
         assert state.mode == DayRiskMode.STOP_FOR_DAY
 
-    def test_stop_from_defensive_at_minus_10(self) -> None:
+    def test_no_stop_at_minus_11(self) -> None:
+        """11% loss not enough for 12% limit."""
+        m = _mgr()
+        m.update(Decimal("100"))
+        state = m.update(Decimal("89"))  # -11%
+        assert state.mode != DayRiskMode.STOP_FOR_DAY
+
+    def test_stop_from_defensive_at_minus_12(self) -> None:
         m = _mgr()
         m.update(Decimal("100"))
         m.update(Decimal("103.5"))
-        state = m.update(Decimal("90"))
+        state = m.update(Decimal("88"))  # -12%
         assert state.mode == DayRiskMode.STOP_FOR_DAY
 
 
@@ -112,7 +119,7 @@ class TestStopForDayLatched:
     def test_recovery_does_not_exit_stop(self) -> None:
         m = _mgr()
         m.update(Decimal("100"))
-        m.update(Decimal("90"))
+        m.update(Decimal("88"))  # -12%
         assert m.mode == DayRiskMode.STOP_FOR_DAY
         state = m.update(Decimal("105"))
         assert state.mode == DayRiskMode.STOP_FOR_DAY
@@ -120,7 +127,7 @@ class TestStopForDayLatched:
     def test_multiple_updates_stay_latched(self) -> None:
         m = _mgr()
         m.update(Decimal("100"))
-        m.update(Decimal("90"))
+        m.update(Decimal("88"))
         for eq in [Decimal("95"), Decimal("100"), Decimal("110")]:
             state = m.update(eq)
             assert state.mode == DayRiskMode.STOP_FOR_DAY
@@ -154,7 +161,7 @@ class TestSessionRollover:
         """Session key change triggers full reset."""
         m = _mgr()
         m.update(Decimal("100"), session_key="2026-04-06")
-        m.update(Decimal("90"), session_key="2026-04-06")  # STOP_FOR_DAY
+        m.update(Decimal("88"), session_key="2026-04-06")  # STOP_FOR_DAY
         assert m.mode == DayRiskMode.STOP_FOR_DAY
 
         # New day → reset
@@ -166,7 +173,7 @@ class TestSessionRollover:
     def test_same_session_key_no_reset(self) -> None:
         m = _mgr()
         m.update(Decimal("100"), session_key="2026-04-06")
-        m.update(Decimal("90"), session_key="2026-04-06")
+        m.update(Decimal("88"), session_key="2026-04-06")
         assert m.mode == DayRiskMode.STOP_FOR_DAY
 
         # Same day → stays latched
@@ -177,7 +184,7 @@ class TestSessionRollover:
         """Explicit reset API works."""
         m = _mgr()
         m.update(Decimal("100"))
-        m.update(Decimal("90"))
+        m.update(Decimal("88"))
         assert m.mode == DayRiskMode.STOP_FOR_DAY
 
         m.reset_for_new_day(equity_start=Decimal("92"))
@@ -189,7 +196,7 @@ class TestSessionRollover:
         """After rollover, normal transitions work again."""
         m = _mgr()
         m.update(Decimal("100"), session_key="day1")
-        m.update(Decimal("90"), session_key="day1")  # STOP
+        m.update(Decimal("88"), session_key="day1")  # STOP
         assert m.is_stop_for_day()
 
         m.update(Decimal("200"), session_key="day2")  # new day, reset
