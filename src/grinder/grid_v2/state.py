@@ -870,16 +870,19 @@ class GridV2StateMachine:
                 if eo.status == ExitOrderStatus.OPEN:
                     exit_occupied.add(eo.price)
 
-            # ADR-110: Suppress replenish when inventory is already full.
+            # ADR-110 + ADR-170: Suppress replenish using headroom logic.
             # new_open is the lot count AFTER this exit fill removed one lot.
-            _inventory_has_room = len(new_open) < self._config.max_inventory_levels
+            # Headroom limits same-side entries to prevent burst overshoot.
+            _headroom = max(0, self._config.max_inventory_levels - len(new_open))
+            _inventory_has_room = _headroom > 0
 
             if snap.mode == BranchMode.LONG_BRANCH:
                 buy_prices = list(snap.entry_window.buy_entry_prices)
                 sell_prices = list(snap.entry_window.sell_entry_prices)
                 # One-sided: do NOT restore SELL entries in LONG_BRANCH.
                 # Opposite side stays empty until FLAT reseed.
-                if len(buy_prices) < self._config.entry_levels_per_side and _inventory_has_room:
+                _max_same_side = min(self._config.entry_levels_per_side, _headroom)
+                if len(buy_prices) < _max_same_side and _inventory_has_room:
                     next_price = (
                         buy_prices[0] + step_delta
                         if buy_prices
@@ -945,7 +948,8 @@ class GridV2StateMachine:
                 sell_prices = list(snap.entry_window.sell_entry_prices)
                 # One-sided: do NOT restore BUY entries in SHORT_BRANCH.
                 # Opposite side stays empty until FLAT reseed.
-                if len(sell_prices) < self._config.entry_levels_per_side and _inventory_has_room:
+                _max_same_side_s = min(self._config.entry_levels_per_side, _headroom)
+                if len(sell_prices) < _max_same_side_s and _inventory_has_room:
                     next_price = (
                         sell_prices[0] - step_delta
                         if sell_prices
