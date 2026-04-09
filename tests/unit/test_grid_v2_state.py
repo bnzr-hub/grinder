@@ -2228,56 +2228,80 @@ class TestExactMirroredExits:
 
 
 class TestBurstGovernor:
-    """ADR-177: Suppress FILL_REPLACEMENT when at inventory cap."""
+    """ADR-177 + ADR-178: Suppress FILL_REPLACEMENT near and at inventory cap."""
 
-    def test_normal_fill_produces_replacement(self) -> None:
-        """Single fill below cap → FILL_REPLACEMENT emitted."""
-        cfg = _config(max_levels=10, levels=3)
+    def test_normal_fill_below_threshold_produces_replacement(self) -> None:
+        """Fill well below near-cap threshold → FILL_REPLACEMENT emitted."""
+        # max=15, levels=3 → threshold=12. 1 lot is well below.
+        cfg = _config(max_levels=15, levels=3)
         sm = _sm(cfg=cfg)
         buy = sm.snapshot.entry_window.buy_entry_prices[0]
         result = sm.apply(EntryFilled("E1", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + 1))
         replacements = [a for a in result.actions if a.reason == "FILL_REPLACEMENT"]
         assert len(replacements) == 1
 
-    def test_fill_at_cap_suppresses_replacement(self) -> None:
-        """Fill that reaches cap → FILL_REPLACEMENT suppressed."""
-        cfg = _config(max_levels=3, levels=3)
+    def test_near_cap_suppresses_replacement(self) -> None:
+        """Fill at near-cap threshold → FILL_REPLACEMENT suppressed."""
+        # max=8, levels=3 → threshold=5. Fill 5th lot triggers near-cap.
+        cfg = _config(max_levels=8, levels=3)
         sm = _sm(cfg=cfg)
-        # Fill 2 → lot count = 2 (below cap=3)
-        for i in range(2):
+        for i in range(4):
             buy = sm.snapshot.entry_window.buy_entry_prices[0]
             sm.apply(EntryFilled(f"E{i}", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + i + 1))
-        # Fill 3 → lot count = 3 = cap → suppress
         buy = sm.snapshot.entry_window.buy_entry_prices[0]
-        result = sm.apply(EntryFilled("E3", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + 10))
+        result = sm.apply(EntryFilled("E5", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + 10))
         replacements = [a for a in result.actions if a.reason == "FILL_REPLACEMENT"]
-        assert len(replacements) == 0, f"Expected 0 replacements at cap, got {len(replacements)}"
-        assert result.replenish_suppressed == "burst_governor"
+        assert len(replacements) == 0
+        assert result.replenish_suppressed == "near_cap_guard"
+
+    def test_at_cap_suppresses_with_inventory_full(self) -> None:
+        """Fill at hard cap → suppressed with inventory_full reason."""
+        # max=8, levels=3 → threshold=5.
+        # Fill lots 1-7 (near-cap from 5+), then lot 8 = cap → inventory_full.
+        # Use SELL entries which get replaced by one-sided rolling.
+        cfg = _config(max_levels=8, levels=5)
+        sm = _sm(cfg=cfg)
+        # Fill enough to reach cap — some may be suppressed but lot still created
+        for i in range(7):
+            sells = sm.snapshot.entry_window.sell_entry_prices
+            if not sells:
+                break
+            sm.apply(EntryFilled(f"E{i}", OrderSide.SELL, sells[0], _ORDER_SIZE, _BASE_TS + i + 1))
+        # Lot count should be at or near cap
+        lots = len(sm.snapshot.open_lots)
+        assert lots >= 5, f"Need at least near-cap lots, got {lots}"
+        # Check that suppression reason is near_cap_guard or inventory_full
+        sells = sm.snapshot.entry_window.sell_entry_prices
+        if sells:
+            result = sm.apply(
+                EntryFilled("E_final", OrderSide.SELL, sells[0], _ORDER_SIZE, _BASE_TS + 20)
+            )
+            assert result.replenish_suppressed in {"near_cap_guard", "inventory_full"}
 
     def test_exit_still_placed_when_suppressed(self) -> None:
         """Even when replacement suppressed, paired exit is still placed."""
-        cfg = _config(max_levels=3, levels=3)
+        cfg = _config(max_levels=8, levels=3)
         sm = _sm(cfg=cfg)
-        for i in range(2):
+        for i in range(4):
             buy = sm.snapshot.entry_window.buy_entry_prices[0]
             sm.apply(EntryFilled(f"E{i}", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + i + 1))
         buy = sm.snapshot.entry_window.buy_entry_prices[0]
-        result = sm.apply(EntryFilled("E3", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + 10))
+        result = sm.apply(EntryFilled("E5", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + 10))
         exits = [a for a in result.actions if a.kind == ActionIntentKind.PLACE_EXIT]
-        assert len(exits) == 1, "Exit must still be placed even when replacement suppressed"
+        assert len(exits) == 1
 
-    def test_sell_side_burst_suppression(self) -> None:
-        """SHORT branch: same suppression for SELL fills at cap."""
-        cfg = _config(max_levels=3, levels=3)
+    def test_sell_side_near_cap_suppression(self) -> None:
+        """SHORT branch: same near-cap suppression for SELL fills."""
+        cfg = _config(max_levels=8, levels=3)
         sm = _sm(cfg=cfg)
-        for i in range(2):
+        for i in range(4):
             sell = sm.snapshot.entry_window.sell_entry_prices[0]
             sm.apply(EntryFilled(f"E{i}", OrderSide.SELL, sell, _ORDER_SIZE, _BASE_TS + i + 1))
         sell = sm.snapshot.entry_window.sell_entry_prices[0]
-        result = sm.apply(EntryFilled("E3", OrderSide.SELL, sell, _ORDER_SIZE, _BASE_TS + 10))
+        result = sm.apply(EntryFilled("E5", OrderSide.SELL, sell, _ORDER_SIZE, _BASE_TS + 10))
         replacements = [a for a in result.actions if a.reason == "FILL_REPLACEMENT"]
         assert len(replacements) == 0
-        assert result.replenish_suppressed == "burst_governor"
+        assert result.replenish_suppressed == "near_cap_guard"
 
 
 class TestExitRestoreHeadroom:

@@ -564,13 +564,23 @@ class GridV2StateMachine:
             last_recenter_ts=snap.last_recenter_ts,
         )
         result = self._commit(new_snapshot, tuple(actions))
-        # ADR-177: Tag burst suppression for observability
+        # ADR-177 + ADR-178: Tag suppression for observability
         lots_after = len(snap.open_lots) + 1
+        _near_cap = max(
+            cfg.entry_levels_per_side,
+            cfg.max_inventory_levels - cfg.entry_levels_per_side,
+        )
         if lots_after >= cfg.max_inventory_levels:
             result = TransitionResult(
                 snapshot=result.snapshot,
                 actions=result.actions,
-                replenish_suppressed="burst_governor",
+                replenish_suppressed="inventory_full",
+            )
+        elif lots_after >= _near_cap:
+            result = TransitionResult(
+                snapshot=result.snapshot,
+                actions=result.actions,
+                replenish_suppressed="near_cap_guard",
             )
         return result
 
@@ -698,12 +708,24 @@ class GridV2StateMachine:
         cfg = self._config
         actions: list[ActionIntent] = []
 
-        # ADR-177: Burst governor — suppress FILL_REPLACEMENT when inventory
-        # is at or near cap. Lots after this fill = current + 1 (lot not yet
-        # in snapshot). This prevents the hot-path snowball where each fill
-        # creates a new entry that immediately fills in trending markets.
+        # ADR-177 + ADR-178: Suppress FILL_REPLACEMENT under inventory pressure.
+        # Lots after this fill = current + 1 (lot not yet in snapshot).
+        # Near-cap guard: suppress when within entry_levels_per_side of cap.
+        # This stops the hot-path snowball earlier — not just at hard cap,
+        # but when the branch is already deep enough that further entries
+        # amplify risk faster than reconciler can contain.
         lots_after_fill = len(self._snapshot.open_lots) + 1
-        _burst_suppress = lots_after_fill >= cfg.max_inventory_levels
+        # Near-cap threshold: suppress when within one ladder's depth of cap.
+        # Minimum threshold = entry_levels_per_side to avoid suppressing
+        # trivially early in configs where max ≈ levels.
+        _near_cap_threshold = min(
+            cfg.max_inventory_levels,
+            max(
+                cfg.entry_levels_per_side,
+                cfg.max_inventory_levels - cfg.entry_levels_per_side,
+            ),
+        )
+        _burst_suppress = lots_after_fill >= _near_cap_threshold
 
         # Collect occupied prices to prevent collisions with exits/entries
         occupied = self._occupied_prices()
