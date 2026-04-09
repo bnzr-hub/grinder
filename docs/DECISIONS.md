@@ -5189,3 +5189,10 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Lower the suppression threshold from `max_inventory_levels` to `max_inventory_levels - entry_levels_per_side`. With defaults 15-5=10, FILL_REPLACEMENT suppresses at 10+ lots instead of 15. This means the last `entry_levels_per_side` lots worth of fills cannot self-amplify through the hot path.
 - **Invariant:** Below threshold (< 10 lots), normal rolling works. At/above threshold, only exits are placed, no new same-side entries from fill path. Reconciler can still restore entries after exits reduce lot count.
 - **Consequences:** Snowball weakened earlier. Cap overshoot further reduced. Normal calm trading below 10 lots unaffected.
+
+### ADR-179: Stale entry aging — retire old resting entries (2026-04-09)
+
+- **Problem:** Live canary showed old seed/rolling entries surviving 20+ minutes unchanged, then burst-filling when price revisited those levels. Multiple stale entries filling together triggered the same-side cascade that burst governor and near-cap guard exist to contain.
+- **Decision:** Add `_GRID_V2_STALE_ENTRY_TTL_S = 600` (10 min). On each account sync, parse entry CID timestamps from exchange-visible orders. If `now - cid.ts > TTL`, dispatch a cancel via `_process_action`. Reconciler will restore fresh topology on the next cycle.
+- **Invariant:** Recent entries (< 10 min) are never retired. Only exchange-visible entries with parseable grid_v2 CIDs are candidates. Cancels go through normal safety gates. No effect during AWAITING_SYNC.
+- **Consequences:** Old seed entries can no longer sit indefinitely and later burst-fill unchanged. The delayed-trigger burst scenario from MAGMA/RAVE is materially addressed at the source.
