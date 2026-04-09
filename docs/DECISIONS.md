@@ -5137,3 +5137,10 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Add structured observability fields: (1) `TransitionResult.reseed_suppressed` / `replenish_suppressed` in SM for fill-driven decisions, (2) `ReconcileResult.inventory_headroom` + inflight counts in reconciler, (3) enriched `GRID_V2_SYNC_RECONCILER` and `GRID_V2_FILL_PROCESSED` log lines with headroom/inflight/suppression data.
 - **Invariant:** No behavior change — observability only. Healthy steady-state logs remain low-noise (suppression fields empty when not triggered).
 - **Consequences:** Canary reviewer can distinguish normal inflight lag from true topology fault. Reseed cooldown and headroom suppression are explicitly visible in logs.
+
+### ADR-172: Unified corrective-action priority in sync reconciler (2026-04-09)
+
+- **Problem:** Reconciler actions were ordered by code layout, not by explicit safety priority. Under tight budget, entry cancels could consume slots before safety-critical exit corrections.
+- **Decision:** Reorder action emission into three explicit tiers: P1 exit safety (cancel extra exits, atomic exit reprice pairs), P2 entry cleanup (cancel extra/mispriced entries), P3 entry restoration (place missing/repriced entries). Each tier is self-contained with deterministic sub-ordering.
+- **Invariant:** Exit safety work always executes before entry work under budget pressure. Atomic exit reprice pairs remain unsplittable. Same input always produces same action sequence.
+- **Consequences:** Limited-budget cycles prioritize position protection over revenue restoration. No strategy behavior change — only ordering of already-detected corrections.

@@ -875,3 +875,86 @@ class TestPriceAwareExitReconciliation:
         r = reconcile_grid_state(snap, "BTCUSDT", bridge, max_actions=1)
         reprice = [a for a in r.actions if "REPRICE_EXIT" in a.reason]
         assert len(reprice) == 0
+
+
+class TestActionPriority:
+    """ADR-172: Safety-first priority — exit work before entry work."""
+
+    def test_exit_reprice_beats_entry_cancel_under_budget(self) -> None:
+        """Budget=2: mispriced exit pair wins over extra entry cancel."""
+        eo = _make_exit_order(
+            "eo1", price=Decimal("50250"), qty=Decimal("100"), side=OrderSide.SELL
+        )
+        bridge = _make_bridge(
+            buy_prices=(),
+            sell_prices=(),
+            exit_orders=(eo,),
+            tick_size=Decimal("0.10"),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            levels=0,
+        )
+        snap = _make_snapshot(
+            entry_orders={("BUY", "99.00"): "entry_extra"},
+            exit_orders_priced=[("exit_eo1", "SELL", "50200")],
+        )
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge, max_actions=2)
+        # Budget=2: exit reprice pair (cancel+place) should take priority
+        assert len(r.actions) == 2
+        assert r.actions[0].reason == "grid_v2_RECONCILE_REPRICE_EXIT_CANCEL"
+        assert r.actions[1].reason == "grid_v2_RECONCILE_REPRICE_EXIT_PLACE"
+
+    def test_extra_exit_cancel_before_entry_cancel(self) -> None:
+        """Budget=1: extra exit cancel wins over extra entry cancel."""
+        bridge = _make_bridge(
+            buy_prices=(),
+            sell_prices=(),
+            exit_orders=(),
+            tick_size=Decimal("0.10"),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            levels=0,
+        )
+        snap = _make_snapshot(
+            entry_orders={("BUY", "99.00"): "entry_extra"},
+            exit_cids=["exit_orphan"],
+        )
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge, max_actions=1)
+        assert len(r.actions) == 1
+        assert r.actions[0].reason == "grid_v2_RECONCILE_CANCEL_EXIT"
+
+    def test_entry_work_proceeds_when_exit_clean(self) -> None:
+        """No exit work needed → entry restoration gets budget."""
+        bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"),),
+            sell_prices=(),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=1,
+        )
+        snap = _make_snapshot()
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge, max_actions=1)
+        assert len(r.actions) == 1
+        assert r.actions[0].reason == "grid_v2_RECONCILE_PLACE_ENTRY"
+
+    def test_deterministic_same_input(self) -> None:
+        """Same input always produces identical action order."""
+        eo = _make_exit_order(
+            "eo1", price=Decimal("50250"), qty=Decimal("100"), side=OrderSide.SELL
+        )
+        bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"),),
+            sell_prices=(),
+            exit_orders=(eo,),
+            tick_size=Decimal("0.10"),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            levels=1,
+        )
+        snap = _make_snapshot(
+            exit_orders_priced=[("exit_eo1", "SELL", "50200")],
+        )
+        r1 = reconcile_grid_state(snap, "BTCUSDT", bridge, max_actions=10)
+        r2 = reconcile_grid_state(snap, "BTCUSDT", bridge, max_actions=10)
+        assert r1.actions == r2.actions

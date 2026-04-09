@@ -343,40 +343,17 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
             m for m in geometry_exit_mismatches if m[3] not in pending_exit_cancel_cids
         ]
 
-    # --- Build actions: CANCEL first, then PLACE (deterministic order) ---
+    # --- Build actions: safety-first priority order (ADR-172) ---
+    # Priority tiers:
+    #   P1: Exit safety — cancel wrong/extra exits, atomic exit reprice pairs
+    #   P2: Entry cleanup — cancel extra/mispriced entries
+    #   P3: Entry restoration — place missing/repriced entries
     actions: list[ExecutionAction] = []
     budget = max_actions
 
-    for side, price in sorted(extra_entries, key=lambda x: (x[0].value, x[1])):
-        if len(actions) >= budget:
-            break
-        entry_cid = actual_entry_by_key.get((side, price))
-        if entry_cid is None:
-            continue  # inflight-only entry, not on exchange — skip cancel
-        actions.append(
-            ExecutionAction(
-                action_type=ActionType.CANCEL,
-                order_id=entry_cid,
-                symbol=symbol,
-                reason="grid_v2_RECONCILE_CANCEL_ENTRY",
-            )
-        )
+    # --- P1: Exit safety (highest priority) ---
 
-    for _side, _expected_price, _actual_price, cid in sorted(
-        geometry_entry_mismatches,
-        key=lambda x: (x[0].value, x[1], x[2], x[3]),
-    ):
-        if len(actions) >= budget:
-            break
-        actions.append(
-            ExecutionAction(
-                action_type=ActionType.CANCEL,
-                order_id=cid,
-                symbol=symbol,
-                reason="grid_v2_RECONCILE_REPRICE_ENTRY_CANCEL",
-            )
-        )
-
+    # P1a: Cancel extra exits
     for cid in sorted(extra_exits):
         if len(actions) >= budget:
             break
@@ -389,8 +366,7 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
             )
         )
 
-    # Exit geometry: atomic cancel+place for mispriced exits (safety-first,
-    # must not split across budget boundaries — exit correction before entry work)
+    # P1b: Atomic exit reprice (cancel+place together, never split)
     for side, expected_price, _actual_price, cid in sorted(
         geometry_exit_mismatches,
         key=lambda x: (x[0].value, x[1], x[2], x[3]),
@@ -418,6 +394,43 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
             )
         )
 
+    # --- P2: Entry cleanup ---
+
+    # P2a: Cancel extra entries
+    for side, price in sorted(extra_entries, key=lambda x: (x[0].value, x[1])):
+        if len(actions) >= budget:
+            break
+        entry_cid = actual_entry_by_key.get((side, price))
+        if entry_cid is None:
+            continue  # inflight-only entry, not on exchange — skip cancel
+        actions.append(
+            ExecutionAction(
+                action_type=ActionType.CANCEL,
+                order_id=entry_cid,
+                symbol=symbol,
+                reason="grid_v2_RECONCILE_CANCEL_ENTRY",
+            )
+        )
+
+    # P2b: Cancel mispriced entries
+    for _side, _expected_price, _actual_price, cid in sorted(
+        geometry_entry_mismatches,
+        key=lambda x: (x[0].value, x[1], x[2], x[3]),
+    ):
+        if len(actions) >= budget:
+            break
+        actions.append(
+            ExecutionAction(
+                action_type=ActionType.CANCEL,
+                order_id=cid,
+                symbol=symbol,
+                reason="grid_v2_RECONCILE_REPRICE_ENTRY_CANCEL",
+            )
+        )
+
+    # --- P3: Entry restoration (lowest priority) ---
+
+    # P3a: Place missing entries
     for side, price in sorted(missing_entries, key=lambda x: (x[0].value, x[1])):
         if len(actions) >= budget:
             break
@@ -435,6 +448,7 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
             )
         )
 
+    # P3b: Place repriced entries
     for side, expected_price, _actual_price, _cid in sorted(
         geometry_entry_mismatches,
         key=lambda x: (x[0].value, x[1], x[2], x[3]),
