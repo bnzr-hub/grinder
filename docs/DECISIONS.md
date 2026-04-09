@@ -5174,3 +5174,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Remove the exit spacing guard entirely. Each lot now preserves its exact mirrored exit price (`entry ± step`, tick-quantized). Same-price or near-price exits are allowed — Binance supports multiple reduce-only orders at the same price, and CID-based tracking already handles ownership.
 - **Invariant:** `exit_price = entry_price ± one_grid_step` (after tick quantization). No additional outward shift. No cascade drift.
 - **Consequences:** Strategy geometry matches configured grid step. Exits are placed at their intended prices. Unwind speed returns to design expectations. Reconciler desired/actual comparison becomes semantically correct.
+
+### ADR-177: Burst governor for fill-driven rolling entries (2026-04-09)
+
+- **Problem:** Live canary showed cascading snowball: each same-side fill emitted `FILL_REPLACEMENT` entry, which immediately filled in trending market, creating the next replacement — 10+ fills in seconds, breaching inventory cap. MAGMAUSDT reached 20 lots (cap=15), RAVEUSDT reached 16 lots.
+- **Root cause:** `_update_window_after_fill()` had no inventory gate. Fill-driven `FILL_REPLACEMENT` entries were placed unconditionally regardless of current lot count. Reconciler headroom only applied on sync cycles, not in the hot fill path.
+- **Decision:** Add `_burst_suppress` check in `_update_window_after_fill()`: if `lots_after_fill >= max_inventory_levels`, suppress `FILL_REPLACEMENT`. The fill's exit and opposite-side trim still happen normally — only the new same-side entry placement is suppressed.
+- **Invariant:** Normal rolling works when below cap. Burst suppression activates at cap boundary. Startup seed and reseed paths unaffected. Tagged via `replenish_suppressed="burst_governor"` for observability.
+- **Consequences:** Hot-path snowball is bounded at inventory cap. Trending market fills stop self-amplifying once cap is reached.

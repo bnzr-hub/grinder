@@ -2227,6 +2227,59 @@ class TestExactMirroredExits:
             )
 
 
+class TestBurstGovernor:
+    """ADR-177: Suppress FILL_REPLACEMENT when at inventory cap."""
+
+    def test_normal_fill_produces_replacement(self) -> None:
+        """Single fill below cap → FILL_REPLACEMENT emitted."""
+        cfg = _config(max_levels=10, levels=3)
+        sm = _sm(cfg=cfg)
+        buy = sm.snapshot.entry_window.buy_entry_prices[0]
+        result = sm.apply(EntryFilled("E1", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + 1))
+        replacements = [a for a in result.actions if a.reason == "FILL_REPLACEMENT"]
+        assert len(replacements) == 1
+
+    def test_fill_at_cap_suppresses_replacement(self) -> None:
+        """Fill that reaches cap → FILL_REPLACEMENT suppressed."""
+        cfg = _config(max_levels=3, levels=3)
+        sm = _sm(cfg=cfg)
+        # Fill 2 → lot count = 2 (below cap=3)
+        for i in range(2):
+            buy = sm.snapshot.entry_window.buy_entry_prices[0]
+            sm.apply(EntryFilled(f"E{i}", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + i + 1))
+        # Fill 3 → lot count = 3 = cap → suppress
+        buy = sm.snapshot.entry_window.buy_entry_prices[0]
+        result = sm.apply(EntryFilled("E3", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + 10))
+        replacements = [a for a in result.actions if a.reason == "FILL_REPLACEMENT"]
+        assert len(replacements) == 0, f"Expected 0 replacements at cap, got {len(replacements)}"
+        assert result.replenish_suppressed == "burst_governor"
+
+    def test_exit_still_placed_when_suppressed(self) -> None:
+        """Even when replacement suppressed, paired exit is still placed."""
+        cfg = _config(max_levels=3, levels=3)
+        sm = _sm(cfg=cfg)
+        for i in range(2):
+            buy = sm.snapshot.entry_window.buy_entry_prices[0]
+            sm.apply(EntryFilled(f"E{i}", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + i + 1))
+        buy = sm.snapshot.entry_window.buy_entry_prices[0]
+        result = sm.apply(EntryFilled("E3", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + 10))
+        exits = [a for a in result.actions if a.kind == ActionIntentKind.PLACE_EXIT]
+        assert len(exits) == 1, "Exit must still be placed even when replacement suppressed"
+
+    def test_sell_side_burst_suppression(self) -> None:
+        """SHORT branch: same suppression for SELL fills at cap."""
+        cfg = _config(max_levels=3, levels=3)
+        sm = _sm(cfg=cfg)
+        for i in range(2):
+            sell = sm.snapshot.entry_window.sell_entry_prices[0]
+            sm.apply(EntryFilled(f"E{i}", OrderSide.SELL, sell, _ORDER_SIZE, _BASE_TS + i + 1))
+        sell = sm.snapshot.entry_window.sell_entry_prices[0]
+        result = sm.apply(EntryFilled("E3", OrderSide.SELL, sell, _ORDER_SIZE, _BASE_TS + 10))
+        replacements = [a for a in result.actions if a.reason == "FILL_REPLACEMENT"]
+        assert len(replacements) == 0
+        assert result.replenish_suppressed == "burst_governor"
+
+
 class TestExitRestoreHeadroom:
     """ADR-170: EXIT_RESTORE respects headroom near inventory cap."""
 
