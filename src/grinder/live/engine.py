@@ -2359,15 +2359,25 @@ class LiveEngineV0:
             expected_entry_keys.add((OrderSide.BUY, bridge._quantize_price(p, OrderSide.BUY)))
         for p in sm.snapshot.entry_window.sell_entry_prices:
             expected_entry_keys.add((OrderSide.SELL, bridge._quantize_price(p, OrderSide.SELL)))
-        inventory_full = (
-            sm.mode != BranchMode.FLAT
-            and len(sm.snapshot.open_lots) >= bridge._config.max_inventory_levels
-        )
+        # Headroom-aware entry suppression: reduce same-side entries as
+        # inventory approaches cap. Mirrors reconciler headroom logic.
         target_entry_keys = set(expected_entry_keys)
-        if inventory_full:
-            # Safety: when inventory cap is reached, do not replenish/maintain
-            # branch entries from integrity repair. Let exits reduce exposure first.
-            target_entry_keys = set()
+        if sm.mode != BranchMode.FLAT:
+            lots_open = len(sm.snapshot.open_lots)
+            max_inv = bridge._config.max_inventory_levels
+            headroom = max(0, max_inv - lots_open)
+            if headroom == 0:
+                target_entry_keys = set()
+            elif headroom < bridge._config.entry_levels_per_side:
+                branch_side = OrderSide.BUY if sm.mode == BranchMode.LONG_BRANCH else OrderSide.SELL
+                ref = sm.snapshot.entry_window.reference_price
+                same_side = sorted(
+                    [(s, p) for s, p in target_entry_keys if s == branch_side],
+                    key=lambda k: abs(k[1] - ref),
+                )
+                if len(same_side) > headroom:
+                    to_remove = set(same_side[headroom:])
+                    target_entry_keys -= to_remove
         expected_entries = len(target_entry_keys)
 
         # EXIT integrity: expected exits from lot ledger
@@ -4957,11 +4967,21 @@ class LiveEngineV0:
                 _desired_keys.add(
                     (OrderSide.SELL, self._grid_v2_bridge._quantize_price(_p, OrderSide.SELL))
                 )
-            if (
-                _sm.mode != BranchMode.FLAT
-                and len(_sm.snapshot.open_lots) >= self._grid_v2_bridge._config.max_inventory_levels
-            ):
-                _desired_keys = set()  # inventory full → no desired entries
+            if _sm.mode != BranchMode.FLAT:
+                _lots = len(_sm.snapshot.open_lots)
+                _max = self._grid_v2_bridge._config.max_inventory_levels
+                _hr = max(0, _max - _lots)
+                if _hr == 0:
+                    _desired_keys = set()
+                elif _hr < self._grid_v2_bridge._config.entry_levels_per_side:
+                    _bs = OrderSide.BUY if _sm.mode == BranchMode.LONG_BRANCH else OrderSide.SELL
+                    _ref = _sm.snapshot.entry_window.reference_price
+                    _ss = sorted(
+                        [(s, p) for s, p in _desired_keys if s == _bs],
+                        key=lambda k: abs(k[1] - _ref),
+                    )
+                    if len(_ss) > _hr:
+                        _desired_keys -= set(_ss[_hr:])
 
             _actual_keys: set[tuple[OrderSide, Decimal]] = set()
             for _o in result.snapshot.open_orders:
