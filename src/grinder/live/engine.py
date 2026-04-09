@@ -4864,7 +4864,10 @@ class LiveEngineV0:
                 gen = self._account_sync_generation + 1  # gen about to be set
                 expired: list[str] = []
                 for cid, dispatch_gen in list(self._grid_v2_pending_place_cids.items()):
-                    if cid in visible_cids or (gen - dispatch_gen) >= _GRID_V2_PENDING_PLACE_STALE_GENS:
+                    if (
+                        cid in visible_cids
+                        or (gen - dispatch_gen) >= _GRID_V2_PENDING_PLACE_STALE_GENS
+                    ):
                         expired.append(cid)
                 if expired:
                     for cid in expired:
