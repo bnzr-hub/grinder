@@ -2215,8 +2215,7 @@ class TestExitRestoreHeadroom:
             )
         )
         # With headroom=2 and existing buy entries, restore should be limited
-        places = [a for a in result.actions if a.kind == ActionIntentKind.PLACE_ENTRY]
-        buy_entries_after = len(sm.snapshot.entry_window.buy_entry_prices)
+        buy_entries_after = len(result.snapshot.entry_window.buy_entry_prices)
         # buy entries should not exceed headroom
         assert buy_entries_after <= 2, (
             f"Expected <= 2 buy entries (headroom=2), got {buy_entries_after}"
@@ -2237,7 +2236,7 @@ class TestExitRestoreHeadroom:
         assert len(sm.snapshot.open_lots) == 5
         # Exit one → 4 lots, headroom=1
         exit_eo = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
-        result = sm.apply(
+        r = sm.apply(
             ExitFilled(
                 exit_order_id=exit_eo.exit_order_id,
                 lot_id=exit_eo.lot_id,
@@ -2246,7 +2245,7 @@ class TestExitRestoreHeadroom:
                 ts=_BASE_TS + 100,
             )
         )
-        buy_entries_after = len(sm.snapshot.entry_window.buy_entry_prices)
+        buy_entries_after = len(r.snapshot.entry_window.buy_entry_prices)
         assert buy_entries_after <= 1, (
             f"Expected <= 1 buy entry (headroom=1), got {buy_entries_after}"
         )
