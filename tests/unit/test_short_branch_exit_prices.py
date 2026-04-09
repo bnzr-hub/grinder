@@ -222,14 +222,15 @@ class TestCollisionGuardStillWorks:
         sm.apply(EntryFilled("e2", OrderSide.SELL, Decimal("102"), Decimal("1"), 2002))
 
         exits = {eo.lot_id: eo.price for eo in sm.snapshot.exit_orders}
-        # x1: raw 99.99, no collision
-        # x2: raw 100.98, too close to 99.99 (0.99 < 1.00), shifted twice to 98.98
+        # ADR-176: exits preserve exact mirrored price, no collision shift.
+        # x1: entry 101 → exit at 101*(1-0.01) = 99.99
+        # x2: entry 102 → exit at 102*(1-0.01) = 100.98 (exact mirror, not shifted)
         assert exits["lot-e1"] == Decimal("99.99"), f"x1={exits['lot-e1']}"
-        assert exits["lot-e2"] == Decimal("98.98"), f"x2={exits['lot-e2']}"
-        # Verify both are tick-aligned and properly spaced
+        assert exits["lot-e2"] == Decimal("100.98"), f"x2={exits['lot-e2']}"
+        # Verify both are tick-aligned
         assert exits["lot-e1"] % Decimal("0.01") == 0
         assert exits["lot-e2"] % Decimal("0.01") == 0
-        from grinder.grid_v2.state import _grid_step_price  # noqa: PLC0415
-
-        step = _grid_step_price(Decimal("100"), cfg.grid_step_pct, cfg.price_tick_size)
-        assert abs(exits["lot-e1"] - exits["lot-e2"]) >= step
+        # ADR-176: exits at exact mirrored prices, spacing no longer enforced.
+        # Both exits should be exactly one step from their respective entries.
+        assert abs(exits["lot-e1"] - Decimal("99.99")) <= Decimal("0.01")
+        assert abs(exits["lot-e2"] - Decimal("100.98")) <= Decimal("0.01")
