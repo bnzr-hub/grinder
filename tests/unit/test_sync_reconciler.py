@@ -839,3 +839,39 @@ class TestPriceAwareExitReconciliation:
         )
         reprice = [a for a in r.actions if "REPRICE_EXIT" in a.reason]
         assert len(reprice) == 0
+
+    def test_exit_reprice_atomic_under_budget(self) -> None:
+        """Exit cancel+place must be atomic — both or neither."""
+        eo = _make_exit_order(
+            "eo1", price=Decimal("50250"), qty=Decimal("100"), side=OrderSide.SELL
+        )
+        bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"),),
+            sell_prices=(),
+            exit_orders=(eo,),
+            tick_size=Decimal("0.10"),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            levels=1,
+        )
+        snap = _make_snapshot(
+            exit_orders_priced=[("exit_eo1", "SELL", "50200")],
+        )
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge, max_actions=2)
+        reprice = [a for a in r.actions if "REPRICE_EXIT" in a.reason]
+        assert len(reprice) == 2
+        assert reprice[0].action_type == ActionType.CANCEL
+        assert reprice[1].action_type == ActionType.PLACE
+
+    def test_exit_reprice_skipped_if_budget_too_small(self) -> None:
+        """Budget=1 cannot fit atomic exit reprice → skip entirely."""
+        eo = _make_exit_order(
+            "eo1", price=Decimal("50250"), qty=Decimal("100"), side=OrderSide.SELL
+        )
+        bridge = _make_bridge(exit_orders=(eo,), tick_size=Decimal("0.10"))
+        snap = _make_snapshot(
+            exit_orders_priced=[("exit_eo1", "SELL", "50200")],
+        )
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge, max_actions=1)
+        reprice = [a for a in r.actions if "REPRICE_EXIT" in a.reason]
+        assert len(reprice) == 0

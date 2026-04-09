@@ -389,19 +389,32 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
             )
         )
 
-    # Exit geometry: cancel mispriced exits
-    for _side, _expected, _actual, cid in sorted(
+    # Exit geometry: atomic cancel+place for mispriced exits (safety-first,
+    # must not split across budget boundaries — exit correction before entry work)
+    for side, expected_price, _actual_price, cid in sorted(
         geometry_exit_mismatches,
         key=lambda x: (x[0].value, x[1], x[2], x[3]),
     ):
-        if len(actions) >= budget:
-            break
+        if len(actions) + 2 > budget:
+            break  # need room for both cancel AND place
+        qty = desired_exit_qtys.get(cid, bridge._config.order_size)
         actions.append(
             ExecutionAction(
                 action_type=ActionType.CANCEL,
                 order_id=cid,
                 symbol=symbol,
                 reason="grid_v2_RECONCILE_REPRICE_EXIT_CANCEL",
+            )
+        )
+        actions.append(
+            ExecutionAction(
+                action_type=ActionType.PLACE,
+                symbol=symbol,
+                side=side,
+                price=expected_price,
+                quantity=qty,
+                reduce_only=True,
+                reason="grid_v2_RECONCILE_REPRICE_EXIT_PLACE",
             )
         )
 
@@ -439,26 +452,6 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
                 price=expected_price,
                 quantity=bridge._config.order_size,
                 reason="grid_v2_RECONCILE_REPRICE_ENTRY_PLACE",
-            )
-        )
-
-    # Exit geometry: place corrected exits at expected price
-    for side, expected_price, _actual_price, cid in sorted(
-        geometry_exit_mismatches,
-        key=lambda x: (x[0].value, x[1], x[2], x[3]),
-    ):
-        if len(actions) >= budget:
-            break
-        qty = desired_exit_qtys.get(cid, bridge._config.order_size)
-        actions.append(
-            ExecutionAction(
-                action_type=ActionType.PLACE,
-                symbol=symbol,
-                side=side,
-                price=expected_price,
-                quantity=qty,
-                reduce_only=True,
-                reason="grid_v2_RECONCILE_REPRICE_EXIT_PLACE",
             )
         )
 
