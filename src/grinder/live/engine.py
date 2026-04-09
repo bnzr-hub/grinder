@@ -1266,6 +1266,9 @@ class LiveEngineV0:
                 default=True,
                 strict=False,
             ),
+            reseed_cooldown_ms=int(
+                os.environ.get("GRINDER_GRID_V2_RESEED_COOLDOWN_MS", "30000")
+            ),
             netoff_enabled=parse_bool(
                 "GRINDER_GRID_V2_NETOFF_ENABLED",
                 default=False,

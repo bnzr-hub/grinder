@@ -5114,3 +5114,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Add `pending_entry_place_keys` and `pending_entry_cancel_keys` to `reconcile_grid_state()`. Uses `(side, price)` keys (not raw CIDs) to match entry diff semantics. Engine builds these by looking up pending entry CIDs in the adapter registry. Cancel lookup checks both active and stale entries.
 - **Invariant:** True missing/extra entries still detected. Batch seed and reseed paths unchanged. Entry-exit inflight sets kept strictly separated.
 - **Consequences:** Transient entry topology noise reduced. No duplicate entry placements or cancels under lag.
+
+### ADR-169: Flat reseed anti-churn cooldown (2026-04-09)
+
+- **Problem:** Live canary showed repeated full reseeds when price oscillated near the FLAT reseed level — 3 full reseeds (15+ actions each) in 1 minute. Each reseed cancels all entries and replaces them, which is rate-limit expensive and operationally noisy.
+- **Root cause:** `_apply_exit_filled()` checked `last_recenter_ts` but never used it as a cooldown gate. Every return to FLAT triggered a full reseed unconditionally.
+- **Decision:** Add `reseed_cooldown_ms` config (default 30s). In `_apply_exit_filled()`, suppress flat reseed if `event.ts - last_recenter_ts < cooldown`. Configurable via `GRINDER_GRID_V2_RESEED_COOLDOWN_MS`.
+- **Invariant:** First reseed after cooldown always proceeds. Batch semantics preserved — when reseed does happen, it's still a full cancel+place batch. Startup seed unaffected.
+- **Consequences:** Reseed storms under price oscillation are eliminated. Rate-limit pressure reduced. Normal reseed after genuine FLAT return still works.
