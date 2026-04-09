@@ -412,13 +412,29 @@ class GridV2Bridge:
         # Step 5: convert to ExecutionActions
         exec_actions = self._to_execution_actions(resolved.actions)
 
-        logger.info(
-            "%s symbol=%s cid=%s actions=%d",
-            BRIDGE_FILL_PROCESSED,
-            self._symbol,
-            client_order_id,
-            len(exec_actions),
-        )
+        _suppress_parts: list[str] = []
+        if result.reseed_suppressed:
+            _suppress_parts.append(f"reseed={result.reseed_suppressed}")
+        if result.replenish_suppressed:
+            _suppress_parts.append(f"replenish={result.replenish_suppressed}")
+        _suppress_str = " ".join(_suppress_parts)
+        if _suppress_str:
+            logger.info(
+                "%s symbol=%s cid=%s actions=%d suppressed=%s",
+                BRIDGE_FILL_PROCESSED,
+                self._symbol,
+                client_order_id,
+                len(exec_actions),
+                _suppress_str,
+            )
+        else:
+            logger.info(
+                "%s symbol=%s cid=%s actions=%d",
+                BRIDGE_FILL_PROCESSED,
+                self._symbol,
+                client_order_id,
+                len(exec_actions),
+            )
 
         return FillResult(
             translated=translated,

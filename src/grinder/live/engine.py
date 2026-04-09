@@ -5164,7 +5164,8 @@ class LiveEngineV0:
                     "missing=%d extra=%d "
                     "desired_exits=%d actual_exits=%d missing_exits=%d extra_exits=%d "
                     "would_cancel=%d would_place=%d cycle_ms=%d "
-                    "projection=%s capacity=%s primary=%s",
+                    "projection=%s capacity=%s primary=%s "
+                    "headroom=%s inflight_ep=%d inflight_ec=%d inflight_xp=%d inflight_xc=%d",
                     self._grid_v2_symbol,
                     self._grid_v2_bridge.state_machine.mode.value
                     if self._grid_v2_bridge.state_machine
@@ -5184,6 +5185,11 @@ class LiveEngineV0:
                     recon.projection_mode.value,
                     recon.legal_entry_capacity,
                     is_primary,
+                    recon.inventory_headroom,
+                    recon.inflight_entry_places,
+                    recon.inflight_entry_cancels,
+                    recon.inflight_exit_places,
+                    recon.inflight_exit_cancels,
                 )
             # PRIMARY MODE: stage actions for dispatch on next process_snapshot tick
             if is_primary and recon.actions:

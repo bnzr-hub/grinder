@@ -5130,3 +5130,10 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Replace binary `inventory_full` with headroom-based suppression. `headroom = max(0, cap - lots)`. When `headroom < entry_levels_per_side`, reduce same-side entries to `headroom` count (keep closest to reference price). Applied in reconciler, engine integrity repair, and risk saturation detection.
 - **Invariant:** At cap → zero same-side entries (unchanged). Below cap but near → proportionally fewer entries. Far from cap → full entries (unchanged). Batch seed/reseed paths unaffected (FLAT mode is excluded).
 - **Consequences:** Burst overshoot materially reduced. At 14/15, only 1 same-side entry remains resting. A single-fill burst cannot push past 15.
+
+### ADR-171: Explicit topology suppression and reconciliation reasons (2026-04-09)
+
+- **Problem:** Canary analysis required guessing why `actions=1`, `missing=1`, or reseed did/didn't happen. Logs showed what happened but not why.
+- **Decision:** Add structured observability fields: (1) `TransitionResult.reseed_suppressed` / `replenish_suppressed` in SM for fill-driven decisions, (2) `ReconcileResult.inventory_headroom` + inflight counts in reconciler, (3) enriched `GRID_V2_SYNC_RECONCILER` and `GRID_V2_FILL_PROCESSED` log lines with headroom/inflight/suppression data.
+- **Invariant:** No behavior change — observability only. Healthy steady-state logs remain low-noise (suppression fields empty when not triggered).
+- **Consequences:** Canary reviewer can distinguish normal inflight lag from true topology fault. Reseed cooldown and headroom suppression are explicitly visible in logs.
