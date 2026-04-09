@@ -5159,3 +5159,10 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Add `_GRID_V2_AWAITING_SYNC_EXPIRY_GENS = 6` (6 sync checks). If seed visibility doesn't fully converge after 6 checks, force-clear the latch with `GRID_V2_AWAITING_SYNC_EXPIRED` log. Normal reconciler takes over.
 - **Invariant:** Natural clear still works when all seeds are visible. Expiry only triggers after bounded checks. Counter resets on every latch set/clear.
 - **Consequences:** `AWAITING_SYNC` can no longer wedge a symbol indefinitely. Immediate-fill-before-first-snapshot race is bounded.
+
+### ADR-175: Batch flat reseed entry placement (2026-04-09)
+
+- **Problem:** After exit-to-flat, reseed entry PLACE actions went through the serial dispatch loop while startup seed used batch dispatch. This made flat reseed recovery slower than startup.
+- **Decision:** Detect reseed PLACE entries (reason="RECENTER") in the fill action pipeline, split them out of serial dispatch, and route through `_dispatch_grid_v2_seed_batch()` — the same batch helper used for startup seed.
+- **Invariant:** Startup seed batch unchanged. Normal rolling/restore entry placement stays serial. Only full-flat reseed RECENTER entries are batched. CID/registry ownership preserved through existing seed batch helper.
+- **Consequences:** Flat reseed entry ladder appears on exchange faster, matching startup seed speed.
