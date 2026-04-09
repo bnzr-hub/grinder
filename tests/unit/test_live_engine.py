@@ -7025,6 +7025,58 @@ class TestSyncReconcilerPrimary:
         assert out[0].client_order_id is not None
         assert bridge.adapter.is_ours(out[0].client_order_id)
 
+    def test_primary_reconciler_reprice_place_gets_grid_v2_cid(self) -> None:
+        """Reconciler REPRICE_ENTRY_PLACE is also materialized with grid_v2 CID."""
+        paper = MagicMock()
+        paper.process_snapshot.return_value = MagicMock(actions=[])
+        port = NoOpExchangePort()
+        config = LiveEngineConfig(armed=True, mode=SafeMode.LIVE_TRADE)
+        env = {
+            "GRINDER_GRID_V2_ENABLED": "1",
+            "GRINDER_GRID_V2_SYMBOL": "BTCUSDT",
+            "GRINDER_GRID_V2_TICK_SIZE": "0.01",
+            "GRINDER_GRID_V2_SYNC_RECONCILER_ENABLED": "1",
+            "GRINDER_GRID_V2_SYNC_RECONCILER_PRIMARY": "1",
+            "GRINDER_GRID_V2_SYNC_RECONCILER_SHADOW": "0",
+        }
+        with patch.dict("os.environ", env):
+            engine = LiveEngineV0(
+                paper_engine=paper,
+                exchange_port=port,
+                config=config,
+            )
+        snap = Snapshot(
+            ts=1000,
+            symbol="BTCUSDT",
+            bid_price=Decimal("50000"),
+            ask_price=Decimal("50001"),
+            bid_qty=Decimal("1"),
+            ask_qty=Decimal("1"),
+            last_price=Decimal("50000.5"),
+            last_qty=Decimal("0.5"),
+        )
+        engine._last_account_snapshot = AccountSnapshot(
+            positions=(), open_orders=(), ts=1000, source="test"
+        )
+        engine.process_snapshot(snap)
+        bridge = engine._grid_v2_bridge
+        assert bridge is not None
+
+        recon_place = ExecutionAction(
+            action_type=ActionType.PLACE,
+            symbol="BTCUSDT",
+            side=OrderSide.BUY,
+            price=Decimal("49900"),
+            quantity=Decimal("0.001"),
+            reason="grid_v2_RECONCILE_REPRICE_ENTRY_PLACE",
+            client_order_id=None,
+        )
+        out = engine._grid_v2_materialize_reconciler_actions((recon_place,), ts=2000)
+        assert len(out) == 1
+        assert out[0].client_order_id is not None
+        assert out[0].reason == "grid_v2_RECONCILE_REPRICE_ENTRY_PLACE"
+        assert bridge.adapter.is_ours(out[0].client_order_id)
+
     def test_position_drift_reconstructs_branch_mode(self) -> None:
         """If exchange position is non-flat while SM is FLAT, sync forces reconstruction."""
         paper = MagicMock()

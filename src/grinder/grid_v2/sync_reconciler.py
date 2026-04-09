@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from grinder.core import OrderSide
 from grinder.execution.types import ActionType, ExecutionAction
+from grinder.grid_v2.geometry import match_entries_with_tolerance
 from grinder.grid_v2.state import BranchMode, ExitOrderStatus
 
 if TYPE_CHECKING:
@@ -252,15 +253,56 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
             desired_exit_cids.add(reg_cid)
 
     # --- Diff: actual vs effective (NOT vs theoretical) ---
-    # Inflight-aware entry diff: pending placements count as effectively
-    # present, pending cancels count as effectively absent.
-    effective_actual_entries = set(actual_entry_by_key.keys())
-    if pending_entry_place_keys:
-        effective_actual_entries |= pending_entry_place_keys
+    # Entry diff is geometry-aware for exchange-visible entries and inflight-aware
+    # for pending place/cancel state. This avoids classifying a slightly off-grid
+    # entry as a naive "extra + missing" pair.
+    visible_entry_by_key = dict(actual_entry_by_key)
     if pending_entry_cancel_keys:
-        effective_actual_entries -= pending_entry_cancel_keys
-    missing_entries = effective_entry_keys - effective_actual_entries
-    extra_entries = effective_actual_entries - effective_entry_keys
+        for key in pending_entry_cancel_keys:
+            visible_entry_by_key.pop(key, None)
+
+    geometry_entry_mismatches: list[tuple[OrderSide, Decimal, Decimal, str]] = []
+    if bridge._config.price_tick_size > 0:
+        str_expected = {(side.value, price) for side, price in effective_entry_keys}
+        str_actual = {
+            (side.value, price): cid for (side, price), cid in visible_entry_by_key.items()
+        }
+        _matched, truly_missing_str, truly_extra_str, geometry_mismatch_str = (
+            match_entries_with_tolerance(
+                str_expected,
+                str_actual,
+                bridge._config.price_tick_size,
+            )
+        )
+        missing_entries = {
+            (OrderSide(side), price) for side, price in truly_missing_str
+        }
+        extra_entries = {
+            (OrderSide(side), price) for side, price in truly_extra_str
+        }
+        geometry_entry_mismatches = [
+            (OrderSide(side), expected_price, actual_price, cid)
+            for side, expected_price, actual_price, cid in geometry_mismatch_str
+        ]
+    else:
+        effective_actual_entries = set(visible_entry_by_key.keys())
+        missing_entries = effective_entry_keys - effective_actual_entries
+        extra_entries = effective_actual_entries - effective_entry_keys
+
+    if pending_entry_place_keys:
+        missing_entries -= pending_entry_place_keys
+        geometry_entry_mismatches = [
+            mismatch
+            for mismatch in geometry_entry_mismatches
+            if (mismatch[0], mismatch[1]) not in pending_entry_place_keys
+        ]
+    if pending_entry_cancel_keys:
+        extra_entries -= pending_entry_cancel_keys
+        geometry_entry_mismatches = [
+            mismatch
+            for mismatch in geometry_entry_mismatches
+            if (mismatch[0], mismatch[2]) not in pending_entry_cancel_keys
+        ]
 
     # Inflight-aware exit diff: pending placements count as effectively
     # present, pending cancels count as effectively absent.
@@ -291,6 +333,21 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
             )
         )
 
+    for side, expected_price, actual_price, cid in sorted(
+        geometry_entry_mismatches,
+        key=lambda x: (x[0].value, x[1], x[2], x[3]),
+    ):
+        if len(actions) >= budget:
+            break
+        actions.append(
+            ExecutionAction(
+                action_type=ActionType.CANCEL,
+                order_id=cid,
+                symbol=symbol,
+                reason="grid_v2_RECONCILE_REPRICE_ENTRY_CANCEL",
+            )
+        )
+
     for cid in sorted(extra_exits):
         if len(actions) >= budget:
             break
@@ -317,6 +374,26 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
                 price=price,
                 quantity=bridge._config.order_size,
                 reason="grid_v2_RECONCILE_PLACE_ENTRY",
+            )
+        )
+
+    for side, expected_price, _actual_price, _cid in sorted(
+        geometry_entry_mismatches,
+        key=lambda x: (x[0].value, x[1], x[2], x[3]),
+    ):
+        if len(actions) >= budget:
+            break
+        existing_cid = bridge.adapter.registry.cid_for_entry(side, expected_price)
+        if existing_cid is not None:
+            continue
+        actions.append(
+            ExecutionAction(
+                action_type=ActionType.PLACE,
+                symbol=symbol,
+                side=side,
+                price=expected_price,
+                quantity=bridge._config.order_size,
+                reason="grid_v2_RECONCILE_REPRICE_ENTRY_PLACE",
             )
         )
 

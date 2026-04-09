@@ -80,7 +80,8 @@ If documents conflict, trust order is:
 - `docs/41_AUTONOMOUS_RISK_MANAGER_V1_SPEC.md` — candidate autonomous capital/risk manager architecture
 - `docs/42_AUTONOMOUS_RISK_REMEDIATION_SPEC.md` — active remediation contract for removing legacy/manual autonomous risk fallbacks
 - `docs/43_GRID_RUNTIME_V2_ARCHITECTURE_AUDIT.md` — candidate architecture audit for simplifying live grid runtime into a WS-first exchange-backed desired-state model
-- `docs/44_INCREMENTAL_GRID_SIMPLIFICATION_PLAN.md` — recommended low-risk plan for simplifying live grid maintenance via exit-first diff logic, explicit inflight tracking, and staged repair cleanup
+- `docs/44_INCREMENTAL_GRID_SIMPLIFICATION_PLAN.md` — completed incremental execution plan for stabilizing live grid maintenance via exit-first diff logic, inflight handling, anti-churn, burst hardening, and observability
+- `docs/45_GRID_RUNTIME_PHASE2_PLAN.md` — recommended next-phase plan focused on price-aware reconciliation, corrective-action priority, and explicit inflight TTL semantics
 
 ---
 
