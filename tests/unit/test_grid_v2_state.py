@@ -1922,15 +1922,10 @@ def _open_exit_prices_list(sm: GridV2StateMachine) -> list[Decimal]:
 
 
 class TestExitStepSpacing:
-    """Verify exits maintain minimum grid-step spacing after collision resolution."""
+    """ADR-176: Exits preserve exact mirrored price — no spacing drift."""
 
-    @staticmethod
-    def _step_price() -> Decimal:
-        """Canonical step_price for ref=100, step=1%, tick=0.01."""
-        return _grid_step_price(_REF_PRICE, Decimal("0.01"), Decimal("0.01"))
-
-    def test_two_nearby_entries_exits_spaced_by_step(self) -> None:
-        """Two BUY fills at adjacent prices → exits spaced ≥ step_price exactly."""
+    def test_two_nearby_entries_exits_both_mirrored(self) -> None:
+        """Two BUY fills at adjacent prices → exits at exact mirrored targets."""
         cfg = _config(step=Decimal("0.01"), levels=5, tick_size=Decimal("0.01"))
         sm = GridV2StateMachine.create_initial(cfg, Decimal("100"), _BASE_TS)
 
@@ -1940,14 +1935,14 @@ class TestExitStepSpacing:
         buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(_entry_filled(side=OrderSide.BUY, price=buy2, order_id="e2", ts=_BASE_TS + 2))
 
-        exits = _open_exit_prices_list(sm)
-        assert len(exits) == 2
-        spacing = abs(exits[1] - exits[0])
-        step = self._step_price()
-        assert spacing >= step, f"Exit spacing {spacing} < step {step}"
+        for lot in sm.snapshot.open_lots:
+            expected = lot.entry_price * (Decimal(1) + Decimal("0.01"))
+            assert abs(lot.exit_price - expected) <= Decimal("0.02"), (
+                f"Lot {lot.lot_id}: exit {lot.exit_price} drifted from expected {expected}"
+            )
 
-    def test_three_clustered_lots_all_unique_step_spaced(self) -> None:
-        """Three BUY fills → three exits, all unique, pairwise ≥ step_price."""
+    def test_three_clustered_lots_all_mirrored(self) -> None:
+        """Three BUY fills → all exits at exact mirrored step (may share price)."""
         cfg = _config(step=Decimal("0.01"), levels=5, tick_size=Decimal("0.01"))
         sm = GridV2StateMachine.create_initial(cfg, Decimal("100"), _BASE_TS)
 
@@ -1959,18 +1954,14 @@ class TestExitStepSpacing:
                 _entry_filled(side=OrderSide.BUY, price=buy, order_id=f"e{i}", ts=_BASE_TS + i + 1)
             )
 
-        exits = _open_exit_prices_list(sm)
-        assert len(exits) == 3
-        assert len(set(exits)) == 3, f"Duplicate exits: {exits}"
-        step = self._step_price()
-        for i in range(len(exits) - 1):
-            spacing = abs(exits[i + 1] - exits[i])
-            assert spacing >= step, (
-                f"Pair {exits[i]}-{exits[i + 1]} spacing {spacing} < step {step}"
+        for lot in sm.snapshot.open_lots:
+            expected = lot.entry_price * (Decimal(1) + Decimal("0.01"))
+            assert abs(lot.exit_price - expected) <= Decimal("0.02"), (
+                f"Lot {lot.lot_id}: exit {lot.exit_price} drifted from expected {expected}"
             )
 
-    def test_short_branch_buy_exits_step_spaced(self) -> None:
-        """SHORT lots → BUY exits also maintain step spacing."""
+    def test_short_branch_buy_exits_mirrored(self) -> None:
+        """SHORT lots → BUY exits at exact mirrored step."""
         cfg = _config(step=Decimal("0.01"), levels=5, tick_size=Decimal("0.01"))
         sm = GridV2StateMachine.create_initial(cfg, Decimal("100"), _BASE_TS)
 
@@ -1984,11 +1975,11 @@ class TestExitStepSpacing:
                 )
             )
 
-        exits = _open_exit_prices_list(sm)
-        assert len(exits) == 2
-        step = self._step_price()
-        spacing = abs(exits[1] - exits[0])
-        assert spacing >= step, f"Exit spacing {spacing} < step {step}"
+        for lot in sm.snapshot.open_lots:
+            expected = lot.entry_price * (Decimal(1) - Decimal("0.01"))
+            assert abs(lot.exit_price - expected) <= Decimal("0.02"), (
+                f"Lot {lot.lot_id}: exit {lot.exit_price} drifted from expected {expected}"
+            )
 
     def test_no_shift_when_base_exit_already_clear(self) -> None:
         """Single lot: base exit has no collision → no shift needed."""
@@ -2005,15 +1996,11 @@ class TestExitStepSpacing:
         expected = buy * (Decimal(1) + Decimal("0.01"))
         assert exits[0] == expected
 
-    def test_dense_occupied_exits_fail_closed(self) -> None:
-        """When search exhausted (dense occupied ladder), PLACE_EXIT is skipped.
-
-        Lot still created but exit deferred to reconciler.
-        """
+    def test_dense_entries_all_exits_placed(self) -> None:
+        """ADR-176: Dense fills → all exits placed at exact mirrored price (no fail-closed)."""
         cfg = _config(step=Decimal("0.01"), levels=5, max_levels=3, tick_size=Decimal("0.01"))
         sm = GridV2StateMachine.create_initial(cfg, Decimal("100"), _BASE_TS)
 
-        # Fill 3 BUY entries → 3 lots + 3 exits
         for i in range(3):
             if not sm.snapshot.entry_window.buy_entry_prices:
                 break
@@ -2023,15 +2010,12 @@ class TestExitStepSpacing:
             )
             assert not r.rejected
 
-        # All exits should be unique and step-spaced (or some skipped if no slot)
-        exits = _open_exit_prices_list(sm)
-        assert len(set(exits)) == len(exits), f"Duplicate exits: {exits}"
-        step = self._step_price()
-        for i in range(len(exits) - 1):
-            spacing = abs(exits[i + 1] - exits[i])
-            assert spacing >= step, (
-                f"Pair {exits[i]}-{exits[i + 1]} spacing {spacing} < step {step}"
-            )
+        # All lots get exits — no fail-closed skip
+        exits = [eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN]
+        assert len(exits) == len(sm.snapshot.open_lots)
+        for lot in sm.snapshot.open_lots:
+            expected = lot.entry_price * (Decimal(1) + Decimal("0.01"))
+            assert abs(lot.exit_price - expected) <= Decimal("0.02")
 
 
 class TestReplenishSuppressedWhenInventoryFull:
@@ -2185,6 +2169,63 @@ class TestReplenishSuppressedWhenInventoryFull:
         assert len(sm.snapshot.open_lots) == 2
         places = [a for a in result.actions if a.kind == ActionIntentKind.PLACE_ENTRY]
         assert len(places) == 0, f"No replenish when at max, got {len(places)}"
+
+
+class TestExactMirroredExits:
+    """ADR-176: Each lot preserves exact mirrored exit — no spacing drift."""
+
+    def test_single_buy_entry_exact_exit(self) -> None:
+        """Single BUY entry → SELL exit at entry * (1 + step)."""
+        sm = _sm()
+        buy = sm.snapshot.entry_window.buy_entry_prices[0]
+        result = sm.apply(EntryFilled("E1", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + 1))
+        assert not result.rejected
+        lot = sm.snapshot.open_lots[0]
+        expected_exit = buy * (Decimal(1) + _STEP)
+        # Allow tick quantization tolerance
+        assert abs(lot.exit_price - expected_exit) <= Decimal("0.01")
+
+    def test_single_sell_entry_exact_exit(self) -> None:
+        """Single SELL entry → BUY exit at entry * (1 - step)."""
+        sm = _sm()
+        sell = sm.snapshot.entry_window.sell_entry_prices[0]
+        result = sm.apply(EntryFilled("E1", OrderSide.SELL, sell, _ORDER_SIZE, _BASE_TS + 1))
+        assert not result.rejected
+        lot = sm.snapshot.open_lots[0]
+        expected_exit = sell * (Decimal(1) - _STEP)
+        assert abs(lot.exit_price - expected_exit) <= Decimal("0.01")
+
+    def test_multiple_same_side_no_cascade_drift(self) -> None:
+        """Multiple BUY fills → all exits at exact one-step distance."""
+        cfg = _config(levels=5, max_levels=10)
+        sm = _sm(cfg=cfg)
+        for i in range(5):
+            buy = sm.snapshot.entry_window.buy_entry_prices[0]
+            sm.apply(EntryFilled(f"E{i}", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + i + 1))
+
+        for lot in sm.snapshot.open_lots:
+            expected = lot.entry_price * (Decimal(1) + _STEP)
+            distance = abs(lot.exit_price - expected)
+            assert distance <= Decimal("0.02"), (
+                f"Lot {lot.lot_id}: exit {lot.exit_price} is {distance} from "
+                f"expected {expected} — cascade drift detected"
+            )
+
+    def test_same_price_exits_allowed(self) -> None:
+        """Two entries at same price → two exits at same price (no shift)."""
+        sm = _sm()
+        buy = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("E1", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + 1))
+        # Second fill at same price (rolling may add it back)
+        sm.apply(EntryFilled("E2", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + 2))
+        exits = [eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN]
+        exit_prices = [eo.price for eo in exits]
+        # Both exits should be at the same mirrored price (or very close)
+        if len(exit_prices) >= 2:
+            assert abs(exit_prices[0] - exit_prices[1]) <= Decimal("0.02"), (
+                f"Same-price entries should produce same-price exits, "
+                f"got {exit_prices[0]} and {exit_prices[1]}"
+            )
 
 
 class TestExitRestoreHeadroom:

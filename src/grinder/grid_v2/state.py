@@ -446,7 +446,7 @@ class GridV2StateMachine:
             return "BRANCH_INCOMPATIBLE"
         return ""
 
-    def _execute_entry(self, event: EntryFilled) -> TransitionResult:  # noqa: PLR0912
+    def _execute_entry(self, event: EntryFilled) -> TransitionResult:
         """Execute a validated entry fill."""
         snap = self._snapshot
         cfg = self._config
@@ -467,30 +467,14 @@ class GridV2StateMachine:
             exit_rounding = ROUND_DOWN if exit_side == OrderSide.BUY else ROUND_UP
             exit_price = _round_to_tick(exit_price, cfg.price_tick_size, rounding=exit_rounding)
 
-        # Exit spacing guard: minimum distance between exits = one grid step.
-        # Shifts by full step_price units (not ticks) to maintain grid geometry.
-        # Bounded search; fail-closed if no valid slot found (skip PLACE_EXIT).
-        existing_exit_prices = {
-            eo.price for eo in snap.exit_orders if eo.status == ExitOrderStatus.OPEN
-        }
+        # ADR-176: Exact mirrored exit per lot — no spacing drift.
+        # Previously, an exit spacing guard shifted exits outward by step_price
+        # when they collided with existing exits. This caused cascade drift:
+        # later lots got exits at 2x-5x intended step distance.
+        # Now removed: same-price / near-price exits are allowed. Per-lot
+        # ownership is tracked by CID / exit_order_id / lot_id, not by
+        # unique price. Binance allows multiple reduce-only orders at same price.
         exit_spacing_valid = True
-        if existing_exit_prices and cfg.price_tick_size > 0:
-            step_price = _grid_step_price(
-                snap.entry_window.reference_price, cfg.grid_step_pct, cfg.price_tick_size
-            )
-            max_attempts = cfg.max_inventory_levels + 2  # bounded by grid capacity
-            for _ in range(max_attempts):
-                too_close = any(abs(exit_price - ep) < step_price for ep in existing_exit_prices)
-                if not too_close:
-                    break
-                if exit_side == OrderSide.SELL:
-                    exit_price = exit_price + step_price
-                else:
-                    exit_price = exit_price - step_price
-            else:
-                # Exhausted search: no valid slot found. Fail-closed: skip PLACE_EXIT.
-                # Lot is still created; exit will be placed by reconciler on next cycle.
-                exit_spacing_valid = False
 
         lot = InventoryLot(
             lot_id=f"lot-{event.order_id}",

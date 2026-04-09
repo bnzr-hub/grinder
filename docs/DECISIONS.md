@@ -5166,3 +5166,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Detect reseed PLACE entries (reason="RECENTER") in the fill action pipeline, split them out of serial dispatch, and route through `_dispatch_grid_v2_seed_batch()` — the same batch helper used for startup seed.
 - **Invariant:** Startup seed batch unchanged. Normal rolling/restore entry placement stays serial. Only full-flat reseed RECENTER entries are batched. CID/registry ownership preserved through existing seed batch helper.
 - **Consequences:** Flat reseed entry ladder appears on exchange faster, matching startup seed speed.
+
+### ADR-176: Exact mirrored exits — remove exit spacing drift (2026-04-09)
+
+- **Problem:** Live canary showed SIRENUSDT exits at 2x-5x grid step distance from their entry fills. The exit spacing guard in `_execute_entry()` shifted exit prices outward by `step_price` to avoid collisions with existing exits. With multiple same-side fills, this cascaded: each exit pushed the next further away.
+- **Root cause:** The spacing guard treated exit price uniqueness as a hard requirement, but per-lot exit ownership is already tracked by CID/exit_order_id/lot_id, not by unique price. The guard violated the more important invariant: each lot's exit should be exactly one grid step from its entry.
+- **Decision:** Remove the exit spacing guard entirely. Each lot now preserves its exact mirrored exit price (`entry ± step`, tick-quantized). Same-price or near-price exits are allowed — Binance supports multiple reduce-only orders at the same price, and CID-based tracking already handles ownership.
+- **Invariant:** `exit_price = entry_price ± one_grid_step` (after tick quantization). No additional outward shift. No cascade drift.
+- **Consequences:** Strategy geometry matches configured grid step. Exits are placed at their intended prices. Unwind speed returns to design expectations. Reconciler desired/actual comparison becomes semantically correct.
