@@ -3443,6 +3443,7 @@ class LiveEngineV0:
 
         _seed_batch: list[ExecutionAction] = []  # tracked for latency logging
         _fill_cancel_batch: list[ExecutionAction] = []  # post-fill concurrent cancel wave
+        _reseed_batch: list[ExecutionAction] = []  # ADR-175: flat reseed PLACE batch
         # Step 1: Get actions -- either from GridV2Bridge, LiveGridPlannerV1, or PaperEngine
         if self._grid_v2_enabled and snapshot.symbol == self._grid_v2_symbol:
             # Grid V2 symbol: either active (dispatch actions) or blocked (no actions).
@@ -3471,9 +3472,17 @@ class LiveEngineV0:
                     for a in fill_actions
                     if not (a.action_type == ActionType.CANCEL and a.order_id in _fill_cancel_cids)
                 ]
-                raw_actions: list[ExecutionAction] = _fill_non_cancel + list(
-                    grid_v2_integrity_actions
-                )
+                # Split reseed PLACE entries for batch dispatch (ADR-175).
+                # RECENTER entries from flat reseed should be placed as a batch
+                # for speed, just like startup seed.
+                _reseed_batch = [
+                    a
+                    for a in _fill_non_cancel
+                    if a.action_type == ActionType.PLACE and a.reason == "RECENTER"
+                ]
+                _reseed_cids = {id(a) for a in _reseed_batch}
+                _fill_rest = [a for a in _fill_non_cancel if id(a) not in _reseed_cids]
+                raw_actions: list[ExecutionAction] = _fill_rest + list(grid_v2_integrity_actions)
             else:
                 # Blocked: startup not done, failed, or non-flat/no-orders guard hit.
                 raw_actions = []
@@ -3664,6 +3673,11 @@ class LiveEngineV0:
         if _seed_batch:
             seed_result = self._dispatch_grid_v2_seed_batch(_seed_batch, snapshot.ts)
             live_actions.extend(seed_result.live_actions)
+
+        # Dispatch flat-reseed PLACE entries as batch (ADR-175)
+        if _reseed_batch:
+            reseed_result = self._dispatch_grid_v2_seed_batch(_reseed_batch, snapshot.ts)
+            live_actions.extend(reseed_result.live_actions)
 
         # Dispatch post-fill cancel wave with bounded concurrency
         if _fill_cancel_batch:
