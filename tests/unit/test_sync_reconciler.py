@@ -425,3 +425,40 @@ class TestInflightExitReconciliation:
         r = reconcile_grid_state(snap, "BTCUSDT", bridge)
         # No pending args → old behavior: missing = 1
         assert r.missing_exits == 1
+
+    def test_unfiltered_entry_cid_contaminates_exit_diff(self) -> None:
+        """Caller MUST filter pending CIDs by EXIT kind before passing.
+
+        If an entry CID leaks into pending_exit_place_cids, the reconciler
+        will misclassify it as an extra exit. This test documents the
+        contract: filtering is the caller's responsibility (engine.py).
+        """
+        bridge = _make_bridge(
+            exit_orders=(_make_exit_order("eo1"),),
+        )
+        snap = _make_snapshot(exit_cids=[])
+        # Unfiltered entry CID passed as pending exit → contaminates diff
+        r = reconcile_grid_state(
+            snap,
+            "BTCUSDT",
+            bridge,
+            pending_exit_place_cids=frozenset({"entry_e0"}),
+        )
+        # entry CID misclassified as extra exit — proves caller must filter
+        assert r.extra_exits == 1
+
+    def test_filtered_exit_only_cids_clean(self) -> None:
+        """With properly filtered exit-only CIDs, no contamination."""
+        bridge = _make_bridge(
+            exit_orders=(_make_exit_order("eo1"),),
+        )
+        snap = _make_snapshot(exit_cids=[])
+        # Only exit CID in pending → correct behavior
+        r = reconcile_grid_state(
+            snap,
+            "BTCUSDT",
+            bridge,
+            pending_exit_place_cids=frozenset({"exit_eo1"}),
+        )
+        assert r.missing_exits == 0
+        assert r.extra_exits == 0
