@@ -1396,6 +1396,7 @@ class LiveEngineV0:
         self._grid_v2_pending_seed_cids = frozenset(
             a.order_id for a in seed if a.action_type == ActionType.PLACE and a.order_id
         )
+        self._grid_v2_awaiting_sync_checks = 0
         self._grid_v2_pending_cancels.clear()
         self._grid_v2_pending_place_cids.clear()
         self._grid_v2_definitively_rejected_cids.clear()
@@ -1531,6 +1532,7 @@ class LiveEngineV0:
                         for ea in f2_exits
                         if ea.action_type == ActionType.PLACE and ea.client_order_id is not None
                     )
+                    self._grid_v2_awaiting_sync_checks = 0
                 logger.warning(
                     "GRID_V2_F2_PROTECTIVE_RECOVERY symbol=%s protective_exits=%d pos_qty=%s",
                     self._grid_v2_symbol,
@@ -1559,6 +1561,7 @@ class LiveEngineV0:
                         for ea in reseed
                         if ea.action_type == ActionType.PLACE and ea.client_order_id is not None
                     )
+                    self._grid_v2_awaiting_sync_checks = 0
             self._grid_v2_started = True
         elif pos_qty != 0:
             # Non-flat position with no grid_v2 orders: F2 recovery path.
@@ -1590,6 +1593,7 @@ class LiveEngineV0:
                         for ea in f2_exits
                         if ea.action_type == ActionType.PLACE and ea.client_order_id is not None
                     )
+                    self._grid_v2_awaiting_sync_checks = 0
                 logger.warning(
                     "GRID_V2_F2_PROTECTIVE_RECOVERY symbol=%s protective_exits=%d pos_qty=%s "
                     "reason=no_grid_v2_orders",
@@ -1607,6 +1611,7 @@ class LiveEngineV0:
             # Seeds are not on exchange yet; registry-vs-exchange diff would be all
             # false positives until account sync confirms orders are visible.
             self._grid_v2_awaiting_sync = True
+            self._grid_v2_awaiting_sync_checks = 0
             self._grid_v2_definitively_rejected_cids.clear()
             self._grid_v2_fill_eligible_cids.clear()
             self._grid_v2_pending_seed_cids = frozenset(
@@ -1674,6 +1679,7 @@ class LiveEngineV0:
         self._grid_v2_seed_actions = list(seed)
         self._grid_v2_fill_eligible_cids.clear()
         self._grid_v2_awaiting_sync = True
+        self._grid_v2_awaiting_sync_checks = 0
         self._grid_v2_definitively_rejected_cids.clear()
         self._grid_v2_pending_seed_cids = frozenset(
             ea.client_order_id for ea in seed if ea.client_order_id is not None
@@ -1868,6 +1874,7 @@ class LiveEngineV0:
                     for ea in protective
                     if ea.action_type == ActionType.PLACE and ea.client_order_id is not None
                 )
+                self._grid_v2_awaiting_sync_checks = 0
 
         logger.warning(
             "GRID_V2_SYNC_POSITION_DRIFT_RECONSTRUCTED symbol=%s old_mode=%s new_mode=%s "
@@ -3914,6 +3921,7 @@ class LiveEngineV0:
                     )
                     if not self._grid_v2_pending_seed_cids:
                         self._grid_v2_awaiting_sync = False
+                        self._grid_v2_awaiting_sync_checks = 0
                         logger.warning(
                             "GRID_V2_AWAITING_SYNC_CLEARED_ON_SEED_FAILURE "
                             "reason=all_seeds_definitively_failed"
@@ -7214,6 +7222,7 @@ class LiveEngineV0:
             )
             if not self._grid_v2_pending_seed_cids:
                 self._grid_v2_awaiting_sync = False
+                self._grid_v2_awaiting_sync_checks = 0
                 logger.warning(
                     "GRID_V2_AWAITING_SYNC_CLEARED_ON_SEED_FAILURE "
                     "reason=all_seeds_definitively_failed"
