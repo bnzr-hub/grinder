@@ -80,11 +80,13 @@ def _make_snapshot(
     symbol: str = "BTCUSDT",
     entry_orders: dict[tuple[str, str], str] | None = None,
     exit_cids: list[str] | None = None,
+    exit_orders_priced: list[tuple[str, str, str]] | None = None,
 ) -> AccountSnapshot:
     """Build AccountSnapshot with open orders.
 
     entry_orders: {(side_str, price_str): cid, ...}
-    exit_cids: [cid, ...]
+    exit_cids: [cid, ...] (default price 50000, side SELL)
+    exit_orders_priced: [(cid, side_str, price_str), ...] (explicit price/side)
     """
     orders: list[OpenOrderSnap] = []
     if entry_orders:
@@ -119,6 +121,22 @@ def _make_snapshot(
                     ts=1000,
                 )
             )
+    if exit_orders_priced:
+        for cid, side, price in exit_orders_priced:
+            orders.append(
+                OpenOrderSnap(
+                    order_id=cid,
+                    symbol=symbol,
+                    side=side,
+                    order_type="LIMIT",
+                    price=Decimal(price),
+                    qty=Decimal("100"),
+                    filled_qty=Decimal("0"),
+                    reduce_only=True,
+                    status="NEW",
+                    ts=1000,
+                )
+            )
     return AccountSnapshot(
         positions=(),
         open_orders=tuple(orders),
@@ -127,10 +145,19 @@ def _make_snapshot(
     )
 
 
-def _make_exit_order(exit_order_id: str, status: str = "OPEN") -> MagicMock:
+def _make_exit_order(
+    exit_order_id: str,
+    status: str = "OPEN",
+    price: Decimal = Decimal("50250"),
+    qty: Decimal = Decimal("100"),
+    side: OrderSide = OrderSide.SELL,
+) -> MagicMock:
     eo = MagicMock()
     eo.exit_order_id = exit_order_id
     eo.status = ExitOrderStatus(status)
+    eo.price = price
+    eo.qty = qty
+    eo.side = side
     return eo
 
 
@@ -734,3 +761,81 @@ class TestPriceAwareEntryReconciliation:
         assert r.missing_entries == 0
         assert r.extra_entries == 0
         assert r.actions == ()
+
+
+class TestPriceAwareExitReconciliation:
+    """Exit geometry: mispriced exits should be corrected, not just presence-checked."""
+
+    def test_exact_exit_match_no_action(self) -> None:
+        """Exit at exact expected price → no correction."""
+        eo = _make_exit_order("eo1", price=Decimal("50250"), side=OrderSide.SELL)
+        bridge = _make_bridge(exit_orders=(eo,), tick_size=Decimal("0.10"))
+        snap = _make_snapshot(
+            exit_orders_priced=[("exit_eo1", "SELL", "50250")],
+        )
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        assert r.missing_exits == 0
+        assert r.extra_exits == 0
+        reprice = [a for a in r.actions if "REPRICE_EXIT" in a.reason]
+        assert len(reprice) == 0
+
+    def test_fuzzy_valid_exit_no_action(self) -> None:
+        """Exit within 1 tick of expected → no correction."""
+        eo = _make_exit_order("eo1", price=Decimal("50250"), side=OrderSide.SELL)
+        bridge = _make_bridge(exit_orders=(eo,), tick_size=Decimal("0.10"))
+        snap = _make_snapshot(
+            exit_orders_priced=[("exit_eo1", "SELL", "50250.10")],
+        )
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        reprice = [a for a in r.actions if "REPRICE_EXIT" in a.reason]
+        assert len(reprice) == 0
+
+    def test_mispriced_exit_correction(self) -> None:
+        """Exit materially off expected price → cancel + place correction."""
+        eo = _make_exit_order(
+            "eo1", price=Decimal("50250"), qty=Decimal("100"), side=OrderSide.SELL
+        )
+        bridge = _make_bridge(exit_orders=(eo,), tick_size=Decimal("0.10"))
+        snap = _make_snapshot(
+            exit_orders_priced=[("exit_eo1", "SELL", "50200")],
+        )
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        reprice = [a for a in r.actions if "REPRICE_EXIT" in a.reason]
+        assert len(reprice) == 2
+        assert reprice[0].action_type == ActionType.CANCEL
+        assert reprice[0].order_id == "exit_eo1"
+        assert reprice[1].action_type == ActionType.PLACE
+        assert reprice[1].price == Decimal("50250")
+        assert reprice[1].reduce_only is True
+
+    def test_pending_exit_place_suppresses_reprice(self) -> None:
+        """If corrected exit already inflight, no duplicate correction."""
+        eo = _make_exit_order("eo1", price=Decimal("50250"), side=OrderSide.SELL)
+        bridge = _make_bridge(exit_orders=(eo,), tick_size=Decimal("0.10"))
+        snap = _make_snapshot(
+            exit_orders_priced=[("exit_eo1", "SELL", "50200")],
+        )
+        r = reconcile_grid_state(
+            snap,
+            "BTCUSDT",
+            bridge,
+            pending_exit_place_cids=frozenset({"exit_eo1"}),
+        )
+        reprice = [a for a in r.actions if "REPRICE_EXIT" in a.reason]
+        assert len(reprice) == 0
+
+    def test_pending_exit_cancel_suppresses_reprice(self) -> None:
+        """If wrong exit already being cancelled, no duplicate correction."""
+        eo = _make_exit_order("eo1", price=Decimal("50250"), side=OrderSide.SELL)
+        bridge = _make_bridge(exit_orders=(eo,), tick_size=Decimal("0.10"))
+        snap = _make_snapshot(
+            exit_orders_priced=[("exit_eo1", "SELL", "50200")],
+        )
+        r = reconcile_grid_state(
+            snap,
+            "BTCUSDT",
+            bridge,
+            pending_exit_cancel_cids=frozenset({"exit_eo1"}),
+        )
+        reprice = [a for a in r.actions if "REPRICE_EXIT" in a.reason]
+        assert len(reprice) == 0
