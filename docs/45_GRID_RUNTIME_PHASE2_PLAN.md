@@ -140,19 +140,19 @@ The runtime already behaves more "exit-first" than "entry-first," but there is n
 
 ### 4.7 Price-aware off-grid alignment
 
-**Status:** In progress
+**Status:** PR-1 open
 
 Implemented:
 
 - `geometry.py` has fuzzy matching
 - legacy integrity repair path in `engine.py` uses it for entry geometry repair
-- local phase-2 work has started to bring fuzzy entry matching into `sync_reconciler.py`
+- PR `#650` brings fuzzy entry matching into `sync_reconciler.py`
 
 Still not fully implemented:
 
 - exit repair still focuses on presence / absence more than wrong-price correction
 - there is no unified correction model for "this order exists but stands on the wrong grid level"
-- entry-side price-aware correction still needs live validation and then a merged PR
+- entry-side price-aware correction still needs review, merge, and live validation
 
 This is the single most important unresolved item from the review.
 
@@ -210,7 +210,7 @@ This is where the next phase should focus first.
 
 ### PR-1: Price-aware reconciliation for entries
 
-**Status:** In progress locally
+**Status:** PR open (`#650`)
 
 Goal:
 

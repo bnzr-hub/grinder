@@ -711,3 +711,26 @@ class TestPriceAwareEntryReconciliation:
         assert r.actions[1].side == OrderSide.BUY
         assert r.actions[1].price == Decimal("99.00")
         assert r.actions[1].reason == "grid_v2_RECONCILE_REPRICE_ENTRY_PLACE"
+
+    def test_pending_place_suppresses_reprice_for_expected_slot(self) -> None:
+        """Pending expected-slot place suppresses duplicate geometry correction."""
+        bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"),),
+            sell_prices=(),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=1,
+        )
+        snap = _make_snapshot(
+            entry_orders={("BUY", "98.00"): "entry_buy_wrong"},
+        )
+        r = reconcile_grid_state(
+            snap,
+            "BTCUSDT",
+            bridge,
+            pending_entry_place_keys=frozenset({(OrderSide.BUY, Decimal("99.00"))}),
+        )
+        assert r.missing_entries == 0
+        assert r.extra_entries == 0
+        assert tuple() == r.actions
