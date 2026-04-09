@@ -350,13 +350,13 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     for side, price in sorted(extra_entries, key=lambda x: (x[0].value, x[1])):
         if len(actions) >= budget:
             break
-        cid = actual_entry_by_key.get((side, price))
-        if cid is None:
+        entry_cid = actual_entry_by_key.get((side, price))
+        if entry_cid is None:
             continue  # inflight-only entry, not on exchange — skip cancel
         actions.append(
             ExecutionAction(
                 action_type=ActionType.CANCEL,
-                order_id=cid,
+                order_id=entry_cid,
                 symbol=symbol,
                 reason="grid_v2_RECONCILE_CANCEL_ENTRY",
             )
