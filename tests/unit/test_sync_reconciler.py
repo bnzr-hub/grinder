@@ -17,6 +17,7 @@ from decimal import Decimal
 from unittest.mock import MagicMock
 
 from grinder.account.contracts import AccountSnapshot, OpenOrderSnap
+from grinder.core import OrderSide
 from grinder.execution.types import ActionType
 from grinder.grid_v2.state import BranchMode, ExitOrderStatus
 from grinder.grid_v2.sync_reconciler import reconcile_grid_state
@@ -663,3 +664,73 @@ class TestInventoryHeadroom:
         snap = _make_snapshot()
         r = reconcile_grid_state(snap, "BTCUSDT", bridge)
         assert r.theoretical_desired_entry_count == 4
+
+
+class TestPriceAwareEntryReconciliation:
+    """Off-grid entries should use fuzzy/geometry-aware matching in reconciler."""
+
+    def test_fuzzy_valid_entry_is_kept(self) -> None:
+        """Entry within one tick of desired price is treated as valid."""
+        bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"),),
+            sell_prices=(),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=1,
+        )
+        snap = _make_snapshot(
+            entry_orders={("BUY", "99.01"): "entry_buy_fuzzy"},
+        )
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        assert r.missing_entries == 0
+        assert r.extra_entries == 0
+        assert r.actions == ()
+
+    def test_off_grid_entry_becomes_cancel_plus_replace(self) -> None:
+        """Entry far from desired price is corrected, not treated as structural drift."""
+        bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"),),
+            sell_prices=(),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=1,
+        )
+        snap = _make_snapshot(
+            entry_orders={("BUY", "98.00"): "entry_buy_wrong"},
+        )
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        assert r.missing_entries == 0
+        assert r.extra_entries == 0
+        assert len(r.actions) == 2
+        assert r.actions[0].action_type == ActionType.CANCEL
+        assert r.actions[0].order_id == "entry_buy_wrong"
+        assert r.actions[0].reason == "grid_v2_RECONCILE_REPRICE_ENTRY_CANCEL"
+        assert r.actions[1].action_type == ActionType.PLACE
+        assert r.actions[1].side == OrderSide.BUY
+        assert r.actions[1].price == Decimal("99.00")
+        assert r.actions[1].reason == "grid_v2_RECONCILE_REPRICE_ENTRY_PLACE"
+
+    def test_pending_place_suppresses_reprice_for_expected_slot(self) -> None:
+        """Pending expected-slot place suppresses duplicate geometry correction."""
+        bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"),),
+            sell_prices=(),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=1,
+        )
+        snap = _make_snapshot(
+            entry_orders={("BUY", "98.00"): "entry_buy_wrong"},
+        )
+        r = reconcile_grid_state(
+            snap,
+            "BTCUSDT",
+            bridge,
+            pending_entry_place_keys=frozenset({(OrderSide.BUY, Decimal("99.00"))}),
+        )
+        assert r.missing_entries == 0
+        assert r.extra_entries == 0
+        assert r.actions == ()

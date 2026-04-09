@@ -1908,7 +1908,11 @@ class LiveEngineV0:
         for a in actions:
             if (
                 a.action_type == ActionType.PLACE
-                and a.reason == "grid_v2_RECONCILE_PLACE_ENTRY"
+                and a.reason
+                in {
+                    "grid_v2_RECONCILE_PLACE_ENTRY",
+                    "grid_v2_RECONCILE_REPRICE_ENTRY_PLACE",
+                }
                 and a.side is not None
                 and a.price is not None
                 and a.client_order_id is None
@@ -1919,7 +1923,7 @@ class LiveEngineV0:
                     replace(
                         a,
                         client_order_id=cid,
-                        reason="grid_v2_RECONCILE_PLACE_ENTRY",
+                        reason=a.reason,
                     )
                 )
                 continue
@@ -5088,7 +5092,8 @@ class LiveEngineV0:
                 pending_entry_cancel_keys=frozenset(_pending_entry_cancel_keys),
             )
             has_diff = bool(
-                recon.missing_entries
+                recon.actions
+                or recon.missing_entries
                 or recon.extra_entries
                 or recon.missing_exits
                 or recon.extra_exits
