@@ -117,6 +117,8 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     risk_entry_capacity: int | None = None,
     pending_exit_place_cids: frozenset[str] | None = None,
     pending_exit_cancel_cids: frozenset[str] | None = None,
+    pending_entry_place_keys: frozenset[tuple[OrderSide, Decimal]] | None = None,
+    pending_entry_cancel_keys: frozenset[tuple[OrderSide, Decimal]] | None = None,
 ) -> ReconcileResult:
     """Compute deterministic repair actions from fresh account snapshot.
 
@@ -127,12 +129,16 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
         max_actions: Max total actions (cancel + place) per sync cycle.
         risk_entry_capacity: Legal additional entry capacity (ADR-102/103).
             None = unconstrained (risk base disabled or data unavailable).
+            0 = fully constrained (no new entries allowed).
+            N > 0 = partial capacity (truncate desired to N entries).
         pending_exit_place_cids: Exit CIDs dispatched but not yet visible
             on exchange. Treated as effectively present for missing_exits.
         pending_exit_cancel_cids: Exit CIDs with pending cancel dispatched
             but not yet reflected. Treated as effectively absent for extra_exits.
-            0 = fully constrained (no new entries allowed).
-            N > 0 = partial capacity (truncate desired to N entries).
+        pending_entry_place_keys: Entry (side, price) keys dispatched but
+            not yet visible. Treated as effectively present for missing_entries.
+        pending_entry_cancel_keys: Entry (side, price) keys with pending
+            cancel. Treated as effectively absent for extra_entries.
 
     Returns:
         ReconcileResult with deterministic action list and projection metadata.
@@ -224,9 +230,15 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
             desired_exit_cids.add(reg_cid)
 
     # --- Diff: actual vs effective (NOT vs theoretical) ---
-    actual_entry_keys = set(actual_entry_by_key.keys())
-    missing_entries = effective_entry_keys - actual_entry_keys
-    extra_entries = actual_entry_keys - effective_entry_keys
+    # Inflight-aware entry diff: pending placements count as effectively
+    # present, pending cancels count as effectively absent.
+    effective_actual_entries = set(actual_entry_by_key.keys())
+    if pending_entry_place_keys:
+        effective_actual_entries |= pending_entry_place_keys
+    if pending_entry_cancel_keys:
+        effective_actual_entries -= pending_entry_cancel_keys
+    missing_entries = effective_entry_keys - effective_actual_entries
+    extra_entries = effective_actual_entries - effective_entry_keys
 
     # Inflight-aware exit diff: pending placements count as effectively
     # present, pending cancels count as effectively absent.
@@ -245,7 +257,9 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     for side, price in sorted(extra_entries, key=lambda x: (x[0].value, x[1])):
         if len(actions) >= budget:
             break
-        cid = actual_entry_by_key[(side, price)]
+        cid = actual_entry_by_key.get((side, price))
+        if cid is None:
+            continue  # inflight-only entry, not on exchange — skip cancel
         actions.append(
             ExecutionAction(
                 action_type=ActionType.CANCEL,

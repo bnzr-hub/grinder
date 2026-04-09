@@ -462,3 +462,124 @@ class TestInflightExitReconciliation:
         )
         assert r.missing_exits == 0
         assert r.extra_exits == 0
+
+
+# --- Tests: Inflight-aware entry reconciliation ---
+
+
+class TestInflightEntryReconciliation:
+    """Entry diff must account for pending place/cancel to avoid false missing/extra."""
+
+    def test_pending_entry_place_suppresses_false_missing(self) -> None:
+        """Entry dispatched but not visible → not counted as missing."""
+        from grinder.core import OrderSide  # noqa: PLC0415
+
+        bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"),),
+            sell_prices=(Decimal("101.00"),),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=1,
+        )
+        # No entries on exchange
+        snap = _make_snapshot()
+        # But pending place has BUY@99
+        r = reconcile_grid_state(
+            snap,
+            "BTCUSDT",
+            bridge,
+            pending_entry_place_keys=frozenset({(OrderSide.BUY, Decimal("99.00"))}),
+        )
+        # BUY@99 should not be missing (it's pending)
+        # SELL@101 is still missing
+        assert r.missing_entries == 1  # only SELL@101
+
+    def test_pending_entry_cancel_suppresses_false_extra(self) -> None:
+        """Entry cancel sent but still visible → not counted as extra."""
+        from grinder.core import OrderSide  # noqa: PLC0415
+
+        bridge = _make_bridge(
+            buy_prices=(),
+            sell_prices=(),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=0,
+        )
+        # Old entry still on exchange
+        snap = _make_snapshot(
+            entry_orders={("BUY", "99.00"): "entry_old"},
+        )
+        # Cancel pending for it
+        r = reconcile_grid_state(
+            snap,
+            "BTCUSDT",
+            bridge,
+            pending_entry_cancel_keys=frozenset({(OrderSide.BUY, Decimal("99.00"))}),
+        )
+        assert r.extra_entries == 0
+
+    def test_true_missing_entry_still_detected(self) -> None:
+        """No snapshot entry, no pending → genuinely missing."""
+        bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"),),
+            sell_prices=(),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=1,
+        )
+        snap = _make_snapshot()
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        assert r.missing_entries == 1
+
+    def test_true_extra_entry_still_detected(self) -> None:
+        """Snapshot has entry, not desired → genuinely extra."""
+        bridge = _make_bridge(
+            buy_prices=(),
+            sell_prices=(),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=0,
+        )
+        snap = _make_snapshot(
+            entry_orders={("BUY", "99.00"): "entry_stale"},
+        )
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        assert r.extra_entries == 1
+
+    def test_pending_exit_does_not_contaminate_entry_diff(self) -> None:
+        """Pending exit CID must not affect entry missing/extra."""
+        bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"),),
+            sell_prices=(),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=1,
+        )
+        snap = _make_snapshot()
+        # Pending exit should not suppress entry missing
+        r = reconcile_grid_state(
+            snap,
+            "BTCUSDT",
+            bridge,
+            pending_exit_place_cids=frozenset({"exit_x0"}),
+        )
+        assert r.missing_entries == 1  # entry still missing
+
+    def test_backwards_compatible_without_pending_entry(self) -> None:
+        """Without pending_entry args, old behavior preserved."""
+        bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"),),
+            sell_prices=(),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=1,
+        )
+        snap = _make_snapshot()
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        assert r.missing_entries == 1

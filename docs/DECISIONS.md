@@ -5107,3 +5107,10 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Add `pending_exit_place_cids` and `pending_exit_cancel_cids` to `reconcile_grid_state()`. Pending placements count as effectively present (suppresses false missing). Pending cancels count as effectively absent (suppresses false extra). Backwards compatible: without these args, old behavior preserved.
 - **Invariant:** True missing/extra exits are still detected. Only inflight-lag artifacts are suppressed.
 - **Consequences:** Transient `missing_exits` noise is reduced under burst fills. No duplicate exit actions. Reconciler diagnostics become trustworthy indicators of real topology gaps.
+
+### ADR-168: Inflight-aware entry reconciliation in sync reconciler (2026-04-09)
+
+- **Problem:** Live canary showed repeated transient `missing=1` and `extra=1` on entry side under burst fills and reseed transitions. Entry diff used only snapshot-visible orders.
+- **Decision:** Add `pending_entry_place_keys` and `pending_entry_cancel_keys` to `reconcile_grid_state()`. Uses `(side, price)` keys (not raw CIDs) to match entry diff semantics. Engine builds these by looking up pending entry CIDs in the adapter registry. Cancel lookup checks both active and stale entries.
+- **Invariant:** True missing/extra entries still detected. Batch seed and reseed paths unchanged. Entry-exit inflight sets kept strictly separated.
+- **Consequences:** Transient entry topology noise reduced. No duplicate entry placements or cancels under lag.

@@ -5016,27 +5016,48 @@ class LiveEngineV0:
                     if self._risk_cap_consecutive_blocks.get(_sym, 0) > 0:
                         self._risk_cap_consecutive_blocks[_sym] = 0
 
-            # Filter pending CIDs to EXIT kind only — pending entry CIDs
-            # must not contaminate exit reconciliation (would create bogus extras).
+            # Build inflight state for both entry and exit reconciliation.
+            # Filter by CID kind to prevent cross-contamination.
             _bridge = self._grid_v2_bridge
-            _pending_exit_places = frozenset(
-                cid
-                for cid in self._grid_v2_pending_place_cids
-                if (p := _bridge.adapter.parse_cid(cid)) is not None and p.kind.value == "EXIT"
-            )
-            _pending_exit_cancels = frozenset(
-                cid
-                for cid in self._grid_v2_pending_cancels
-                if (p := _bridge.adapter.parse_cid(cid)) is not None and p.kind.value == "EXIT"
-            )
+            _pending_exit_places: set[str] = set()
+            _pending_entry_place_keys: set[tuple] = set()
+            for cid in self._grid_v2_pending_place_cids:
+                parsed = _bridge.adapter.parse_cid(cid)
+                if parsed is None:
+                    continue
+                if parsed.kind.value == "EXIT":
+                    _pending_exit_places.add(cid)
+                elif parsed.kind.value == "ENTRY":
+                    reg = _bridge.adapter.registry.lookup_entry(cid)
+                    if reg is not None:
+                        _pending_entry_place_keys.add((reg.side, reg.price))
+
+            _pending_exit_cancels: set[str] = set()
+            _pending_entry_cancel_keys: set[tuple] = set()
+            for cid in self._grid_v2_pending_cancels:
+                parsed = _bridge.adapter.parse_cid(cid)
+                if parsed is None:
+                    continue
+                if parsed.kind.value == "EXIT":
+                    _pending_exit_cancels.add(cid)
+                elif parsed.kind.value == "ENTRY":
+                    # Check stale entries too — cancel moves entry to stale cache
+                    reg = _bridge.adapter.registry.lookup_entry(cid)
+                    if reg is None:
+                        reg = _bridge.adapter.registry.lookup_stale_entry(cid)
+                    if reg is not None:
+                        _pending_entry_cancel_keys.add((reg.side, reg.price))
+
             recon = reconcile_grid_state(
                 snapshot=result.snapshot,
                 symbol=self._grid_v2_symbol,
                 bridge=_bridge,
                 max_actions=self._sync_reconciler_max_actions,
                 risk_entry_capacity=_legal_cap,
-                pending_exit_place_cids=_pending_exit_places,
-                pending_exit_cancel_cids=_pending_exit_cancels,
+                pending_exit_place_cids=frozenset(_pending_exit_places),
+                pending_exit_cancel_cids=frozenset(_pending_exit_cancels),
+                pending_entry_place_keys=frozenset(_pending_entry_place_keys),
+                pending_entry_cancel_keys=frozenset(_pending_entry_cancel_keys),
             )
             has_diff = bool(
                 recon.missing_entries
