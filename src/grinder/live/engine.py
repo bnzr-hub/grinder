@@ -2365,10 +2365,11 @@ class LiveEngineV0:
         if sm.mode != BranchMode.FLAT:
             lots_open = len(sm.snapshot.open_lots)
             max_inv = bridge._config.max_inventory_levels
+            _lps = getattr(bridge._config, "entry_levels_per_side", 5)
             headroom = max(0, max_inv - lots_open)
             if headroom == 0:
                 target_entry_keys = set()
-            elif headroom < bridge._config.entry_levels_per_side:
+            elif isinstance(_lps, int) and headroom < _lps:
                 branch_side = OrderSide.BUY if sm.mode == BranchMode.LONG_BRANCH else OrderSide.SELL
                 ref = sm.snapshot.entry_window.reference_price
                 same_side = sorted(
@@ -4973,7 +4974,13 @@ class LiveEngineV0:
                 _hr = max(0, _max - _lots)
                 if _hr == 0:
                     _desired_keys = set()
-                elif _hr < self._grid_v2_bridge._config.entry_levels_per_side:
+                elif (
+                    isinstance(
+                        _lps2 := getattr(self._grid_v2_bridge._config, "entry_levels_per_side", 5),
+                        int,
+                    )
+                    and _hr < _lps2
+                ):
                     _bs = OrderSide.BUY if _sm.mode == BranchMode.LONG_BRANCH else OrderSide.SELL
                     _ref = _sm.snapshot.entry_window.reference_price
                     _ss = sorted(

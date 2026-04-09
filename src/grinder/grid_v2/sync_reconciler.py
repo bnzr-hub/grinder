@@ -161,10 +161,11 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     if sm.mode != BranchMode.FLAT:
         lots_open = len(sm.snapshot.open_lots)
         max_inv = bridge._config.max_inventory_levels
+        _levels_per_side = getattr(bridge._config, "entry_levels_per_side", 5)
         headroom = max(0, max_inv - lots_open)
         if headroom == 0:
             theoretical_entry_keys = set()
-        elif headroom < bridge._config.entry_levels_per_side:
+        elif isinstance(_levels_per_side, int) and headroom < _levels_per_side:
             # Reduce same-side entries to headroom count.
             # Keep entries closest to reference price (highest priority).
             branch_side = OrderSide.BUY if sm.mode == BranchMode.LONG_BRANCH else OrderSide.SELL
