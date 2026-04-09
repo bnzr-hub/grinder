@@ -2217,7 +2217,7 @@ class TestReseedCooldown:
         # Cycle 1: entry → exit → FLAT → reseed
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
-        exit1 = [eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN][0]
+        exit1 = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
         r1 = sm.apply(
             ExitFilled(
                 exit_order_id=exit1.exit_order_id,
@@ -2233,7 +2233,7 @@ class TestReseedCooldown:
         # Cycle 2: entry → exit → FLAT within cooldown → NO reseed
         buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E2", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 2000))
-        exit2 = [eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN][0]
+        exit2 = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
         r2 = sm.apply(
             ExitFilled(
                 exit_order_id=exit2.exit_order_id,
@@ -2254,7 +2254,7 @@ class TestReseedCooldown:
         # Cycle 1: reseed
         buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
-        exit1 = [eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN][0]
+        exit1 = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
         sm.apply(
             ExitFilled(
                 exit_order_id=exit1.exit_order_id,
@@ -2268,7 +2268,7 @@ class TestReseedCooldown:
         # Cycle 2: after cooldown (31s later)
         buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
         sm.apply(EntryFilled("E3", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 32000))
-        exit2 = [eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN][0]
+        exit2 = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
         r2 = sm.apply(
             ExitFilled(
                 exit_order_id=exit2.exit_order_id,
