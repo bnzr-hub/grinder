@@ -718,9 +718,12 @@ class GridV2StateMachine:
         # Near-cap threshold: suppress when within one ladder's depth of cap.
         # Minimum threshold = entry_levels_per_side to avoid suppressing
         # trivially early in configs where max ≈ levels.
-        _near_cap_threshold = max(
-            cfg.entry_levels_per_side,
-            cfg.max_inventory_levels - cfg.entry_levels_per_side,
+        _near_cap_threshold = min(
+            cfg.max_inventory_levels,
+            max(
+                cfg.entry_levels_per_side,
+                cfg.max_inventory_levels - cfg.entry_levels_per_side,
+            ),
         )
         _burst_suppress = lots_after_fill >= _near_cap_threshold
 

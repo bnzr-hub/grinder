@@ -19,11 +19,14 @@ from grinder.grid_v2.state import (
 
 
 def _cfg() -> GridV2Config:
+    # entry_levels=5, max_inventory=20. Near-cap threshold = min(20, max(5,20-5)) = 15.
+    # Rolling fills freely up to 15, then near-cap suppresses.
+    # 5 levels per side gives enough distance for rolling to reach 20.
     return GridV2Config(
         grid_step_pct=Decimal("0.0025"),
         entry_levels_per_side=5,
         order_size=Decimal("15"),
-        max_inventory_levels=10,
+        max_inventory_levels=20,
         max_inventory_notional_usd=Decimal("100"),
         price_tick_size=Decimal("0.0001"),
         reseed_on_flat=True,
@@ -54,10 +57,11 @@ class TestLongBranchUnwindRestore:
         """Going from 10→9 lots: entry must be restored despite exit collision."""
         sm = GridV2StateMachine.create_initial(_cfg(), Decimal("0.5024"), 1000)
         _fill_to_max(sm)
-        # ADR-178: near-cap guard may stop before max_inventory_levels.
-        # With max=10, levels=5, threshold=5: fills ~9 lots (initial 5 + rolling ~4).
-        assert len(sm.snapshot.open_lots) >= 5, (
-            f"Need at least 5 lots, got {len(sm.snapshot.open_lots)}"
+        # With max=20, levels=5: near-cap threshold=15, but B3-alt distance
+        # guard limits rolling to ~10 entries from reference. Assert we fill
+        # enough to meaningfully test the unwind path.
+        assert len(sm.snapshot.open_lots) >= 8, (
+            f"Need deep inventory for unwind test, got {len(sm.snapshot.open_lots)}"
         )
         assert len(sm.snapshot.entry_window.buy_entry_prices) == 0
 
@@ -144,7 +148,12 @@ class TestShortBranchUnwindRestore:
             idx = len(sm.snapshot.open_lots)
             sm.apply(EntryFilled(f"e{idx}", OrderSide.SELL, sp[0], Decimal("15"), 3000 + idx))
 
-        assert len(sm.snapshot.open_lots) >= 5
+        # With max=20, levels=5: near-cap threshold=15, but B3-alt distance
+        # guard limits rolling to ~10 entries from reference. Assert we fill
+        # enough to meaningfully test the unwind path.
+        assert len(sm.snapshot.open_lots) >= 8, (
+            f"Need deep inventory for unwind test, got {len(sm.snapshot.open_lots)}"
+        )
 
         lot = sm.snapshot.open_lots[0]
         exit_eo = next(
