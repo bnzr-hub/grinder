@@ -165,6 +165,7 @@ _GRID_V2_PENDING_CANCEL_STALE_MS = 15_000  # 15s: pending cancel considered stal
 _GRID_V2_PENDING_CANCEL_STALE_GENS = 2  # 2 sync generations: pending cancel stale (dual bound)
 _GRID_V2_PENDING_PLACE_STALE_GENS = 4  # 4 sync generations: pending place considered stale
 _GRID_V2_AWAITING_SYNC_EXPIRY_GENS = 6  # ADR-174: max gens before forced clear of seed latch
+_GRID_V2_STALE_ENTRY_TTL_S = 600  # ADR-179: 10 min — cancel entries older than this
 _GRID_V2_ESCALATION_LOG_INTERVAL = 10  # log escalation every Nth defer (anti-spam)
 _GRID_V2_DRIFT_RECONSTRUCT_COOLDOWN_GENS = (
     3  # wait 3 sync cycles after FLAT before drift reconstruct
@@ -5143,6 +5144,47 @@ class LiveEngineV0:
                         )
                     if self._risk_cap_consecutive_blocks.get(_sym, 0) > 0:
                         self._risk_cap_consecutive_blocks[_sym] = 0
+
+            # ADR-179: Retire stale entry orders that have been resting too long.
+            # Old seed/rolling entries can sit for 20+ min and then burst-fill
+            # when price revisits, triggering cascade. Cancel entries whose CID
+            # timestamp exceeds TTL. Let reconciler restore fresh topology.
+            if (
+                self._grid_v2_bridge is not None
+                and self._grid_v2_bridge.state_machine is not None
+                and self._grid_v2_started
+                and not self._grid_v2_awaiting_sync
+            ):
+                _now_s = int(time.time())
+                _stale_cancels: list[str] = []
+                for o in result.snapshot.open_orders:
+                    if o.symbol != self._grid_v2_symbol:
+                        continue
+                    parsed = self._grid_v2_bridge.adapter.parse_cid(o.order_id)
+                    if parsed is None or parsed.kind.value != "ENTRY":
+                        continue
+                    age_s = _now_s - parsed.ts
+                    if age_s > _GRID_V2_STALE_ENTRY_TTL_S:
+                        _stale_cancels.append(o.order_id)
+                if _stale_cancels:
+                    _retired = 0
+                    for cid in _stale_cancels:
+                        action = ExecutionAction(
+                            action_type=ActionType.CANCEL,
+                            order_id=cid,
+                            symbol=self._grid_v2_symbol,
+                            reason="grid_v2_STALE_ENTRY_RETIRED",
+                        )
+                        r = self._process_action(action, int(time.time() * 1000))
+                        if r.status == LiveActionStatus.EXECUTED:
+                            _retired += 1
+                    if _retired:
+                        logger.info(
+                            "GRID_V2_STALE_ENTRIES_RETIRED symbol=%s count=%d ttl_s=%d",
+                            self._grid_v2_symbol,
+                            _retired,
+                            _GRID_V2_STALE_ENTRY_TTL_S,
+                        )
 
             # Build inflight state for both entry and exit reconciliation.
             # Filter by CID kind AND freshness (ADR-173 TTL contract):
