@@ -75,6 +75,7 @@ class GridV2Config:
     reseed_on_flat_only_on_skew: bool = (
         True  # Default: in preserve mode, reseed only when BUY/SELL ladder is skewed
     )
+    reseed_cooldown_ms: int = 30_000  # Min interval between flat reseeds (anti-churn)
     netoff_enabled: bool = False  # When True, opposite-side entry fill = close lot (net-off)
 
     def __post_init__(self) -> None:
@@ -851,6 +852,11 @@ class GridV2StateMachine:
             self._config.reseed_on_flat
             or (self._config.reseed_on_flat_only_on_skew and _ladder_skewed)
         )
+        # Anti-churn: suppress reseed if last reseed was too recent.
+        if _flat_reseed and snap.last_recenter_ts is not None:
+            elapsed = event.ts - snap.last_recenter_ts
+            if elapsed < self._config.reseed_cooldown_ms:
+                _flat_reseed = False
         restore_without_reseed = _returning_to_flat and not _flat_reseed
         if new_open or restore_without_reseed:
             step_delta = _grid_step_price(

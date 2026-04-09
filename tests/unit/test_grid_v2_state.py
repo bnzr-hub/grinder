@@ -52,6 +52,7 @@ def _config(
     tick_size: Decimal = Decimal("0.01"),
     reseed_on_flat: bool = True,
     reseed_on_flat_only_on_skew: bool = True,
+    reseed_cooldown_ms: int = 0,
 ) -> GridV2Config:
     return GridV2Config(
         grid_step_pct=step,
@@ -62,6 +63,7 @@ def _config(
         price_tick_size=tick_size,
         reseed_on_flat=reseed_on_flat,
         reseed_on_flat_only_on_skew=reseed_on_flat_only_on_skew,
+        reseed_cooldown_ms=reseed_cooldown_ms,
     )
 
 
@@ -2183,3 +2185,120 @@ class TestReplenishSuppressedWhenInventoryFull:
         assert len(sm.snapshot.open_lots) == 2
         places = [a for a in result.actions if a.kind == ActionIntentKind.PLACE_ENTRY]
         assert len(places) == 0, f"No replenish when at max, got {len(places)}"
+
+
+class TestReseedCooldown:
+    """Anti-churn: suppress repeated flat reseeds within cooldown window."""
+
+    def test_normal_reseed_still_works(self) -> None:
+        """First flat return triggers reseed as before."""
+        cfg = _config(reseed_on_flat=True)
+        sm = _sm(cfg=cfg)
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
+        exit_eo = sm.snapshot.exit_orders[0]
+        result = sm.apply(
+            ExitFilled(
+                exit_order_id=exit_eo.exit_order_id,
+                lot_id=exit_eo.lot_id,
+                price=exit_eo.price,
+                qty=_ORDER_SIZE,
+                ts=_BASE_TS + 2,
+            )
+        )
+        recenters = [a for a in result.actions if a.reason == "RECENTER"]
+        assert len(recenters) > 0
+
+    def test_rapid_reseed_suppressed_within_cooldown(self) -> None:
+        """Second flat return within cooldown → no reseed (anti-churn)."""
+        cfg = _config(reseed_on_flat=True, reseed_cooldown_ms=30_000)
+        sm = _sm(cfg=cfg)
+
+        # Cycle 1: entry → exit → FLAT → reseed
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
+        exit1 = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
+        r1 = sm.apply(
+            ExitFilled(
+                exit_order_id=exit1.exit_order_id,
+                lot_id=exit1.lot_id,
+                price=exit1.price,
+                qty=_ORDER_SIZE,
+                ts=_BASE_TS + 1000,  # first reseed
+            )
+        )
+        assert any(a.reason == "RECENTER" for a in r1.actions)
+        assert sm.snapshot.last_recenter_ts == _BASE_TS + 1000
+
+        # Cycle 2: entry → exit → FLAT within cooldown → NO reseed
+        buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("E2", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 2000))
+        exit2 = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
+        r2 = sm.apply(
+            ExitFilled(
+                exit_order_id=exit2.exit_order_id,
+                lot_id=exit2.lot_id,
+                price=exit2.price,
+                qty=_ORDER_SIZE,
+                ts=_BASE_TS + 5000,  # only 4s after first reseed, within 30s cooldown
+            )
+        )
+        recenters = [a for a in r2.actions if a.reason == "RECENTER"]
+        assert len(recenters) == 0, "Reseed should be suppressed within cooldown"
+
+    def test_reseed_allowed_after_cooldown_expires(self) -> None:
+        """After cooldown expires, reseed is allowed again."""
+        cfg = _config(reseed_on_flat=True, reseed_cooldown_ms=30_000)
+        sm = _sm(cfg=cfg)
+
+        # Cycle 1: reseed
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
+        exit1 = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
+        sm.apply(
+            ExitFilled(
+                exit_order_id=exit1.exit_order_id,
+                lot_id=exit1.lot_id,
+                price=exit1.price,
+                qty=_ORDER_SIZE,
+                ts=_BASE_TS + 1000,
+            )
+        )
+
+        # Cycle 2: after cooldown (31s later)
+        buy2 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("E3", OrderSide.BUY, buy2, _ORDER_SIZE, _BASE_TS + 32000))
+        exit2 = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
+        r2 = sm.apply(
+            ExitFilled(
+                exit_order_id=exit2.exit_order_id,
+                lot_id=exit2.lot_id,
+                price=exit2.price,
+                qty=_ORDER_SIZE,
+                ts=_BASE_TS + 35000,  # 34s after first reseed, past 30s cooldown
+            )
+        )
+        recenters = [a for a in r2.actions if a.reason == "RECENTER"]
+        assert len(recenters) > 0, "Reseed should be allowed after cooldown"
+
+    def test_batch_semantics_preserved(self) -> None:
+        """When reseed does happen, it's still a batch (cancel+place all)."""
+        cfg = _config(reseed_on_flat=True, levels=3)
+        sm = _sm(cfg=cfg)
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
+        exit1 = sm.snapshot.exit_orders[0]
+        result = sm.apply(
+            ExitFilled(
+                exit_order_id=exit1.exit_order_id,
+                lot_id=exit1.lot_id,
+                price=exit1.price,
+                qty=_ORDER_SIZE,
+                ts=_BASE_TS + 2,
+            )
+        )
+        cancels = [a for a in result.actions if a.reason == "RECENTER_REPLACE"]
+        places = [a for a in result.actions if a.reason == "RECENTER"]
+        # Batch: cancel existing + place new
+        assert len(cancels) > 0
+        assert len(places) > 0
