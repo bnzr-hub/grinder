@@ -5020,7 +5020,7 @@ class LiveEngineV0:
             # Filter by CID kind to prevent cross-contamination.
             _bridge = self._grid_v2_bridge
             _pending_exit_places: set[str] = set()
-            _pending_entry_place_keys: set[tuple] = set()
+            _pending_entry_place_keys: set[tuple[object, ...]] = set()
             for cid in self._grid_v2_pending_place_cids:
                 parsed = _bridge.adapter.parse_cid(cid)
                 if parsed is None:
@@ -5033,7 +5033,7 @@ class LiveEngineV0:
                         _pending_entry_place_keys.add((reg.side, reg.price))
 
             _pending_exit_cancels: set[str] = set()
-            _pending_entry_cancel_keys: set[tuple] = set()
+            _pending_entry_cancel_keys: set[tuple[object, ...]] = set()
             for cid in self._grid_v2_pending_cancels:
                 parsed = _bridge.adapter.parse_cid(cid)
                 if parsed is None:
