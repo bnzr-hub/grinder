@@ -5099,3 +5099,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Add `actual_exit_cids` parameter to `compute_desired_exits()`. When provided, two-pass budget allocation: exits already on exchange get budget first, then remaining exits. This prevents stale deferred exits from consuming budget that is already occupied by live exchange orders.
 - **Invariant:** Exits on exchange always get budget priority. Unregistered exits only get budget if room remains after on-exchange exits are accounted for. Backwards compatible: without `actual_exit_cids`, SM ordering is preserved.
 - **Consequences:** Stale DEFERRED exits are cut at topology level when budget is full, eliminating the BLOCKED re-place path. Exit maintenance converges from current exchange truth, not stale repair history.
+
+### ADR-167: Inflight-aware exit reconciliation in sync reconciler (2026-04-09)
+
+- **Problem:** Live canary showed repeated transient `missing_exits=1` in sync reconciler logs under burst fills. The reconciler computed `missing_exits = desired_exit_cids - actual_exit_cids` using only snapshot-visible orders. Exits dispatched but not yet visible (inflight) appeared as false missing.
+- **Root cause:** Sync reconciler had zero inflight awareness for exits. Exit topology repair (ADR-105) already checked `_grid_v2_pending_place_cids` before placing, but the reconciler's diagnostic diff didn't account for pending state.
+- **Decision:** Add `pending_exit_place_cids` and `pending_exit_cancel_cids` to `reconcile_grid_state()`. Pending placements count as effectively present (suppresses false missing). Pending cancels count as effectively absent (suppresses false extra). Backwards compatible: without these args, old behavior preserved.
+- **Invariant:** True missing/extra exits are still detected. Only inflight-lag artifacts are suppressed.
+- **Consequences:** Transient `missing_exits` noise is reduced under burst fills. No duplicate exit actions. Reconciler diagnostics become trustworthy indicators of real topology gaps.

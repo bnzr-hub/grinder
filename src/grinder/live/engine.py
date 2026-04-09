@@ -5016,12 +5016,27 @@ class LiveEngineV0:
                     if self._risk_cap_consecutive_blocks.get(_sym, 0) > 0:
                         self._risk_cap_consecutive_blocks[_sym] = 0
 
+            # Filter pending CIDs to EXIT kind only — pending entry CIDs
+            # must not contaminate exit reconciliation (would create bogus extras).
+            _bridge = self._grid_v2_bridge
+            _pending_exit_places = frozenset(
+                cid
+                for cid in self._grid_v2_pending_place_cids
+                if (p := _bridge.adapter.parse_cid(cid)) is not None and p.kind.value == "EXIT"
+            )
+            _pending_exit_cancels = frozenset(
+                cid
+                for cid in self._grid_v2_pending_cancels
+                if (p := _bridge.adapter.parse_cid(cid)) is not None and p.kind.value == "EXIT"
+            )
             recon = reconcile_grid_state(
                 snapshot=result.snapshot,
                 symbol=self._grid_v2_symbol,
-                bridge=self._grid_v2_bridge,
+                bridge=_bridge,
                 max_actions=self._sync_reconciler_max_actions,
                 risk_entry_capacity=_legal_cap,
+                pending_exit_place_cids=_pending_exit_places,
+                pending_exit_cancel_cids=_pending_exit_cancels,
             )
             has_diff = bool(
                 recon.missing_entries
