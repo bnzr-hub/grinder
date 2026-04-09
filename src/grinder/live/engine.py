@@ -5168,15 +5168,23 @@ class LiveEngineV0:
                         _stale_cancels.append(o.order_id)
                 if _stale_cancels:
                     _retired = 0
+                    _ts_ms = int(time.time() * 1000)
+                    _gen = self._account_sync_generation
                     for cid in _stale_cancels:
+                        # Skip if already pending cancel (avoid duplicate -2011)
+                        if cid in self._grid_v2_pending_cancels:
+                            continue
                         action = ExecutionAction(
                             action_type=ActionType.CANCEL,
                             order_id=cid,
                             symbol=self._grid_v2_symbol,
                             reason="grid_v2_STALE_ENTRY_RETIRED",
                         )
-                        r = self._process_action(action, int(time.time() * 1000))
+                        r = self._process_action(action, _ts_ms)
                         if r.status == LiveActionStatus.EXECUTED:
+                            # Register in pending-cancels so reconciler
+                            # treats it as inflight and doesn't re-cancel
+                            self._grid_v2_pending_cancels[cid] = (_ts_ms, _gen)
                             _retired += 1
                     if _retired:
                         logger.info(
