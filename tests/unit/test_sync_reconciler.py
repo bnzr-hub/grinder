@@ -685,7 +685,7 @@ class TestPriceAwareEntryReconciliation:
         r = reconcile_grid_state(snap, "BTCUSDT", bridge)
         assert r.missing_entries == 0
         assert r.extra_entries == 0
-        assert tuple() == r.actions
+        assert r.actions == ()
 
     def test_off_grid_entry_becomes_cancel_plus_replace(self) -> None:
         """Entry far from desired price is corrected, not treated as structural drift."""
@@ -733,4 +733,4 @@ class TestPriceAwareEntryReconciliation:
         )
         assert r.missing_entries == 0
         assert r.extra_entries == 0
-        assert tuple() == r.actions
+        assert r.actions == ()

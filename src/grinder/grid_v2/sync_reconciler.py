@@ -333,7 +333,7 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
             )
         )
 
-    for side, expected_price, actual_price, cid in sorted(
+    for _side, _expected_price, _actual_price, cid in sorted(
         geometry_entry_mismatches,
         key=lambda x: (x[0].value, x[1], x[2], x[3]),
     ):
