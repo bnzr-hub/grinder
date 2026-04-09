@@ -214,6 +214,9 @@ class TransitionResult:
     actions: tuple[ActionIntent, ...]
     rejected: bool = False
     reject_reason: str = ""
+    # ADR-171: Observability — suppression reasons for canary analysis
+    reseed_suppressed: str = ""  # "" = not suppressed, "cooldown" = cooldown active
+    replenish_suppressed: str = ""  # "" = not suppressed, "headroom" / "inventory_full"
 
 
 class GridV2InvariantError(Exception):
@@ -841,6 +844,7 @@ class GridV2StateMachine:
         new_window = snap.entry_window
         new_mode = BranchMode.FLAT if not new_open else snap.mode
         new_last_recenter_ts = snap.last_recenter_ts
+        _replenish_suppressed = ""
         _returning_to_flat = not new_open and snap.mode in {
             BranchMode.LONG_BRANCH,
             BranchMode.SHORT_BRANCH,
@@ -853,10 +857,12 @@ class GridV2StateMachine:
             or (self._config.reseed_on_flat_only_on_skew and _ladder_skewed)
         )
         # Anti-churn: suppress reseed if last reseed was too recent.
+        _reseed_suppressed = ""
         if _flat_reseed and snap.last_recenter_ts is not None:
             elapsed = event.ts - snap.last_recenter_ts
             if elapsed < self._config.reseed_cooldown_ms:
                 _flat_reseed = False
+                _reseed_suppressed = "cooldown"
         restore_without_reseed = _returning_to_flat and not _flat_reseed
         if new_open or restore_without_reseed:
             step_delta = _grid_step_price(
@@ -875,6 +881,13 @@ class GridV2StateMachine:
             # Headroom limits same-side entries to prevent burst overshoot.
             _headroom = max(0, self._config.max_inventory_levels - len(new_open))
             _inventory_has_room = _headroom > 0
+            _replenish_suppressed = (
+                "inventory_full"
+                if _headroom == 0
+                else "headroom"
+                if _headroom < self._config.entry_levels_per_side
+                else ""
+            )
 
             if snap.mode == BranchMode.LONG_BRANCH:
                 buy_prices = list(snap.entry_window.buy_entry_prices)
@@ -1067,7 +1080,16 @@ class GridV2StateMachine:
             emergency_stopped=snap.emergency_stopped,
             last_recenter_ts=new_last_recenter_ts,
         )
-        return self._commit(new_snapshot, tuple(actions))
+        result = self._commit(new_snapshot, tuple(actions))
+        # ADR-171: Attach suppression reasons for observability
+        if _reseed_suppressed or _replenish_suppressed:
+            result = TransitionResult(
+                snapshot=result.snapshot,
+                actions=result.actions,
+                reseed_suppressed=_reseed_suppressed,
+                replenish_suppressed=_replenish_suppressed,
+            )
+        return result
 
     def _find_open_lot(self, lot_id: str) -> tuple[InventoryLot | None, TransitionResult | None]:
         """Find open lot by ID. Returns (lot, None) or (None, rejection)."""

@@ -68,6 +68,12 @@ class ReconcileResult:
     # Shadow-only fields for observability
     would_cancel: int = 0
     would_place: int = 0
+    # ADR-171: Diagnostic fields for canary analysis
+    inventory_headroom: int | None = None  # cap - open_lots (None if FLAT)
+    inflight_entry_places: int = 0  # pending entry placements (suppresses false missing)
+    inflight_entry_cancels: int = 0  # pending entry cancels (suppresses false extra)
+    inflight_exit_places: int = 0  # pending exit placements
+    inflight_exit_cancels: int = 0  # pending exit cancels
 
 
 @dataclass
@@ -155,6 +161,7 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     for p in sm.snapshot.entry_window.sell_entry_prices:
         theoretical_entry_keys.add((OrderSide.SELL, bridge._quantize_price(p, OrderSide.SELL)))
 
+    headroom: int = -1  # sentinel: -1 = FLAT mode (no headroom logic)
     # Inventory headroom: as inventory approaches cap, reduce same-side
     # entries to limit burst overshoot. At cap → zero entries. Near cap →
     # only a few entries remain, so rapid fills can't push far past limit.
@@ -334,6 +341,11 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
         legal_entry_capacity=risk_entry_capacity,
         would_cancel=cancel_count,
         would_place=place_count,
+        inventory_headroom=headroom if sm.mode != BranchMode.FLAT else None,
+        inflight_entry_places=len(pending_entry_place_keys) if pending_entry_place_keys else 0,
+        inflight_entry_cancels=len(pending_entry_cancel_keys) if pending_entry_cancel_keys else 0,
+        inflight_exit_places=len(pending_exit_place_cids) if pending_exit_place_cids else 0,
+        inflight_exit_cancels=len(pending_exit_cancel_cids) if pending_exit_cancel_cids else 0,
     )
 
 
