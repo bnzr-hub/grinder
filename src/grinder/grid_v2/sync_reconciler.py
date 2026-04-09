@@ -274,12 +274,8 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
                 bridge._config.price_tick_size,
             )
         )
-        missing_entries = {
-            (OrderSide(side), price) for side, price in truly_missing_str
-        }
-        extra_entries = {
-            (OrderSide(side), price) for side, price in truly_extra_str
-        }
+        missing_entries = {(OrderSide(side), price) for side, price in truly_missing_str}
+        extra_entries = {(OrderSide(side), price) for side, price in truly_extra_str}
         geometry_entry_mismatches = [
             (OrderSide(side), expected_price, actual_price, cid)
             for side, expected_price, actual_price, cid in geometry_mismatch_str
