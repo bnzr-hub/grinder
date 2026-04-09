@@ -5144,3 +5144,10 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Reorder action emission into three explicit tiers: P1 exit safety (cancel extra exits, atomic exit reprice pairs), P2 entry cleanup (cancel extra/mispriced entries), P3 entry restoration (place missing/repriced entries). Each tier is self-contained with deterministic sub-ordering.
 - **Invariant:** Exit safety work always executes before entry work under budget pressure. Atomic exit reprice pairs remain unsplittable. Same input always produces same action sequence.
 - **Consequences:** Limited-budget cycles prioritize position protection over revenue restoration. No strategy behavior change — only ordering of already-detected corrections.
+
+### ADR-173: Inflight TTL contract for reconciler pending state (2026-04-09)
+
+- **Problem:** Pending place/cancel CIDs were passed to reconciler without freshness filtering. A stuck pending record (exchange never confirms) would suppress correction forever.
+- **Decision:** Filter pending CIDs by freshness before passing to reconciler. Pending places expire after `_GRID_V2_PENDING_PLACE_STALE_GENS` (4 sync gens). Pending cancels expire after `_GRID_V2_PENDING_CANCEL_STALE_MS` (15s) or `_GRID_V2_PENDING_CANCEL_STALE_GENS` (2 gens). Same constants already used for registry cleanup — now also applied to reconciler inflight suppression.
+- **Invariant:** Fresh inflight records suppress duplicate actions. Stale records expire and reconciler re-evaluates from exchange truth. Entry and exit use the same TTL semantics. Natural visibility clears pending before TTL.
+- **Consequences:** No permanent stale suppression. Reconciler eventually reconverges even if a pending action is lost.

@@ -4864,7 +4864,10 @@ class LiveEngineV0:
                 gen = self._account_sync_generation + 1  # gen about to be set
                 expired: list[str] = []
                 for cid, dispatch_gen in list(self._grid_v2_pending_place_cids.items()):
-                    if cid in visible_cids or (gen - dispatch_gen) >= 2:
+                    if (
+                        cid in visible_cids
+                        or (gen - dispatch_gen) >= _GRID_V2_PENDING_PLACE_STALE_GENS
+                    ):
                         expired.append(cid)
                 if expired:
                     for cid in expired:
@@ -5077,11 +5080,20 @@ class LiveEngineV0:
                         self._risk_cap_consecutive_blocks[_sym] = 0
 
             # Build inflight state for both entry and exit reconciliation.
-            # Filter by CID kind to prevent cross-contamination.
+            # Filter by CID kind AND freshness (ADR-173 TTL contract):
+            # - pending places: fresh if within STALE_GENS of current gen
+            # - pending cancels: fresh if within STALE_MS or STALE_GENS
+            # Stale inflight records are excluded so reconciler re-evaluates
+            # from exchange truth instead of suppressing corrections forever.
             _bridge = self._grid_v2_bridge
+            _gen = self._account_sync_generation + 1  # gen about to be set
+            _now_ms = int(time.time() * 1000) if self._grid_v2_pending_cancels else 0
+
             _pending_exit_places: set[str] = set()
             _pending_entry_place_keys: set[Any] = set()
-            for cid in self._grid_v2_pending_place_cids:
+            for cid, dispatch_gen in self._grid_v2_pending_place_cids.items():
+                if (_gen - dispatch_gen) >= _GRID_V2_PENDING_PLACE_STALE_GENS:
+                    continue  # stale — let reconciler re-evaluate
                 parsed = _bridge.adapter.parse_cid(cid)
                 if parsed is None:
                     continue
@@ -5094,14 +5106,20 @@ class LiveEngineV0:
 
             _pending_exit_cancels: set[str] = set()
             _pending_entry_cancel_keys: set[Any] = set()
-            for cid in self._grid_v2_pending_cancels:
+            for cid, (dispatch_ts, dispatch_gen) in self._grid_v2_pending_cancels.items():
+                age_ms = _now_ms - dispatch_ts if _now_ms > 0 else 0
+                gen_delta = _gen - dispatch_gen
+                if (
+                    age_ms >= _GRID_V2_PENDING_CANCEL_STALE_MS
+                    or gen_delta >= _GRID_V2_PENDING_CANCEL_STALE_GENS
+                ):
+                    continue  # stale — let reconciler re-evaluate
                 parsed = _bridge.adapter.parse_cid(cid)
                 if parsed is None:
                     continue
                 if parsed.kind.value == "EXIT":
                     _pending_exit_cancels.add(cid)
                 elif parsed.kind.value == "ENTRY":
-                    # Check stale entries too — cancel moves entry to stale cache
                     reg = _bridge.adapter.registry.lookup_entry(cid)
                     if reg is None:
                         reg = _bridge.adapter.registry.lookup_stale_entry(cid)

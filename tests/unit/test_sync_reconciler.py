@@ -958,3 +958,73 @@ class TestActionPriority:
         r1 = reconcile_grid_state(snap, "BTCUSDT", bridge, max_actions=10)
         r2 = reconcile_grid_state(snap, "BTCUSDT", bridge, max_actions=10)
         assert r1.actions == r2.actions
+
+
+class TestInflightTTL:
+    """ADR-173: Stale inflight records expire; fresh ones suppress duplicates."""
+
+    def test_fresh_pending_place_suppresses(self) -> None:
+        """Pending place within TTL suppresses false missing."""
+        eo = _make_exit_order("eo1", price=Decimal("50250"), side=OrderSide.SELL)
+        bridge = _make_bridge(exit_orders=(eo,), tick_size=Decimal("0.10"))
+        snap = _make_snapshot(exit_cids=[])
+        # Fresh pending exit place → suppresses missing
+        r = reconcile_grid_state(
+            snap,
+            "BTCUSDT",
+            bridge,
+            pending_exit_place_cids=frozenset({"exit_eo1"}),
+        )
+        assert r.missing_exits == 0
+
+    def test_stale_pending_not_passed_means_missing_detected(self) -> None:
+        """If engine filters out stale pending, reconciler sees real missing."""
+        eo = _make_exit_order("eo1", price=Decimal("50250"), side=OrderSide.SELL)
+        bridge = _make_bridge(exit_orders=(eo,), tick_size=Decimal("0.10"))
+        snap = _make_snapshot(exit_cids=[])
+        # No pending passed (engine filtered stale) → missing detected
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        assert r.missing_exits == 1
+
+    def test_fresh_pending_cancel_suppresses(self) -> None:
+        """Pending cancel within TTL suppresses false extra."""
+        bridge = _make_bridge(exit_orders=(), tick_size=Decimal("0.10"))
+        snap = _make_snapshot(exit_cids=["exit_stale"])
+        r = reconcile_grid_state(
+            snap,
+            "BTCUSDT",
+            bridge,
+            pending_exit_cancel_cids=frozenset({"exit_stale"}),
+        )
+        assert r.extra_exits == 0
+
+    def test_stale_pending_cancel_not_passed_means_extra_detected(self) -> None:
+        """If engine filters out stale cancel, reconciler sees real extra."""
+        bridge = _make_bridge(exit_orders=(), tick_size=Decimal("0.10"))
+        snap = _make_snapshot(exit_cids=["exit_stale"])
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        assert r.extra_exits == 1
+
+    def test_entry_and_exit_parity(self) -> None:
+        """Both entry and exit pending follow same suppression pattern."""
+        eo = _make_exit_order("eo1", price=Decimal("50250"), side=OrderSide.SELL)
+        bridge = _make_bridge(
+            buy_prices=(Decimal("99.00"),),
+            sell_prices=(),
+            exit_orders=(eo,),
+            tick_size=Decimal("0.10"),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            levels=1,
+        )
+        snap = _make_snapshot(exit_cids=[])
+        # Both entry and exit pending → both suppressed
+        r = reconcile_grid_state(
+            snap,
+            "BTCUSDT",
+            bridge,
+            pending_exit_place_cids=frozenset({"exit_eo1"}),
+            pending_entry_place_keys=frozenset({(OrderSide.BUY, Decimal("99.00"))}),
+        )
+        assert r.missing_exits == 0
+        assert r.missing_entries == 0
