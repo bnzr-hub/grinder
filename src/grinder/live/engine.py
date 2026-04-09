@@ -164,6 +164,7 @@ _GRID_V2_INTEGRITY_CONVERGENCE_MAX_DEFERS = 6  # after 6 defers, repair proceeds
 _GRID_V2_PENDING_CANCEL_STALE_MS = 15_000  # 15s: pending cancel considered stale for convergence
 _GRID_V2_PENDING_CANCEL_STALE_GENS = 2  # 2 sync generations: pending cancel stale (dual bound)
 _GRID_V2_PENDING_PLACE_STALE_GENS = 4  # 4 sync generations: pending place considered stale
+_GRID_V2_AWAITING_SYNC_EXPIRY_GENS = 6  # ADR-174: max gens before forced clear of seed latch
 _GRID_V2_ESCALATION_LOG_INTERVAL = 10  # log escalation every Nth defer (anti-spam)
 _GRID_V2_DRIFT_RECONSTRUCT_COOLDOWN_GENS = (
     3  # wait 3 sync cycles after FLAT before drift reconstruct
@@ -908,6 +909,7 @@ class LiveEngineV0:
         self._grid_v2_seed_actions: list[ExecutionAction] = []
         self._grid_v2_pending_cancels: dict[str, tuple[int, int]] = {}  # cid → (ts_ms, sync_gen)
         self._grid_v2_awaiting_sync = False  # PR6: skip fill detection until seed CIDs visible
+        self._grid_v2_awaiting_sync_checks: int = 0  # ADR-174: sync checks since latch set
         self._fill_sync_skip_used = False  # one-shot: skip sync on first fill tick only
         self._seed_gate_only_mode = False  # when True, _process_action skips HTTP
         self._seed_gate_passed_intents: list[tuple[ExecutionAction, Any]] = []
@@ -1852,6 +1854,7 @@ class LiveEngineV0:
         self._sync_reconciler_pending_actions = []
         self._grid_v2_awaiting_sync = False
         self._grid_v2_pending_seed_cids = frozenset()
+        self._grid_v2_awaiting_sync_checks = 0
         # Reconstructed orders from exchange are provably live
         self._grid_v2_seed_fill_eligible_from_registry()
 
@@ -4837,20 +4840,39 @@ class LiveEngineV0:
                 else:
                     visible_cids = {o.order_id for o in result.snapshot.open_orders}
                 missing = self._grid_v2_pending_seed_cids - visible_cids
+                self._grid_v2_awaiting_sync_checks += 1
                 if not missing:
                     confirmed_count = len(self._grid_v2_pending_seed_cids)
                     self._grid_v2_awaiting_sync = False
                     self._grid_v2_pending_seed_cids = frozenset()
+                    self._grid_v2_awaiting_sync_checks = 0
                     logger.info(
                         "GRID_V2_AWAITING_SYNC_CLEARED gen=%d seeds_confirmed=%d",
                         self._account_sync_generation + 1,
                         confirmed_count,
                     )
-                else:
-                    logger.debug(
-                        "GRID_V2_AWAITING_SYNC_PENDING missing=%d/%d",
+                elif self._grid_v2_awaiting_sync_checks >= _GRID_V2_AWAITING_SYNC_EXPIRY_GENS:
+                    # ADR-174: bounded expiry — seed CID(s) never became visible
+                    # (likely filled before first snapshot). Force clear and let
+                    # normal reconciler take over.
+                    logger.warning(
+                        "GRID_V2_AWAITING_SYNC_EXPIRED symbol=%s "
+                        "missing_seeds=%d total_seeds=%d checks=%d",
+                        self._grid_v2_symbol,
                         len(missing),
                         len(self._grid_v2_pending_seed_cids),
+                        self._grid_v2_awaiting_sync_checks,
+                    )
+                    self._grid_v2_awaiting_sync = False
+                    self._grid_v2_pending_seed_cids = frozenset()
+                    self._grid_v2_awaiting_sync_checks = 0
+                else:
+                    logger.debug(
+                        "GRID_V2_AWAITING_SYNC_PENDING missing=%d/%d checks=%d/%d",
+                        len(missing),
+                        len(self._grid_v2_pending_seed_cids),
+                        self._grid_v2_awaiting_sync_checks,
+                        _GRID_V2_AWAITING_SYNC_EXPIRY_GENS,
                     )
             # Clear pending-place CIDs: visible on exchange OR grace expired.
             # Grace = 2 sync cycles. After grace, CID released for fill detection

@@ -5151,3 +5151,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Filter pending CIDs by freshness before passing to reconciler. Pending places expire after `_GRID_V2_PENDING_PLACE_STALE_GENS` (4 sync gens). Pending cancels expire after `_GRID_V2_PENDING_CANCEL_STALE_MS` (15s) or `_GRID_V2_PENDING_CANCEL_STALE_GENS` (2 gens). Same constants already used for registry cleanup — now also applied to reconciler inflight suppression.
 - **Invariant:** Fresh inflight records suppress duplicate actions. Stale records expire and reconciler re-evaluates from exchange truth. Entry and exit use the same TTL semantics. Natural visibility clears pending before TTL.
 - **Consequences:** No permanent stale suppression. Reconciler eventually reconverges even if a pending action is lost.
+
+### ADR-174: Bounded expiry for awaiting_sync seed convergence (2026-04-09)
+
+- **Problem:** Live canary showed NOMUSDT stuck in `AWAITING_SYNC` for 14+ minutes. One seed order (e0) filled before the first exchange snapshot, so its CID never appeared in open orders. The latch required ALL seed CIDs to be visible, with no expiry — resulting in permanent degraded mode.
+- **Root cause:** `_grid_v2_awaiting_sync` had no bounded timeout. The visibility check only cleared on full convergence, with no fallback for the "seed filled before first snapshot" race.
+- **Decision:** Add `_GRID_V2_AWAITING_SYNC_EXPIRY_GENS = 6` (6 sync checks). If seed visibility doesn't fully converge after 6 checks, force-clear the latch with `GRID_V2_AWAITING_SYNC_EXPIRED` log. Normal reconciler takes over.
+- **Invariant:** Natural clear still works when all seeds are visible. Expiry only triggers after bounded checks. Counter resets on every latch set/clear.
+- **Consequences:** `AWAITING_SYNC` can no longer wedge a symbol indefinitely. Immediate-fill-before-first-snapshot race is bounded.
