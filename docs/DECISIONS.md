@@ -5182,3 +5182,10 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Add `_burst_suppress` check in `_update_window_after_fill()`: if `lots_after_fill >= max_inventory_levels`, suppress `FILL_REPLACEMENT`. The fill's exit and opposite-side trim still happen normally — only the new same-side entry placement is suppressed.
 - **Invariant:** Normal rolling works when below cap. Burst suppression activates at cap boundary. Startup seed and reseed paths unaffected. Tagged via `replenish_suppressed="burst_governor"` for observability.
 - **Consequences:** Hot-path snowball is bounded at inventory cap. Trending market fills stop self-amplifying once cap is reached.
+
+### ADR-178: Near-cap guard for fill-driven rolling entries (2026-04-09)
+
+- **Problem:** #657 burst governor triggered at hard cap, but the hot path still emitted many same-side replacements before that. ARIAUSDT accumulated deep branch pressure before `inventory_full` kicked in.
+- **Decision:** Lower the suppression threshold from `max_inventory_levels` to `max_inventory_levels - entry_levels_per_side`. With defaults 15-5=10, FILL_REPLACEMENT suppresses at 10+ lots instead of 15. This means the last `entry_levels_per_side` lots worth of fills cannot self-amplify through the hot path.
+- **Invariant:** Below threshold (< 10 lots), normal rolling works. At/above threshold, only exits are placed, no new same-side entries from fill path. Reconciler can still restore entries after exits reduce lot count.
+- **Consequences:** Snowball weakened earlier. Cap overshoot further reduced. Normal calm trading below 10 lots unaffected.
