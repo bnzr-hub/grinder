@@ -575,7 +575,7 @@ class LiveEngineV0:
         self._force_reduce_reason: str = ""
         self._force_reduce_flat_logged: bool = False
         self._force_reduce_exits_cleared: bool = False
-        # Forced-flat: symbol-scoped emergency close at adverse level 20.
+        # Forced-flat: symbol-scoped emergency close at adverse price level 20.
         # Stronger than force-reduce — cancels orders + market-closes position.
         self._forced_flat_requested: bool = False
         self._forced_flat_executed: bool = False
@@ -3098,7 +3098,8 @@ class LiveEngineV0:
             )
             self._regime_registry.publish(snapshot.symbol, rd.regime, rd.reason, rd.confidence)
 
-        # Adverse grid level trigger: FORCE_REDUCE at 16, FORCED_FLAT at 20
+        # Adverse price-level trigger: FORCE_REDUCE at 16 steps, FORCED_FLAT at 20 steps
+        # These are price thresholds (reference ± step_price * level), not lot counts.
         if (
             self._grid_v2_started
             and self._grid_v2_bridge is not None
@@ -4059,9 +4060,13 @@ class LiveEngineV0:
             )
 
     def _check_adverse_level_trigger(self, snapshot: Snapshot) -> None:
-        """Check if price has breached force-reduce (16) or forced-flat (20) adverse levels.
+        """Check if price has breached adverse price thresholds.
 
-        Uses live grid geometry. Checks level 20 first (stronger overrides softer).
+        Thresholds are computed as reference_price ± step_price * level:
+        - Level 16: FORCE_REDUCE (reduce-only unload begins).
+        - Level 20: FORCED_FLAT (emergency full flatten).
+        These are adverse PRICE levels, not lot counts.
+        Checks level 20 first (stronger overrides softer).
         Idempotent. Fail-open on errors.
         """
         import contextlib  # noqa: PLC0415
@@ -4092,7 +4097,7 @@ class LiveEngineV0:
         step_pct = bridge._config.grid_step_pct
         tick = bridge._config.price_tick_size
 
-        # Check level 20 (FORCED_FLAT) first — stronger overrides softer
+        # Check adverse price level 20 (FORCED_FLAT) first — stronger overrides softer
         if not self._forced_flat_requested:
             flat_threshold = compute_adverse_threshold(
                 ref_price,
@@ -4116,7 +4121,7 @@ class LiveEngineV0:
                 self.request_forced_flat(reason="ADVERSE_LEVEL_20")
                 return
 
-        # Check level 16 (FORCE_REDUCE)
+        # Check adverse price level 16 (FORCE_REDUCE)
         if not self._force_reduce_requested:
             reduce_threshold = compute_adverse_threshold(
                 ref_price,

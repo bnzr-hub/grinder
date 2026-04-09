@@ -21,15 +21,21 @@ class GridPolicy:
     Attributes:
         live_entry_levels_per_side: Active entry orders per side of the grid.
             The visible ladder depth at any point in time.
-        max_inventory_levels: Maximum accumulated lots before same-side
-            replenishment is suppressed. Rolling pauses at this level.
-        force_reduce_trigger_level: Lot count that triggers FORCE_REDUCE.
-            Adverse geometry beyond max_inventory indicates risk escalation.
-        forced_flat_trigger_level: Lot count that triggers FORCED_FLAT.
-            Hard emergency boundary — symbol must be fully flattened.
+        max_inventory_levels: Maximum accumulated lots (inventory cap).
+            When reached, same-side replenishment / rolling is suppressed.
+            This is a lot-count cap applied by the grid_v2 state machine.
+        force_reduce_trigger_level: Adverse price level that triggers
+            FORCE_REDUCE. In live runtime, this is computed as a price
+            threshold (reference ± step_price * level) via adverse_trigger.py,
+            NOT as a raw lot count. The level number defines how many grid
+            steps away from reference price the threshold sits.
+        forced_flat_trigger_level: Adverse price level that triggers
+            FORCED_FLAT (emergency symbol flatten). Same price-based
+            semantics as force_reduce_trigger_level — NOT a lot count.
         adverse_depth_levels: Worst-case depth used for risk sizing.
-            Order size is computed to survive this many fills without
-            exceeding the symbol risk budget. Must equal forced_flat_trigger_level.
+            Order size is computed to survive this many adverse price
+            levels without exceeding the symbol risk budget.
+            Must equal forced_flat_trigger_level.
     """
 
     live_entry_levels_per_side: int = 5
