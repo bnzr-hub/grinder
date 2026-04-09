@@ -5022,6 +5022,8 @@ class LiveEngineV0:
                 bridge=self._grid_v2_bridge,
                 max_actions=self._sync_reconciler_max_actions,
                 risk_entry_capacity=_legal_cap,
+                pending_exit_place_cids=frozenset(self._grid_v2_pending_place_cids),
+                pending_exit_cancel_cids=frozenset(self._grid_v2_pending_cancels),
             )
             has_diff = bool(
                 recon.missing_entries

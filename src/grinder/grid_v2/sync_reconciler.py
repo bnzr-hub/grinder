@@ -115,6 +115,8 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     max_actions: int = 10,
     *,
     risk_entry_capacity: int | None = None,
+    pending_exit_place_cids: frozenset[str] | None = None,
+    pending_exit_cancel_cids: frozenset[str] | None = None,
 ) -> ReconcileResult:
     """Compute deterministic repair actions from fresh account snapshot.
 
@@ -125,6 +127,10 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
         max_actions: Max total actions (cancel + place) per sync cycle.
         risk_entry_capacity: Legal additional entry capacity (ADR-102/103).
             None = unconstrained (risk base disabled or data unavailable).
+        pending_exit_place_cids: Exit CIDs dispatched but not yet visible
+            on exchange. Treated as effectively present for missing_exits.
+        pending_exit_cancel_cids: Exit CIDs with pending cancel dispatched
+            but not yet reflected. Treated as effectively absent for extra_exits.
             0 = fully constrained (no new entries allowed).
             N > 0 = partial capacity (truncate desired to N entries).
 
@@ -221,8 +227,16 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     actual_entry_keys = set(actual_entry_by_key.keys())
     missing_entries = effective_entry_keys - actual_entry_keys
     extra_entries = actual_entry_keys - effective_entry_keys
-    missing_exits = desired_exit_cids - actual_exit_cids
-    extra_exits = actual_exit_cids - desired_exit_cids
+
+    # Inflight-aware exit diff: pending placements count as effectively
+    # present, pending cancels count as effectively absent.
+    effective_actual_exits = set(actual_exit_cids)
+    if pending_exit_place_cids:
+        effective_actual_exits |= pending_exit_place_cids
+    if pending_exit_cancel_cids:
+        effective_actual_exits -= pending_exit_cancel_cids
+    missing_exits = desired_exit_cids - effective_actual_exits
+    extra_exits = effective_actual_exits - desired_exit_cids
 
     # --- Build actions: CANCEL first, then PLACE (deterministic order) ---
     actions: list[ExecutionAction] = []

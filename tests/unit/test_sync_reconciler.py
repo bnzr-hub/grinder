@@ -363,3 +363,65 @@ class TestDuplicateEntrySkip:
         r = reconcile_grid_state(snap, "BTCUSDT", bridge)
         place_actions = [a for a in r.actions if a.action_type == ActionType.PLACE]
         assert len(place_actions) == 2  # BUY@99 + SELL@101
+
+
+# --- Tests: Inflight-aware exit reconciliation ---
+
+
+class TestInflightExitReconciliation:
+    """Exit diff must account for pending place/cancel to avoid false missing/extra."""
+
+    def test_pending_place_suppresses_false_missing_exit(self) -> None:
+        """Exit dispatched but not visible → not counted as missing."""
+        bridge = _make_bridge(
+            exit_orders=(_make_exit_order("eo1"),),
+        )
+        # Exit not on exchange yet
+        snap = _make_snapshot(exit_cids=[])
+        # But pending place has its CID
+        r = reconcile_grid_state(
+            snap,
+            "BTCUSDT",
+            bridge,
+            pending_exit_place_cids=frozenset({"exit_eo1"}),
+        )
+        assert r.missing_exits == 0
+
+    def test_pending_cancel_suppresses_false_extra_exit(self) -> None:
+        """Exit cancel sent but still visible → not counted as extra."""
+        bridge = _make_bridge(exit_orders=())
+        # Exit still on exchange but cancel is pending
+        snap = _make_snapshot(exit_cids=["exit_stale"])
+        r = reconcile_grid_state(
+            snap,
+            "BTCUSDT",
+            bridge,
+            pending_exit_cancel_cids=frozenset({"exit_stale"}),
+        )
+        assert r.extra_exits == 0
+
+    def test_true_missing_exit_still_detected(self) -> None:
+        """No snapshot exit, no pending place → genuinely missing."""
+        bridge = _make_bridge(
+            exit_orders=(_make_exit_order("eo1"),),
+        )
+        snap = _make_snapshot(exit_cids=[])
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        assert r.missing_exits == 1
+
+    def test_true_extra_exit_still_detected(self) -> None:
+        """Snapshot has exit, no desired lot → genuinely extra."""
+        bridge = _make_bridge(exit_orders=())
+        snap = _make_snapshot(exit_cids=["exit_orphan"])
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        assert r.extra_exits == 1
+
+    def test_backwards_compatible_without_pending(self) -> None:
+        """Without pending_exit args, behavior is unchanged."""
+        bridge = _make_bridge(
+            exit_orders=(_make_exit_order("eo1"),),
+        )
+        snap = _make_snapshot(exit_cids=[])
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        # No pending args → old behavior: missing = 1
+        assert r.missing_exits == 1
