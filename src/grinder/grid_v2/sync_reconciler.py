@@ -189,6 +189,7 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     # --- Actual exchange state (computed early — needed for gap detection) ---
     actual_entry_by_key: dict[tuple[OrderSide, Decimal], str] = {}
     actual_exit_cids: set[str] = set()
+    actual_exit_prices: dict[str, Decimal] = {}  # CID → exchange price
     for o in snapshot.open_orders:
         if o.symbol != symbol:
             continue
@@ -203,6 +204,7 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
             actual_entry_by_key[(side, o.price)] = o.order_id
         elif parsed.kind.value == "EXIT":
             actual_exit_cids.add(o.order_id)
+            actual_exit_prices[o.order_id] = o.price
 
     # --- Gap detection supplement (on theoretical, BEFORE projection) ---
     from grinder.grid_v2.state import _grid_step_price  # noqa: PLC0415
@@ -243,14 +245,20 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
         sm.snapshot.entry_window.reference_price,
     )
 
-    # --- Exit desired state ---
+    # --- Exit desired state (CID + expected price + qty per lot) ---
     desired_exit_cids: set[str] = set()
+    desired_exit_prices: dict[str, Decimal] = {}  # CID → expected price
+    desired_exit_sides: dict[str, OrderSide] = {}  # CID → side
+    desired_exit_qtys: dict[str, Decimal] = {}  # CID → qty
     for eo in sm.snapshot.exit_orders:
         if eo.status != ExitOrderStatus.OPEN:
             continue
         reg_cid = bridge.adapter.registry.cid_for_exit(eo.exit_order_id)
         if reg_cid is not None:
             desired_exit_cids.add(reg_cid)
+            desired_exit_prices[reg_cid] = eo.price
+            desired_exit_sides[reg_cid] = eo.side
+            desired_exit_qtys[reg_cid] = eo.qty
 
     # --- Diff: actual vs effective (NOT vs theoretical) ---
     # Entry diff is geometry-aware for exchange-visible entries and inflight-aware
@@ -310,6 +318,31 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     missing_exits = desired_exit_cids - effective_actual_exits
     extra_exits = effective_actual_exits - desired_exit_cids
 
+    # Price-aware exit geometry: for CID-matched exits, check if exchange
+    # price matches expected price within tolerance. Mispriced exits get
+    # cancel+replace correction.
+    tick = bridge._config.price_tick_size
+    geometry_exit_mismatches: list[tuple[OrderSide, Decimal, Decimal, str]] = []
+    if tick > 0:
+        matched_cids = desired_exit_cids & effective_actual_exits
+        for cid in sorted(matched_cids):
+            expected = desired_exit_prices.get(cid)
+            actual = actual_exit_prices.get(cid)
+            if expected is None or actual is None:
+                continue  # inflight-only or no price data
+            if abs(expected - actual) > tick:
+                side = desired_exit_sides.get(cid, OrderSide.SELL)
+                geometry_exit_mismatches.append((side, expected, actual, cid))
+    # Suppress exit repricing if correction already inflight
+    if pending_exit_place_cids:
+        geometry_exit_mismatches = [
+            m for m in geometry_exit_mismatches if m[3] not in pending_exit_place_cids
+        ]
+    if pending_exit_cancel_cids:
+        geometry_exit_mismatches = [
+            m for m in geometry_exit_mismatches if m[3] not in pending_exit_cancel_cids
+        ]
+
     # --- Build actions: CANCEL first, then PLACE (deterministic order) ---
     actions: list[ExecutionAction] = []
     budget = max_actions
@@ -317,13 +350,13 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     for side, price in sorted(extra_entries, key=lambda x: (x[0].value, x[1])):
         if len(actions) >= budget:
             break
-        cid = actual_entry_by_key.get((side, price))
-        if cid is None:
+        entry_cid = actual_entry_by_key.get((side, price))
+        if entry_cid is None:
             continue  # inflight-only entry, not on exchange — skip cancel
         actions.append(
             ExecutionAction(
                 action_type=ActionType.CANCEL,
-                order_id=cid,
+                order_id=entry_cid,
                 symbol=symbol,
                 reason="grid_v2_RECONCILE_CANCEL_ENTRY",
             )
@@ -353,6 +386,35 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
                 order_id=cid,
                 symbol=symbol,
                 reason="grid_v2_RECONCILE_CANCEL_EXIT",
+            )
+        )
+
+    # Exit geometry: atomic cancel+place for mispriced exits (safety-first,
+    # must not split across budget boundaries — exit correction before entry work)
+    for side, expected_price, _actual_price, cid in sorted(
+        geometry_exit_mismatches,
+        key=lambda x: (x[0].value, x[1], x[2], x[3]),
+    ):
+        if len(actions) + 2 > budget:
+            break  # need room for both cancel AND place
+        qty = desired_exit_qtys.get(cid, bridge._config.order_size)
+        actions.append(
+            ExecutionAction(
+                action_type=ActionType.CANCEL,
+                order_id=cid,
+                symbol=symbol,
+                reason="grid_v2_RECONCILE_REPRICE_EXIT_CANCEL",
+            )
+        )
+        actions.append(
+            ExecutionAction(
+                action_type=ActionType.PLACE,
+                symbol=symbol,
+                side=side,
+                price=expected_price,
+                quantity=qty,
+                reduce_only=True,
+                reason="grid_v2_RECONCILE_REPRICE_EXIT_PLACE",
             )
         )
 
