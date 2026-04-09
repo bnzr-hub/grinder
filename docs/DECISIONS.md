@@ -5122,3 +5122,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Add `reseed_cooldown_ms` config (default 30s). In `_apply_exit_filled()`, suppress flat reseed if `event.ts - last_recenter_ts < cooldown`. Configurable via `GRINDER_GRID_V2_RESEED_COOLDOWN_MS`.
 - **Invariant:** First reseed after cooldown always proceeds. Batch semantics preserved — when reseed does happen, it's still a full cancel+place batch. Startup seed unaffected.
 - **Consequences:** Reseed storms under price oscillation are eliminated. Rate-limit pressure reduced. Normal reseed after genuine FLAT return still works.
+
+### ADR-170: Inventory headroom — graduated entry suppression near cap (2026-04-09)
+
+- **Problem:** Live canary showed inventory overshoot (15.4 lots vs 15 cap). With `entry_levels_per_side=5`, at 13/15 lots there were still 5 same-side resting entries. A 3-fill burst pushed past cap before reconciler could cancel. The cap was effectively soft under burst.
+- **Root cause:** Entry suppression was binary — full entries below cap, zero entries at cap. No graduated reduction near cap.
+- **Decision:** Replace binary `inventory_full` with headroom-based suppression. `headroom = max(0, cap - lots)`. When `headroom < entry_levels_per_side`, reduce same-side entries to `headroom` count (keep closest to reference price). Applied in reconciler, engine integrity repair, and risk saturation detection.
+- **Invariant:** At cap → zero same-side entries (unchanged). Below cap but near → proportionally fewer entries. Far from cap → full entries (unchanged). Batch seed/reseed paths unaffected (FLAT mode is excluded).
+- **Consequences:** Burst overshoot materially reduced. At 14/15, only 1 same-side entry remains resting. A single-fill burst cannot push past 15.

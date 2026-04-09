@@ -583,3 +583,83 @@ class TestInflightEntryReconciliation:
         snap = _make_snapshot()
         r = reconcile_grid_state(snap, "BTCUSDT", bridge)
         assert r.missing_entries == 1
+
+
+# --- Tests: Inventory headroom burst protection ---
+
+
+class TestInventoryHeadroom:
+    """Near-cap same-side entries are reduced to limit burst overshoot."""
+
+    def test_at_cap_zero_desired_entries(self) -> None:
+        """At max inventory, no desired entries (existing behavior)."""
+        lots = tuple(MagicMock() for _ in range(15))
+        bridge = _make_bridge(
+            mode=BranchMode.LONG_BRANCH,
+            buy_prices=(Decimal("99.00"), Decimal("98.00"), Decimal("97.00")),
+            sell_prices=(),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=3,
+            max_inv=15,
+            open_lots=lots,
+        )
+        snap = _make_snapshot()
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        assert r.theoretical_desired_entry_count == 0
+
+    def test_near_cap_reduces_same_side_entries(self) -> None:
+        """At 14/15 lots, only 1 same-side BUY entry desired (headroom=1)."""
+        lots = tuple(MagicMock() for _ in range(14))
+        bridge = _make_bridge(
+            mode=BranchMode.LONG_BRANCH,
+            buy_prices=(Decimal("99.00"), Decimal("98.00"), Decimal("97.00")),
+            sell_prices=(),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=3,
+            max_inv=15,
+            open_lots=lots,
+        )
+        snap = _make_snapshot()
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        # Headroom = 1 → only 1 BUY entry desired (closest to ref)
+        assert r.theoretical_desired_entry_count == 1
+
+    def test_far_from_cap_full_entries(self) -> None:
+        """At 5/15 lots, full entry_levels_per_side desired."""
+        lots = tuple(MagicMock() for _ in range(5))
+        bridge = _make_bridge(
+            mode=BranchMode.LONG_BRANCH,
+            buy_prices=(Decimal("99.00"), Decimal("98.00"), Decimal("97.00")),
+            sell_prices=(),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=3,
+            max_inv=15,
+            open_lots=lots,
+        )
+        snap = _make_snapshot()
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        assert r.theoretical_desired_entry_count == 3
+
+    def test_flat_mode_not_affected(self) -> None:
+        """FLAT mode ignores headroom (batch seed/reseed must work)."""
+        lots = tuple(MagicMock() for _ in range(14))
+        bridge = _make_bridge(
+            mode=BranchMode.FLAT,
+            buy_prices=(Decimal("99.00"), Decimal("98.00")),
+            sell_prices=(Decimal("101.00"), Decimal("102.00")),
+            ref_price=Decimal("100"),
+            step_pct=Decimal("0.01"),
+            tick_size=Decimal("0.01"),
+            levels=2,
+            max_inv=15,
+            open_lots=lots,
+        )
+        snap = _make_snapshot()
+        r = reconcile_grid_state(snap, "BTCUSDT", bridge)
+        assert r.theoretical_desired_entry_count == 4

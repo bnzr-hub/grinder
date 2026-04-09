@@ -155,13 +155,28 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
     for p in sm.snapshot.entry_window.sell_entry_prices:
         theoretical_entry_keys.add((OrderSide.SELL, bridge._quantize_price(p, OrderSide.SELL)))
 
-    # Inventory cap: when full, theoretical desired is also 0
-    inventory_full = (
-        sm.mode != BranchMode.FLAT
-        and len(sm.snapshot.open_lots) >= bridge._config.max_inventory_levels
-    )
-    if inventory_full:
-        theoretical_entry_keys = set()
+    # Inventory headroom: as inventory approaches cap, reduce same-side
+    # entries to limit burst overshoot. At cap → zero entries. Near cap →
+    # only a few entries remain, so rapid fills can't push far past limit.
+    if sm.mode != BranchMode.FLAT:
+        lots_open = len(sm.snapshot.open_lots)
+        max_inv = bridge._config.max_inventory_levels
+        _levels_per_side = getattr(bridge._config, "entry_levels_per_side", 5)
+        headroom = max(0, max_inv - lots_open)
+        if headroom == 0:
+            theoretical_entry_keys = set()
+        elif isinstance(_levels_per_side, int) and headroom < _levels_per_side:
+            # Reduce same-side entries to headroom count.
+            # Keep entries closest to reference price (highest priority).
+            branch_side = OrderSide.BUY if sm.mode == BranchMode.LONG_BRANCH else OrderSide.SELL
+            ref = sm.snapshot.entry_window.reference_price
+            same_side = sorted(
+                [(s, p) for s, p in theoretical_entry_keys if s == branch_side],
+                key=lambda k: abs(k[1] - ref),
+            )
+            if len(same_side) > headroom:
+                to_remove = set(same_side[headroom:])
+                theoretical_entry_keys -= to_remove
 
     # --- Actual exchange state (computed early — needed for gap detection) ---
     actual_entry_by_key: dict[tuple[OrderSide, Decimal], str] = {}

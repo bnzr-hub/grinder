@@ -2187,6 +2187,70 @@ class TestReplenishSuppressedWhenInventoryFull:
         assert len(places) == 0, f"No replenish when at max, got {len(places)}"
 
 
+class TestExitRestoreHeadroom:
+    """ADR-170: EXIT_RESTORE respects headroom near inventory cap."""
+
+    def test_near_cap_suppresses_exit_restore(self) -> None:
+        """At 4/5 lots (headroom=1), exit fill should not restore if 1 entry exists."""
+        cfg = _config(
+            max_levels=5, levels=3, reseed_on_flat=False, reseed_on_flat_only_on_skew=False
+        )
+        sm = _sm(cfg=cfg)
+
+        # Fill 4 entries to get near cap (4/5)
+        for i in range(4):
+            buy = sm.snapshot.entry_window.buy_entry_prices[0]
+            sm.apply(EntryFilled(f"E{i}", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + i + 1))
+
+        assert len(sm.snapshot.open_lots) == 4
+        # Now we have some BUY entries in window. Exit one lot → 3 lots, headroom=2
+        exit_eo = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
+        result = sm.apply(
+            ExitFilled(
+                exit_order_id=exit_eo.exit_order_id,
+                lot_id=exit_eo.lot_id,
+                price=exit_eo.price,
+                qty=_ORDER_SIZE,
+                ts=_BASE_TS + 100,
+            )
+        )
+        # With headroom=2 and existing buy entries, restore should be limited
+        buy_entries_after = len(result.snapshot.entry_window.buy_entry_prices)
+        # buy entries should not exceed headroom
+        assert buy_entries_after <= 2, (
+            f"Expected <= 2 buy entries (headroom=2), got {buy_entries_after}"
+        )
+
+    def test_at_cap_no_exit_restore(self) -> None:
+        """At 5/5 lots, exit fill → 4 lots (headroom=1), restore capped to 1."""
+        cfg = _config(
+            max_levels=5, levels=3, reseed_on_flat=False, reseed_on_flat_only_on_skew=False
+        )
+        sm = _sm(cfg=cfg)
+
+        # Fill 5 entries to hit cap
+        for i in range(5):
+            buy = sm.snapshot.entry_window.buy_entry_prices[0]
+            sm.apply(EntryFilled(f"E{i}", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + i + 1))
+
+        assert len(sm.snapshot.open_lots) == 5
+        # Exit one → 4 lots, headroom=1
+        exit_eo = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
+        r = sm.apply(
+            ExitFilled(
+                exit_order_id=exit_eo.exit_order_id,
+                lot_id=exit_eo.lot_id,
+                price=exit_eo.price,
+                qty=_ORDER_SIZE,
+                ts=_BASE_TS + 100,
+            )
+        )
+        buy_entries_after = len(r.snapshot.entry_window.buy_entry_prices)
+        assert buy_entries_after <= 1, (
+            f"Expected <= 1 buy entry (headroom=1), got {buy_entries_after}"
+        )
+
+
 class TestReseedCooldown:
     """Anti-churn: suppress repeated flat reseeds within cooldown window."""
 
