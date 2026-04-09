@@ -29,7 +29,6 @@ from grinder.grid_v2.state import (
     LotStatus,
     OperatorCleanup,
     RecenterRequested,
-    _grid_step_price,
 )
 
 # ---------------------------------------------------------------------------
