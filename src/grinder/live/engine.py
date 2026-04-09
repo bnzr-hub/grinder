@@ -1762,7 +1762,7 @@ class LiveEngineV0:
                 cids.add(o.order_id)
         return cids
 
-    def _grid_v2_sync_reconstruct_on_position_drift(self, snapshot: AccountSnapshot) -> None:  # noqa: PLR0911, PLR0912
+    def _grid_v2_sync_reconstruct_on_position_drift(self, snapshot: AccountSnapshot) -> None:  # noqa: PLR0911, PLR0912, PLR0915
         """Fast-path recovery for sync drift: position is non-flat while SM is FLAT.
 
         This addresses rapid-fill races where exchange position updates first, but
