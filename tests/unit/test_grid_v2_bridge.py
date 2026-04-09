@@ -4031,7 +4031,7 @@ class TestPendingPlaceCidVisibility:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """P0: After 2 sync cycles, pending CID released for fill detection."""
+        """P0: After STALE_GENS sync cycles, pending CID released for fill detection."""
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         from grinder.account.contracts import AccountSnapshot  # noqa: PLC0415
@@ -4088,14 +4088,16 @@ class TestPendingPlaceCidVisibility:
         mock_syncer.compute_position_notional = AccountSyncer.compute_position_notional
         engine._account_syncer = mock_syncer
 
-        for i in range(2):
+        from grinder.live.engine import _GRID_V2_PENDING_PLACE_STALE_GENS  # noqa: PLC0415
+
+        for i in range(_GRID_V2_PENDING_PLACE_STALE_GENS):
             empty_snap = AccountSnapshot(
                 positions=(), open_orders=(), ts=_BASE_TS + 20000 + i * 5000, source="test"
             )
             mock_syncer.sync.return_value = SyncResult(snapshot=empty_snap)
             engine._tick_account_sync()
 
-        # After 2 sync cycles, CID should be released from pending
+        # After STALE_GENS sync cycles, CID should be released from pending
         assert new_cid not in engine._grid_v2_pending_place_cids, (
             "CID must be released after grace period"
         )
