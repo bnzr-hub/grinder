@@ -82,6 +82,7 @@ If documents conflict, trust order is:
 - `docs/43_GRID_RUNTIME_V2_ARCHITECTURE_AUDIT.md` — candidate architecture audit for simplifying live grid runtime into a WS-first exchange-backed desired-state model
 - `docs/44_INCREMENTAL_GRID_SIMPLIFICATION_PLAN.md` — completed incremental execution plan for stabilizing live grid maintenance via exit-first diff logic, inflight handling, anti-churn, burst hardening, and observability
 - `docs/45_GRID_RUNTIME_PHASE2_PLAN.md` — recommended next-phase plan focused on price-aware reconciliation, corrective-action priority, and explicit inflight TTL semantics
+- `docs/46_BURST_CASCADE_AND_INVENTORY_SNOWBALL_PLAN.md` — active execution plan for burst cascade, stale same-side entries, one-sided branch amplification, and hot-path inventory snowball control
 
 ---
 

@@ -563,7 +563,16 @@ class GridV2StateMachine:
             emergency_stopped=snap.emergency_stopped,
             last_recenter_ts=snap.last_recenter_ts,
         )
-        return self._commit(new_snapshot, tuple(actions))
+        result = self._commit(new_snapshot, tuple(actions))
+        # ADR-177: Tag burst suppression for observability
+        lots_after = len(snap.open_lots) + 1
+        if lots_after >= cfg.max_inventory_levels:
+            result = TransitionResult(
+                snapshot=result.snapshot,
+                actions=result.actions,
+                replenish_suppressed="burst_governor",
+            )
+        return result
 
     def _execute_netoff(self, event: EntryFilled) -> TransitionResult:
         """Close closest lot via opposite-side entry fill (net-off).
@@ -689,6 +698,13 @@ class GridV2StateMachine:
         cfg = self._config
         actions: list[ActionIntent] = []
 
+        # ADR-177: Burst governor — suppress FILL_REPLACEMENT when inventory
+        # is at or near cap. Lots after this fill = current + 1 (lot not yet
+        # in snapshot). This prevents the hot-path snowball where each fill
+        # creates a new entry that immediately fills in trending markets.
+        lots_after_fill = len(self._snapshot.open_lots) + 1
+        _burst_suppress = lots_after_fill >= cfg.max_inventory_levels
+
         # Collect occupied prices to prevent collisions with exits/entries
         occupied = self._occupied_prices()
         # Remove the filled price — it's no longer occupied by an entry
@@ -719,9 +735,11 @@ class GridV2StateMachine:
                 )
             else:
                 new_sells = ()
-            # Collision + distance guard: skip if occupied or too far from reference
+            # Collision + distance + burst guard
             distance_from_ref = abs(window.reference_price - new_farthest)
-            skip_place = new_farthest in occupied or distance_from_ref > max_distance
+            skip_place = (
+                new_farthest in occupied or distance_from_ref > max_distance or _burst_suppress
+            )
             if skip_place:
                 new_buys = remaining[: cfg.entry_levels_per_side]
             else:
@@ -752,9 +770,11 @@ class GridV2StateMachine:
                 )
             else:
                 new_buys = ()
-            # Collision + distance guard: skip if occupied or too far from reference
+            # Collision + distance + burst guard
             distance_from_ref = abs(new_farthest - window.reference_price)
-            skip_place = new_farthest in occupied or distance_from_ref > max_distance
+            skip_place = (
+                new_farthest in occupied or distance_from_ref > max_distance or _burst_suppress
+            )
             if skip_place:
                 new_sells = remaining[: cfg.entry_levels_per_side]
             else:
