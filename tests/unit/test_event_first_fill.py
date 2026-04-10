@@ -17,7 +17,7 @@ from grinder.account.contracts import AccountSnapshot, OpenOrderSnap
 from grinder.account.event_ledger import EventLedger
 from grinder.connectors.live_connector import SafeMode
 from grinder.core import OrderSide, OrderState
-from grinder.execution.futures_events import FuturesOrderEvent
+from grinder.execution.futures_events import FuturesOrderEvent, UserDataEvent
 from grinder.live import LiveEngineConfig, LiveEngineV0
 
 
@@ -315,3 +315,118 @@ class TestUserDataFillDedup:
 
         # bridge.on_fill should NOT be called (deduped)
         bridge.on_fill.assert_not_called()
+
+
+class TestFillConsumedPendingVisibility:
+    """ADR-181: successful user-data fill must terminate pending-visibility lifecycle.
+
+    Without this, a CID that fills before ever appearing in an openOrders snapshot
+    can later be misclassified as "never seen" and cleaned by the bounded fallback,
+    corrupting entry tracking on fast-fill symbols (live P0 observed 2026-04-10).
+    """
+
+    @staticmethod
+    def _mk_engine_and_bridge(rejected: bool = False) -> tuple[LiveEngineV0, MagicMock]:
+        engine = _make_engine()
+        engine._grid_v2_enabled = True
+        engine._grid_v2_symbol = "BTCUSDT"
+        engine._grid_v2_started = True
+        engine._event_ledger = MagicMock()
+        engine._event_ledger.is_trusted = True
+        engine._symbol_risk_manager = MagicMock()
+        engine._symbol_risk_manager.config.enabled = False
+
+        bridge = MagicMock()
+        bridge.reconstruction_ok = True
+        bridge.adapter.is_ours.return_value = True
+        bridge.adapter.parse_cid.return_value = MagicMock(kind=MagicMock(value="ENTRY"))
+        bridge._config.order_size = Decimal("0.001")
+        bridge.on_fill.return_value = MagicMock(
+            rejected=rejected,
+            reject_reason="DUPLICATE_ENTRY_FILL" if rejected else None,
+            execution_actions=[],
+            transition=None,
+        )
+        engine._grid_v2_bridge = bridge
+        return engine, bridge
+
+    @staticmethod
+    def _fill_event(cid: str = _G_ENTRY_CID, ts: int = 3000) -> UserDataEvent:
+        return UserDataEvent(
+            event_type=MagicMock(value="ORDER_TRADE_UPDATE"),
+            order_event=_ws_event(
+                cid,
+                status=OrderState.FILLED,
+                executed_qty="0.001",
+                ts=ts,
+            ),
+        )
+
+    def _prepopulate_trackers(self, engine: LiveEngineV0, cid: str = _G_ENTRY_CID) -> None:
+        engine._grid_v2_pending_place_cids[cid] = 0
+        engine._grid_v2_fill_eligible_cids.add(cid)
+        engine._grid_v2_entry_reg_gen[cid] = 0
+
+    def test_successful_fill_clears_all_three_pending_trackers(self) -> None:
+        """REQ-001 happy path: success branch pops pending_place, fill_eligible, entry_reg_gen."""
+        engine, bridge = self._mk_engine_and_bridge(rejected=False)
+        self._prepopulate_trackers(engine)
+
+        engine.process_user_data_event(self._fill_event())
+
+        assert _G_ENTRY_CID not in engine._grid_v2_pending_place_cids
+        assert _G_ENTRY_CID not in engine._grid_v2_fill_eligible_cids
+        assert _G_ENTRY_CID not in engine._grid_v2_entry_reg_gen
+        bridge.on_fill.assert_called_once()
+        assert _G_ENTRY_CID in engine._grid_v2_user_fill_seen
+
+    def test_rejected_fill_branch_also_clears_all_three_trackers(self) -> None:
+        """REQ-001 rejected branch: a rejected fill also terminates pending-visibility
+        lifecycle so a duplicate-fill-rejected CID can never later fire NEVER_SEEN."""
+        engine, bridge = self._mk_engine_and_bridge(rejected=True)
+        self._prepopulate_trackers(engine)
+
+        engine.process_user_data_event(self._fill_event())
+
+        assert _G_ENTRY_CID not in engine._grid_v2_pending_place_cids
+        assert _G_ENTRY_CID not in engine._grid_v2_fill_eligible_cids
+        assert _G_ENTRY_CID not in engine._grid_v2_entry_reg_gen
+        assert _G_ENTRY_CID in engine._grid_v2_user_fill_seen
+        bridge.on_fill.assert_called_once()
+
+    def test_replayed_fill_does_not_further_mutate_trackers(self) -> None:
+        """REQ-003: replayed fill is guarded by _grid_v2_user_fill_seen; second call
+        must be a no-op for bridge.on_fill and leave tracking state unchanged."""
+        engine, bridge = self._mk_engine_and_bridge(rejected=False)
+        self._prepopulate_trackers(engine)
+
+        engine.process_user_data_event(self._fill_event())
+        state_after_first = {
+            "pending_place": dict(engine._grid_v2_pending_place_cids),
+            "fill_eligible": set(engine._grid_v2_fill_eligible_cids),
+            "entry_reg_gen": dict(engine._grid_v2_entry_reg_gen),
+            "user_fill_seen": set(engine._grid_v2_user_fill_seen),
+        }
+        assert bridge.on_fill.call_count == 1
+
+        engine.process_user_data_event(self._fill_event(ts=4000))
+
+        assert bridge.on_fill.call_count == 1
+        assert dict(engine._grid_v2_pending_place_cids) == state_after_first["pending_place"]
+        assert set(engine._grid_v2_fill_eligible_cids) == state_after_first["fill_eligible"]
+        assert dict(engine._grid_v2_entry_reg_gen) == state_after_first["entry_reg_gen"]
+        assert set(engine._grid_v2_user_fill_seen) == state_after_first["user_fill_seen"]
+
+    def test_previously_visible_cid_fill_path_still_clears_trackers(self) -> None:
+        """REQ-004: ordinary visible→fill path also goes through the new pops.
+        The fix does not depend on whether the CID was ever in _grid_v2_seen_on_exchange."""
+        engine, bridge = self._mk_engine_and_bridge(rejected=False)
+        self._prepopulate_trackers(engine)
+        engine._grid_v2_seen_on_exchange.add(_G_ENTRY_CID)
+
+        engine.process_user_data_event(self._fill_event())
+
+        assert _G_ENTRY_CID not in engine._grid_v2_pending_place_cids
+        assert _G_ENTRY_CID not in engine._grid_v2_fill_eligible_cids
+        assert _G_ENTRY_CID not in engine._grid_v2_entry_reg_gen
+        bridge.on_fill.assert_called_once()
