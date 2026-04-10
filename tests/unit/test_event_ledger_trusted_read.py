@@ -433,7 +433,9 @@ class TestEngineStaleRegistryRealPath:
         engine._grid_v2_pending_place_cids = {}
         engine._grid_v2_pending_cancels = {}
         engine._grid_v2_bridge = _mock_bridge_for_stale_registry(frozenset({"g-e0", "g-stale"}))
-        engine._grid_v2_seen_on_exchange = {"g-stale"}  # was visible before → eligible for stale cleanup
+        engine._grid_v2_seen_on_exchange = {
+            "g-stale"
+        }  # was visible before → eligible for stale cleanup
 
         # WS + snapshot agree on g-e0 -> trusted
         engine._event_ledger.apply_order_event(_ws_event("g-e0", status=OrderState.OPEN, ts=1500))
@@ -472,7 +474,9 @@ class TestEngineStaleRegistryRealPath:
         engine._grid_v2_pending_place_cids = {}
         engine._grid_v2_pending_cancels = {}
         engine._grid_v2_bridge = _mock_bridge_for_stale_registry(frozenset({"g-e0", "g-stale"}))
-        engine._grid_v2_seen_on_exchange = {"g-stale"}  # was visible before → eligible for stale cleanup
+        engine._grid_v2_seen_on_exchange = {
+            "g-stale"
+        }  # was visible before → eligible for stale cleanup
 
         # Snapshot sees g-e0 (no WS events)
         syncer.sync.return_value = _sync_result(orders=[_order_snap("g-e0")], ts=2000)
