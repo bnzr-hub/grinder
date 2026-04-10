@@ -2847,7 +2847,7 @@ class LiveEngineV0:
             ):
                 self._cancel_dispatched_pending_sync.add(action.order_id)
 
-    def process_user_data_event(self, event: UserDataEvent) -> None:  # noqa: PLR0911, PLR0912, PLR0915
+    def process_user_data_event(self, event: UserDataEvent) -> None:  # noqa: PLR0911, PLR0912
         """Process immediate user-data order events for grid_v2.
 
         This path is a low-latency supplement to account-sync polling:
@@ -2859,17 +2859,11 @@ class LiveEngineV0:
             self._last_user_data_event_mono = time.monotonic()
 
         # ADR-109 Phase 3: Feed position events to PositionLedger.
+        # Decision logging lives inside PositionLedger (apply/drop INFO logs);
+        # no engine-side duplication.
         if event.position_event is not None:
-            pe = event.position_event
-            self._position_ledger.apply_position_event(pe)
+            self._position_ledger.apply_position_event(event.position_event)
             self._last_position_event_mono = time.monotonic()
-            logger.debug(
-                "POSITION_LEDGER_EVENT_APPLIED symbol=%s side=%s amt=%s ts=%d",
-                pe.symbol,
-                pe.position_side,
-                pe.position_amt,
-                pe.ts,
-            )
 
         if not self._is_grid_v2_active(self._grid_v2_symbol):
             return

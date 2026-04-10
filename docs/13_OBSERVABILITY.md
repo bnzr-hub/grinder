@@ -865,6 +865,39 @@ EVENT_LEDGER_RECONCILED orders=5 converged=True
 | `RECONCILED converged=True` | Recovery healed all divergences | Trust can now reconverge |
 | `RECONCILED converged=False` | Recovery closed some but not all | Remaining divergences need more cycles or investigation |
 
+## PositionLedger Event Logging (issue #664 observability)
+
+Structured INFO log signals for `PositionLedger` decisions. Added as an observability-only prerequisite for issue #664 root cause analysis. Emitted by `grinder.account.position_ledger`. No behavior is changed by these logs.
+
+### POSITION_LEDGER_EVENT_APPLIED
+Emitted when a WS `ACCOUNT_UPDATE` position event is accepted into the ledger (passed the stale guard and written).
+```
+POSITION_LEDGER_EVENT_APPLIED symbol=BTCUSDT side=BOTH incoming_amt=0.003 incoming_ts=2000 prev_amt=0.001 prev_ts=1000 new_amt=0.003 new_ts=2000 source=user_data_position
+```
+On first write for a `(symbol, position_side)` key, `prev_amt` and `prev_ts` appear as `None`.
+
+### POSITION_LEDGER_EVENT_DROPPED_STALE
+Emitted when a WS position event is rejected by the stale-event guard (`incoming_ts <= prev_ts`). Captures the same-millisecond case (`incoming_ts == prev_ts`) explicitly so it is directly diagnosable.
+```
+POSITION_LEDGER_EVENT_DROPPED_STALE symbol=BTCUSDT side=BOTH incoming_amt=0.001 incoming_ts=1000 prev_amt=0.002 prev_ts=2000 reason=stale_event_guard source=user_data_position
+```
+
+### POSITION_LEDGER_HYDRATE_APPLIED
+Emitted when `hydrate_from_snapshot` writes or overwrites a ledger entry from a REST snapshot position. Not emitted on the skip branch.
+```
+POSITION_LEDGER_HYDRATE_APPLIED symbol=BTCUSDT side=BOTH amt=0.003 ts=1000 source=snapshot_hydration
+```
+The existing aggregate `POSITION_LEDGER_HYDRATED positions=N ...` event at `_tick_account_sync` remains unchanged and continues to report per-sync counts. The new per-position signal above is for reconstructing individual write sequences.
+
+### Operator interpretation
+| Signal | Meaning | Action |
+|--------|---------|--------|
+| `EVENT_APPLIED` with `prev_amt=None` | First WS position event for this `(symbol, side)` key | Normal bootstrap |
+| `EVENT_APPLIED` with `prev_amt != None` | Ledger overwritten by newer WS event | Normal |
+| `EVENT_DROPPED_STALE` with `incoming_ts < prev_ts` | Out-of-order event correctly rejected | Normal |
+| `EVENT_DROPPED_STALE` with `incoming_ts == prev_ts` | Same-millisecond event rejected — may indicate Finding B (issue #664) | Investigate: compare dropped `incoming_amt` against exchange truth |
+| `HYDRATE_APPLIED` fires for a symbol repeatedly after steady state | Stream is stale, snapshot is the only source writing to ledger | Investigate WS delivery |
+
 ## Timestamp Offset Recovery (ADR-118)
 
 Log signals for server-time offset refresh (clock drift recovery).

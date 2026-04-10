@@ -99,7 +99,20 @@ class PositionLedger:
         existing = self._positions.get(key)
         if existing is not None and event.ts <= existing.last_event_ts:
             self._stale_event_count += 1
+            logger.info(
+                "POSITION_LEDGER_EVENT_DROPPED_STALE symbol=%s side=%s "
+                "incoming_amt=%s incoming_ts=%d prev_amt=%s prev_ts=%d "
+                "reason=stale_event_guard source=user_data_position",
+                event.symbol,
+                event.position_side,
+                event.position_amt,
+                event.ts,
+                existing.position_amt,
+                existing.last_event_ts,
+            )
             return
+        prev_amt = existing.position_amt if existing is not None else None
+        prev_ts = existing.last_event_ts if existing is not None else None
         self._positions[key] = LedgerPosition(
             symbol=event.symbol,
             position_side=event.position_side,
@@ -107,6 +120,19 @@ class PositionLedger:
             entry_price=event.entry_price,
             unrealized_pnl=event.unrealized_pnl,
             last_event_ts=event.ts,
+        )
+        logger.info(
+            "POSITION_LEDGER_EVENT_APPLIED symbol=%s side=%s "
+            "incoming_amt=%s incoming_ts=%d prev_amt=%s prev_ts=%s "
+            "new_amt=%s new_ts=%d source=user_data_position",
+            event.symbol,
+            event.position_side,
+            event.position_amt,
+            event.ts,
+            prev_amt,
+            prev_ts,
+            event.position_amt,
+            event.ts,
         )
         # Bootstrap on first non-zero position event
         if event.position_amt != 0 and not self._bootstrapped:
@@ -171,6 +197,14 @@ class PositionLedger:
                 entry_price=pos.entry_price,
                 unrealized_pnl=pos.unrealized_pnl,
                 last_event_ts=pos.ts,
+            )
+            logger.info(
+                "POSITION_LEDGER_HYDRATE_APPLIED symbol=%s side=%s "
+                "amt=%s ts=%d source=snapshot_hydration",
+                pos.symbol,
+                pos.side,
+                qty,
+                pos.ts,
             )
             hydrated += 1
         if hydrated > 0 and not self._bootstrapped:
