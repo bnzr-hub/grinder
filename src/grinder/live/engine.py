@@ -3428,14 +3428,23 @@ class LiveEngineV0:
                     fill_since_staging = self._last_fill_ts > self._reconciler_staged_fill_ts
                     drained: list[ExecutionAction] = []
                     for a in self._sync_reconciler_pending_actions:
+                        # Issue #667: distinguish self-registered CID from
+                        # foreign-registered. Materialize (engine.py:1945)
+                        # registers the new CID at (side, price) BEFORE the
+                        # PLACE is dispatched — so on the next drain cycle,
+                        # cid_for_entry returns our own CID. Only drop the
+                        # PLACE if the occupying CID is DIFFERENT from the
+                        # action's own client_order_id (fill path took the
+                        # slot under a new CID — the original PR #468 case).
                         if (
                             a.action_type == ActionType.PLACE
                             and a.side is not None
                             and a.price is not None
                             and bridge is not None
-                            and bridge.adapter.registry.cid_for_entry(a.side, a.price) is not None
                         ):
-                            continue  # slot already occupied by fill path
+                            _existing_cid = bridge.adapter.registry.cid_for_entry(a.side, a.price)
+                            if _existing_cid is not None and _existing_cid != a.client_order_id:
+                                continue  # slot occupied by foreign CID (fill path)
                         if a.action_type == ActionType.PLACE and mode_changed:
                             logger.info(
                                 "GRID_V2_STALE_MODE_PLACE_DROPPED symbol=%s "
