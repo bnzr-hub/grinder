@@ -166,6 +166,7 @@ _GRID_V2_PENDING_CANCEL_STALE_GENS = 2  # 2 sync generations: pending cancel sta
 _GRID_V2_PENDING_PLACE_STALE_GENS = 4  # 4 sync generations: pending place considered stale
 _GRID_V2_AWAITING_SYNC_EXPIRY_GENS = 6  # ADR-174: max gens before forced clear of seed latch
 _GRID_V2_STALE_ENTRY_TTL_S = 600  # ADR-179: 10 min — cancel entries older than this
+_GRID_V2_NEVER_SEEN_MAX_GENS = 12  # ADR-180: max sync gens before cleaning never-seen registry CID
 _GRID_V2_ESCALATION_LOG_INTERVAL = 10  # log escalation every Nth defer (anti-spam)
 _GRID_V2_DRIFT_RECONSTRUCT_COOLDOWN_GENS = (
     3  # wait 3 sync cycles after FLAT before drift reconstruct
@@ -925,6 +926,9 @@ class LiveEngineV0:
         # ADR-180: CIDs confirmed visible on exchange at least once.
         # Stale-registry cleaning only applies to CIDs in this set.
         self._grid_v2_seen_on_exchange: set[str] = set()
+        # ADR-180: Registration gen for never-seen CIDs. Bounded fallback:
+        # if never seen after _GRID_V2_NEVER_SEEN_MAX_GENS, clean from registry.
+        self._grid_v2_entry_reg_gen: dict[str, int] = {}  # cid → sync_gen at registration
         # Definitive-reject blocklist: CIDs cleaned by _grid_v2_clean_failed_place
         # must never be treated as fills. Cleared on bridge reset.
         self._grid_v2_definitively_rejected_cids: set[str] = set()
@@ -1405,6 +1409,8 @@ class LiveEngineV0:
         self._grid_v2_pending_place_cids.clear()
         self._grid_v2_definitively_rejected_cids.clear()
         self._grid_v2_fill_eligible_cids.clear()
+        self._grid_v2_seen_on_exchange.clear()
+        self._grid_v2_entry_reg_gen.clear()
         logger.warning(
             "GRID_V2_ORDER_SIZE_RESEED_APPLIED symbol=%s old=%s new=%s cancel=%d seed=%d",
             self._grid_v2_symbol,
@@ -1861,6 +1867,8 @@ class LiveEngineV0:
         self._grid_v2_pending_cancels.clear()
         self._grid_v2_pending_place_cids.clear()
         self._grid_v2_definitively_rejected_cids.clear()
+        self._grid_v2_seen_on_exchange.clear()
+        self._grid_v2_entry_reg_gen.clear()
         self._sync_reconciler_pending_actions = []
         self._grid_v2_awaiting_sync = False
         self._grid_v2_pending_seed_cids = frozenset()
@@ -1935,6 +1943,7 @@ class LiveEngineV0:
             ):
                 cid = bridge.adapter.generate_entry_cid(ts)
                 bridge.adapter.registry.register_entry(cid, a.side, a.price)
+                self._grid_v2_entry_reg_gen[cid] = self._account_sync_generation
                 materialized.append(
                     replace(
                         a,
@@ -5061,9 +5070,33 @@ class LiveEngineV0:
                     stale_cleaned,
                 )
 
-            # Prune seen_on_exchange: remove CIDs no longer in registry
+            # Bounded fallback for never-seen CIDs: if a CID has been in
+            # registry for too long without ever appearing on exchange,
+            # clean it to prevent permanent zombie slots.
+            _gen = self._account_sync_generation + 1
+            _never_seen_cleaned = 0
+            for cid in list(bridge.adapter.registry.all_entry_cids):
+                if cid in self._grid_v2_seen_on_exchange:
+                    continue
+                reg_gen = self._grid_v2_entry_reg_gen.get(cid)
+                if reg_gen is not None and (_gen - reg_gen) >= _GRID_V2_NEVER_SEEN_MAX_GENS:
+                    bridge.adapter.confirm_cancel_entry(cid)
+                    self._grid_v2_entry_reg_gen.pop(cid, None)
+                    _never_seen_cleaned += 1
+            if _never_seen_cleaned:
+                logger.info(
+                    "GRID_V2_NEVER_SEEN_ENTRY_CLEANED symbol=%s count=%d max_gens=%d",
+                    self._grid_v2_symbol,
+                    _never_seen_cleaned,
+                    _GRID_V2_NEVER_SEEN_MAX_GENS,
+                )
+
+            # Prune tracking sets: remove CIDs no longer in registry
             _registry_cids = bridge.adapter.registry.all_entry_cids
             self._grid_v2_seen_on_exchange &= _registry_cids
+            self._grid_v2_entry_reg_gen = {
+                k: v for k, v in self._grid_v2_entry_reg_gen.items() if k in _registry_cids
+            }
 
             from grinder.grid_v2.sync_reconciler import reconcile_grid_state  # noqa: PLC0415
 
