@@ -582,3 +582,59 @@ class TestPositionLedgerSymbolFilter:
         assert hydrated == 1
         assert ledger.positions()[("BTCUSDT", "BOTH")].position_amt == Decimal("0.001")
         assert ("ETHUSDT", "BOTH") not in ledger.positions()
+
+    def test_compare_ignores_pre_polluted_foreign_ledger_entries(self) -> None:
+        """P1 review follow-up: even if a foreign position is already present
+        in the ledger (e.g., from a pre-fix run, from a different write path,
+        or from direct apply_position_event bypassing the hydrate filter),
+        a filtered compare must NOT emit divergence for that foreign entry.
+
+        apply_position_event is the WS write path and is deliberately NOT
+        filter-gated (upstream symbol filter handles it in production).
+        Use it directly here to seed the foreign pollution and verify the
+        ledger-side loop in compare_with_snapshot respects symbol_filter.
+        """
+        ledger = PositionLedger()
+        # Seed BOTH owner and foreign entries via apply path.
+        ledger.apply_position_event(_pos_event(symbol="BTCUSDT", position_amt="0.001"))
+        ledger.apply_position_event(_pos_event(symbol="ETHUSDT", position_amt="-0.5"))
+        ledger.apply_position_event(_pos_event(symbol="MAGMAUSDT", position_amt="100"))
+        # Confirm the foreign entries are really present (pre-pollution state).
+        positions = ledger.positions()
+        assert ("BTCUSDT", "BOTH") in positions
+        assert ("ETHUSDT", "BOTH") in positions
+        assert ("MAGMAUSDT", "BOTH") in positions
+
+        # Snapshot has only the owner symbol, with a matching value.
+        snap = _snap(
+            positions=[_pos_snap(symbol="BTCUSDT", signed_qty="0.001")],
+            ts=2000,
+        )
+
+        result = ledger.compare_with_snapshot(snap, symbol_filter="BTCUSDT")
+        # Ledger-side foreign entries must be out of scope for filtered compare.
+        assert result.is_converged
+        assert len(result.divergences) == 0
+        # Counts must also reflect the filtered scope, not the full dict.
+        assert result.ledger_count == 1
+        assert result.snapshot_count == 1
+
+    def test_compare_pre_polluted_ledger_no_filter_still_reports_all(self) -> None:
+        """Backward-compat guard for the ledger-side filter.
+
+        symbol_filter=None must still walk all entries and report foreign
+        divergences as before the fix. This is the non-engine/replay path.
+        """
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(symbol="BTCUSDT", position_amt="0.001"))
+        ledger.apply_position_event(_pos_event(symbol="ETHUSDT", position_amt="-0.5"))
+        snap = _snap(
+            positions=[_pos_snap(symbol="BTCUSDT", signed_qty="0.001")],
+            ts=2000,
+        )
+        result = ledger.compare_with_snapshot(snap)
+        assert not result.is_converged
+        # ETHUSDT exists in ledger, absent in snapshot → MISSING_IN_SNAPSHOT
+        assert len(result.divergences) == 1
+        assert result.divergences[0].symbol == "ETHUSDT"
+        assert result.divergences[0].kind == PositionDivergenceKind.POSITION_MISSING_IN_SNAPSHOT

@@ -255,6 +255,8 @@ class PositionLedger:
 
         # Check ledger positions against snapshot
         for key, lp in sorted(self._positions.items()):
+            if symbol_filter is not None and lp.symbol != symbol_filter:
+                continue  # foreign pre-polluted ledger entry — out of scope for filtered compare
             if lp.position_amt == 0:
                 continue  # flat in ledger — skip
             snap_qty = snap_positions.pop(key, None)
@@ -288,7 +290,11 @@ class PositionLedger:
                 )
             )
 
-        non_flat_ledger = sum(1 for lp in self._positions.values() if lp.position_amt != 0)
+        non_flat_ledger = sum(
+            1
+            for lp in self._positions.values()
+            if (symbol_filter is None or lp.symbol == symbol_filter) and lp.position_amt != 0
+        )
         non_flat_snap = sum(
             1
             for p in snapshot.positions
