@@ -70,6 +70,8 @@ def _setup_engine(engine: LiveEngineV0) -> MagicMock:
     bridge.reconstruction_ok = True
     bridge._config.max_inventory_levels = 10
     bridge.adapter.registry.all_entry_cids = frozenset({"g-e0", "g-e1", "g-e2"})
+    # ADR-180: mark as seen for stale-cleanup eligibility
+    engine._grid_v2_seen_on_exchange = {"g-e0", "g-e1", "g-e2"}
     bridge.adapter.registry.all_exit_cids = frozenset()
     engine._grid_v2_bridge = bridge
     engine._grid_v2_pending_place_cids = {}
