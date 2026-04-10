@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pytest
 
 from grinder.account.contracts import AccountSnapshot, PositionSnap
 from grinder.account.position_ledger import (
@@ -351,3 +356,109 @@ class TestPositionLedgerGetSignedQty:
         ledger = PositionLedger()
         ledger.apply_position_event(_pos_event(position_amt="-0.003"))
         assert ledger.get_signed_qty("BTCUSDT") == Decimal("-0.003")
+
+
+class TestPositionLedgerLogs:
+    """Issue #664: structured INFO log coverage for apply/drop/hydrate decisions.
+
+    Observability-only. No behavior change. See docs/13_OBSERVABILITY.md.
+    """
+
+    _LEDGER_LOGGER = "grinder.account.position_ledger"
+    _APPLIED = "POSITION_LEDGER_EVENT_APPLIED"
+    _DROPPED = "POSITION_LEDGER_EVENT_DROPPED_STALE"
+    _HYDRATE = "POSITION_LEDGER_HYDRATE_APPLIED"
+
+    def test_applied_log_first_write(self, caplog: pytest.LogCaptureFixture) -> None:
+        ledger = PositionLedger()
+        with caplog.at_level(logging.INFO, logger=self._LEDGER_LOGGER):
+            ledger.apply_position_event(_pos_event(ts=1000, position_amt="0.001"))
+
+        applied = [r for r in caplog.records if self._APPLIED in r.getMessage()]
+        dropped = [r for r in caplog.records if self._DROPPED in r.getMessage()]
+        assert len(applied) == 1
+        assert len(dropped) == 0
+        msg = applied[0].getMessage()
+        assert "symbol=BTCUSDT" in msg
+        assert "side=BOTH" in msg
+        assert "incoming_amt=0.001" in msg
+        assert "incoming_ts=1000" in msg
+        assert "prev_amt=None" in msg
+        assert "prev_ts=None" in msg
+        assert "new_amt=0.001" in msg
+        assert "new_ts=1000" in msg
+        assert "source=user_data_position" in msg
+
+    def test_applied_log_overwrites_prev(self, caplog: pytest.LogCaptureFixture) -> None:
+        ledger = PositionLedger()
+        with caplog.at_level(logging.INFO, logger=self._LEDGER_LOGGER):
+            ledger.apply_position_event(_pos_event(ts=1000, position_amt="0.001"))
+            ledger.apply_position_event(_pos_event(ts=2000, position_amt="0.003"))
+
+        applied = [r for r in caplog.records if self._APPLIED in r.getMessage()]
+        dropped = [r for r in caplog.records if self._DROPPED in r.getMessage()]
+        assert len(applied) == 2
+        assert len(dropped) == 0
+        second = applied[1].getMessage()
+        assert "incoming_amt=0.003" in second
+        assert "incoming_ts=2000" in second
+        assert "prev_amt=0.001" in second
+        assert "prev_ts=1000" in second
+        assert "new_amt=0.003" in second
+        assert "new_ts=2000" in second
+
+    def test_dropped_stale_strict(self, caplog: pytest.LogCaptureFixture) -> None:
+        ledger = PositionLedger()
+        with caplog.at_level(logging.INFO, logger=self._LEDGER_LOGGER):
+            ledger.apply_position_event(_pos_event(ts=2000, position_amt="0.002"))
+            ledger.apply_position_event(_pos_event(ts=1000, position_amt="0.001"))
+
+        applied = [r for r in caplog.records if self._APPLIED in r.getMessage()]
+        dropped = [r for r in caplog.records if self._DROPPED in r.getMessage()]
+        assert len(applied) == 1
+        assert len(dropped) == 1
+        msg = dropped[0].getMessage()
+        assert "incoming_amt=0.001" in msg
+        assert "incoming_ts=1000" in msg
+        assert "prev_amt=0.002" in msg
+        assert "prev_ts=2000" in msg
+        assert "reason=stale_event_guard" in msg
+        assert "source=user_data_position" in msg
+        assert ledger.positions()[("BTCUSDT", "BOTH")].position_amt == Decimal("0.002")
+
+    def test_dropped_same_ms(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Finding B diagnostic: same-ms event is rejected, log captures it explicitly."""
+        ledger = PositionLedger()
+        with caplog.at_level(logging.INFO, logger=self._LEDGER_LOGGER):
+            ledger.apply_position_event(_pos_event(ts=1000, position_amt="0.002"))
+            ledger.apply_position_event(_pos_event(ts=1000, position_amt="0.005"))
+
+        applied = [r for r in caplog.records if self._APPLIED in r.getMessage()]
+        dropped = [r for r in caplog.records if self._DROPPED in r.getMessage()]
+        assert len(applied) == 1
+        assert len(dropped) == 1
+        msg = dropped[0].getMessage()
+        assert "incoming_ts=1000" in msg
+        assert "prev_ts=1000" in msg
+        assert ledger.positions()[("BTCUSDT", "BOTH")].position_amt == Decimal("0.002")
+
+    def test_hydrate_applied_log_write_only(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Hydrate emits log only on the write branch, not on skip."""
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(ts=500, position_amt="0.001"))
+        # pos.ts=1000 > event.ts=500 → write branch
+        snap = _snap(positions=[_pos_snap(signed_qty="0.003")], ts=2000)
+
+        with caplog.at_level(logging.INFO, logger=self._LEDGER_LOGGER):
+            ledger.hydrate_from_snapshot(snap)
+            # Second call: ledger's last_event_ts == pos.ts == 1000 → skip branch
+            ledger.hydrate_from_snapshot(snap)
+
+        hydrate_logs = [r for r in caplog.records if self._HYDRATE in r.getMessage()]
+        assert len(hydrate_logs) == 1
+        msg = hydrate_logs[0].getMessage()
+        assert "symbol=BTCUSDT" in msg
+        assert "side=BOTH" in msg
+        assert "amt=0.003" in msg
+        assert "ts=1000" in msg
+        assert "source=snapshot_hydration" in msg
