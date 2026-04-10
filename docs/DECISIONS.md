@@ -5053,6 +5053,13 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Layering:** `_get_signed_position_qty()` → `get_effective_signed_position_qty()` → trusted ledger if fresh, `_get_signed_position_qty_from_snapshot()` otherwise. No recursion risk.
 - **Scope:** Only `_get_signed_position_qty()` authority changes. No reduce-only budget, portfolio risk, or startup/reconstruct changes. Narrow, reversible boundary switch.
 
+### ADR-109 Phase 3 hotfix: symbol-scoped hydration (2026-04-10, issue #664)
+
+- **Problem:** Each activated symbol gets its own `LiveEngineV0` with its own private `PositionLedger`. WebSocket user-data position events are correctly filtered per symbol, but the REST account snapshot from `GET /fapi/v2/positionRisk` is unfiltered and contains all account positions. Every engine's `_tick_account_sync` called `hydrate_from_snapshot()` unfiltered, so each engine's ledger accumulated stale copies of every other symbol's positions. When a symbol later transitioned through FLAT, the owner engine correctly updated its own ledger via WS, but other engines' ledgers retained the stale non-flat copy (the flat snapshot no longer contained the symbol, so hydrate could not overwrite). Subsequent compares on the polluted ledgers emitted `POSITION_LEDGER_SHADOW_DIVERGENCE symbol=X ledger_amt=<stale>` false positives. Canary post-#661 saw 703 such events across 4 symbols in 26 minutes.
+- **Decision:** Add an optional `symbol_filter: str | None = None` parameter to both `hydrate_from_snapshot()` and `compare_with_snapshot()`. When set, both methods operate only on positions matching the given symbol — other symbols are skipped at the source (not stored, not compared). Engine call sites at `_tick_account_sync` pass `symbol_filter=self._grid_v2_symbol or None`, scoping the ledger to the engine's own symbol. `None` default preserves legacy unfiltered behavior byte-for-byte.
+- **Scope:** Only `hydrate_from_snapshot` and `compare_with_snapshot` signatures change; their bodies gain one `continue` branch each. `apply_position_event`, the stale-event guard, trust state machine, `get_signed_qty`, and `reset` are byte-for-byte unchanged. No constructor or class contract changes (defensive `owner_symbol` hardening deferred as follow-up).
+- **Consequences:** Per-engine ledgers are now symbol-scoped. Cross-engine stale copies can no longer accumulate. `POSITION_LEDGER_SHADOW_DIVERGENCE` is emitted only for the engine's own symbol. Non-engine callers (replay, tests) that pass no filter retain original unfiltered behavior.
+
 
 ### ADR-161: Two-stage bootstrap prefilter (2026-04-06)
 
