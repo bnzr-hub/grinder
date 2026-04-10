@@ -379,3 +379,101 @@ class TestRealFillPathBeatsStaleClean:
 
         # Stale cleaning never touched fill_cid
         bridge.adapter.confirm_cancel_entry.assert_not_called()
+
+
+class TestNeverSeenFallbackSurvivesAdr181:
+    """ADR-181 regression guard: bounded never-seen cleanup must still work
+    for genuinely never-visible, never-filled entries after the new fill-consumed
+    termination logic was added.
+    """
+
+    def test_true_never_seen_cid_still_cleaned_after_max_gens(self) -> None:
+        """A CID that was placed, never appeared in any snapshot, and never
+        received a fill event must still be cleaned by the bounded fallback
+        after _GRID_V2_NEVER_SEEN_MAX_GENS sync cycles."""
+        from grinder.live.engine import _GRID_V2_NEVER_SEEN_MAX_GENS  # noqa: PLC0415
+
+        engine = _make_engine()
+        syncer = _setup_engine(engine)
+        bridge = engine._grid_v2_bridge
+
+        # Replace the default seen CIDs with a single never-seen CID.
+        never_seen_cid = "g_g_BTCUSDT_e0_1000_0"
+        bridge.adapter.registry.all_entry_cids = frozenset({never_seen_cid})
+        engine._grid_v2_seen_on_exchange = set()  # never appeared
+        engine._grid_v2_entry_reg_gen = {never_seen_cid: 0}
+        # Advance account_sync_generation so (gen+1 - reg_gen) >= threshold.
+        engine._account_sync_generation = _GRID_V2_NEVER_SEEN_MAX_GENS
+
+        # Snapshot never contains the CID.
+        syncer.sync.return_value = _sync_result([], ts=2000)
+
+        mock_recon_result = MagicMock(
+            actions=(),
+            would_cancel=0,
+            would_place=0,
+            desired_entry_count=0,
+            theoretical_desired_entry_count=0,
+            actual_entry_count=0,
+            actual_exit_count=0,
+            missing_entries=0,
+            extra_entries=0,
+            missing_exits=0,
+            extra_exits=0,
+            projection_mode=MagicMock(value="UNCONSTRAINED"),
+            legal_entry_capacity=None,
+        )
+        with patch(
+            "grinder.grid_v2.sync_reconciler.reconcile_grid_state",
+            return_value=mock_recon_result,
+        ):
+            engine._tick_account_sync()
+
+        # Bounded fallback must fire on the genuinely never-seen CID.
+        bridge.adapter.confirm_cancel_entry.assert_called_once_with(never_seen_cid)
+
+    def test_fill_consumed_cid_is_not_touched_by_never_seen_fallback(self) -> None:
+        """ADR-181 core invariant: after process_user_data_event handles a fill
+        for a CID (popping it from _grid_v2_entry_reg_gen), the never-seen fallback
+        loop must not later fire on that CID even if max_gens has elapsed."""
+        from grinder.live.engine import _GRID_V2_NEVER_SEEN_MAX_GENS  # noqa: PLC0415
+
+        engine = _make_engine()
+        syncer = _setup_engine(engine)
+        bridge = engine._grid_v2_bridge
+
+        filled_cid = "g_g_BTCUSDT_e0_1000_0"
+        bridge.adapter.registry.all_entry_cids = frozenset({filled_cid})
+        engine._grid_v2_seen_on_exchange = set()  # never appeared on snapshot
+        # Simulate the post-ADR-181 state after a user-data fill:
+        # entry_reg_gen has been popped by process_user_data_event.
+        engine._grid_v2_entry_reg_gen = {}
+        engine._grid_v2_user_fill_seen.add(filled_cid)
+        engine._account_sync_generation = _GRID_V2_NEVER_SEEN_MAX_GENS * 2
+
+        syncer.sync.return_value = _sync_result([], ts=2000)
+        mock_recon_result = MagicMock(
+            actions=(),
+            would_cancel=0,
+            would_place=0,
+            desired_entry_count=0,
+            theoretical_desired_entry_count=0,
+            actual_entry_count=0,
+            actual_exit_count=0,
+            missing_entries=0,
+            extra_entries=0,
+            missing_exits=0,
+            extra_exits=0,
+            projection_mode=MagicMock(value="UNCONSTRAINED"),
+            legal_entry_capacity=None,
+        )
+        with patch(
+            "grinder.grid_v2.sync_reconciler.reconcile_grid_state",
+            return_value=mock_recon_result,
+        ):
+            engine._tick_account_sync()
+
+        # The fill-consumed CID must NOT be cleaned by the never-seen fallback,
+        # because ADR-181 removed its entry from _grid_v2_entry_reg_gen at fill
+        # time, making reg_gen is None → condition `reg_gen is not None` fails.
+        bridge.adapter.confirm_cancel_entry.assert_not_called()

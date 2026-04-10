@@ -2847,7 +2847,7 @@ class LiveEngineV0:
             ):
                 self._cancel_dispatched_pending_sync.add(action.order_id)
 
-    def process_user_data_event(self, event: UserDataEvent) -> None:  # noqa: PLR0911, PLR0912
+    def process_user_data_event(self, event: UserDataEvent) -> None:  # noqa: PLR0911, PLR0912, PLR0915
         """Process immediate user-data order events for grid_v2.
 
         This path is a low-latency supplement to account-sync polling:
@@ -2918,9 +2918,18 @@ class LiveEngineV0:
                     reason,
                 )
                 self._grid_v2_user_fill_seen.add(oe.client_order_id)
+                # ADR-181: rejected fill also terminates pending-visibility lifecycle
+                self._grid_v2_pending_place_cids.pop(oe.client_order_id, None)
+                self._grid_v2_fill_eligible_cids.discard(oe.client_order_id)
+                self._grid_v2_entry_reg_gen.pop(oe.client_order_id, None)
                 return
 
             self._grid_v2_user_fill_seen.add(oe.client_order_id)
+            # ADR-181: successful fill terminates pending-visibility lifecycle so
+            # the never-seen cleanup cannot later false-fire on a consumed CID
+            self._grid_v2_pending_place_cids.pop(oe.client_order_id, None)
+            self._grid_v2_fill_eligible_cids.discard(oe.client_order_id)
+            self._grid_v2_entry_reg_gen.pop(oe.client_order_id, None)
             self._last_fill_ts = max(self._last_fill_ts, oe.ts)  # ADR-111
             self._burst_suppression_fired = False  # new fill → allow one suppression
             # ADR-109 Phase 2 PR-2: event-first fill observability
