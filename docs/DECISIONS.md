@@ -4603,6 +4603,7 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Fix:** Record `_reconciler_staged_mode` at staging time. At drain time, drop PLACEs if current SM mode differs from staged mode. Log: `GRID_V2_STALE_MODE_PLACE_DROPPED`.
 - **Implementation:** `src/grinder/live/engine.py`.
 - **Tests:** 4 adversarial tests in `tests/unit/test_stale_mode_placement.py`.
+- **2026-04-10 hotfix (issue #667):** The same drain loop also carries a `cid_for_entry` check added by PR #468 to drop stale PLACEs when the fill path took the slot under a different CID. A cross-PR interaction with PR #462 (materialize registers the new CID at staging time) caused the check to drop the action's own self-registered CID, producing permanent entry starvation after an ADR-179 mass cancel on no-fill symbols. Fixed by comparing `existing_cid != a.client_order_id` so self-registered CIDs pass through while foreign CIDs still drop the stale PLACE. Regression coverage: `TestReconcilerStagingDrainSelfSuppression` in `tests/unit/test_stale_mode_placement.py`. Mode-change and fill-since-staging drops (original ADR-112) are untouched.
 
 ### ADR-113: Exit Topology Repair Re-Registration (2026-03-29)
 
