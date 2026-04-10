@@ -5196,3 +5196,11 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** Add `_GRID_V2_STALE_ENTRY_TTL_S = 600` (10 min). On each account sync, parse entry CID timestamps from exchange-visible orders. If `now - cid.ts > TTL`, dispatch a cancel via `_process_action`. Reconciler will restore fresh topology on the next cycle.
 - **Invariant:** Recent entries (< 10 min) are never retired. Only exchange-visible entries with parseable grid_v2 CIDs are candidates. Cancels go through normal safety gates. No effect during AWAITING_SYNC.
 - **Consequences:** Old seed entries can no longer sit indefinitely and later burst-fill unchanged. The delayed-trigger burst scenario from MAGMA/RAVE is materially addressed at the source.
+
+### ADR-180: Protect never-seen reconciler entries from stale-registry cleanup (2026-04-10)
+
+- **Problem:** Live canary showed P0 entry coverage collapse: reconciler placed missing entries (HTTP 200), but stale-registry cleaning removed them from the adapter registry before the next snapshot confirmed visibility. SIRENUSDT had 252 cleaning events and lost all entry coverage.
+- **Root cause:** Stale-registry cleaning used a 2-cycle absence rule but didn't distinguish "never seen on exchange yet" (newly placed) from "previously visible, now gone" (actually stale). Once `pending_place` grace expired, never-seen entries were cleaned like dead CIDs.
+- **Decision:** Add `_grid_v2_seen_on_exchange: set[str]` tracking. On each sync, mark entry CIDs visible on exchange. Stale-registry cleaning only applies to CIDs in `seen_on_exchange` — never-seen entries are protected until first confirmed visibility. Pruned per-sync to remove CIDs no longer in registry.
+- **Invariant:** Never-seen entries are protected from stale cleanup. Seen-then-absent entries follow normal 2-cycle absence rule. No permanent zombie CIDs (pruning removes stale seen entries).
+- **Consequences:** Reconciler-placed entries survive until exchange confirms them. Entry coverage no longer collapses from placement-visibility race.

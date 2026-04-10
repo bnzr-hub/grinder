@@ -922,6 +922,9 @@ class LiveEngineV0:
         # to avoid racing with fill detection (filled entries disappear
         # from snapshot but should be processed as fills, not cleaned).
         self._prev_absent_registry_cids: set[str] = set()
+        # ADR-180: CIDs confirmed visible on exchange at least once.
+        # Stale-registry cleaning only applies to CIDs in this set.
+        self._grid_v2_seen_on_exchange: set[str] = set()
         # Definitive-reject blocklist: CIDs cleaned by _grid_v2_clean_failed_place
         # must never be treated as fills. Cleared on bridge reset.
         self._grid_v2_definitively_rejected_cids: set[str] = set()
@@ -5017,21 +5020,30 @@ class LiveEngineV0:
             and self._grid_v2_bridge.reconstruction_ok
         ):
             # Pre-pass: clean stale registry entries that block reconciler PLACE.
-            # Two-cycle rule: only clean CIDs absent from exchange in BOTH
-            # previous AND current sync. This prevents racing with fill
-            # detection — a filled entry disappears from snapshot but must
-            # be processed as a fill before it can be cleaned as stale.
+            # ADR-180: Track which entry CIDs have been seen on exchange.
+            # Stale-registry cleaning only applies to CIDs that were visible
+            # at least once — never-seen reconciler placements are protected.
             if self._event_ledger.is_trusted:
                 exchange_cids = set(self._event_ledger.open_orders().keys())
             else:
                 exchange_cids = {o.order_id for o in result.snapshot.open_orders}
             bridge = self._grid_v2_bridge
+
+            # Mark CIDs as seen when they appear on exchange for the first time
+            for cid in list(bridge.adapter.registry.all_entry_cids):
+                if cid in exchange_cids:
+                    self._grid_v2_seen_on_exchange.add(cid)
+
+            # Two-cycle absence rule: only for CIDs that were seen before.
+            # Never-seen CIDs (recently placed by reconciler) are protected
+            # until they either become visible or pending_place grace expires.
             current_absent: set[str] = set()
             for cid in list(bridge.adapter.registry.all_entry_cids):
                 if (
                     cid not in exchange_cids
                     and cid not in self._grid_v2_pending_place_cids
                     and cid not in self._grid_v2_pending_cancels
+                    and cid in self._grid_v2_seen_on_exchange  # only clean seen entries
                 ):
                     current_absent.add(cid)
             # Only clean CIDs absent in both consecutive syncs
@@ -5039,6 +5051,7 @@ class LiveEngineV0:
             stale_cleaned = 0
             for cid in stale_candidates:
                 bridge.adapter.confirm_cancel_entry(cid)
+                self._grid_v2_seen_on_exchange.discard(cid)
                 stale_cleaned += 1
             self._prev_absent_registry_cids = current_absent
             if stale_cleaned:
@@ -5047,6 +5060,10 @@ class LiveEngineV0:
                     self._grid_v2_symbol,
                     stale_cleaned,
                 )
+
+            # Prune seen_on_exchange: remove CIDs no longer in registry
+            _registry_cids = bridge.adapter.registry.all_entry_cids
+            self._grid_v2_seen_on_exchange &= _registry_cids
 
             from grinder.grid_v2.sync_reconciler import reconcile_grid_state  # noqa: PLC0415
 
