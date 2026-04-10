@@ -326,8 +326,12 @@ class TestPositionLedgerHydration:
         assert ledger._bootstrapped
         assert ledger.is_trusted
 
-    def test_hydrate_multi_symbol(self) -> None:
-        """Multiple positions hydrated correctly."""
+    def test_hydrate_multi_symbol_no_filter(self) -> None:
+        """Multiple positions hydrated correctly when no symbol_filter is passed.
+
+        Backward compatibility: `symbol_filter=None` (default) preserves the
+        original unfiltered behavior byte-for-byte.
+        """
         ledger = PositionLedger()
         snap = _snap(
             positions=[
@@ -462,3 +466,119 @@ class TestPositionLedgerLogs:
         assert "amt=0.003" in msg
         assert "ts=1000" in msg
         assert "source=snapshot_hydration" in msg
+
+
+class TestPositionLedgerSymbolFilter:
+    """Issue #664: symbol-scoped hydrate/compare prevent cross-engine pollution.
+
+    Each per-symbol engine has its own PositionLedger instance but the REST
+    account snapshot is unfiltered and contains all symbols. Without filter,
+    every engine hydrates every position, then stale cross-symbol copies
+    generate false divergence logs when the real owner symbol transitions
+    through FLAT. Fix: pass engine's own symbol as filter on both hydrate and
+    compare so each engine-local ledger stays scoped to its owner symbol.
+    """
+
+    def test_hydrate_skips_foreign_symbols(self) -> None:
+        """Multi-symbol snapshot + symbol_filter = only owner symbol written."""
+        ledger = PositionLedger()
+        snap = _snap(
+            positions=[
+                _pos_snap(symbol="BTCUSDT", signed_qty="0.001"),
+                _pos_snap(symbol="ETHUSDT", signed_qty="-0.5"),
+                _pos_snap(symbol="MAGMAUSDT", signed_qty="100"),
+            ],
+            ts=2000,
+        )
+        hydrated = ledger.hydrate_from_snapshot(snap, symbol_filter="BTCUSDT")
+        assert hydrated == 1
+        positions = ledger.positions()
+        assert ("BTCUSDT", "BOTH") in positions
+        assert ("ETHUSDT", "BOTH") not in positions
+        assert ("MAGMAUSDT", "BOTH") not in positions
+
+    def test_hydrate_owner_symbol_unaffected(self) -> None:
+        """Owner symbol hydration behavior is identical to no-filter case."""
+        ledger = PositionLedger()
+        snap = _snap(
+            positions=[
+                _pos_snap(symbol="BTCUSDT", signed_qty="0.005"),
+                _pos_snap(symbol="ETHUSDT", signed_qty="-1.0"),
+            ],
+            ts=2000,
+        )
+        hydrated = ledger.hydrate_from_snapshot(snap, symbol_filter="BTCUSDT")
+        assert hydrated == 1
+        assert ledger.positions()[("BTCUSDT", "BOTH")].position_amt == Decimal("0.005")
+        assert ledger._bootstrapped
+
+    def test_compare_no_false_divergence_foreign_symbols(self) -> None:
+        """The canary reproduction scenario.
+
+        ARIA-engine's ledger was hydrated filtered; subsequent compare against
+        the same multi-symbol snapshot must NOT flag foreign symbols as
+        POSITION_MISSING_IN_LEDGER and must NOT see any foreign stale state.
+        """
+        ledger = PositionLedger()
+        snap = _snap(
+            positions=[
+                _pos_snap(symbol="BTCUSDT", signed_qty="0.001"),
+                _pos_snap(symbol="ETHUSDT", signed_qty="-0.5"),
+                _pos_snap(symbol="MAGMAUSDT", signed_qty="100"),
+            ],
+            ts=2000,
+        )
+        ledger.hydrate_from_snapshot(snap, symbol_filter="BTCUSDT")
+        result = ledger.compare_with_snapshot(snap, symbol_filter="BTCUSDT")
+        assert result.is_converged
+        assert len(result.divergences) == 0
+        assert result.ledger_count == 1
+        assert result.snapshot_count == 1
+
+    def test_compare_owner_symbol_amt_mismatch_still_detected(self) -> None:
+        """Regression guard: filtered compare still catches real owner-side divergence."""
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(symbol="BTCUSDT", position_amt="0.005"))
+        snap = _snap(
+            positions=[
+                _pos_snap(symbol="BTCUSDT", signed_qty="0.003"),
+                _pos_snap(symbol="ETHUSDT", signed_qty="-1.0"),
+            ],
+            ts=2000,
+        )
+        result = ledger.compare_with_snapshot(snap, symbol_filter="BTCUSDT")
+        assert not result.is_converged
+        assert len(result.divergences) == 1
+        assert result.divergences[0].symbol == "BTCUSDT"
+        assert result.divergences[0].kind == PositionDivergenceKind.POSITION_AMT_MISMATCH
+
+    def test_ws_apply_unaffected_by_hydrate_filter(self) -> None:
+        """REQ-005: WS apply path still works after filtered hydration."""
+        ledger = PositionLedger()
+        ledger.apply_position_event(_pos_event(symbol="BTCUSDT", position_amt="0.003"))
+        foreign_snap = _snap(
+            positions=[
+                _pos_snap(symbol="BTCUSDT", signed_qty="0.003"),
+                _pos_snap(symbol="ETHUSDT", signed_qty="-0.5"),
+            ],
+            ts=2000,
+        )
+        ledger.hydrate_from_snapshot(foreign_snap, symbol_filter="BTCUSDT")
+        assert ledger.get_signed_qty("BTCUSDT") == Decimal("0.003")
+        assert ("ETHUSDT", "BOTH") not in ledger.positions()
+
+    def test_hydrate_multi_symbol_with_filter(self) -> None:
+        """Paired with test_hydrate_multi_symbol_no_filter: same snapshot,
+        with filter only owner is written, proving backward compat boundary."""
+        ledger = PositionLedger()
+        snap = _snap(
+            positions=[
+                _pos_snap(symbol="BTCUSDT", signed_qty="0.001"),
+                _pos_snap(symbol="ETHUSDT", signed_qty="-0.5"),
+            ],
+            ts=2000,
+        )
+        hydrated = ledger.hydrate_from_snapshot(snap, symbol_filter="BTCUSDT")
+        assert hydrated == 1
+        assert ledger.positions()[("BTCUSDT", "BOTH")].position_amt == Decimal("0.001")
+        assert ("ETHUSDT", "BOTH") not in ledger.positions()

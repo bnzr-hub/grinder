@@ -165,7 +165,11 @@ class PositionLedger:
             return Decimal("0")
         return lp.position_amt
 
-    def hydrate_from_snapshot(self, snapshot: AccountSnapshot) -> int:
+    def hydrate_from_snapshot(
+        self,
+        snapshot: AccountSnapshot,
+        symbol_filter: str | None = None,
+    ) -> int:
         """Bootstrap/refresh ledger from snapshot positions.
 
         Populates the ledger with non-zero positions from the snapshot
@@ -177,11 +181,21 @@ class PositionLedger:
 
         Called on every sync cycle (mirrors EventLedger pattern).
         Returns the number of positions hydrated.
+
+        Args:
+            snapshot: Unfiltered account snapshot (may contain all symbols).
+            symbol_filter: When set, only positions matching this symbol are
+                written. Prevents cross-symbol pollution in per-engine ledgers
+                (see #664, ADR-109 Phase 3 hotfix). When None, all symbols are
+                hydrated — preserves original behavior for non-engine-scoped
+                callers and tests.
         """
         hydrated = 0
         for pos in snapshot.positions:
             qty = pos.signed_qty if pos.signed_qty is not None else pos.qty
             if qty == 0:
+                continue
+            if symbol_filter is not None and pos.symbol != symbol_filter:
                 continue
             key = (pos.symbol, pos.side)
             existing = self._positions.get(key)
@@ -211,16 +225,30 @@ class PositionLedger:
             self._bootstrapped = True
         return hydrated
 
-    def compare_with_snapshot(self, snapshot: AccountSnapshot) -> PositionComparisonResult:
+    def compare_with_snapshot(
+        self,
+        snapshot: AccountSnapshot,
+        symbol_filter: str | None = None,
+    ) -> PositionComparisonResult:
         """Compare ledger positions against snapshot positions.
 
         Only compares position_amt (the most critical field for correctness).
+
+        Args:
+            snapshot: Unfiltered account snapshot (may contain all symbols).
+            symbol_filter: When set, only positions matching this symbol are
+                considered on both sides. Must match the symbol passed to
+                `hydrate_from_snapshot` so the comparison is over the same
+                scoped state (see #664, ADR-109 Phase 3 hotfix). When None,
+                all symbols are compared — preserves original behavior.
         """
         divergences: list[PositionDivergence] = []
 
         # Build snapshot position map: (symbol, side) → signed_qty
         snap_positions: dict[tuple[str, str], Decimal] = {}
         for pos in snapshot.positions:
+            if symbol_filter is not None and pos.symbol != symbol_filter:
+                continue
             qty = pos.signed_qty if pos.signed_qty is not None else pos.qty
             if qty != 0:
                 snap_positions[(pos.symbol, pos.side)] = qty
@@ -264,7 +292,8 @@ class PositionLedger:
         non_flat_snap = sum(
             1
             for p in snapshot.positions
-            if (p.signed_qty if p.signed_qty is not None else p.qty) != 0
+            if (symbol_filter is None or p.symbol == symbol_filter)
+            and (p.signed_qty if p.signed_qty is not None else p.qty) != 0
         )
 
         return PositionComparisonResult(

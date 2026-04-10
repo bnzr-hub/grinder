@@ -4852,9 +4852,16 @@ class LiveEngineV0:
                         shadow.ledger_open_orders,
                         shadow.snapshot_open_orders,
                     )
-            # ADR-109 Phase 3: PositionLedger hydration + comparison + trust decision
+            # ADR-109 Phase 3: PositionLedger hydration + comparison + trust decision.
+            # #664 hotfix: scope ledger to engine's own symbol so per-engine ledgers
+            # don't accumulate cross-symbol stale copies from the unfiltered REST
+            # account snapshot. `or None` handles the non-grid_v2 engine case where
+            # _grid_v2_symbol is an empty string — falls back to no-filter behavior.
+            _ledger_symbol_scope = self._grid_v2_symbol or None
             try:
-                pos_hydrated = self._position_ledger.hydrate_from_snapshot(result.snapshot)
+                pos_hydrated = self._position_ledger.hydrate_from_snapshot(
+                    result.snapshot, symbol_filter=_ledger_symbol_scope
+                )
                 if pos_hydrated > 0:
                     logger.info(
                         "POSITION_LEDGER_HYDRATED positions=%d snapshot_ts=%d "
@@ -4864,7 +4871,9 @@ class LiveEngineV0:
                         self._position_ledger._bootstrapped,
                         self._position_ledger.is_trusted,
                     )
-                pos_cmp = self._position_ledger.compare_with_snapshot(result.snapshot)
+                pos_cmp = self._position_ledger.compare_with_snapshot(
+                    result.snapshot, symbol_filter=_ledger_symbol_scope
+                )
                 self._position_ledger.record_comparison_result(pos_cmp.is_converged)
                 logger.debug(
                     "POSITION_LEDGER_COMPARE converged=%s bootstrapped=%s trusted=%s "
