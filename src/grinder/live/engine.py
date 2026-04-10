@@ -2918,7 +2918,9 @@ class LiveEngineV0:
                     reason,
                 )
                 self._grid_v2_user_fill_seen.add(oe.client_order_id)
-                # ADR-181: rejected fill also terminates pending-visibility lifecycle
+                # ADR-181: rejected fill also terminates pending-visibility lifecycle.
+                # Side-agnostic — these are entry-only trackers, so pop/discard are
+                # no-ops for exit CIDs and we don't need to branch on parsed.kind.
                 self._grid_v2_pending_place_cids.pop(oe.client_order_id, None)
                 self._grid_v2_fill_eligible_cids.discard(oe.client_order_id)
                 self._grid_v2_entry_reg_gen.pop(oe.client_order_id, None)
@@ -2926,7 +2928,9 @@ class LiveEngineV0:
 
             self._grid_v2_user_fill_seen.add(oe.client_order_id)
             # ADR-181: successful fill terminates pending-visibility lifecycle so
-            # the never-seen cleanup cannot later false-fire on a consumed CID
+            # the never-seen cleanup cannot later false-fire on a consumed CID.
+            # Side-agnostic — these are entry-only trackers, so pop/discard are
+            # no-ops for exit CIDs and we don't need to branch on parsed.kind.
             self._grid_v2_pending_place_cids.pop(oe.client_order_id, None)
             self._grid_v2_fill_eligible_cids.discard(oe.client_order_id)
             self._grid_v2_entry_reg_gen.pop(oe.client_order_id, None)
