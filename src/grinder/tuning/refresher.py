@@ -5,6 +5,13 @@ and atomically replaces AutonomousTuningState. Keeps TuningCache warm,
 selector features fresh, and bridge config updated for future activations.
 
 Does NOT hot-swap geometry of already-running engines.
+
+Dynamic bootstrap discovery (PR-1, 2026-04-11): optionally runs a bounded
+coarse→prefilter scan on every refresh cycle to identify newly eligible
+post-startup symbols. **PR-1 is discovery-only:** the selected list is
+logged and stored on ``self._last_dynamic_candidates``, but the shared
+tuning state is not mutated. Merging newly tuned symbols into
+``AutonomousTuningState.candidates`` is the job of PR-2.
 """
 
 from __future__ import annotations
@@ -12,11 +19,17 @@ from __future__ import annotations
 import logging
 import threading
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_REFRESH_INTERVAL_S = 240.0
+_DEFAULT_DYNAMIC_BOOTSTRAP_COARSE_LIMIT = 100
+_DEFAULT_DYNAMIC_BOOTSTRAP_TUNE_LIMIT = 30
+_DEFAULT_DYNAMIC_BOOTSTRAP_MAX_NEW_PER_CYCLE = 5
 
 
 class TuningRefresher:
@@ -26,6 +39,12 @@ class TuningRefresher:
     - TuningCache entries
     - AutonomousTuningState (selector features + tuning results)
     - Bridge per-symbol config (for future activations, not active engines)
+
+    When ``universe_provider`` + ``coarse_select_fn`` + ``prefilter_fn`` are
+    supplied, it also runs bounded dynamic candidate discovery on each cycle
+    to identify post-startup symbols that have become prefilter-eligible.
+    **Discovery-only in PR-1**: the resulting list is logged and stored on
+    ``self._last_dynamic_candidates`` but never merged into shared state.
     """
 
     def __init__(
@@ -37,6 +56,14 @@ class TuningRefresher:
         registry: Any,  # EngineRegistry
         args: Any,  # argparse.Namespace
         interval_s: float = _DEFAULT_REFRESH_INTERVAL_S,
+        # --- Dynamic bootstrap discovery (PR-1) ---
+        universe_provider: Any = None,
+        blacklist: frozenset[str] = frozenset(),
+        coarse_select_fn: Callable[..., list[str]] | None = None,
+        prefilter_fn: Callable[..., list[str]] | None = None,
+        dynamic_bootstrap_coarse_limit: int = _DEFAULT_DYNAMIC_BOOTSTRAP_COARSE_LIMIT,
+        dynamic_bootstrap_tune_limit: int = _DEFAULT_DYNAMIC_BOOTSTRAP_TUNE_LIMIT,
+        dynamic_bootstrap_max_new_per_cycle: int = _DEFAULT_DYNAMIC_BOOTSTRAP_MAX_NEW_PER_CYCLE,
     ) -> None:
         self._state = state
         self._cache = cache
@@ -47,6 +74,17 @@ class TuningRefresher:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._cycle_count = 0
+        # Dynamic bootstrap discovery (PR-1)
+        self._universe_provider = universe_provider
+        self._blacklist = blacklist
+        self._coarse_select_fn = coarse_select_fn
+        self._prefilter_fn = prefilter_fn
+        self._dynamic_bootstrap_coarse_limit = dynamic_bootstrap_coarse_limit
+        self._dynamic_bootstrap_tune_limit = dynamic_bootstrap_tune_limit
+        self._dynamic_bootstrap_max_new_per_cycle = dynamic_bootstrap_max_new_per_cycle
+        # Most recent dynamic discovery result. Observational only in PR-1;
+        # PR-2 will consume this to drive the tuning solver.
+        self._last_dynamic_candidates: list[str] = []
 
     @property
     def state(self) -> Any:
@@ -97,6 +135,15 @@ class TuningRefresher:
             fetch_selection_features,
             fetch_selection_features_v2,
         )
+
+        # Dynamic bootstrap discovery (PR-1). Isolated try/except so a
+        # discovery failure cannot poison the main refresh path. Runs even
+        # when the current candidate set is empty so operators can observe
+        # what WOULD be picked up if PR-2 merge semantics existed.
+        try:
+            self._discover_new_candidates()
+        except Exception as e:
+            logger.warning("DYNAMIC_BOOTSTRAP_DISCOVERY_FAILED error=%s", e)
 
         candidates = self._state.candidates
         if not candidates:
@@ -155,6 +202,108 @@ class TuningRefresher:
             timer.elapsed_ms(),
             self._state.version,
         )
+
+    def _discover_new_candidates(self) -> list[str]:
+        """Bounded post-startup discovery of newly eligible symbols (PR-1).
+
+        Runs the same two-stage filter the cold bootstrap uses:
+          1. Coarse top-N by 24h quote volume
+          2. Prefilter (volume floor, NATR floor, adaptive spacing, blacklist)
+
+        Then subtracts already-tracked candidates in
+        ``AutonomousTuningState.candidates`` and keeps the top-K remaining
+        as the "selected" dynamic bootstrap set. The selected list is
+        stored on ``self._last_dynamic_candidates`` and logged via
+        ``DYNAMIC_BOOTSTRAP_DISCOVERY_RESULT``. **PR-1 does not tune or
+        merge the selected symbols** — that is PR-2's job.
+
+        Discovery is disabled (no-op) if any of the injected dependencies
+        are missing: ``universe_provider``, ``coarse_select_fn``, or
+        ``prefilter_fn``. This keeps backwards compatibility for tests
+        that construct ``TuningRefresher`` without these plumbing args.
+
+        Returns:
+            List of newly discovered symbols not already tracked, bounded
+            by ``dynamic_bootstrap_max_new_per_cycle``. Empty list when
+            discovery is disabled or no new candidates found.
+        """
+        if (
+            self._universe_provider is None
+            or self._coarse_select_fn is None
+            or self._prefilter_fn is None
+        ):
+            # Discovery plumbing not wired — stay quiet.
+            return []
+
+        logger.info("DYNAMIC_BOOTSTRAP_DISCOVERY_START")
+
+        try:
+            discovered = self._universe_provider.get_candidates()
+        except Exception as e:
+            logger.warning("DYNAMIC_BOOTSTRAP_UNIVERSE_FETCH_FAILED error=%s", e)
+            self._last_dynamic_candidates = []
+            return []
+
+        if not discovered:
+            logger.info(
+                "DYNAMIC_BOOTSTRAP_DISCOVERY_RESULT discovered=0 coarse=0 "
+                "prefiltered=0 new=0 selected=0"
+            )
+            self._last_dynamic_candidates = []
+            return []
+
+        mainnet = getattr(self._args, "mainnet", False)
+        testnet = not mainnet
+
+        # Coarse: top-N by 24h volume. Same cadence/semantics as cold bootstrap.
+        try:
+            coarse = self._coarse_select_fn(
+                discovered,
+                self._dynamic_bootstrap_coarse_limit,
+                testnet=testnet,
+            )
+        except Exception as e:
+            logger.warning("DYNAMIC_BOOTSTRAP_COARSE_SELECT_FAILED error=%s", e)
+            self._last_dynamic_candidates = []
+            return []
+
+        # Prefilter: volume + NATR + spacing + blacklist gates. Same semantics.
+        try:
+            prefiltered = self._prefilter_fn(
+                coarse,
+                limit=self._dynamic_bootstrap_tune_limit,
+                mainnet=mainnet,
+                blacklist=self._blacklist,
+            )
+        except Exception as e:
+            logger.warning("DYNAMIC_BOOTSTRAP_PREFILTER_FAILED error=%s", e)
+            self._last_dynamic_candidates = []
+            return []
+
+        # Subtract already-tracked candidates — we only care about NEW ones.
+        known = set(self._state.candidates)
+        new_symbols = [sym for sym in prefiltered if sym not in known]
+
+        # Bounded selection: keep the top-K (prefilter preserves rank order).
+        selected = new_symbols[: self._dynamic_bootstrap_max_new_per_cycle]
+
+        logger.info(
+            "DYNAMIC_BOOTSTRAP_DISCOVERY_RESULT discovered=%d coarse=%d "
+            "prefiltered=%d new=%d selected=%d",
+            len(discovered),
+            len(coarse),
+            len(prefiltered),
+            len(new_symbols),
+            len(selected),
+        )
+        if selected:
+            logger.info(
+                "DYNAMIC_BOOTSTRAP_DISCOVERY_SELECTED symbols=%s",
+                ",".join(selected),
+            )
+
+        self._last_dynamic_candidates = selected
+        return selected
 
     def _retune_symbols(
         self,
