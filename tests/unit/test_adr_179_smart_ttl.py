@@ -12,8 +12,10 @@ aged entry depends on whether it still corresponds to a current effective
 
 from __future__ import annotations
 
+import logging
 import time
 from decimal import Decimal
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 from grinder.account.contracts import AccountSnapshot, OpenOrderSnap
@@ -21,7 +23,13 @@ from grinder.connectors.live_connector import SafeMode
 from grinder.core import OrderSide
 from grinder.execution.types import ActionType, ExecutionAction
 from grinder.live import LiveEngineConfig, LiveEngineV0
-from grinder.live.engine import LiveActionStatus
+from grinder.live.engine import (
+    _GRID_V2_STALE_SKIP_LOG_KEEPALIVE_GENS,
+    LiveActionStatus,
+)
+
+if TYPE_CHECKING:
+    import pytest
 
 
 def _make_engine() -> LiveEngineV0:
@@ -284,3 +292,181 @@ class TestADR179SmartTTL:
             "retired. ADR-179's original protection against delayed burst "
             "fills on orphan seeds must remain intact."
         )
+
+
+def _stale_log_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Filter caplog to GRID_V2_STALE_ENTRIES_RETIRED records only."""
+    return [
+        r
+        for r in caplog.records
+        if r.name == "grinder.live.engine" and "GRID_V2_STALE_ENTRIES_RETIRED" in r.getMessage()
+    ]
+
+
+class TestADR179SkipOnlyLogThrottle:
+    """Skip-only `count=0 skipped_in_set=N` logs are throttled to log-on-change
+    plus periodic keepalive. Real retire (`count > 0`) is unthrottled and
+    refreshes the throttle state.
+    """
+
+    def _run_skip_only(
+        self,
+        engine: LiveEngineV0,
+        syncer: MagicMock,
+        order: OpenOrderSnap,
+        effective: frozenset[tuple[OrderSide, Decimal]],
+    ) -> None:
+        """Run one tick that produces a skip-only condition (no real retire)."""
+        _run_tick(engine, syncer, [order], effective)
+
+    def test_repeated_steady_state_logs_only_on_first_cycle(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Steady state: same skipped_in_set N cycles in a row → 1 log line."""
+        engine = _make_engine()
+        now = int(time.time())
+        cid = "g-healthy"
+        syncer = _setup_engine(engine, {cid: now - 700})
+        order = _order(cid, "BUY", "50000")
+        effective = frozenset({(OrderSide.BUY, Decimal("50000"))})
+
+        with caplog.at_level(logging.INFO, logger="grinder.live.engine"):
+            for _ in range(5):
+                self._run_skip_only(engine, syncer, order, effective)
+
+        records = _stale_log_records(caplog)
+        assert len(records) == 1, (
+            f"Expected exactly 1 skip-only log over 5 steady-state cycles, "
+            f"got {len(records)}: {[r.getMessage() for r in records]}"
+        )
+        assert "skipped_in_set=1" in records[0].getMessage()
+        assert "count=0" in records[0].getMessage()
+
+    def test_change_in_skipped_count_re_emits_log(self, caplog: pytest.LogCaptureFixture) -> None:
+        """When skipped_in_set changes (e.g. another aged in-set entry appears),
+        the throttle releases and the new count is logged immediately."""
+        engine = _make_engine()
+        now = int(time.time())
+        cid_a = "g-healthy-a"
+        cid_b = "g-healthy-b"
+        syncer = _setup_engine(
+            engine,
+            {cid_a: now - 700, cid_b: now - 700},
+        )
+        order_a = _order(cid_a, "BUY", "50000")
+        order_b = _order(cid_b, "SELL", "50100")
+        effective = frozenset(
+            {
+                (OrderSide.BUY, Decimal("50000")),
+                (OrderSide.SELL, Decimal("50100")),
+            }
+        )
+
+        with caplog.at_level(logging.INFO, logger="grinder.live.engine"):
+            # Tick 1: 1 aged in-set
+            _run_tick(engine, syncer, [order_a], effective)
+            # Tick 2-3: same condition — throttled
+            _run_tick(engine, syncer, [order_a], effective)
+            _run_tick(engine, syncer, [order_a], effective)
+            # Tick 4: 2 aged in-set — changed → must re-emit
+            _run_tick(engine, syncer, [order_a, order_b], effective)
+            # Tick 5: still 2 — throttled again
+            _run_tick(engine, syncer, [order_a, order_b], effective)
+
+        records = _stale_log_records(caplog)
+        messages = [r.getMessage() for r in records]
+        assert len(records) == 2, (
+            f"Expected 2 skip-only logs (tick 1 + tick 4), got {len(records)}: {messages}"
+        )
+        assert "skipped_in_set=1" in messages[0]
+        assert "skipped_in_set=2" in messages[1]
+
+    def test_keepalive_emits_after_threshold_cycles(self, caplog: pytest.LogCaptureFixture) -> None:
+        """After KEEPALIVE_GENS cycles in unchanged steady state, a heartbeat
+        log fires so operators can confirm the path is still active."""
+        engine = _make_engine()
+        now = int(time.time())
+        cid = "g-healthy"
+        syncer = _setup_engine(engine, {cid: now - 700})
+        order = _order(cid, "BUY", "50000")
+        effective = frozenset({(OrderSide.BUY, Decimal("50000"))})
+
+        with caplog.at_level(logging.INFO, logger="grinder.live.engine"):
+            for _ in range(_GRID_V2_STALE_SKIP_LOG_KEEPALIVE_GENS + 1):
+                _run_tick(engine, syncer, [order], effective)
+
+        records = _stale_log_records(caplog)
+        assert len(records) == 2, (
+            f"Expected exactly 2 logs over {_GRID_V2_STALE_SKIP_LOG_KEEPALIVE_GENS + 1} "
+            f"cycles (tick 1 + keepalive), got {len(records)}"
+        )
+        for r in records:
+            assert "skipped_in_set=1" in r.getMessage()
+
+    def test_real_retire_path_is_unthrottled(self, caplog: pytest.LogCaptureFixture) -> None:
+        """`count > 0` real retire logs immediately every cycle, regardless of
+        prior skip-only throttle state. The throttle must not gate retire logs.
+        """
+        engine = _make_engine()
+        now = int(time.time())
+        orphan = "g-orphan"
+        syncer = _setup_engine(engine, {orphan: now - 700})
+        order = _order(orphan, "SELL", "49000")
+        effective: frozenset[tuple[OrderSide, Decimal]] = frozenset()
+
+        with caplog.at_level(logging.INFO, logger="grinder.live.engine"):
+            for _ in range(3):
+                # Re-add the orphan each tick because dispatch removes it from
+                # pending_cancels — keep simulating "fresh aged orphan present"
+                # to assert each cycle still logs.
+                engine._grid_v2_pending_cancels.clear()
+                _run_tick(engine, syncer, [order], effective)
+
+        records = _stale_log_records(caplog)
+        assert len(records) == 3, (
+            f"Real retire path is throttled: expected 3 logs, got {len(records)}"
+        )
+        for r in records:
+            msg = r.getMessage()
+            assert "count=1" in msg
+            assert "skipped_in_set=0" in msg
+
+    def test_real_retire_resets_skip_throttle_state(self, caplog: pytest.LogCaptureFixture) -> None:
+        """After a real retire, the next skip-only event must log even if
+        the count matches the prior skip-only count, because the registry
+        just changed and operators need to see the new context.
+        """
+        engine = _make_engine()
+        now = int(time.time())
+        healthy = "g-healthy"
+        orphan = "g-orphan"
+        syncer = _setup_engine(
+            engine,
+            {healthy: now - 700, orphan: now - 700},
+        )
+        order_healthy = _order(healthy, "BUY", "50000")
+        order_orphan = _order(orphan, "SELL", "49000")
+        effective = frozenset({(OrderSide.BUY, Decimal("50000"))})
+
+        with caplog.at_level(logging.INFO, logger="grinder.live.engine"):
+            # Tick 1: skip-only (1 in-set, no orphan yet) → log emitted
+            _run_tick(engine, syncer, [order_healthy], effective)
+            # Tick 2: same condition → throttled
+            _run_tick(engine, syncer, [order_healthy], effective)
+            # Tick 3: orphan appears → real retire fires (count=1) AND
+            # in-set still skipped (skipped_in_set=1). Real retire path runs.
+            engine._grid_v2_pending_cancels.clear()
+            _run_tick(engine, syncer, [order_healthy, order_orphan], effective)
+            # Tick 4: orphan gone, only healthy → skip-only with same count=1.
+            # Must log because retire reset the throttle state.
+            _run_tick(engine, syncer, [order_healthy], effective)
+
+        records = _stale_log_records(caplog)
+        messages = [r.getMessage() for r in records]
+        assert len(records) == 3, (
+            f"Expected 3 logs (tick 1 skip + tick 3 retire + tick 4 reset-skip), "
+            f"got {len(records)}: {messages}"
+        )
+        assert "count=0" in messages[0] and "skipped_in_set=1" in messages[0]
+        assert "count=1" in messages[1] and "skipped_in_set=1" in messages[1]
+        assert "count=0" in messages[2] and "skipped_in_set=1" in messages[2]
