@@ -7101,17 +7101,31 @@ class LiveEngineV0:
         return count
 
     def _get_grid_exit_order_ids(self) -> set[str]:
-        """Get exchange order IDs of all grid-owned exit orders."""
+        """Get exchange clientOrderIds of all grid-owned exit orders.
+
+        Returns the set of CIDs registered in ``adapter.registry.all_exit_cids``.
+        These are the **actual clientOrderIds** that were sent to the
+        exchange as ``newClientOrderId`` on PLACE_EXIT, and they match
+        ``OpenOrderSnap.order_id`` populated from Binance's
+        ``openOrders`` REST (see ``binance_futures_port.py`` —
+        ``order_id = o.get("clientOrderId") or str(o.get("orderId", ""))``).
+
+        Do NOT use ``ExitRegistration.exit_order_id`` here — that field
+        is a state-machine internal string of the form
+        ``f"exit-{entry_order_id}"`` and is never sent to the exchange.
+        Using it would produce an empty intersection in
+        ``_count_grid_exits`` / ``_cancel_grid_exits_for_force_reduce``,
+        causing the FORCE_REDUCE pre-clear path to silently skip every
+        cancel and falsely log ``FORCE_REDUCE_EXIT_ORDERS_CLEARED``,
+        leaving the reduce-only budget saturated and the unload step
+        permanently blocked by ``REDUCE_ONLY_BUDGET_EXCEEDED``. This was
+        the exact deadlock observed on AIOTUSDT in the post-#675 canary
+        (22:07:16 → 22:10:59 forced flat).
+        """
         bridge = self._grid_v2_bridge
         if bridge is None or bridge.adapter is None:
             return set()
-        registry = bridge.adapter.registry
-        ids: set[str] = set()
-        for cid in registry.all_exit_cids:
-            reg = registry.lookup_exit(cid)
-            if reg is not None:
-                ids.add(reg.exit_order_id)
-        return ids
+        return set(bridge.adapter.registry.all_exit_cids)
 
     def _cancel_grid_exits_for_force_reduce(self, symbol: str, acct: AccountSnapshot) -> int:
         """Cancel grid-owned reduce-only exit orders to free budget for unload.
