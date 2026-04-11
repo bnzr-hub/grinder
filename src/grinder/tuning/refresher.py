@@ -128,7 +128,7 @@ class TuningRefresher:
                     e,
                 )
 
-    def _run_one_cycle(self) -> None:
+    def _run_one_cycle(self) -> None:  # noqa: PLR0915
         """Execute one refresh cycle. Fail-open: exceptions propagate to _run_loop."""
         from grinder.observability.latency_telemetry import PhaseTimer  # noqa: PLC0415
         from grinder.selector.feature_provider import (  # noqa: PLC0415
@@ -137,16 +137,18 @@ class TuningRefresher:
         )
 
         # Dynamic bootstrap discovery (PR-1). Isolated try/except so a
-        # discovery failure cannot poison the main refresh path. Runs even
-        # when the current candidate set is empty so operators can observe
-        # what WOULD be picked up if PR-2 merge semantics existed.
+        # discovery failure cannot poison the main refresh path.
         try:
             self._discover_new_candidates()
         except Exception as e:
             logger.warning("DYNAMIC_BOOTSTRAP_DISCOVERY_FAILED error=%s", e)
 
-        candidates = self._state.candidates
-        if not candidates:
+        candidates = list(self._state.candidates)
+        # PR-2: snapshot the dynamic selection so we operate on a stable
+        # list even if discovery fires again between here and commit.
+        dynamic_candidates = list(self._last_dynamic_candidates)
+
+        if not candidates and not dynamic_candidates:
             return
 
         timer = PhaseTimer()
@@ -159,46 +161,113 @@ class TuningRefresher:
             logger.warning("TUNING_REFRESH_ABORT reason=no_real_risk_budget")
             return
 
-        logger.info("TUNING_REFRESH_START candidates=%d", len(candidates))
-
-        # Fetch features
-        v1_features = fetch_selection_features(candidates, mainnet=mainnet)
-        natr_map: dict[str, Decimal] = {sym: f.natr_14_5m for sym, f in v1_features.items()}
-
-        # Stage tuning results (no cache writes yet)
-        tuned_results, tuned_sizes, tuning_order_sizes, all_results = self._retune_symbols(
-            candidates, natr_map, symbol_risk_budget
+        logger.info(
+            "TUNING_REFRESH_START candidates=%d dynamic=%d",
+            len(candidates),
+            len(dynamic_candidates),
         )
 
-        # Fetch V2 features with real order sizes
+        # --- Refresh existing tuned candidates (unchanged legacy path) ---
+        tuned_results: dict[str, Any] = {}
+        tuned_sizes: dict[str, str] = {}
+        natr_map: dict[str, Decimal] = {}
+        v1_features: dict[str, Any] = {}
         v2_features: dict[str, Any] = {}
-        if tuned_sizes:
-            v2_features = fetch_selection_features_v2(
-                list(tuned_sizes.keys()),
-                tuning_order_sizes=tuning_order_sizes,
-                max_notional_per_order=None,
-                mainnet=mainnet,
+        all_results: list[tuple[str, Any]] = []
+
+        if candidates:
+            v1_features = fetch_selection_features(candidates, mainnet=mainnet)
+            natr_map = {sym: f.natr_14_5m for sym, f in v1_features.items()}
+
+            tuned_results, tuned_sizes, tuning_order_sizes, all_results = self._retune_symbols(
+                candidates, natr_map, symbol_risk_budget
             )
 
-        # Commit phase: cache → state → bridge (all-or-nothing on exception)
+            if tuned_sizes:
+                v2_features = fetch_selection_features_v2(
+                    list(tuned_sizes.keys()),
+                    tuning_order_sizes=tuning_order_sizes,
+                    max_notional_per_order=None,
+                    mainnet=mainnet,
+                )
+
+        # --- PR-2: Dynamic tuning admission ---
+        new_tuned_results: dict[str, Any] = {}
+        new_tuned_sizes: dict[str, str] = {}
+        new_natr_map: dict[str, Decimal] = {}
+        new_v1_features: dict[str, Any] = {}
+        new_v2_features: dict[str, Any] = {}
+        new_all_results: list[tuple[str, Any]] = []
+
+        if dynamic_candidates:
+            try:
+                (
+                    new_tuned_results,
+                    new_tuned_sizes,
+                    _new_order_sizes,
+                    new_natr_map,
+                    new_v1_features,
+                    new_v2_features,
+                    new_all_results,
+                ) = self._tune_dynamic_candidates(dynamic_candidates, symbol_risk_budget, mainnet)
+            except Exception as e:
+                # Fail-open: a dynamic tuning crash must not break the
+                # refresh commit for existing tuned candidates.
+                logger.warning("DYNAMIC_BOOTSTRAP_TUNING_FAILED error=%s", e)
+                new_tuned_results = {}
+                new_tuned_sizes = {}
+                new_natr_map = {}
+                new_v1_features = {}
+                new_v2_features = {}
+                new_all_results = []
+
+        # --- Atomic merge (ADR-183 PR-2 shared state invariant) ---
+        # Build one snapshot where every symbol in `merged_candidates` is
+        # also present in every map field. Failed dynamic tunings are NOT
+        # added to any map — they only land in `new_all_results` for
+        # cache bookkeeping.
+        merged_tuned_results = {**tuned_results, **new_tuned_results}
+        merged_tuned_sizes = {**tuned_sizes, **new_tuned_sizes}
+        merged_natr_map = {**natr_map, **new_natr_map}
+        merged_v1_features = {**v1_features, **new_v1_features}
+        merged_v2_features = {**v2_features, **new_v2_features}
+
+        merged_candidates: list[str] | None = None
+        if new_tuned_sizes:
+            # Preserve discovery rank order when extending the candidate list.
+            newly_admitted = [sym for sym in dynamic_candidates if sym in new_tuned_sizes]
+            merged_candidates = [*candidates, *newly_admitted]
+
+        # --- Commit phase: cache → state → bridge ---
         for sym, result in all_results:
+            self._cache.put(sym, result)
+        for sym, result in new_all_results:
             self._cache.put(sym, result)
 
         self._state.replace(
-            tuned_results=tuned_results,
-            tuned_sizes=tuned_sizes,
-            natr_map=natr_map,
-            v1_features=v1_features,
-            v2_features=v2_features,
+            tuned_results=merged_tuned_results,
+            tuned_sizes=merged_tuned_sizes,
+            natr_map=merged_natr_map,
+            v1_features=merged_v1_features,
+            v2_features=merged_v2_features,
+            candidates=merged_candidates,
         )
 
-        self._update_bridge(tuned_results, tuned_sizes, natr_map)
+        self._update_bridge(merged_tuned_results, merged_tuned_sizes, merged_natr_map)
         self._update_equity()
+
+        if new_tuned_sizes:
+            logger.info(
+                "DYNAMIC_BOOTSTRAP_STATE_EXTENDED admitted=%d total_candidates=%d version=%d",
+                len(new_tuned_sizes),
+                len(merged_candidates) if merged_candidates is not None else len(candidates),
+                self._state.version,
+            )
 
         logger.info(
             "TUNING_REFRESH_COMPLETE tuned=%d total=%d elapsed_ms=%d version=%d",
-            len(tuned_sizes),
-            len(candidates),
+            len(merged_tuned_sizes),
+            len(candidates) + len(dynamic_candidates),
             timer.elapsed_ms(),
             self._state.version,
         )
@@ -304,6 +373,97 @@ class TuningRefresher:
 
         self._last_dynamic_candidates = selected
         return selected
+
+    def _tune_dynamic_candidates(
+        self,
+        candidates: list[str],
+        symbol_risk_budget: Decimal,
+        mainnet: bool,
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, str],
+        dict[str, Decimal],
+        dict[str, Decimal],
+        dict[str, Any],
+        dict[str, Any],
+        list[tuple[str, Any]],
+    ]:
+        """Run the full bootstrap pipeline on a bounded dynamic subset (PR-2).
+
+        Mirrors ``_run_one_cycle``'s existing features → retune → v2 path
+        but scoped to the PR-1 dynamic discovery selection. Returns only
+        the **successfully tuned** symbols in the map-shaped return slots
+        (natr/v1/v2/tuning_order_sizes) so the caller can merge them into
+        ``AutonomousTuningState`` without producing a torn snapshot.
+        Failed candidates are retained only in ``all_results`` for cache
+        writes — never in the shared state maps.
+
+        Returns:
+            ``(tuned_results, tuned_sizes, successful_order_sizes,
+            successful_natr, successful_v1, v2_features, all_results)``.
+            All five map fields share the same key set: exactly the
+            successfully tuned subset. ``all_results`` includes every
+            attempted symbol so the cache can record rejection reasons.
+        """
+        from grinder.selector.feature_provider import (  # noqa: PLC0415
+            fetch_selection_features,
+            fetch_selection_features_v2,
+        )
+
+        if not candidates:
+            return {}, {}, {}, {}, {}, {}, []
+
+        v1_features = fetch_selection_features(candidates, mainnet=mainnet)
+        if not v1_features:
+            logger.info("DYNAMIC_BOOTSTRAP_TUNING_NO_FEATURES count=%d", len(candidates))
+            return {}, {}, {}, {}, {}, {}, []
+
+        natr_map: dict[str, Decimal] = {sym: f.natr_14_5m for sym, f in v1_features.items()}
+        # Only attempt to tune symbols with an NATR reading — mirrors
+        # cold bootstrap's fail-closed NATR requirement.
+        tunable = [sym for sym in candidates if sym in natr_map]
+
+        tuned_results, tuned_sizes, tuning_order_sizes, all_results = self._retune_symbols(
+            tunable, natr_map, symbol_risk_budget
+        )
+
+        v2_features: dict[str, Any] = {}
+        if tuned_sizes:
+            v2_features = fetch_selection_features_v2(
+                list(tuned_sizes.keys()),
+                tuning_order_sizes=tuning_order_sizes,
+                max_notional_per_order=None,
+                mainnet=mainnet,
+            )
+
+        # Filter all map-shaped outputs to the successful subset so the
+        # merged snapshot in _run_one_cycle cannot produce torn state.
+        successful_natr = {sym: n for sym, n in natr_map.items() if sym in tuned_sizes}
+        successful_v1 = {sym: f for sym, f in v1_features.items() if sym in tuned_sizes}
+        successful_order_sizes = {
+            sym: s for sym, s in tuning_order_sizes.items() if sym in tuned_sizes
+        }
+
+        logger.info(
+            "DYNAMIC_BOOTSTRAP_TUNING_RESULT attempted=%d tuned=%d",
+            len(candidates),
+            len(tuned_sizes),
+        )
+        if tuned_sizes:
+            logger.info(
+                "DYNAMIC_BOOTSTRAP_ADMITTED symbols=%s",
+                ",".join(sorted(tuned_sizes.keys())),
+            )
+
+        return (
+            tuned_results,
+            tuned_sizes,
+            successful_order_sizes,
+            successful_natr,
+            successful_v1,
+            v2_features,
+            all_results,
+        )
 
     def _retune_symbols(
         self,
