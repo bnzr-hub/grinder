@@ -167,6 +167,9 @@ _GRID_V2_PENDING_PLACE_STALE_GENS = 4  # 4 sync generations: pending place consi
 _GRID_V2_AWAITING_SYNC_EXPIRY_GENS = 6  # ADR-174: max gens before forced clear of seed latch
 _GRID_V2_STALE_ENTRY_TTL_S = 600  # ADR-179: 10 min — cancel entries older than this
 _GRID_V2_NEVER_SEEN_MAX_GENS = 12  # ADR-180: max sync gens before cleaning never-seen registry CID
+_GRID_V2_STALE_SKIP_LOG_KEEPALIVE_GENS = (
+    60  # ADR-179 smart TTL: keepalive cadence for skip-only logs
+)
 _GRID_V2_ESCALATION_LOG_INTERVAL = 10  # log escalation every Nth defer (anti-spam)
 _GRID_V2_DRIFT_RECONSTRUCT_COOLDOWN_GENS = (
     3  # wait 3 sync cycles after FLAT before drift reconstruct
@@ -929,6 +932,14 @@ class LiveEngineV0:
         # ADR-180: Registration gen for never-seen CIDs. Bounded fallback:
         # if never seen after _GRID_V2_NEVER_SEEN_MAX_GENS, clean from registry.
         self._grid_v2_entry_reg_gen: dict[str, int] = {}  # cid → sync_gen at registration
+        # ADR-179 smart TTL: throttle state for skip-only stale-entry logs.
+        # `last_count` = -1 sentinel = "never logged a skip-only event yet".
+        # `last_log_gen` = sync generation when the last skip-only log was emitted.
+        # The skip-only path logs only when `skipped_in_set` changes OR when
+        # `_GRID_V2_STALE_SKIP_LOG_KEEPALIVE_GENS` cycles passed since the last
+        # log, whichever comes first. Real retire (count > 0) is unthrottled.
+        self._grid_v2_stale_skip_last_count: int = -1
+        self._grid_v2_stale_skip_last_log_gen: int = 0
         # Definitive-reject blocklist: CIDs cleaned by _grid_v2_clean_failed_place
         # must never be treated as fills. Cleared on bridge reset.
         self._grid_v2_definitively_rejected_cids: set[str] = set()
@@ -5297,6 +5308,11 @@ class LiveEngineV0:
                             self._grid_v2_pending_cancels[cid] = (_ts_ms, _gen)
                             _retired += 1
                     if _retired:
+                        # Real retire path is unthrottled — operators must
+                        # see every actual cancel batch immediately. Refresh
+                        # the skip-only throttle state so the next skip-only
+                        # event after a real retire is treated as new
+                        # context (the registry just changed).
                         logger.info(
                             "GRID_V2_STALE_ENTRIES_RETIRED symbol=%s count=%d "
                             "ttl_s=%d skipped_in_set=%d",
@@ -5305,14 +5321,27 @@ class LiveEngineV0:
                             _GRID_V2_STALE_ENTRY_TTL_S,
                             _skipped_in_set,
                         )
+                        self._grid_v2_stale_skip_last_count = -1
+                        self._grid_v2_stale_skip_last_log_gen = self._account_sync_generation
                 elif _skipped_in_set:
-                    logger.info(
-                        "GRID_V2_STALE_ENTRIES_RETIRED symbol=%s count=0 "
-                        "ttl_s=%d skipped_in_set=%d",
-                        self._grid_v2_symbol,
-                        _GRID_V2_STALE_ENTRY_TTL_S,
-                        _skipped_in_set,
+                    # Skip-only path: throttle to "log on change" with a
+                    # periodic keepalive every _GRID_V2_STALE_SKIP_LOG_KEEPALIVE_GENS
+                    # cycles so quiet symbols still produce a heartbeat.
+                    _changed = _skipped_in_set != self._grid_v2_stale_skip_last_count
+                    _gens_since_log = (
+                        self._account_sync_generation - self._grid_v2_stale_skip_last_log_gen
                     )
+                    _keepalive_due = _gens_since_log >= _GRID_V2_STALE_SKIP_LOG_KEEPALIVE_GENS
+                    if _changed or _keepalive_due:
+                        logger.info(
+                            "GRID_V2_STALE_ENTRIES_RETIRED symbol=%s count=0 "
+                            "ttl_s=%d skipped_in_set=%d",
+                            self._grid_v2_symbol,
+                            _GRID_V2_STALE_ENTRY_TTL_S,
+                            _skipped_in_set,
+                        )
+                        self._grid_v2_stale_skip_last_count = _skipped_in_set
+                        self._grid_v2_stale_skip_last_log_gen = self._account_sync_generation
 
             # Build inflight state for both entry and exit reconciliation.
             # Filter by CID kind AND freshness (ADR-173 TTL contract):
