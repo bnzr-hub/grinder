@@ -39,6 +39,7 @@ import os
 import signal
 import sys
 import time
+import urllib.parse
 import urllib.request
 from decimal import Decimal
 from typing import Any
@@ -136,11 +137,16 @@ def _current_utc_session_key() -> str:
 
 
 def _fetch_price_rest(symbol: str, testnet: bool = True) -> Decimal | None:
-    """Fetch current price from Binance Futures REST API (no auth needed)."""
+    """Fetch current price from Binance Futures REST API (no auth needed).
+
+    Symbol is percent-encoded before URL interpolation so non-ASCII symbol
+    payloads (e.g. ``币安人生USDT`` returned by exchange info) do not trip
+    ``http.client``'s ``request.encode('ascii')`` on the HTTP request line.
+    """
     from decimal import Decimal  # noqa: PLC0415
 
     base = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
-    url = f"{base}/fapi/v1/ticker/price?symbol={symbol}"
+    url = f"{base}/fapi/v1/ticker/price?symbol={urllib.parse.quote(symbol, safe='')}"
     try:
         with urllib.request.urlopen(url, timeout=5) as resp:
             data = json.loads(resp.read())
