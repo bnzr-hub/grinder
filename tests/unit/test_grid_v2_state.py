@@ -2483,3 +2483,282 @@ class TestReseedCooldown:
         # Batch: cancel existing + place new
         assert len(cancels) > 0
         assert len(places) > 0
+
+
+class TestH4FlatResymmetrize:
+    """H4 fix (2026-04-11): re-symmetrize the FLAT entry window when the
+    flat reseed was suppressed by `reseed_cooldown_ms`. Without this fix,
+    the symbol could end up in `mode=FLAT` with a one-sided branch-shaped
+    window indefinitely (until the next entry fill triggered another branch
+    cycle), because the legacy fall-through reused the in-branch one-sided
+    EXIT_RESTORE path.
+
+    Invariants:
+      - cooldown semantics stay intact (`last_recenter_ts` not bumped)
+      - in-branch one-sided EXIT_RESTORE behavior is unchanged
+      - first flat reseed (no cooldown) still uses RECENTER, not the new path
+      - the H4 case (second unwind within cooldown) ends with mode=FLAT and
+        a symmetric window populated on both sides
+    """
+
+    def _full_cycle(
+        self,
+        sm: GridV2StateMachine,
+        side: OrderSide,
+        order_id: str,
+        entry_ts: int,
+        exit_ts: int,
+    ) -> None:
+        """Helper: open one lot and close it, advancing the SM by one cycle."""
+        if side == OrderSide.BUY:
+            entry_price = sm.snapshot.entry_window.buy_entry_prices[0]
+        else:
+            entry_price = sm.snapshot.entry_window.sell_entry_prices[0]
+        sm.apply(EntryFilled(order_id, side, entry_price, _ORDER_SIZE, entry_ts))
+        eo = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
+        sm.apply(
+            ExitFilled(
+                exit_order_id=eo.exit_order_id,
+                lot_id=eo.lot_id,
+                price=eo.price,
+                qty=_ORDER_SIZE,
+                ts=exit_ts,
+            )
+        )
+
+    def test_second_unwind_within_cooldown_yields_symmetric_flat(self) -> None:
+        """The exact bug scenario: branch → flat → re-branch → flat within
+        `reseed_cooldown_ms`. After the fix, the second flat must still be
+        symmetric, not one-sided.
+        """
+        cfg = _config(reseed_on_flat=True, reseed_cooldown_ms=30_000)
+        sm = _sm(cfg=cfg)
+
+        # Cycle 1: BUY entry → exit → flat reseed (genuine recenter)
+        self._full_cycle(sm, OrderSide.BUY, "E1", _BASE_TS + 1, _BASE_TS + 1000)
+        assert sm.snapshot.last_recenter_ts == _BASE_TS + 1000
+        assert sm.mode == BranchMode.FLAT
+        assert len(sm.snapshot.entry_window.buy_entry_prices) > 0
+        assert len(sm.snapshot.entry_window.sell_entry_prices) > 0
+
+        # Cycle 2: SELL entry → exit → cooldown-suppressed flat reseed.
+        # 4 seconds after first reseed, well within 30 s cooldown.
+        sell1 = sm.snapshot.entry_window.sell_entry_prices[0]
+        sm.apply(EntryFilled("E2", OrderSide.SELL, sell1, _ORDER_SIZE, _BASE_TS + 4000))
+        eo2 = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
+        result = sm.apply(
+            ExitFilled(
+                exit_order_id=eo2.exit_order_id,
+                lot_id=eo2.lot_id,
+                price=eo2.price,
+                qty=_ORDER_SIZE,
+                ts=_BASE_TS + 5000,
+            )
+        )
+
+        # H4 fix invariants
+        assert sm.mode == BranchMode.FLAT, "Must end up in FLAT after full unwind"
+        assert len(sm.snapshot.entry_window.buy_entry_prices) > 0, (
+            "H4 regression: BUY side empty after cooldown-suppressed unwind"
+        )
+        assert len(sm.snapshot.entry_window.sell_entry_prices) > 0, (
+            "H4 regression: SELL side empty after cooldown-suppressed unwind"
+        )
+
+        # The new path emits FLAT_RESYMMETRIZE actions, NOT RECENTER.
+        recenters = [a for a in result.actions if a.reason == "RECENTER"]
+        resymmetrize_places = [a for a in result.actions if a.reason == "FLAT_RESYMMETRIZE"]
+        assert len(recenters) == 0, "Cooldown must still suppress RECENTER reason"
+        assert len(resymmetrize_places) > 0, (
+            "H4 fix: FLAT_RESYMMETRIZE actions must be emitted on cooldown unwind"
+        )
+
+    def test_resymmetrize_does_not_bump_last_recenter_ts(self) -> None:
+        """The fix must not pretend a recenter happened. `last_recenter_ts`
+        stays anchored to the genuine first reseed so the cooldown gate
+        remains correctly armed against the original recenter event.
+        """
+        cfg = _config(reseed_on_flat=True, reseed_cooldown_ms=30_000)
+        sm = _sm(cfg=cfg)
+
+        # Cycle 1: genuine reseed at t=1000
+        self._full_cycle(sm, OrderSide.BUY, "E1", _BASE_TS + 1, _BASE_TS + 1000)
+        first_recenter_ts = sm.snapshot.last_recenter_ts
+        assert first_recenter_ts == _BASE_TS + 1000
+
+        # Cycle 2: cooldown-suppressed unwind at t=5000
+        self._full_cycle(sm, OrderSide.SELL, "E2", _BASE_TS + 4000, _BASE_TS + 5000)
+
+        # last_recenter_ts must NOT be advanced — cooldown still arms against
+        # the genuine first recenter at t=1000.
+        assert sm.snapshot.last_recenter_ts == first_recenter_ts, (
+            "Resymmetrize must not bump last_recenter_ts"
+        )
+
+    def test_cooldown_stays_armed_for_subsequent_genuine_recenter(self) -> None:
+        """After a resymmetrize, the cooldown gate is still measured against
+        the original recenter timestamp. So a third unwind that happens
+        AFTER the cooldown expires (relative to the first recenter) must
+        produce a real RECENTER, not another resymmetrize.
+        """
+        cfg = _config(reseed_on_flat=True, reseed_cooldown_ms=30_000)
+        sm = _sm(cfg=cfg)
+
+        # Cycle 1: genuine reseed at t=1000
+        self._full_cycle(sm, OrderSide.BUY, "E1", _BASE_TS + 1, _BASE_TS + 1000)
+        # Cycle 2: resymmetrize at t=5000 (within cooldown)
+        self._full_cycle(sm, OrderSide.SELL, "E2", _BASE_TS + 4000, _BASE_TS + 5000)
+        # Cycle 3: genuine reseed at t=35000 (past 30 s cooldown from t=1000)
+        sell2 = sm.snapshot.entry_window.sell_entry_prices[0]
+        sm.apply(EntryFilled("E3", OrderSide.SELL, sell2, _ORDER_SIZE, _BASE_TS + 32000))
+        eo3 = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
+        result = sm.apply(
+            ExitFilled(
+                exit_order_id=eo3.exit_order_id,
+                lot_id=eo3.lot_id,
+                price=eo3.price,
+                qty=_ORDER_SIZE,
+                ts=_BASE_TS + 35000,
+            )
+        )
+
+        recenters = [a for a in result.actions if a.reason == "RECENTER"]
+        assert len(recenters) > 0, "Genuine recenter must fire after cooldown expires"
+        assert sm.snapshot.last_recenter_ts == _BASE_TS + 35000, (
+            "last_recenter_ts must advance for genuine recenters"
+        )
+
+    def test_first_unwind_no_cooldown_still_uses_recenter(self) -> None:
+        """Regression guard: the first unwind (no prior recenter) must still
+        emit RECENTER actions, not FLAT_RESYMMETRIZE. The new path is only
+        for the cooldown-suppressed corner case.
+        """
+        cfg = _config(reseed_on_flat=True, reseed_cooldown_ms=30_000)
+        sm = _sm(cfg=cfg)
+
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 1))
+        eo = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
+        result = sm.apply(
+            ExitFilled(
+                exit_order_id=eo.exit_order_id,
+                lot_id=eo.lot_id,
+                price=eo.price,
+                qty=_ORDER_SIZE,
+                ts=_BASE_TS + 1000,
+            )
+        )
+
+        recenters = [a for a in result.actions if a.reason == "RECENTER"]
+        resymm = [a for a in result.actions if a.reason == "FLAT_RESYMMETRIZE"]
+        assert len(recenters) > 0, "First unwind must produce a real RECENTER"
+        assert len(resymm) == 0, "First unwind must NOT use the resymmetrize path"
+
+    def test_in_branch_exit_restore_unchanged(self) -> None:
+        """Regression guard: while still in BRANCH (positions still open),
+        EXIT_RESTORE must remain same-side only. Opposite side stays empty.
+        The new path must not affect the in-branch maintenance flow.
+        """
+        cfg = _config(reseed_on_flat=True, reseed_cooldown_ms=30_000, max_levels=10)
+        sm = _sm(cfg=cfg)
+
+        # Open two BUY lots — branch is LONG with multiple open lots
+        buys = sm.snapshot.entry_window.buy_entry_prices
+        sm.apply(EntryFilled("E1", OrderSide.BUY, buys[0], _ORDER_SIZE, _BASE_TS + 1))
+        sm.apply(EntryFilled("E2", OrderSide.BUY, buys[1], _ORDER_SIZE, _BASE_TS + 2))
+        assert sm.mode == BranchMode.LONG_BRANCH
+        # Branch entry zeroed sells
+        assert sm.snapshot.entry_window.sell_entry_prices == ()
+
+        # Close ONE lot — still in branch (1 lot remains open)
+        eo1 = next(
+            eo
+            for eo in sm.snapshot.exit_orders
+            if eo.status == ExitOrderStatus.OPEN and eo.lot_id == "lot-E1"
+        )
+        result = sm.apply(
+            ExitFilled(
+                exit_order_id=eo1.exit_order_id,
+                lot_id=eo1.lot_id,
+                price=eo1.price,
+                qty=_ORDER_SIZE,
+                ts=_BASE_TS + 100,
+            )
+        )
+
+        # Mode still branch, sell side still empty (in-branch one-sided rule)
+        assert sm.mode == BranchMode.LONG_BRANCH
+        assert sm.snapshot.entry_window.sell_entry_prices == ()
+        # No FLAT_RESYMMETRIZE — still in branch
+        assert all(a.reason != "FLAT_RESYMMETRIZE" for a in result.actions)
+        assert all(a.reason != "FLAT_RESYMMETRIZE_REPLACE" for a in result.actions)
+
+    def test_resymmetrize_emits_diff_not_full_replacement(self) -> None:
+        """The new path emits a minimal cancel+place delta against the old
+        one-sided window — not a full cancel-all/place-all ceremony. Only
+        prices that actually move are touched.
+        """
+        cfg = _config(reseed_on_flat=True, reseed_cooldown_ms=30_000)
+        sm = _sm(cfg=cfg)
+
+        # Cycle 1: reseed
+        self._full_cycle(sm, OrderSide.BUY, "E1", _BASE_TS + 1, _BASE_TS + 1000)
+        symmetric_buys_after_first = set(sm.snapshot.entry_window.buy_entry_prices)
+        symmetric_sells_after_first = set(sm.snapshot.entry_window.sell_entry_prices)
+
+        # Cycle 2: cooldown-suppressed unwind via SELL branch
+        sell1 = sm.snapshot.entry_window.sell_entry_prices[0]
+        sm.apply(EntryFilled("E2", OrderSide.SELL, sell1, _ORDER_SIZE, _BASE_TS + 4000))
+        # Branch entry zeroed buys
+        assert sm.snapshot.entry_window.buy_entry_prices == ()
+        eo2 = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
+        result = sm.apply(
+            ExitFilled(
+                exit_order_id=eo2.exit_order_id,
+                lot_id=eo2.lot_id,
+                price=eo2.price,
+                qty=_ORDER_SIZE,
+                ts=_BASE_TS + 5000,
+            )
+        )
+
+        # The diff: BUY side was () → must place all symmetric BUY entries.
+        # SELL side: same reference price → likely identical, no churn.
+        place_buys = [
+            a for a in result.actions if a.reason == "FLAT_RESYMMETRIZE" and a.side == OrderSide.BUY
+        ]
+        assert len(place_buys) == cfg.entry_levels_per_side, (
+            "Must place exactly entry_levels_per_side BUY entries to restore symmetry"
+        )
+
+        # Final window must match what _build_entry_window would generate
+        assert set(sm.snapshot.entry_window.buy_entry_prices) == symmetric_buys_after_first
+        assert set(sm.snapshot.entry_window.sell_entry_prices) == symmetric_sells_after_first
+
+    def test_cooldown_disabled_no_resymmetrize_path(self) -> None:
+        """When `reseed_cooldown_ms=0`, the cooldown gate never fires and
+        every flat unwind hits the genuine RECENTER path. The new
+        resymmetrize path is silent.
+        """
+        cfg = _config(reseed_on_flat=True, reseed_cooldown_ms=0)
+        sm = _sm(cfg=cfg)
+
+        self._full_cycle(sm, OrderSide.BUY, "E1", _BASE_TS + 1, _BASE_TS + 1000)
+        # Even an immediate second cycle should reseed via RECENTER (no cooldown)
+        sell1 = sm.snapshot.entry_window.sell_entry_prices[0]
+        sm.apply(EntryFilled("E2", OrderSide.SELL, sell1, _ORDER_SIZE, _BASE_TS + 1100))
+        eo = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
+        result = sm.apply(
+            ExitFilled(
+                exit_order_id=eo.exit_order_id,
+                lot_id=eo.lot_id,
+                price=eo.price,
+                qty=_ORDER_SIZE,
+                ts=_BASE_TS + 1200,
+            )
+        )
+
+        recenters = [a for a in result.actions if a.reason == "RECENTER"]
+        resymm = [a for a in result.actions if a.reason == "FLAT_RESYMMETRIZE"]
+        assert len(recenters) > 0
+        assert len(resymm) == 0

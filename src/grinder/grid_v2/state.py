@@ -890,7 +890,68 @@ class GridV2StateMachine:
                 _flat_reseed = False
                 _reseed_suppressed = "cooldown"
         restore_without_reseed = _returning_to_flat and not _flat_reseed
-        if new_open or restore_without_reseed:
+        # H4 fix (2026-04-11): when returning to FLAT and the flat reseed was
+        # suppressed BY THE COOLDOWN GATE specifically, the legacy fall-through
+        # used the in-branch one-sided EXIT_RESTORE path, which left FLAT with
+        # an asymmetric `(populated_side, ())` window indefinitely. Now we
+        # detect that exact case and re-symmetrize the window without bumping
+        # `last_recenter_ts` (so the cooldown stays armed for genuine
+        # recenters and we don't pretend a recenter happened).
+        _resymmetrize_flat = _returning_to_flat and _reseed_suppressed == "cooldown"
+        if _resymmetrize_flat:
+            new_window = _build_entry_window(
+                snap.entry_window.reference_price,
+                self._config.entry_levels_per_side,
+                self._config.grid_step_pct,
+                self._config.price_tick_size,
+            )
+            _old_buys = set(snap.entry_window.buy_entry_prices)
+            _old_sells = set(snap.entry_window.sell_entry_prices)
+            _new_buys = set(new_window.buy_entry_prices)
+            _new_sells = set(new_window.sell_entry_prices)
+            # Diff against the old branch-shaped window. Emit only the
+            # actual deltas — no full cancel-all/place-all ceremony.
+            for _p in sorted(_old_buys - _new_buys, reverse=True):
+                actions.append(
+                    ActionIntent(
+                        kind=ActionIntentKind.CANCEL_ENTRY,
+                        side=OrderSide.BUY,
+                        price=_p,
+                        reason="FLAT_RESYMMETRIZE_REPLACE",
+                    )
+                )
+            for _p in sorted(_old_sells - _new_sells):
+                actions.append(
+                    ActionIntent(
+                        kind=ActionIntentKind.CANCEL_ENTRY,
+                        side=OrderSide.SELL,
+                        price=_p,
+                        reason="FLAT_RESYMMETRIZE_REPLACE",
+                    )
+                )
+            for _p in sorted(_new_buys - _old_buys, reverse=True):
+                actions.append(
+                    ActionIntent(
+                        kind=ActionIntentKind.PLACE_ENTRY,
+                        side=OrderSide.BUY,
+                        price=_p,
+                        qty=self._config.order_size,
+                        reason="FLAT_RESYMMETRIZE",
+                    )
+                )
+            for _p in sorted(_new_sells - _old_sells):
+                actions.append(
+                    ActionIntent(
+                        kind=ActionIntentKind.PLACE_ENTRY,
+                        side=OrderSide.SELL,
+                        price=_p,
+                        qty=self._config.order_size,
+                        reason="FLAT_RESYMMETRIZE",
+                    )
+                )
+            # Intentionally do NOT update `new_last_recenter_ts` — cooldown
+            # stays armed against the previous genuine recenter.
+        elif new_open or restore_without_reseed:
             step_delta = _grid_step_price(
                 snap.entry_window.reference_price,
                 self._config.grid_step_pct,
