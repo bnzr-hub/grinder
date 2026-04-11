@@ -5224,6 +5224,13 @@ class LiveEngineV0:
             # Old seed/rolling entries can sit for 20+ min and then burst-fill
             # when price revisits, triggering cascade. Cancel entries whose CID
             # timestamp exceeds TTL. Let reconciler restore fresh topology.
+            #
+            # Smart TTL (2026-04-11): aged entries that still occupy a current
+            # effective entry slot are NOT retired. They are on-grid by the
+            # same computation reconciler uses, so cancel-and-replace would
+            # produce an avoidable ~1 sync-cycle coverage gap with no safety
+            # benefit. Out-of-set aged entries (orphans, post-transition stale
+            # topology) are still retired as before.
             if (
                 self._grid_v2_bridge is not None
                 and self._grid_v2_bridge.state_machine is not None
@@ -5231,7 +5238,9 @@ class LiveEngineV0:
                 and not self._grid_v2_awaiting_sync
             ):
                 _now_s = int(time.time())
-                _stale_cancels: list[str] = []
+                # Pass 1: collect aged entries (lazy — effective-keys
+                # computation only runs if there is at least one candidate).
+                _aged_candidates: list[tuple[OrderSide | None, Decimal, str]] = []
                 for o in result.snapshot.open_orders:
                     if o.symbol != self._grid_v2_symbol:
                         continue
@@ -5239,8 +5248,34 @@ class LiveEngineV0:
                     if parsed is None or parsed.kind.value != "ENTRY":
                         continue
                     age_s = _now_s - parsed.ts
-                    if age_s > _GRID_V2_STALE_ENTRY_TTL_S:
-                        _stale_cancels.append(o.order_id)
+                    if age_s <= _GRID_V2_STALE_ENTRY_TTL_S:
+                        continue
+                    try:
+                        _side = OrderSide(o.side)
+                    except ValueError:
+                        _side = None  # unknown side → never in-set
+                    _aged_candidates.append((_side, o.price, o.order_id))
+
+                _stale_cancels: list[str] = []
+                _skipped_in_set = 0
+                if _aged_candidates:
+                    from grinder.grid_v2.sync_reconciler import (  # noqa: PLC0415
+                        compute_effective_entry_keys,
+                    )
+
+                    _eff_entry_keys = compute_effective_entry_keys(
+                        result.snapshot,
+                        self._grid_v2_symbol,
+                        self._grid_v2_bridge,
+                        risk_entry_capacity=_legal_cap,
+                    )
+                    for _side_or_none, _price, _cid in _aged_candidates:
+                        # Smart TTL: aged entry on a valid effective slot
+                        # stays. Unknown side (parse failure) always goes.
+                        if _side_or_none is not None and (_side_or_none, _price) in _eff_entry_keys:
+                            _skipped_in_set += 1
+                            continue
+                        _stale_cancels.append(_cid)
                 if _stale_cancels:
                     _retired = 0
                     _ts_ms = int(time.time() * 1000)
@@ -5263,11 +5298,21 @@ class LiveEngineV0:
                             _retired += 1
                     if _retired:
                         logger.info(
-                            "GRID_V2_STALE_ENTRIES_RETIRED symbol=%s count=%d ttl_s=%d",
+                            "GRID_V2_STALE_ENTRIES_RETIRED symbol=%s count=%d "
+                            "ttl_s=%d skipped_in_set=%d",
                             self._grid_v2_symbol,
                             _retired,
                             _GRID_V2_STALE_ENTRY_TTL_S,
+                            _skipped_in_set,
                         )
+                elif _skipped_in_set:
+                    logger.info(
+                        "GRID_V2_STALE_ENTRIES_RETIRED symbol=%s count=0 "
+                        "ttl_s=%d skipped_in_set=%d",
+                        self._grid_v2_symbol,
+                        _GRID_V2_STALE_ENTRY_TTL_S,
+                        _skipped_in_set,
+                    )
 
             # Build inflight state for both entry and exit reconciliation.
             # Filter by CID kind AND freshness (ADR-173 TTL contract):

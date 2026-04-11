@@ -115,45 +115,43 @@ def _project_desired_entries(
     return set(ranked[:risk_entry_capacity]), ProjectionMode.RISK_CONSTRAINED_PARTIAL
 
 
-def reconcile_grid_state(  # noqa: PLR0912, PLR0915
+def _compute_effective_state(  # noqa: PLR0912, PLR0915
     snapshot: AccountSnapshot,
     symbol: str,
-    bridge: Any,  # GridV2Bridge — use Any to avoid circular import
-    max_actions: int = 10,
-    *,
-    risk_entry_capacity: int | None = None,
-    pending_exit_place_cids: frozenset[str] | None = None,
-    pending_exit_cancel_cids: frozenset[str] | None = None,
-    pending_entry_place_keys: frozenset[tuple[OrderSide, Decimal]] | None = None,
-    pending_entry_cancel_keys: frozenset[tuple[OrderSide, Decimal]] | None = None,
-) -> ReconcileResult:
-    """Compute deterministic repair actions from fresh account snapshot.
+    bridge: Any,
+    risk_entry_capacity: int | None,
+) -> tuple[
+    set[tuple[OrderSide, Decimal]],
+    ProjectionMode,
+    dict[tuple[OrderSide, Decimal], str],
+    set[str],
+    dict[str, Decimal],
+    set[tuple[OrderSide, Decimal]],
+    int,
+]:
+    """Compute effective entry keys and actual exchange state for a symbol.
 
-    Args:
-        snapshot: Fresh account snapshot (just fetched from exchange).
-        symbol: Trading symbol.
-        bridge: GridV2Bridge instance (for SM state, adapter, quantize).
-        max_actions: Max total actions (cancel + place) per sync cycle.
-        risk_entry_capacity: Legal additional entry capacity (ADR-102/103).
-            None = unconstrained (risk base disabled or data unavailable).
-            0 = fully constrained (no new entries allowed).
-            N > 0 = partial capacity (truncate desired to N entries).
-        pending_exit_place_cids: Exit CIDs dispatched but not yet visible
-            on exchange. Treated as effectively present for missing_exits.
-        pending_exit_cancel_cids: Exit CIDs with pending cancel dispatched
-            but not yet reflected. Treated as effectively absent for extra_exits.
-        pending_entry_place_keys: Entry (side, price) keys dispatched but
-            not yet visible. Treated as effectively present for missing_entries.
-        pending_entry_cancel_keys: Entry (side, price) keys with pending
-            cancel. Treated as effectively absent for extra_entries.
+    Pure helper shared between reconcile_grid_state and engine-side callers
+    (ADR-179 smart TTL). Mirrors the three-layer pipeline:
+      1. theoretical entry keys from SM entry window
+      2. headroom reduction (branch mode, near-cap)
+      3. actual exchange state from snapshot
+      4. gap detection supplement (adds missing in-between levels)
+      5. risk projection → effective entry keys
 
     Returns:
-        ReconcileResult with deterministic action list and projection metadata.
+        (effective_entry_keys, projection_mode,
+         actual_entry_by_key, actual_exit_cids, actual_exit_prices,
+         theoretical_entry_keys_final, headroom)
+
+        ``theoretical_entry_keys_final`` is the post-headroom, post-gap,
+        pre-projection set (what reconcile_grid_state reports as
+        ``theoretical_desired_entry_count``). ``headroom`` uses ``-1`` as
+        the FLAT sentinel matching reconcile_grid_state's original output.
     """
-    t0 = time.monotonic()
+    from grinder.grid_v2.state import _grid_step_price  # noqa: PLC0415
+
     sm = bridge.state_machine
-    if sm is None:
-        return _empty_result(0)
 
     # --- Layer 1: Theoretical desired state (what SM wants) ---
     theoretical_entry_keys: set[tuple[OrderSide, Decimal]] = set()
@@ -207,8 +205,6 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
             actual_exit_prices[o.order_id] = o.price
 
     # --- Gap detection supplement (on theoretical, BEFORE projection) ---
-    from grinder.grid_v2.state import _grid_step_price  # noqa: PLC0415
-
     step = _grid_step_price(
         sm.snapshot.entry_window.reference_price,
         bridge._config.grid_step_pct,
@@ -244,6 +240,100 @@ def reconcile_grid_state(  # noqa: PLR0912, PLR0915
         risk_entry_capacity,
         sm.snapshot.entry_window.reference_price,
     )
+
+    return (
+        effective_entry_keys,
+        projection_mode,
+        actual_entry_by_key,
+        actual_exit_cids,
+        actual_exit_prices,
+        theoretical_entry_keys,
+        headroom,
+    )
+
+
+def compute_effective_entry_keys(
+    snapshot: AccountSnapshot,
+    symbol: str,
+    bridge: Any,
+    *,
+    risk_entry_capacity: int | None = None,
+) -> frozenset[tuple[OrderSide, Decimal]]:
+    """Return the current effective entry (side, price) set for a symbol.
+
+    Thin wrapper over ``_compute_effective_state`` that yields only the
+    effective entry keys. Used by ADR-179 stale-entry aging to skip aged
+    entries that still occupy a valid effective grid slot (smart TTL).
+
+    Mirrors ``reconcile_grid_state``'s first phase byte-for-byte so the two
+    callers never disagree about what "still on-grid" means.
+    """
+    if bridge.state_machine is None:
+        return frozenset()
+    (
+        effective,
+        _mode,
+        _actual,
+        _exit_cids,
+        _exit_prices,
+        _theoretical,
+        _headroom,
+    ) = _compute_effective_state(snapshot, symbol, bridge, risk_entry_capacity)
+    return frozenset(effective)
+
+
+def reconcile_grid_state(  # noqa: PLR0912, PLR0915
+    snapshot: AccountSnapshot,
+    symbol: str,
+    bridge: Any,  # GridV2Bridge — use Any to avoid circular import
+    max_actions: int = 10,
+    *,
+    risk_entry_capacity: int | None = None,
+    pending_exit_place_cids: frozenset[str] | None = None,
+    pending_exit_cancel_cids: frozenset[str] | None = None,
+    pending_entry_place_keys: frozenset[tuple[OrderSide, Decimal]] | None = None,
+    pending_entry_cancel_keys: frozenset[tuple[OrderSide, Decimal]] | None = None,
+) -> ReconcileResult:
+    """Compute deterministic repair actions from fresh account snapshot.
+
+    Args:
+        snapshot: Fresh account snapshot (just fetched from exchange).
+        symbol: Trading symbol.
+        bridge: GridV2Bridge instance (for SM state, adapter, quantize).
+        max_actions: Max total actions (cancel + place) per sync cycle.
+        risk_entry_capacity: Legal additional entry capacity (ADR-102/103).
+            None = unconstrained (risk base disabled or data unavailable).
+            0 = fully constrained (no new entries allowed).
+            N > 0 = partial capacity (truncate desired to N entries).
+        pending_exit_place_cids: Exit CIDs dispatched but not yet visible
+            on exchange. Treated as effectively present for missing_exits.
+        pending_exit_cancel_cids: Exit CIDs with pending cancel dispatched
+            but not yet reflected. Treated as effectively absent for extra_exits.
+        pending_entry_place_keys: Entry (side, price) keys dispatched but
+            not yet visible. Treated as effectively present for missing_entries.
+        pending_entry_cancel_keys: Entry (side, price) keys with pending
+            cancel. Treated as effectively absent for extra_entries.
+
+    Returns:
+        ReconcileResult with deterministic action list and projection metadata.
+    """
+    t0 = time.monotonic()
+    sm = bridge.state_machine
+    if sm is None:
+        return _empty_result(0)
+
+    # --- Layers 1+2: theoretical → headroom → actual → gap → projection ---
+    # Shared with ADR-179 stale-aging path so both callers agree on what
+    # counts as "still on-grid".
+    (
+        effective_entry_keys,
+        projection_mode,
+        actual_entry_by_key,
+        actual_exit_cids,
+        actual_exit_prices,
+        theoretical_entry_keys,
+        headroom,
+    ) = _compute_effective_state(snapshot, symbol, bridge, risk_entry_capacity)
 
     # --- Exit desired state (CID + expected price + qty per lot) ---
     desired_exit_cids: set[str] = set()
