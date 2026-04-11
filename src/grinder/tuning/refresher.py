@@ -468,12 +468,18 @@ class TuningRefresher:
 
     @staticmethod
     def _fetch_price(symbol: str, testnet: bool) -> Decimal | None:
-        """Fetch current price from REST. Fail-open."""
+        """Fetch current price from REST. Fail-open.
+
+        Symbol is percent-encoded before URL interpolation so non-ASCII
+        symbol payloads don't trip ``http.client``'s ASCII encoding on the
+        HTTP request line — mirrors the cold bootstrap ``_fetch_price_rest``.
+        """
         import json  # noqa: PLC0415
+        import urllib.parse  # noqa: PLC0415
         import urllib.request  # noqa: PLC0415
 
         base = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
-        url = f"{base}/fapi/v1/ticker/price?symbol={symbol}"
+        url = f"{base}/fapi/v1/ticker/price?symbol={urllib.parse.quote(symbol, safe='')}"
         try:
             with urllib.request.urlopen(url, timeout=5) as resp:
                 data = json.loads(resp.read())
