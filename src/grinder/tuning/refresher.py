@@ -128,7 +128,7 @@ class TuningRefresher:
                     e,
                 )
 
-    def _run_one_cycle(self) -> None:  # noqa: PLR0915
+    def _run_one_cycle(self) -> None:  # noqa: PLR0912, PLR0915
         """Execute one refresh cycle. Fail-open: exceptions propagate to _run_loop."""
         from grinder.observability.latency_telemetry import PhaseTimer  # noqa: PLC0415
         from grinder.selector.feature_provider import (  # noqa: PLC0415
@@ -226,17 +226,89 @@ class TuningRefresher:
         # also present in every map field. Failed dynamic tunings are NOT
         # added to any map — they only land in `new_all_results` for
         # cache bookkeeping.
-        merged_tuned_results = {**tuned_results, **new_tuned_results}
-        merged_tuned_sizes = {**tuned_sizes, **new_tuned_sizes}
-        merged_natr_map = {**natr_map, **new_natr_map}
-        merged_v1_features = {**v1_features, **new_v1_features}
-        merged_v2_features = {**v2_features, **new_v2_features}
+        merged_tuned_results: dict[str, Any] = {**tuned_results, **new_tuned_results}
+        merged_tuned_sizes: dict[str, str] = {**tuned_sizes, **new_tuned_sizes}
+        merged_natr_map: dict[str, Decimal] = {**natr_map, **new_natr_map}
+        merged_v1_features: dict[str, Any] = {**v1_features, **new_v1_features}
+        merged_v2_features: dict[str, Any] = {**v2_features, **new_v2_features}
 
-        merged_candidates: list[str] | None = None
-        if new_tuned_sizes:
-            # Preserve discovery rank order when extending the candidate list.
-            newly_admitted = [sym for sym in dynamic_candidates if sym in new_tuned_sizes]
-            merged_candidates = [*candidates, *newly_admitted]
+        # --- P1 fix: preserve coherent snapshot for existing candidates
+        # that failed retune this cycle ---
+        # An existing candidate can fail retune transiently (missing price,
+        # missing constraints, missing NATR, solver NO_GO). Without this
+        # backfill, such a symbol would remain in `state.candidates` via
+        # `[*candidates, ...]` below but be absent from
+        # `merged_tuned_sizes`/etc — a torn snapshot that breaks the
+        # atomic visibility invariant. Backfill rule: if the symbol had a
+        # fully-coherent entry in the previous committed state, reuse that
+        # entry this cycle. Otherwise the symbol is dropped from
+        # `merged_candidates` in the strict-intersection rebuild below so
+        # the invariant still holds structurally.
+        prev_tuned_results = self._state.tuned_results
+        prev_tuned_sizes = self._state.tuned_sizes
+        prev_natr_map = self._state.natr_map
+        prev_v1_features = self._state.v1_features
+        prev_v2_features = self._state.v2_features
+        backfilled: list[str] = []
+        for sym in candidates:
+            if sym in merged_tuned_sizes:
+                continue  # freshly retuned this cycle, no backfill needed
+            # Only backfill when the previous committed snapshot had a
+            # fully-coherent entry — otherwise we'd re-introduce torn state.
+            if not (
+                sym in prev_tuned_results
+                and sym in prev_tuned_sizes
+                and sym in prev_natr_map
+                and sym in prev_v1_features
+                and sym in prev_v2_features
+            ):
+                continue  # no coherent previous entry — drop from candidates
+            merged_tuned_results[sym] = prev_tuned_results[sym]
+            merged_tuned_sizes[sym] = prev_tuned_sizes[sym]
+            merged_natr_map[sym] = prev_natr_map[sym]
+            merged_v1_features[sym] = prev_v1_features[sym]
+            merged_v2_features[sym] = prev_v2_features[sym]
+            backfilled.append(sym)
+
+        if backfilled:
+            logger.info(
+                "TUNING_REFRESH_BACKFILLED count=%d symbols=%s",
+                len(backfilled),
+                ",".join(backfilled[:5]),
+            )
+
+        # --- Atomic visibility rebuild ---
+        # After merge + backfill, rebuild `merged_candidates` as the strict
+        # intersection of all five map fields, preserving discovery rank
+        # order (existing first, then newly admitted dynamic). Then scrub
+        # the maps to exactly this key set so the inverse invariant
+        # ("no map key without candidates") also holds structurally.
+        newly_admitted = [sym for sym in dynamic_candidates if sym in new_tuned_sizes]
+        candidate_pool = [*candidates, *newly_admitted]
+        merged_candidates: list[str] = [
+            sym
+            for sym in candidate_pool
+            if sym in merged_tuned_sizes
+            and sym in merged_tuned_results
+            and sym in merged_natr_map
+            and sym in merged_v1_features
+            and sym in merged_v2_features
+        ]
+        canon: set[str] = set(merged_candidates)
+        if canon != set(merged_tuned_sizes.keys()) or canon != set(merged_v1_features.keys()):
+            merged_tuned_results = {s: v for s, v in merged_tuned_results.items() if s in canon}
+            merged_tuned_sizes = {s: v for s, v in merged_tuned_sizes.items() if s in canon}
+            merged_natr_map = {s: v for s, v in merged_natr_map.items() if s in canon}
+            merged_v1_features = {s: v for s, v in merged_v1_features.items() if s in canon}
+            merged_v2_features = {s: v for s, v in merged_v2_features.items() if s in canon}
+
+        dropped_from_candidates = [sym for sym in candidates if sym not in canon]
+        if dropped_from_candidates:
+            logger.info(
+                "TUNING_REFRESH_DROPPED count=%d symbols=%s",
+                len(dropped_from_candidates),
+                ",".join(dropped_from_candidates[:5]),
+            )
 
         # --- Commit phase: cache → state → bridge ---
         for sym, result in all_results:
@@ -260,7 +332,7 @@ class TuningRefresher:
             logger.info(
                 "DYNAMIC_BOOTSTRAP_STATE_EXTENDED admitted=%d total_candidates=%d version=%d",
                 len(new_tuned_sizes),
-                len(merged_candidates) if merged_candidates is not None else len(candidates),
+                len(merged_candidates),
                 self._state.version,
             )
 

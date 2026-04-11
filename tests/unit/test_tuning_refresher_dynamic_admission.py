@@ -649,6 +649,210 @@ class TestSingleAtomicReplaceCall:
         assert "NEWUSDT" in call["candidates"]
 
 
+class TestExistingCandidateFailsRetune:
+    """P1 regression: an existing candidate that fails retune this cycle
+    must not leave the shared state in a torn snapshot.
+
+    The bug (pre-fix): ``merged_candidates = [*candidates, *newly_admitted]``
+    unconditionally carried forward the OLD candidates list. If an
+    existing candidate failed retune — solver NO_GO, missing NATR,
+    missing constraints, missing price — it would remain in
+    ``state.candidates`` after commit but be absent from
+    ``tuned_results`` / ``tuned_sizes`` / ``v2_features`` (which are
+    populated only for successful retunes). This is a direct violation
+    of the atomic visibility invariant.
+
+    The fix: backfill the previous coherent snapshot for failed
+    existing symbols when the old state had a full entry. Symbols
+    without a coherent previous entry are dropped from
+    ``merged_candidates`` via the strict-intersection rebuild so the
+    invariant still holds structurally.
+    """
+
+    def _assert_state_coherent(self, state: AutonomousTuningState) -> None:
+        """Re-import the invariant checker from TestAtomicVisibilityInvariant."""
+        TestAtomicVisibilityInvariant()._assert_state_coherent(state)
+
+    def test_existing_fails_with_backfill_preserves_prior_snapshot(self) -> None:
+        """Existing candidate's retune fails THIS cycle, but the symbol
+        had a fully-coherent entry in the previous committed state →
+        the symbol is preserved using the old cached entry. Both the
+        symbol and the newly admitted dynamic candidate appear in the
+        commit, and the state is coherent.
+        """
+        # Previous state: BTCUSDT tuned + fully coherent
+        refresher, state = _make_refresher(
+            initial_candidates=["BTCUSDT"],
+            initial_tuned_results={"BTCUSDT": _make_tuned_result("BTCUSDT")},
+            initial_tuned_sizes={"BTCUSDT": "1"},
+            initial_natr_map={"BTCUSDT": Decimal("1.5")},
+            initial_v1_features={"BTCUSDT": _FakeFeature()},
+            initial_v2_features={"BTCUSDT": _FakeFeature()},
+            dynamic_selection=["NEWUSDT"],
+        )
+
+        # This cycle: existing BTCUSDT fails retune (NO_GO), new NEWUSDT
+        # succeeds. Without the P1 fix, BTCUSDT would be in candidates
+        # but absent from every map field — torn snapshot.
+        fakes = _CycleFakes(
+            existing_candidates=["BTCUSDT"],
+            dynamic_candidates=["NEWUSDT"],
+            existing_retune_results={
+                "BTCUSDT": _make_rejected_result("BTCUSDT"),
+            },
+        )
+        _run_cycle(refresher, fakes)
+
+        # Both symbols present — BTCUSDT via backfill, NEWUSDT via admission
+        assert set(state.candidates) == {"BTCUSDT", "NEWUSDT"}
+        # Atomic visibility invariant holds in both directions
+        self._assert_state_coherent(state)
+        # BTCUSDT's entry is the PRESERVED previous one (not a fresh tune)
+        assert "BTCUSDT" in state.tuned_results
+        assert "BTCUSDT" in state.tuned_sizes
+
+    def test_existing_fails_without_backfill_drops_from_candidates(self) -> None:
+        """Existing candidate failed retune AND had no coherent previous
+        entry (e.g. v2_features was missing from the prior commit) →
+        the symbol is dropped from ``merged_candidates`` and every map
+        is scrubbed so the inverse invariant still holds.
+        """
+        # Previous state: BTCUSDT partially committed — tuned_results
+        # and tuned_sizes present but v2_features absent (simulates an
+        # incoherent prior commit, e.g. first cycle after a legacy path
+        # before PR-2 existed)
+        refresher, state = _make_refresher(
+            initial_candidates=["BTCUSDT"],
+            initial_tuned_results={"BTCUSDT": _make_tuned_result("BTCUSDT")},
+            initial_tuned_sizes={"BTCUSDT": "1"},
+            initial_natr_map={"BTCUSDT": Decimal("1.5")},
+            initial_v1_features={"BTCUSDT": _FakeFeature()},
+            initial_v2_features={},  # ← missing, backfill blocked
+            dynamic_selection=["NEWUSDT"],
+        )
+        fakes = _CycleFakes(
+            existing_candidates=["BTCUSDT"],
+            dynamic_candidates=["NEWUSDT"],
+            existing_retune_results={
+                "BTCUSDT": _make_rejected_result("BTCUSDT"),
+            },
+        )
+        _run_cycle(refresher, fakes)
+
+        # BTCUSDT dropped entirely — only NEWUSDT survives
+        assert state.candidates == ["NEWUSDT"]
+        # Atomic visibility invariant still holds
+        self._assert_state_coherent(state)
+        # BTCUSDT is completely absent from every map field
+        assert "BTCUSDT" not in state.tuned_results
+        assert "BTCUSDT" not in state.tuned_sizes
+        assert "BTCUSDT" not in state.natr_map
+        assert "BTCUSDT" not in state.v1_features
+        assert "BTCUSDT" not in state.v2_features
+
+    def test_mixed_existing_success_and_failure_with_dynamic(self) -> None:
+        """3 existing candidates: 1 succeeds, 1 fails with backfill, 1
+        fails without backfill. Plus 1 dynamic admission. Final state
+        must be coherent: the 1 successful + 1 backfilled + 1 dynamic,
+        and the un-backfillable one is gone.
+        """
+        refresher, state = _make_refresher(
+            initial_candidates=["GOOD", "BACKFILL", "GHOST"],
+            initial_tuned_results={
+                "GOOD": _make_tuned_result("GOOD"),
+                "BACKFILL": _make_tuned_result("BACKFILL"),
+                # GHOST has no previous coherent entry
+            },
+            initial_tuned_sizes={"GOOD": "1", "BACKFILL": "1"},
+            initial_natr_map={
+                "GOOD": Decimal("1.5"),
+                "BACKFILL": Decimal("1.5"),
+            },
+            initial_v1_features={
+                "GOOD": _FakeFeature(),
+                "BACKFILL": _FakeFeature(),
+            },
+            initial_v2_features={
+                "GOOD": _FakeFeature(),
+                "BACKFILL": _FakeFeature(),
+            },
+            dynamic_selection=["NEW"],
+        )
+        fakes = _CycleFakes(
+            existing_candidates=["GOOD", "BACKFILL", "GHOST"],
+            dynamic_candidates=["NEW"],
+            existing_retune_results={
+                "GOOD": _make_tuned_result("GOOD"),  # succeeds
+                "BACKFILL": _make_rejected_result("BACKFILL"),  # fails, has backfill
+                "GHOST": _make_rejected_result("GHOST"),  # fails, no backfill
+            },
+        )
+        _run_cycle(refresher, fakes)
+
+        # GOOD: fresh retune; BACKFILL: restored from old state; NEW:
+        # admitted. GHOST: dropped (had no prior coherent entry).
+        assert set(state.candidates) == {"GOOD", "BACKFILL", "NEW"}
+        self._assert_state_coherent(state)
+        assert "GHOST" not in state.tuned_results
+        assert "GHOST" not in state.tuned_sizes
+        assert "GHOST" not in state.v1_features
+
+    def test_inverse_invariant_no_orphan_map_keys(self) -> None:
+        """Legacy path fetched v1_features for EVERY candidate but
+        ``tuned_results`` / ``tuned_sizes`` / ``v2_features`` only for
+        successful ones. If an existing candidate fails retune without
+        backfill, the final commit must not leave the failed symbol in
+        v1_features/natr_map either.
+        """
+
+        # Simulate: fake _fake_fetch_v1 returns features for ALL existing
+        # candidates (matches real fetch_selection_features behavior), but
+        # the retune rejects one of them.
+        class _FetchAllV1Fakes(_CycleFakes):
+            def _fake_fetch_v1(
+                self,
+                symbols: list[str],
+                *,
+                mainnet: bool,  # noqa: ARG002
+            ) -> dict[str, Any]:
+                # Return features for every requested symbol, even those
+                # that will be rejected — matches real fetch behavior.
+                return {s: _FakeFeature() for s in symbols}
+
+        refresher, state = _make_refresher(
+            initial_candidates=["KEEP", "DROPME"],
+            # Previous coherent entries for KEEP only; DROPME had none
+            initial_tuned_results={"KEEP": _make_tuned_result("KEEP")},
+            initial_tuned_sizes={"KEEP": "1"},
+            initial_natr_map={"KEEP": Decimal("1.5")},
+            initial_v1_features={"KEEP": _FakeFeature()},
+            initial_v2_features={"KEEP": _FakeFeature()},
+            dynamic_selection=[],
+        )
+        fakes = _FetchAllV1Fakes(
+            existing_candidates=["KEEP", "DROPME"],
+            dynamic_candidates=[],
+            existing_retune_results={
+                "KEEP": _make_tuned_result("KEEP"),
+                "DROPME": _make_rejected_result("DROPME"),
+            },
+        )
+        _run_cycle(refresher, fakes)
+
+        assert state.candidates == ["KEEP"]
+        # DROPME must NOT appear in any map (inverse invariant)
+        assert "DROPME" not in state.tuned_results
+        assert "DROPME" not in state.tuned_sizes
+        assert "DROPME" not in state.natr_map
+        assert "DROPME" not in state.v1_features, (
+            "inverse invariant violation: DROPME fetched this cycle but "
+            "never successfully tuned — must be scrubbed from v1_features "
+            "so selector cannot observe it"
+        )
+        assert "DROPME" not in state.v2_features
+        TestAtomicVisibilityInvariant()._assert_state_coherent(state)
+
+
 class TestStateVersionAdvances:
     """Every successful commit bumps ``state.version``."""
 
