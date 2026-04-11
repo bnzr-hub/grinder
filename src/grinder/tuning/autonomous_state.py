@@ -76,9 +76,21 @@ class AutonomousTuningState:
         natr_map: dict[str, Decimal],
         v1_features: dict[str, Any],
         v2_features: dict[str, Any],
+        candidates: list[str] | None = None,
     ) -> None:
-        """Atomically replace all state references."""
+        """Atomically replace all state references.
+
+        ``candidates`` is optional for backwards compatibility with the
+        cold bootstrap path and existing refresh cycles that only refresh
+        the known tuned set. When supplied (ADR-183 PR-2 dynamic admission),
+        the candidates list is replaced under the same lock as the other
+        maps so downstream readers can never observe a torn snapshot where
+        a symbol is in ``candidates`` but missing from one of the map
+        fields, or vice versa.
+        """
         with self._lock:
+            if candidates is not None:
+                self._candidates = candidates
             self._tuned_results = tuned_results
             self._tuned_sizes = tuned_sizes
             self._natr_map = natr_map
