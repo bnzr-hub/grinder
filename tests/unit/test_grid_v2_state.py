@@ -2305,10 +2305,37 @@ class TestBurstGovernor:
 
 
 class TestExitRestoreHeadroom:
-    """ADR-170: EXIT_RESTORE respects headroom near inventory cap."""
+    """ADR-170 + H2 fix (2026-04-11): EXIT_RESTORE does not ADD new entries
+    when headroom is low, but the SM window itself is not trimmed by
+    headroom — headroom bounding is now enforced by the reconciler
+    projection (``sync_reconciler._project_desired_entries`` +
+    ``_compute_effective_state``), not by in-place shrinking in the
+    state machine.
 
-    def test_near_cap_suppresses_exit_restore(self) -> None:
-        """At 4/5 lots (headroom=1), exit fill should not restore if 1 entry exists."""
+    Pre-H2-fix: ``_update_window_after_fill`` trimmed the branch window
+    by 1 on every ``skip_place=True`` fill, so near-cap lots drove
+    ``buy_entry_prices`` down to 0-1. Under that semantics, a subsequent
+    exit fill could at most restore up to ``headroom`` entries.
+
+    Post-H2-fix: the SM window stays at ``entry_levels_per_side`` through
+    burst, and the reconciler enforces headroom downstream by truncating
+    ``effective_entry_keys``. The test invariants move accordingly:
+
+      - The SM window remains at ``entry_levels_per_side`` after the
+        exit fill.
+      - EXIT_RESTORE **does not add new entries** (it may only SHIFT
+        existing ones via cancel+place, which is count-neutral).
+      - The reconciler is responsible for the final headroom bound on
+        what actually reaches the exchange.
+    """
+
+    def test_near_cap_suppresses_exit_restore_add(self) -> None:
+        """Near cap (4/5 lots → exit → 3 lots, headroom=2): EXIT_RESTORE
+        must not emit a pure add (``PLACE_ENTRY`` without a paired
+        ``EXIT_RESTORE_SHIFT`` cancel). The SM window stays at
+        ``entry_levels_per_side`` — headroom cap enforcement is the
+        reconciler's job.
+        """
         cfg = _config(
             max_levels=5, levels=3, reseed_on_flat=False, reseed_on_flat_only_on_skew=False
         )
@@ -2320,7 +2347,6 @@ class TestExitRestoreHeadroom:
             sm.apply(EntryFilled(f"E{i}", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + i + 1))
 
         assert len(sm.snapshot.open_lots) == 4
-        # Now we have some BUY entries in window. Exit one lot → 3 lots, headroom=2
         exit_eo = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
         result = sm.apply(
             ExitFilled(
@@ -2331,27 +2357,48 @@ class TestExitRestoreHeadroom:
                 ts=_BASE_TS + 100,
             )
         )
-        # With headroom=2 and existing buy entries, restore should be limited
+
+        # H2 fix invariant: SM window stays at levels_per_side.
         buy_entries_after = len(result.snapshot.entry_window.buy_entry_prices)
-        # buy entries should not exceed headroom
-        assert buy_entries_after <= 2, (
-            f"Expected <= 2 buy entries (headroom=2), got {buy_entries_after}"
+        assert buy_entries_after == cfg.entry_levels_per_side, (
+            f"H2 fix: SM window should stay at {cfg.entry_levels_per_side}, got {buy_entries_after}"
         )
 
-    def test_at_cap_no_exit_restore(self) -> None:
-        """At 5/5 lots, exit fill → 4 lots (headroom=1), restore capped to 1."""
+        # ADR-170 invariant: EXIT_RESTORE must not ADD beyond headroom.
+        # Shift is count-neutral (cancel + place). Pure add would be a
+        # PLACE_ENTRY with reason=EXIT_RESTORE not preceded by a
+        # CANCEL_ENTRY with reason=EXIT_RESTORE_SHIFT.
+        shift_cancels = [
+            a
+            for a in result.actions
+            if a.kind == ActionIntentKind.CANCEL_ENTRY and a.reason == "EXIT_RESTORE_SHIFT"
+        ]
+        restore_places = [
+            a
+            for a in result.actions
+            if a.kind == ActionIntentKind.PLACE_ENTRY and a.reason == "EXIT_RESTORE"
+        ]
+        # Every restore place must have a matching shift cancel (no pure adds).
+        assert len(restore_places) == len(shift_cancels), (
+            f"EXIT_RESTORE emitted {len(restore_places)} places vs "
+            f"{len(shift_cancels)} shift cancels — pure add detected "
+            f"when headroom was low, ADR-170 invariant violated"
+        )
+
+    def test_at_cap_no_exit_restore_add(self) -> None:
+        """At cap (5/5 lots → exit → 4 lots, headroom=1): EXIT_RESTORE
+        must not add new entries. Same invariants as the near-cap test.
+        """
         cfg = _config(
             max_levels=5, levels=3, reseed_on_flat=False, reseed_on_flat_only_on_skew=False
         )
         sm = _sm(cfg=cfg)
 
-        # Fill 5 entries to hit cap
         for i in range(5):
             buy = sm.snapshot.entry_window.buy_entry_prices[0]
             sm.apply(EntryFilled(f"E{i}", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + i + 1))
 
         assert len(sm.snapshot.open_lots) == 5
-        # Exit one → 4 lots, headroom=1
         exit_eo = next(eo for eo in sm.snapshot.exit_orders if eo.status == ExitOrderStatus.OPEN)
         r = sm.apply(
             ExitFilled(
@@ -2362,10 +2409,125 @@ class TestExitRestoreHeadroom:
                 ts=_BASE_TS + 100,
             )
         )
+
         buy_entries_after = len(r.snapshot.entry_window.buy_entry_prices)
-        assert buy_entries_after <= 1, (
-            f"Expected <= 1 buy entry (headroom=1), got {buy_entries_after}"
+        assert buy_entries_after == cfg.entry_levels_per_side, (
+            f"H2 fix: SM window should stay at {cfg.entry_levels_per_side}, got {buy_entries_after}"
         )
+
+        shift_cancels = [
+            a
+            for a in r.actions
+            if a.kind == ActionIntentKind.CANCEL_ENTRY and a.reason == "EXIT_RESTORE_SHIFT"
+        ]
+        restore_places = [
+            a
+            for a in r.actions
+            if a.kind == ActionIntentKind.PLACE_ENTRY and a.reason == "EXIT_RESTORE"
+        ]
+        assert len(restore_places) == len(shift_cancels), (
+            f"At cap: EXIT_RESTORE emitted {len(restore_places)} places vs "
+            f"{len(shift_cancels)} shift cancels — pure add detected"
+        )
+
+
+class TestH2DeadWindowClosed:
+    """H2 fix regression (2026-04-11): trim-without-replace dead window.
+
+    Pre-fix, ``_update_window_after_fill`` trimmed the filled entry from
+    the same-side window even when the inline FILL_REPLACEMENT PLACE was
+    gated (burst / distance / collision). Repeated suppressed fills then
+    decayed the branch window 5→4→3→2→1→0, producing multi-minute dead
+    windows observed on ARIAUSDT (14:55), SKYAIUSDT (21:51 / 21:59), and
+    ENJUSDT (22:01:42→22:04:05) during the post-#676 canary on 2026-04-11.
+
+    Post-fix, the same-side visible window count stays stable at
+    ``entry_levels_per_side`` through any number of suppressed fills —
+    only the inline PLACE is gated. The reconciler (with headroom-aware
+    projection) remains the single source of anti-snowball enforcement.
+    """
+
+    def test_burst_suppressed_fill_keeps_window_stable(self) -> None:
+        """Fills hitting ``_burst_suppress=True`` must not shrink the
+        same-side window. Window count stays at ``entry_levels_per_side``
+        and no FILL_REPLACEMENT PLACE is emitted."""
+        cfg = _config(
+            max_levels=4,
+            levels=3,
+            reseed_on_flat=False,
+            reseed_on_flat_only_on_skew=False,
+        )
+        sm = _sm(cfg=cfg)
+        # near_cap_threshold = min(4, max(3, 4-3)) = 3 → burst suppresses
+        # from lot #3 onward.
+
+        # First fill: not yet in burst zone, replacement placed.
+        buy0 = sm.snapshot.entry_window.buy_entry_prices[0]
+        r0 = sm.apply(EntryFilled("E0", OrderSide.BUY, buy0, _ORDER_SIZE, _BASE_TS + 1))
+        assert len(sm.snapshot.entry_window.buy_entry_prices) == cfg.entry_levels_per_side
+        place0 = [a for a in r0.actions if a.kind == ActionIntentKind.PLACE_ENTRY]
+        assert len(place0) == 1, "fill #1 (pre-burst) should emit a FILL_REPLACEMENT"
+
+        # Second fill: lot #2, still pre-burst.
+        buy1 = sm.snapshot.entry_window.buy_entry_prices[0]
+        sm.apply(EntryFilled("E1", OrderSide.BUY, buy1, _ORDER_SIZE, _BASE_TS + 2))
+        assert len(sm.snapshot.entry_window.buy_entry_prices) == cfg.entry_levels_per_side
+
+        # Third fill onwards: burst suppression active. Window must stay
+        # stable and no FILL_REPLACEMENT PLACE may be emitted inline.
+        for i in range(2, cfg.max_inventory_levels):
+            buy = sm.snapshot.entry_window.buy_entry_prices[0]
+            r = sm.apply(EntryFilled(f"E{i}", OrderSide.BUY, buy, _ORDER_SIZE, _BASE_TS + i + 1))
+            assert len(sm.snapshot.entry_window.buy_entry_prices) == cfg.entry_levels_per_side, (
+                f"fill #{i + 1} under burst: window shrank to "
+                f"{len(sm.snapshot.entry_window.buy_entry_prices)} "
+                f"(expected {cfg.entry_levels_per_side})"
+            )
+            fill_replacements = [
+                a
+                for a in r.actions
+                if a.kind == ActionIntentKind.PLACE_ENTRY and a.reason == "FILL_REPLACEMENT"
+            ]
+            assert fill_replacements == [], (
+                f"fill #{i + 1} under burst: inline FILL_REPLACEMENT must be gated, "
+                f"got {len(fill_replacements)}"
+            )
+
+    def test_repeated_suppressed_fills_preserve_window_sell_side(self) -> None:
+        """SHORT branch mirror: repeated burst-suppressed SELL fills must
+        keep the sell-side window at ``entry_levels_per_side``."""
+        cfg = _config(
+            max_levels=4,
+            levels=3,
+            reseed_on_flat=False,
+            reseed_on_flat_only_on_skew=False,
+        )
+        sm = _sm(cfg=cfg)
+
+        for i in range(cfg.max_inventory_levels):
+            sell = sm.snapshot.entry_window.sell_entry_prices[0]
+            r = sm.apply(EntryFilled(f"S{i}", OrderSide.SELL, sell, _ORDER_SIZE, _BASE_TS + i + 1))
+            assert len(sm.snapshot.entry_window.sell_entry_prices) == cfg.entry_levels_per_side, (
+                f"SELL fill #{i + 1}: sell-side window shrank to "
+                f"{len(sm.snapshot.entry_window.sell_entry_prices)}"
+            )
+            # Pre-burst fills may emit PLACE; burst-suppressed ones must not.
+            lots_after = i + 1
+            _near_cap = min(
+                cfg.max_inventory_levels,
+                max(
+                    cfg.entry_levels_per_side, cfg.max_inventory_levels - cfg.entry_levels_per_side
+                ),
+            )
+            if lots_after >= _near_cap:
+                fill_replacements = [
+                    a
+                    for a in r.actions
+                    if a.kind == ActionIntentKind.PLACE_ENTRY and a.reason == "FILL_REPLACEMENT"
+                ]
+                assert fill_replacements == [], (
+                    f"SELL fill #{lots_after}: inline FILL_REPLACEMENT must be gated"
+                )
 
 
 class TestReseedCooldown:

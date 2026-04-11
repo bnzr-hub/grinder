@@ -762,10 +762,29 @@ class GridV2StateMachine:
             skip_place = (
                 new_farthest in occupied or distance_from_ref > max_distance or _burst_suppress
             )
-            if skip_place:
-                new_buys = remaining[: cfg.entry_levels_per_side]
-            else:
-                new_buys = (*remaining, new_farthest)[: cfg.entry_levels_per_side]
+            # H2 fix (2026-04-11 post-#676 ENJ canary): keep the same-side
+            # window count stable by extending to ``new_farthest`` regardless
+            # of ``skip_place``. Only the inline PLACE action is gated.
+            #
+            # Pre-fix, the trim-without-replace path under ``skip_place=True``
+            # decayed the branch window 5→4→3→2→1→0 across repeated bursts,
+            # producing 3-minute dead windows (ENJ 22:01:42→22:04:05,
+            # SKYAIUSDT transients at 21:51 and 21:59). Anti-snowball
+            # semantics are preserved because:
+            #   1) The inline FILL_REPLACEMENT PLACE is still suppressed
+            #      under ``skip_place=True`` — fills do not trigger direct
+            #      cascading placements.
+            #   2) Missing entries are restored by the reconciler on its
+            #      bounded ~5s cadence, rate-limiting new placements.
+            #   3) The reconciler's headroom-aware projection truncates
+            #      ``theoretical_entry_keys`` when
+            #      ``lots_open >= max_inv - entry_levels_per_side`` — this
+            #      is the correct place to enforce the near-cap soft cap.
+            #   4) ``new_farthest`` is further from current market than the
+            #      filled price, so reconciler placement there is unlikely
+            #      to immediately re-fill during the ongoing burst.
+            new_buys = (*remaining, new_farthest)[: cfg.entry_levels_per_side]
+            if not skip_place:
                 actions.append(
                     ActionIntent(
                         kind=ActionIntentKind.PLACE_ENTRY,
@@ -797,10 +816,12 @@ class GridV2StateMachine:
             skip_place = (
                 new_farthest in occupied or distance_from_ref > max_distance or _burst_suppress
             )
-            if skip_place:
-                new_sells = remaining[: cfg.entry_levels_per_side]
-            else:
-                new_sells = (*remaining, new_farthest)[: cfg.entry_levels_per_side]
+            # H2 fix (2026-04-11): symmetric to BUY branch above.
+            # Keep same-side window count stable by extending to new_farthest;
+            # only the inline PLACE is gated by skip_place. See full
+            # rationale in the BUY branch above.
+            new_sells = (*remaining, new_farthest)[: cfg.entry_levels_per_side]
+            if not skip_place:
                 actions.append(
                     ActionIntent(
                         kind=ActionIntentKind.PLACE_ENTRY,

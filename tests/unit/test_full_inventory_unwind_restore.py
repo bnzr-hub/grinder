@@ -34,36 +34,56 @@ def _cfg() -> GridV2Config:
 
 
 def _fill_to_max(sm: GridV2StateMachine) -> None:
-    """Fill entries until no more buy entries available or max reached.
+    """Fill BUY entries until the inventory cap is reached.
 
-    ADR-178 near-cap guard may suppress FILL_REPLACEMENT before
-    max_inventory_levels, so this fills as many as the window allows.
+    Under the H2 fix (2026-04-11), the same-side window count stays at
+    ``entry_levels_per_side`` even when near-cap burst suppression or the
+    B3-alt distance guard is active — only the inline FILL_REPLACEMENT
+    PLACE is gated. So the old ``while buy_prices: ...`` termination
+    condition never fires. Instead we bound by ``max_inventory_levels``
+    and stop when the state machine starts rejecting fills with
+    ``MAX_INVENTORY_LEVELS``.
     """
     buy_prices = list(sm.snapshot.entry_window.buy_entry_prices)
     for i, price in enumerate(buy_prices):
         sm.apply(EntryFilled(f"e{i}", OrderSide.BUY, price, Decimal("15"), 2000 + i))
-    while True:
+    max_iters = 30
+    for _ in range(max_iters):
         bp = list(sm.snapshot.entry_window.buy_entry_prices)
         if not bp:
             break
-        idx = len(sm.snapshot.open_lots)
-        sm.apply(EntryFilled(f"e{idx}", OrderSide.BUY, bp[0], Decimal("15"), 3000 + idx))
+        prev_lots = len(sm.snapshot.open_lots)
+        sm.apply(
+            EntryFilled(f"e{prev_lots}", OrderSide.BUY, bp[0], Decimal("15"), 3000 + prev_lots)
+        )
+        if len(sm.snapshot.open_lots) == prev_lots:
+            break  # fill rejected (cap reached)
 
 
 class TestLongBranchUnwindRestore:
-    """LONG_BRANCH: full inventory → exit fills → entries restore."""
+    """LONG_BRANCH: full inventory → exit fills → entries restore.
+
+    Under the H2 fix (2026-04-11), the same-side window stays at
+    ``entry_levels_per_side`` regardless of burst/distance gating, so
+    EXIT_RESTORE takes the SHIFT path (cancel farthest + place closer)
+    rather than a pure ADD. Assertions reflect that: we still expect
+    exactly one PLACE_ENTRY per first exit fill, but the window count
+    stays stable rather than going 0 → 1.
+    """
 
     def test_first_exit_fill_restores_entry(self) -> None:
-        """Going from 10→9 lots: entry must be restored despite exit collision."""
-        sm = GridV2StateMachine.create_initial(_cfg(), Decimal("0.5024"), 1000)
+        """Deep inventory → single exit fill emits one EXIT_RESTORE PLACE."""
+        cfg = _cfg()
+        sm = GridV2StateMachine.create_initial(cfg, Decimal("0.5024"), 1000)
         _fill_to_max(sm)
-        # With max=20, levels=5: near-cap threshold=15, but B3-alt distance
-        # guard limits rolling to ~10 entries from reference. Assert we fill
-        # enough to meaningfully test the unwind path.
+        # Notional cap (max_inventory_notional_usd=100, size=15 * px~0.48)
+        # limits rolling to ~13 lots before the cap rejects. Deep enough to
+        # meaningfully exercise the unwind path.
         assert len(sm.snapshot.open_lots) >= 8, (
             f"Need deep inventory for unwind test, got {len(sm.snapshot.open_lots)}"
         )
-        assert len(sm.snapshot.entry_window.buy_entry_prices) == 0
+        # H2 invariant: window stays stable at entry_levels_per_side.
+        assert len(sm.snapshot.entry_window.buy_entry_prices) == cfg.entry_levels_per_side
 
         lot = sm.snapshot.open_lots[0]
         exit_eo = next(
@@ -74,8 +94,18 @@ class TestLongBranchUnwindRestore:
         r = sm.apply(ExitFilled(exit_eo.exit_order_id, lot.lot_id, exit_eo.price, lot.qty, 5000))
 
         place_entries = [a for a in r.actions if a.kind == ActionIntentKind.PLACE_ENTRY]
+        shift_cancels = [
+            a
+            for a in r.actions
+            if a.kind == ActionIntentKind.CANCEL_ENTRY and a.reason == "EXIT_RESTORE_SHIFT"
+        ]
         assert len(place_entries) == 1, f"Expected 1 restored entry, got {len(place_entries)}"
-        assert len(sm.snapshot.entry_window.buy_entry_prices) == 1
+        # EXIT_RESTORE SHIFT invariant: balanced cancel+place.
+        assert len(shift_cancels) == 1, (
+            f"Expected 1 EXIT_RESTORE_SHIFT cancel, got {len(shift_cancels)}"
+        )
+        # Window stays stable.
+        assert len(sm.snapshot.entry_window.buy_entry_prices) == cfg.entry_levels_per_side
 
     def test_full_unwind_restores_all_entries(self) -> None:
         """10→0 lots: entries progressively restored, then reseed on FLAT."""
@@ -137,23 +167,27 @@ class TestShortBranchUnwindRestore:
         cfg = _cfg()
         sm = GridV2StateMachine.create_initial(cfg, Decimal("0.5024"), 1000)
 
-        # Fill sell entries to build SHORT inventory
+        # Fill sell entries to build SHORT inventory (H2-aware termination).
         sell_prices = list(sm.snapshot.entry_window.sell_entry_prices)
         for i, price in enumerate(sell_prices):
             sm.apply(EntryFilled(f"e{i}", OrderSide.SELL, price, Decimal("15"), 2000 + i))
-        while True:
+        max_iters = 30
+        for _ in range(max_iters):
             sp = list(sm.snapshot.entry_window.sell_entry_prices)
             if not sp:
                 break
-            idx = len(sm.snapshot.open_lots)
-            sm.apply(EntryFilled(f"e{idx}", OrderSide.SELL, sp[0], Decimal("15"), 3000 + idx))
+            prev_lots = len(sm.snapshot.open_lots)
+            sm.apply(
+                EntryFilled(f"e{prev_lots}", OrderSide.SELL, sp[0], Decimal("15"), 3000 + prev_lots)
+            )
+            if len(sm.snapshot.open_lots) == prev_lots:
+                break  # fill rejected (cap reached)
 
-        # With max=20, levels=5: near-cap threshold=15, but B3-alt distance
-        # guard limits rolling to ~10 entries from reference. Assert we fill
-        # enough to meaningfully test the unwind path.
         assert len(sm.snapshot.open_lots) >= 8, (
             f"Need deep inventory for unwind test, got {len(sm.snapshot.open_lots)}"
         )
+        # H2 invariant: window stays stable at entry_levels_per_side.
+        assert len(sm.snapshot.entry_window.sell_entry_prices) == cfg.entry_levels_per_side
 
         lot = sm.snapshot.open_lots[0]
         exit_eo = next(
@@ -164,4 +198,13 @@ class TestShortBranchUnwindRestore:
         r = sm.apply(ExitFilled(exit_eo.exit_order_id, lot.lot_id, exit_eo.price, lot.qty, 5000))
 
         pe = [a for a in r.actions if a.kind == ActionIntentKind.PLACE_ENTRY]
+        shift_cancels = [
+            a
+            for a in r.actions
+            if a.kind == ActionIntentKind.CANCEL_ENTRY and a.reason == "EXIT_RESTORE_SHIFT"
+        ]
         assert len(pe) == 1, f"Expected 1 restored sell entry, got {len(pe)}"
+        assert len(shift_cancels) == 1, (
+            f"Expected 1 EXIT_RESTORE_SHIFT cancel, got {len(shift_cancels)}"
+        )
+        assert len(sm.snapshot.entry_window.sell_entry_prices) == cfg.entry_levels_per_side
