@@ -541,8 +541,14 @@ def _build_tuning_state_and_selector(
     blacklist: frozenset[str],
     bridge: Any,
     registry: Any,
+    universe_provider: Any = None,
 ) -> tuple[Any, Any, Any, Any]:
-    """Build shared tuning state, refresher, and selector closures (ADR-162)."""
+    """Build shared tuning state, refresher, and selector closures (ADR-162).
+
+    ``universe_provider`` is optional; when supplied, ``TuningRefresher``
+    runs bounded dynamic candidate discovery on each cycle (PR-1,
+    observational only — no state mutation).
+    """
     from grinder.tuning.autonomous_state import AutonomousTuningState  # noqa: PLC0415
     from grinder.tuning.refresher import TuningRefresher  # noqa: PLC0415
 
@@ -563,7 +569,16 @@ def _build_tuning_state_and_selector(
     prefilter, ranker = _build_v2_selector(state, tuning_cache, blacklist)
 
     refresher = TuningRefresher(
-        state=state, cache=tuning_cache, bridge=bridge, registry=registry, args=args
+        state=state,
+        cache=tuning_cache,
+        bridge=bridge,
+        registry=registry,
+        args=args,
+        # Dynamic bootstrap discovery wiring (PR-1, observational only).
+        universe_provider=universe_provider,
+        blacklist=blacklist,
+        coarse_select_fn=_select_bootstrap_subset,
+        prefilter_fn=_apply_bootstrap_prefilter,
     )
 
     return state, refresher, prefilter, ranker
@@ -799,6 +814,7 @@ def build_runtime(args: argparse.Namespace) -> dict:  # type: ignore[type-arg]  
         blacklist,
         bridge,
         registry,
+        universe_provider=universe_provider,
     )
 
     # Risk admission gate — filters ranked candidates before orchestrator
