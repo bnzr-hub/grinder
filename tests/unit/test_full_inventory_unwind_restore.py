@@ -34,32 +34,40 @@ def _cfg() -> GridV2Config:
 
 
 def _fill_to_max(sm: GridV2StateMachine) -> None:
-    """Fill entries until no more buy entries available or max reached.
+    """Fill BUY entries until the window is empty or max inventory is reached.
 
-    ADR-178 near-cap guard may suppress FILL_REPLACEMENT before
-    max_inventory_levels, so this fills as many as the window allows.
+    The H2 fix (2026-04-11) is scoped to the ``_burst_suppress`` subcase
+    of ``_update_window_after_fill`` — collision and distance guards
+    still shrink the same-side window. With this test config
+    (levels=5, max_inventory=20, notional=100, ref=0.5024), the
+    B3-alt distance guard fires around fill 6 and shrinks the window
+    one entry per fill, so the loop terminates when ``buy_entry_prices``
+    drains.
     """
     buy_prices = list(sm.snapshot.entry_window.buy_entry_prices)
     for i, price in enumerate(buy_prices):
         sm.apply(EntryFilled(f"e{i}", OrderSide.BUY, price, Decimal("15"), 2000 + i))
-    while True:
+    max_iters = 30
+    for _ in range(max_iters):
         bp = list(sm.snapshot.entry_window.buy_entry_prices)
         if not bp:
             break
-        idx = len(sm.snapshot.open_lots)
-        sm.apply(EntryFilled(f"e{idx}", OrderSide.BUY, bp[0], Decimal("15"), 3000 + idx))
+        prev_lots = len(sm.snapshot.open_lots)
+        sm.apply(
+            EntryFilled(f"e{prev_lots}", OrderSide.BUY, bp[0], Decimal("15"), 3000 + prev_lots)
+        )
+        if len(sm.snapshot.open_lots) == prev_lots:
+            break  # fill rejected (cap reached)
 
 
 class TestLongBranchUnwindRestore:
     """LONG_BRANCH: full inventory → exit fills → entries restore."""
 
     def test_first_exit_fill_restores_entry(self) -> None:
-        """Going from 10→9 lots: entry must be restored despite exit collision."""
+        """Going from deep inventory: entry must be restored despite exit collision."""
         sm = GridV2StateMachine.create_initial(_cfg(), Decimal("0.5024"), 1000)
         _fill_to_max(sm)
-        # With max=20, levels=5: near-cap threshold=15, but B3-alt distance
-        # guard limits rolling to ~10 entries from reference. Assert we fill
-        # enough to meaningfully test the unwind path.
+        # Distance guard fires mid-fill, shrinking the window to 0.
         assert len(sm.snapshot.open_lots) >= 8, (
             f"Need deep inventory for unwind test, got {len(sm.snapshot.open_lots)}"
         )
@@ -137,20 +145,22 @@ class TestShortBranchUnwindRestore:
         cfg = _cfg()
         sm = GridV2StateMachine.create_initial(cfg, Decimal("0.5024"), 1000)
 
-        # Fill sell entries to build SHORT inventory
+        # Fill sell entries to build SHORT inventory.
         sell_prices = list(sm.snapshot.entry_window.sell_entry_prices)
         for i, price in enumerate(sell_prices):
             sm.apply(EntryFilled(f"e{i}", OrderSide.SELL, price, Decimal("15"), 2000 + i))
-        while True:
+        max_iters = 30
+        for _ in range(max_iters):
             sp = list(sm.snapshot.entry_window.sell_entry_prices)
             if not sp:
                 break
-            idx = len(sm.snapshot.open_lots)
-            sm.apply(EntryFilled(f"e{idx}", OrderSide.SELL, sp[0], Decimal("15"), 3000 + idx))
+            prev_lots = len(sm.snapshot.open_lots)
+            sm.apply(
+                EntryFilled(f"e{prev_lots}", OrderSide.SELL, sp[0], Decimal("15"), 3000 + prev_lots)
+            )
+            if len(sm.snapshot.open_lots) == prev_lots:
+                break  # fill rejected (cap reached)
 
-        # With max=20, levels=5: near-cap threshold=15, but B3-alt distance
-        # guard limits rolling to ~10 entries from reference. Assert we fill
-        # enough to meaningfully test the unwind path.
         assert len(sm.snapshot.open_lots) >= 8, (
             f"Need deep inventory for unwind test, got {len(sm.snapshot.open_lots)}"
         )

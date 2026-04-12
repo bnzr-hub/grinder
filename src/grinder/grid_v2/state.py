@@ -693,7 +693,7 @@ class GridV2StateMachine:
             occupied.add(p)
         return occupied
 
-    def _update_window_after_fill(
+    def _update_window_after_fill(  # noqa: PLR0915
         self, event: EntryFilled
     ) -> tuple[EntryWindow, tuple[ActionIntent, ...]]:
         """Apply rolling-window update for an accepted entry fill.
@@ -757,15 +757,31 @@ class GridV2StateMachine:
                 )
             else:
                 new_sells = ()
-            # Collision + distance + burst guard
+            # Collision + distance + burst guard.
             distance_from_ref = abs(window.reference_price - new_farthest)
-            skip_place = (
-                new_farthest in occupied or distance_from_ref > max_distance or _burst_suppress
-            )
-            if skip_place:
+            _collision = new_farthest in occupied
+            _out_of_distance = distance_from_ref > max_distance
+            skip_place = _collision or _out_of_distance or _burst_suppress
+            # H2 fix (2026-04-11 post-#676 ENJ canary): keep the same-side
+            # window count stable **only** when the inline PLACE is gated
+            # by burst suppression. Collision and distance guards are
+            # legitimate "don't add this level at all" decisions that the
+            # reconciler cannot replicate (it does not know about
+            # ``occupied`` or ``max_distance``), so extending the window
+            # to ``new_farthest`` under those guards would silently defeat
+            # the collision / max-distance protections at the reconciler
+            # boundary. The dead-window incidents (ENJ 22:01:42→22:04:05,
+            # SKYAIUSDT 21:51 / 21:59, ARIA 14:55) were driven by
+            # ``_burst_suppress`` specifically — that is the subcase
+            # where the reconciler *is* aware (via headroom-aware
+            # projection in ``sync_reconciler._project_desired_entries``)
+            # and will correctly re-place the truncated levels.
+            _h2_keep_window_stable = _burst_suppress and not (_collision or _out_of_distance)
+            if skip_place and not _h2_keep_window_stable:
                 new_buys = remaining[: cfg.entry_levels_per_side]
             else:
                 new_buys = (*remaining, new_farthest)[: cfg.entry_levels_per_side]
+            if not skip_place:
                 actions.append(
                     ActionIntent(
                         kind=ActionIntentKind.PLACE_ENTRY,
@@ -792,15 +808,21 @@ class GridV2StateMachine:
                 )
             else:
                 new_buys = ()
-            # Collision + distance + burst guard
+            # Collision + distance + burst guard.
             distance_from_ref = abs(new_farthest - window.reference_price)
-            skip_place = (
-                new_farthest in occupied or distance_from_ref > max_distance or _burst_suppress
-            )
-            if skip_place:
+            _collision = new_farthest in occupied
+            _out_of_distance = distance_from_ref > max_distance
+            skip_place = _collision or _out_of_distance or _burst_suppress
+            # H2 fix (2026-04-11): symmetric to BUY branch above.
+            # Only ``_burst_suppress`` keeps the window stable; collision
+            # and distance guards shrink the same-side count as before.
+            # See full rationale in the BUY branch above.
+            _h2_keep_window_stable = _burst_suppress and not (_collision or _out_of_distance)
+            if skip_place and not _h2_keep_window_stable:
                 new_sells = remaining[: cfg.entry_levels_per_side]
             else:
                 new_sells = (*remaining, new_farthest)[: cfg.entry_levels_per_side]
+            if not skip_place:
                 actions.append(
                     ActionIntent(
                         kind=ActionIntentKind.PLACE_ENTRY,
