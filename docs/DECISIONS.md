@@ -5260,7 +5260,7 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
   - ASCII symbols (matching `[A-Z0-9]+`) pass through unchanged.
   - Non-ASCII symbols are hashed: `X` + `SHA1(symbol.encode()).hexdigest().upper()`, then truncated to `max_len`.
   - `generate_client_order_id()` raises `ValueError` when an ASCII symbol would need to be truncated (preserves identity; triggers the `g_` prefix fallback in `_generate_client_order_id_with_fallback`). Non-ASCII hash tokens are truncated silently since the truncated prefix still provides sufficient collision resistance.
-  - `_resolve_symbol_for_order_id()` (port) and adapter `parse_cid`/`is_ours` use `.startswith()` instead of `==` for reverse lookup, since the CID stores a truncated hash.
+  - All reverse-lookup call sites (`_resolve_symbol_for_order_id`, `adapter.parse_cid`, `adapter.is_ours`, `engine._count/_clear_pending_cancels_for_symbol`) use `cid_symbol_matches(symbol, parsed_token)`. This function applies **exact equality** for ASCII symbols (prevents false positives such as `"BTCUSDT".startswith("BTC")` incorrectly matching a CID for the unrelated `"BTC"` symbol) and **`startswith`** for non-ASCII symbols (CID stores truncated SHA1 hash, prefix is sufficient for identity).
 - **Alternatives considered:**
   - Replace all non-ASCII with ASCII slug — rejected: lossy, not reversible without whitelist, same prefix collision risk.
   - Keep full hash, always 41 chars — rejected: exceeds Binance 36-char limit.
