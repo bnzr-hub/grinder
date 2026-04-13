@@ -3216,6 +3216,17 @@ class LiveEngineV0:
         if self._forced_flat_requested:
             if not self._forced_flat_executed:
                 self._execute_forced_flat(snapshot)
+            # Keep account sync alive in forced-flat terminal state.
+            # Without this, the short-circuit below starves
+            # _tick_account_sync, so last_sync_success_ts grows stale
+            # and health degrades HEALTHY → DEGRADED_SYNC (+15 s) →
+            # STALE_TRUTH (+30 s) irreversibly until shutdown.
+            if self._is_account_sync_enabled() and snapshot.ts > 0:
+                effective_interval, _ = self._get_effective_sync_interval()
+                elapsed = snapshot.ts - self._account_sync_last_attempt_ms
+                if elapsed >= effective_interval:
+                    self._account_sync_last_attempt_ms = snapshot.ts
+                    self._tick_account_sync()
             return LiveEngineOutput(
                 paper_output=_DeferredPaperOutput(ts=snapshot.ts, symbol=snapshot.symbol),
                 live_actions=[],
