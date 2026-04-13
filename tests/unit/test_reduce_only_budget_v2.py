@@ -424,17 +424,20 @@ class TestRepairConvergence:
 
         assert ("BTCUSDT", "SELL") in pending
 
-    def test_all_cancels_ok_clears_flag(self) -> None:
-        """All cancels succeed → flag cleared, CONVERGED."""
+    def test_all_cancels_ok_does_not_clear_flag(self) -> None:
+        """All cancels succeed → budget is legal, but flag stays until
+        exit topology converges in _exit_topology_repair_on_sync()."""
         pending: set[tuple[str, str]] = {("BTCUSDT", "SELL")}
         all_ok = True
 
         if all_ok:
-            pending.discard(("BTCUSDT", "SELL"))
+            # Budget cancels OK — do NOT clear flag here.
+            # Clearance is gated by topology convergence.
+            pass
         else:
             pending.add(("BTCUSDT", "SELL"))
 
-        assert ("BTCUSDT", "SELL") not in pending
+        assert ("BTCUSDT", "SELL") in pending
 
     def test_no_surplus_does_not_clear_flag(self) -> None:
         """If surplus is empty on sync, flag stays until topology converges."""

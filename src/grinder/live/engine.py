@@ -6050,6 +6050,7 @@ class LiveEngineV0:
         logs deferred placements.
         """
         from grinder.grid_v2.exit_repair import (  # noqa: PLC0415
+            DesiredExit,
             RepairTrigger,
             compute_desired_exits,
             compute_exit_topology_repair,
@@ -6124,9 +6125,13 @@ class LiveEngineV0:
         desired = desired_sell + desired_buy
 
         def _side_converged(
-            desired_exits: list["DesiredExit"],
+            desired_exits: list[DesiredExit],
             actual_cids: set[str],
         ) -> bool:
+            # Empty desired list means SM hasn't loaded exits yet —
+            # treat as not converged to avoid vacuous-true false positive.
+            if not desired_exits:
+                return False
             # Converged for this side if every desired exit is registered
             # and visible on exchange. Extra exits are handled by repair.
             for de in desired_exits:

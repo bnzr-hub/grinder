@@ -14,11 +14,11 @@ from grinder.account.contracts import AccountSnapshot, OpenOrderSnap, PositionSn
 from grinder.connectors.live_connector import SafeMode
 from grinder.core import OrderSide
 from grinder.execution.types import ActionType
+from grinder.grid_v2.adapter import GridV2OrderKind
 from grinder.grid_v2.exit_repair import (
     DesiredExit,
     compute_exit_topology_repair,
 )
-from grinder.grid_v2.adapter import GridV2OrderKind
 from grinder.grid_v2.state import ExitOrder, ExitOrderStatus
 from grinder.live import LiveEngineConfig, LiveEngineV0
 from grinder.live.engine import LiveActionStatus
