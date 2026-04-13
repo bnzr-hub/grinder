@@ -77,6 +77,7 @@ from grinder.net.retry_policy import (
 )
 from grinder.reconcile.identity import (
     OrderIdentityConfig,
+    cid_symbol_matches,
     generate_client_order_id,
     get_default_identity_config,
     parse_client_order_id,
@@ -282,6 +283,7 @@ class BinanceFuturesPort:
     _position_mode: str | None = field(default=None, repr=False)
     _leverage_set: dict[str, int] = field(default_factory=dict, repr=False)
     _ts_offset_ms: int = field(default=0, repr=False)
+    _cid_symbol_map: dict[str, str] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         """Read debug flags once at init."""
@@ -305,6 +307,41 @@ class BinanceFuturesPort:
                 f"Symbol '{symbol}' not in whitelist: {self.config.symbol_whitelist}",
                 pre_send=True,
             )
+
+    def register_order_symbol(self, order_id: str, symbol: str) -> None:
+        """Register the real exchange symbol for a clientOrderId."""
+        if order_id:
+            self._cid_symbol_map[order_id] = symbol
+
+    def _resolve_symbol_for_order_id(self, order_id: str) -> str:
+        """Resolve the real symbol for a clientOrderId (handles CID-normalized symbols)."""
+        mapped = self._cid_symbol_map.get(order_id)
+        if mapped is not None:
+            return mapped
+
+        parsed = parse_client_order_id(order_id)
+        if parsed is None:
+            raise ConnectorNonRetryableError(
+                f"Cannot parse order_id '{order_id}'. "
+                "In v0.1, only orders placed via BinanceFuturesPort can be cancelled."
+            )
+        if not self.config.symbol_whitelist:
+            return parsed.symbol
+
+        # Try direct match first.
+        if parsed.symbol in self.config.symbol_whitelist:
+            return parsed.symbol
+
+        # Try normalized-match for non-ASCII symbols.
+        # For ASCII symbols: require exact equality (startswith would cause false
+        # positives, e.g. "BTCUSDT".startswith("BTC") matching a "BTC" CID).
+        # For non-ASCII symbols: CID stores a truncated SHA1 hash token.
+        for symbol in self.config.symbol_whitelist:
+            if cid_symbol_matches(symbol, parsed.symbol):
+                self._cid_symbol_map[order_id] = symbol
+                return symbol
+
+        return parsed.symbol
 
     def _validate_notional(self, price: Decimal, quantity: Decimal) -> None:
         """Validate order notional is within limits (mainnet guard)."""
@@ -788,7 +825,10 @@ class BinanceFuturesPort:
 
         if isinstance(response.json_data, dict):
             # Return clientOrderId (our ID) for internal tracking, not orderId (Binance numeric)
-            return str(response.json_data.get("clientOrderId", client_order_id))
+            cid = str(response.json_data.get("clientOrderId", client_order_id))
+            self.register_order_symbol(cid, symbol)
+            return cid
+        self.register_order_symbol(client_order_id, symbol)
         return client_order_id
 
     def place_market_order(
@@ -855,7 +895,10 @@ class BinanceFuturesPort:
 
         if isinstance(response.json_data, dict):
             # Return clientOrderId (our ID) for internal tracking, not orderId (Binance numeric)
-            return str(response.json_data.get("clientOrderId", client_order_id))
+            cid = str(response.json_data.get("clientOrderId", client_order_id))
+            self.register_order_symbol(cid, symbol)
+            return cid
+        self.register_order_symbol(client_order_id, symbol)
         return client_order_id
 
     def cancel_order(self, order_id: str) -> bool:
@@ -872,13 +915,7 @@ class BinanceFuturesPort:
 
         # LC-12: Use proper identity parsing to extract symbol
         # Supports both v1 format (grinder_{strategy}_{symbol}_...) and legacy (grinder_{symbol}_...)
-        parsed = parse_client_order_id(order_id)
-        if parsed is None:
-            raise ConnectorNonRetryableError(
-                f"Cannot parse order_id '{order_id}'. "
-                "In v0.1, only orders placed via BinanceFuturesPort can be cancelled."
-            )
-        symbol = parsed.symbol
+        symbol = self._resolve_symbol_for_order_id(order_id)
 
         self._validate_symbol(symbol)
 

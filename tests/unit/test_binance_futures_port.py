@@ -32,6 +32,7 @@ from grinder.execution.binance_futures_port import (
     BinanceFuturesPortConfig,
 )
 from grinder.execution.binance_port import NoopHttpClient
+from grinder.reconcile.identity import OrderIdentityConfig, generate_client_order_id
 
 # --- Fixtures ---
 
@@ -824,6 +825,53 @@ class TestCancelOrderIdentityParsing:
             port.cancel_order("grinder_d_XYZUSDT_0_1770470846_1")
 
         assert "whitelist" in str(exc_info.value).lower()
+
+    def test_cancel_order_resolves_non_ascii_symbol_from_whitelist(
+        self, futures_noop_client: NoopHttpClient
+    ) -> None:
+        """cancel_order resolves non-ASCII symbols via normalized CID tokens."""
+        config = BinanceFuturesPortConfig(
+            mode=SafeMode.LIVE_TRADE,
+            base_url=BINANCE_FUTURES_TESTNET_URL,
+            api_key="test_key",
+            api_secret="test_secret",
+            symbol_whitelist=["币安人生USDT"],
+            max_orders_per_run=100,
+        )
+        port = BinanceFuturesPort(http_client=futures_noop_client, config=config)
+        identity = OrderIdentityConfig(strategy_id="d")
+        cid = generate_client_order_id(identity, "币安人生USDT", 1, 1704067200000, 1)
+
+        port.cancel_order(cid)
+
+        assert len(futures_noop_client.calls) == 1
+        call = futures_noop_client.calls[0]
+        assert call["params"]["symbol"] == "币安人生USDT"
+
+    def test_cancel_order_ascii_prefix_not_matched_as_longer_symbol(
+        self, futures_noop_client: NoopHttpClient
+    ) -> None:
+        """P1 regression: 'BTC' CID must NOT be resolved to 'BTCUSDT' whitelist entry.
+
+        Previously, a naive startswith check would produce
+        'BTCUSDT'.startswith('BTC') == True, attributing the 'BTC' CID to
+        'BTCUSDT'. cid_symbol_matches() must use exact equality for ASCII symbols.
+        """
+        config = BinanceFuturesPortConfig(
+            mode=SafeMode.LIVE_TRADE,
+            base_url=BINANCE_FUTURES_TESTNET_URL,
+            api_key="test_key",
+            api_secret="test_secret",
+            symbol_whitelist=["BTCUSDT"],
+            max_orders_per_run=100,
+        )
+        port = BinanceFuturesPort(http_client=futures_noop_client, config=config)
+        # Build a CID that parses to symbol "BTC" (simulating an order for the "BTC" symbol).
+        # Direct construction: grinder_d_BTC_1_1704067200_1
+        btc_cid = "grinder_d_BTC_1_1704067200_1"
+
+        with pytest.raises(ConnectorNonRetryableError, match="whitelist"):
+            port.cancel_order(btc_cid)
 
 
 # --- Account Snapshot Tests (PR-Y) ---

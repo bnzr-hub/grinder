@@ -87,6 +87,7 @@ from grinder.reconcile.identity import (
     DEFAULT_PREFIX,
     DEFAULT_STRATEGY_ID,
     OrderIdentityConfig,
+    cid_symbol_matches,
     generate_client_order_id,
     is_tp_order,
     parse_client_order_id,
@@ -4833,6 +4834,11 @@ class LiveEngineV0:
                 self._evaluate_symbol_risk(result.snapshot)
             # PR-L2: Store full snapshot for LiveGridPlannerV1 (open_orders as exchange truth)
             self._last_account_snapshot = result.snapshot
+            # CID symbol mapping for non-ASCII symbols (ADR-183 follow-up).
+            if hasattr(self._exchange_port, "register_order_symbol"):
+                for o in result.snapshot.open_orders:
+                    if parse_client_order_id(o.order_id) is not None:
+                        self._exchange_port.register_order_symbol(o.order_id, o.symbol)
             # ADR-109 Phase 2: Hydrate ledger from every sync (idempotent).
             # Fixes Phase 1 bug: one-shot bootstrap ran on preflight sync
             # (0 orders), causing permanent divergence for the session.
@@ -6457,7 +6463,7 @@ class LiveEngineV0:
         count = 0
         for oid in self._rolling_pending_cancels:
             parsed = parse_client_order_id(oid)
-            if parsed is not None and parsed.symbol == symbol:
+            if parsed is not None and cid_symbol_matches(symbol, parsed.symbol):
                 count += 1
         return count
 
@@ -6470,7 +6476,8 @@ class LiveEngineV0:
         stale = [
             oid
             for oid in self._rolling_pending_cancels
-            if (parsed := parse_client_order_id(oid)) is not None and parsed.symbol == symbol
+            if (parsed := parse_client_order_id(oid)) is not None
+            and cid_symbol_matches(symbol, parsed.symbol)
         ]
         for oid in stale:
             del self._rolling_pending_cancels[oid]
