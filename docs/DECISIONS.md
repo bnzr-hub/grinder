@@ -2032,7 +2032,8 @@
   - **Non-ASCII sanitization (2026-04-13, ADR-182):**
     - `normalize_symbol_for_cid()` added to `reconcile/identity.py`: ASCII symbols pass through unchanged; non-ASCII symbols are hashed via `SHA1(symbol.encode()).hexdigest().upper()` and prefixed with `X`, then truncated to available CID space.
     - `generate_client_order_id()` raises `ValueError` if an ASCII symbol would be truncated (triggers `g_` prefix fallback). Non-ASCII hash tokens are truncated silently.
-    - `_resolve_symbol_for_order_id()` and grid_v2 adapter `parse_cid`/`is_ours` use `.startswith()` for reverse lookup since CID stores truncated hash, not full hash.
+    - `cid_symbol_matches(symbol, parsed_token)` added as the authoritative comparator for CID reverse-lookup. Logic: if `symbol` is ASCII (`[A-Z0-9]+`), require **exact equality** (`full_token == parsed_token`) — using startswith here would cause false positives (e.g. `"BTCUSDT".startswith("BTC")` matching a CID for the unrelated `"BTC"` symbol). If `symbol` is non-ASCII, use `full_token.startswith(parsed_token)` since the CID stores a truncated SHA1 hash.
+    - All reverse-lookup call sites (`_resolve_symbol_for_order_id`, `adapter.parse_cid`, `adapter.is_ours`, `engine._count/_clear_pending_cancels_for_symbol`) use `cid_symbol_matches`.
     - Symbols like `币安人生USDT` previously leaked Chinese chars into the CID causing Binance -1100 rejects. Now sanitized safely.
   - **Strategy allowlist semantics:**
     - If `allowed_strategies` empty at init → defaults to `{strategy_id}`

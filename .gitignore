@@ -91,5 +91,8 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 .claude/
+
+# WIP planning documents (in-progress, not yet merged into a PR)
+docs/46_BURST_CASCADE_AND_INVENTORY_SNOWBALL_PLAN.md
 .env.stage_d
 .agents/
