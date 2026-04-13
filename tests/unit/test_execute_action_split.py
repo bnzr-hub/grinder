@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock
@@ -165,3 +166,86 @@ class TestExecuteActionWrapper:
         action = _place("g-blocked")  # 0.0413 * 124 = 5.12 < 100
         result = engine._execute_action(action, 1000, RiskIntent.INCREASE_RISK)
         assert result.status == LiveActionStatus.BLOCKED
+
+
+class TestOrderSubmitFailedLog:
+    """ORDER_SUBMIT_FAILED structured log event on non-retryable errors."""
+
+    def test_non_retryable_logs_all_fields(self, caplog: Any) -> None:
+        """Non-retryable error must emit ORDER_SUBMIT_FAILED with symbol,
+        side, type, cid, exchange_code, reduce_only, price, qty, error."""
+        engine, _port = _make_engine()
+        action = ExecutionAction(
+            action_type=ActionType.PLACE,
+            symbol="ARIAUSDT",
+            side=OrderSide.SELL,
+            price=Decimal("0.7287"),
+            quantity=Decimal("10"),
+            client_order_id="g_g_ARIAUSDT_e27_1775956613_0",
+            reduce_only=False,
+        )
+        outcome = SubmitOutcome(
+            error="Binance error -4164: Order's notional must be no smaller than 5.0",
+            exchange_code=-4164,
+            attempts=1,
+        )
+        with caplog.at_level(logging.WARNING, logger="grinder.live.engine"):
+            engine._apply_submit_outcome(action, outcome, RiskIntent.INCREASE_RISK)
+
+        order_fail_logs = [r for r in caplog.records if "ORDER_SUBMIT_FAILED" in r.message]
+        assert len(order_fail_logs) == 1, (
+            f"Expected 1 ORDER_SUBMIT_FAILED log, got {len(order_fail_logs)}"
+        )
+        msg = order_fail_logs[0].message
+        assert "symbol=ARIAUSDT" in msg
+        assert "side=SELL" in msg
+        assert "exchange_code=-4164" in msg
+        assert "price=0.7287" in msg
+        assert "qty=10" in msg
+        assert "cid=g_g_ARIAUSDT_e27_1775956613_0" in msg
+        assert "reduce_only=False" in msg
+        assert "-4164" in msg
+
+    def test_reduce_only_2022_logs_before_repair(self, caplog: Any) -> None:
+        """For -2022 reduce-only errors, ORDER_SUBMIT_FAILED must fire
+        BEFORE the REDUCE_ONLY_REPAIR_TRIGGERED handler."""
+        engine, _port = _make_engine()
+        action = ExecutionAction(
+            action_type=ActionType.PLACE,
+            symbol="ARIAUSDT",
+            side=OrderSide.BUY,
+            price=Decimal("0.7237"),
+            quantity=Decimal("10"),
+            client_order_id="g_g_ARIAUSDT_x9_1775953943_0",
+            reduce_only=True,
+        )
+        outcome = SubmitOutcome(
+            error="Binance error -2022: ReduceOnly Order is rejected.",
+            exchange_code=-2022,
+            attempts=1,
+        )
+        with caplog.at_level(logging.WARNING, logger="grinder.live.engine"):
+            engine._apply_submit_outcome(action, outcome, RiskIntent.REDUCE_RISK)
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        submit_idx = next(
+            (i for i, r in enumerate(warnings) if "ORDER_SUBMIT_FAILED" in r.message), None
+        )
+        repair_idx = next(
+            (i for i, r in enumerate(warnings) if "REDUCE_ONLY_REPAIR_TRIGGERED" in r.message),
+            None,
+        )
+        assert submit_idx is not None, "ORDER_SUBMIT_FAILED not emitted"
+        assert repair_idx is not None, "REDUCE_ONLY_REPAIR_TRIGGERED not emitted"
+        assert submit_idx < repair_idx, (
+            "ORDER_SUBMIT_FAILED must fire before REDUCE_ONLY_REPAIR_TRIGGERED"
+        )
+
+    def test_no_log_on_success(self, caplog: Any) -> None:
+        """Successful submit must NOT emit ORDER_SUBMIT_FAILED."""
+        engine, _port = _make_engine()
+        action = _place("g-ok")
+        outcome = SubmitOutcome(order_id="order-1", success=True, attempts=1)
+        with caplog.at_level(logging.WARNING, logger="grinder.live.engine"):
+            engine._apply_submit_outcome(action, outcome, RiskIntent.INCREASE_RISK)
+        assert not any("ORDER_SUBMIT_FAILED" in r.message for r in caplog.records)
