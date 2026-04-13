@@ -8261,13 +8261,25 @@ class LiveEngineV0:
 
         # Non-retryable failure
         error_msg = outcome.error or ""
+        err_code = outcome.exchange_code or _extract_binance_error_code(error_msg)
+        logger.warning(
+            "ORDER_SUBMIT_FAILED symbol=%s side=%s type=%s cid=%s"
+            " exchange_code=%s reduce_only=%s price=%s qty=%s error=%s",
+            action.symbol,
+            action.side.value if action.side else "?",
+            action.action_type.value,
+            action.client_order_id or "?",
+            err_code,
+            action.reduce_only,
+            action.price,
+            action.quantity,
+            error_msg,
+        )
         if "Order count limit reached" in error_msg and not self._order_budget_exhausted:
             self._order_budget_exhausted = True
             logger.warning("ORDER_BUDGET_LATCH activated — planner suppressed for remaining run")
-        if action.reduce_only and action.symbol and action.side is not None:
-            err_code = outcome.exchange_code or _extract_binance_error_code(error_msg)
-            if err_code == -2022:
-                self._on_reduce_only_reject(action.symbol, action.side.value, err_code)
+        if action.reduce_only and action.symbol and action.side is not None and err_code == -2022:
+            self._on_reduce_only_reject(action.symbol, action.side.value, err_code)
         return LiveAction(
             action=action,
             status=LiveActionStatus.FAILED,
