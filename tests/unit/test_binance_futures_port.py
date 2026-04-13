@@ -848,6 +848,31 @@ class TestCancelOrderIdentityParsing:
         call = futures_noop_client.calls[0]
         assert call["params"]["symbol"] == "币安人生USDT"
 
+    def test_cancel_order_ascii_prefix_not_matched_as_longer_symbol(
+        self, futures_noop_client: NoopHttpClient
+    ) -> None:
+        """P1 regression: 'BTC' CID must NOT be resolved to 'BTCUSDT' whitelist entry.
+
+        Previously, a naive startswith check would produce
+        'BTCUSDT'.startswith('BTC') == True, attributing the 'BTC' CID to
+        'BTCUSDT'. cid_symbol_matches() must use exact equality for ASCII symbols.
+        """
+        config = BinanceFuturesPortConfig(
+            mode=SafeMode.LIVE_TRADE,
+            base_url=BINANCE_FUTURES_TESTNET_URL,
+            api_key="test_key",
+            api_secret="test_secret",
+            symbol_whitelist=["BTCUSDT"],
+            max_orders_per_run=100,
+        )
+        port = BinanceFuturesPort(http_client=futures_noop_client, config=config)
+        # Build a CID that parses to symbol "BTC" (simulating an order for the "BTC" symbol).
+        # Direct construction: grinder_d_BTC_1_1704067200_1
+        btc_cid = "grinder_d_BTC_1_1704067200_1"
+
+        with pytest.raises(ConnectorNonRetryableError, match="whitelist"):
+            port.cancel_order(btc_cid)
+
 
 # --- Account Snapshot Tests (PR-Y) ---
 

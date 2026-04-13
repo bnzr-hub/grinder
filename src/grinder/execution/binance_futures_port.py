@@ -77,9 +77,9 @@ from grinder.net.retry_policy import (
 )
 from grinder.reconcile.identity import (
     OrderIdentityConfig,
+    cid_symbol_matches,
     generate_client_order_id,
     get_default_identity_config,
-    normalize_symbol_for_cid,
     parse_client_order_id,
 )
 
@@ -333,9 +333,11 @@ class BinanceFuturesPort:
             return parsed.symbol
 
         # Try normalized-match for non-ASCII symbols.
-        # CID stores a truncated token; full hash must start with the stored prefix.
+        # For ASCII symbols: require exact equality (startswith would cause false
+        # positives, e.g. "BTCUSDT".startswith("BTC") matching a "BTC" CID).
+        # For non-ASCII symbols: CID stores a truncated SHA1 hash token.
         for symbol in self.config.symbol_whitelist:
-            if normalize_symbol_for_cid(symbol).startswith(parsed.symbol):
+            if cid_symbol_matches(symbol, parsed.symbol):
                 self._cid_symbol_map[order_id] = symbol
                 return symbol
 

@@ -87,9 +87,9 @@ from grinder.reconcile.identity import (
     DEFAULT_PREFIX,
     DEFAULT_STRATEGY_ID,
     OrderIdentityConfig,
+    cid_symbol_matches,
     generate_client_order_id,
     is_tp_order,
-    normalize_symbol_for_cid,
     parse_client_order_id,
 )
 from grinder.risk.adaptive_step import AdaptiveStepConfig, AdaptiveStepController, StepFailMode
@@ -6460,11 +6460,10 @@ class LiveEngineV0:
 
         Used by INV-10 ANCHOR_RESET condition (ADR-088).
         """
-        symbol_token = normalize_symbol_for_cid(symbol)
         count = 0
         for oid in self._rolling_pending_cancels:
             parsed = parse_client_order_id(oid)
-            if parsed is not None and symbol_token.startswith(parsed.symbol):
+            if parsed is not None and cid_symbol_matches(symbol, parsed.symbol):
                 count += 1
         return count
 
@@ -6474,12 +6473,11 @@ class LiveEngineV0:
         Multi-symbol safe: only clears entries matching the given symbol.
         Part of INV-10 ANCHOR_RESET engine-side cleanup (ADR-088).
         """
-        symbol_token = normalize_symbol_for_cid(symbol)
         stale = [
             oid
             for oid in self._rolling_pending_cancels
             if (parsed := parse_client_order_id(oid)) is not None
-            and symbol_token.startswith(parsed.symbol)
+            and cid_symbol_matches(symbol, parsed.symbol)
         ]
         for oid in stale:
             del self._rolling_pending_cancels[oid]
