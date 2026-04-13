@@ -5982,16 +5982,9 @@ class LiveEngineV0:
             repair_key = (sym, side.value)
 
             if not surplus:
-                # No surplus on this side — if previously flagged, verify legal
-                # and clear flag only when topology is confirmed clean.
-                if repair_key in self._reduce_only_pending_repair:
-                    self._reduce_only_pending_repair.discard(repair_key)
-                    logger.info(
-                        "GRID_V2_REDUCE_ONLY_REPAIR_CONVERGED symbol=%s side=%s "
-                        "reason=topology_now_legal",
-                        sym,
-                        side.value,
-                    )
+                # No surplus on this side. Do NOT clear pending repair here —
+                # topology may still be missing exits. Clearance is gated by
+                # exit-topology convergence in _exit_topology_repair_on_sync().
                 continue
 
             logger.warning(
@@ -6028,11 +6021,11 @@ class LiveEngineV0:
                     )
 
             if all_ok:
-                # All cancels succeeded — topology should now be legal.
-                # Clear flag so exits can resume.
-                self._reduce_only_pending_repair.discard(repair_key)
+                # All cancels succeeded — budget should be legal, but
+                # exit topology may still be missing. Leave pending repair
+                # clearance to _exit_topology_repair_on_sync().
                 logger.info(
-                    "GRID_V2_REDUCE_ONLY_REPAIR_CONVERGED symbol=%s side=%s cancelled=%d",
+                    "GRID_V2_REDUCE_ONLY_REPAIR_CANCELS_OK symbol=%s side=%s cancelled=%d",
                     sym,
                     side.value,
                     len(surplus),
@@ -6057,12 +6050,14 @@ class LiveEngineV0:
         logs deferred placements.
         """
         from grinder.grid_v2.exit_repair import (  # noqa: PLC0415
+            DesiredExit,
             RepairTrigger,
             compute_desired_exits,
             compute_exit_topology_repair,
         )
         from grinder.live.reduce_only_budget import (  # noqa: PLC0415
             _closeable_qty_for_side,
+            detect_surplus_exits,
         )
 
         sym = self._grid_v2_symbol
@@ -6128,6 +6123,44 @@ class LiveEngineV0:
             actual_exit_cids=frozen_actual,
         )
         desired = desired_sell + desired_buy
+
+        def _side_converged(
+            desired_exits: list[DesiredExit],
+            actual_cids: set[str],
+        ) -> bool:
+            # Empty desired list means SM hasn't loaded exits yet —
+            # treat as not converged to avoid vacuous-true false positive.
+            if not desired_exits:
+                return False
+            # Converged for this side if every desired exit is registered
+            # and visible on exchange. Extra exits are handled by repair.
+            for de in desired_exits:
+                if de.registry_cid is None:
+                    return False
+                if de.registry_cid not in actual_cids:
+                    return False
+            return True
+
+        # Clear reduce-only pending repair only when both budget and
+        # exit topology are legal for that side.
+        for _side, _desired in (
+            (OrderSide.SELL, desired_sell),
+            (OrderSide.BUY, desired_buy),
+        ):
+            repair_key = (sym, _side.value)
+            if repair_key not in self._reduce_only_pending_repair:
+                continue
+            surplus = detect_surplus_exits(snapshot, sym, _side)  # type: ignore[arg-type]
+            if surplus:
+                continue
+            if _side_converged(_desired, actual_exit_cids):
+                self._reduce_only_pending_repair.discard(repair_key)
+                logger.info(
+                    "GRID_V2_REDUCE_ONLY_REPAIR_CONVERGED symbol=%s side=%s "
+                    "reason=topology_now_legal",
+                    sym,
+                    _side.value,
+                )
 
         # Determine trigger
         trigger = RepairTrigger.SYNC_DRIFT
