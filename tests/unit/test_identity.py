@@ -9,6 +9,7 @@ Tests cover:
 """
 
 import os
+import re
 from collections.abc import Generator
 
 import pytest
@@ -24,6 +25,7 @@ from grinder.reconcile.identity import (
     get_default_identity_config,
     is_ours,
     is_tp_order,
+    normalize_symbol_for_cid,
     parse_client_order_id,
     reset_default_identity_config,
     set_default_identity_config,
@@ -127,6 +129,17 @@ class TestOrderIdentityConfig:
         config = OrderIdentityConfig()
         assert config.allow_legacy_format is True
         assert config.is_strategy_allowed(LEGACY_STRATEGY_ID) is True
+
+
+def test_generate_client_order_id_normalizes_non_ascii_symbol() -> None:
+    """Non-ASCII symbols are normalized to CID-safe tokens."""
+    config = OrderIdentityConfig(strategy_id="d")
+    cid = generate_client_order_id(config, "币安人生USDT", 1, 1704067200000, 1)
+    parsed = parse_client_order_id(cid)
+    assert parsed is not None
+    assert normalize_symbol_for_cid("币安人生USDT").startswith(parsed.symbol)
+    assert re.fullmatch(r"[A-Z0-9]+", parsed.symbol)
+    assert len(cid) <= BINANCE_MAX_CLIENT_ORDER_ID_LEN
 
 
 # =============================================================================

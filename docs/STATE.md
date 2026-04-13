@@ -498,6 +498,11 @@ These are **not** a formal checklist. For canonical status, see the ADRs in `doc
     - `place_order()` and `place_market_order()` generate CID with configured prefix first (default `grinder_`)
     - If Binance 36-char limit would be exceeded, port retries once with short prefix `g_`
     - No behavior change for symbols that already fit with `grinder_`
+  - **Non-ASCII symbol sanitization (2026-04-13, ADR-182):**
+    - Symbols containing non-ASCII chars (e.g. `币安人生USDT`) are hashed to a CID-safe token via SHA1: `X{hex_upper}`, truncated to fit 36-char limit
+    - `_resolve_symbol_for_order_id()` reverse-looks up real symbol via `startswith` match against the hash token
+    - ASCII symbols that would be truncated now raise `ValueError` (fallback to `g_` prefix triggered)
+    - Non-ASCII symbols (hash tokens) are always truncated silently as expected
   - **How to verify:**
     ```bash
     PYTHONPATH=src pytest tests/unit/test_binance_futures_port.py -v

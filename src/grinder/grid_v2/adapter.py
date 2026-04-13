@@ -39,6 +39,7 @@ from grinder.reconcile.identity import (
     OrderIdentityConfig,
     generate_client_order_id,
     is_ours,
+    normalize_symbol_for_cid,
     parse_client_order_id,
 )
 
@@ -391,7 +392,7 @@ class GridV2Adapter:
         parsed = parse_client_order_id(cid)
         if parsed is None:
             return None
-        if parsed.symbol != self._symbol:
+        if not normalize_symbol_for_cid(self._symbol).startswith(parsed.symbol):
             return None
         lid = parsed.level_id
         if lid.startswith(_ENTRY_PREFIX):
@@ -422,7 +423,9 @@ class GridV2Adapter:
         if not is_ours(cid, self._identity_config):
             return False
         parsed = parse_client_order_id(cid)
-        return parsed is not None and parsed.symbol == self._symbol
+        return parsed is not None and normalize_symbol_for_cid(self._symbol).startswith(
+            parsed.symbol
+        )
 
     # --- Fill translation (22.4, read-only on registry) ---
 

@@ -2029,6 +2029,11 @@
       first attempt uses configured prefix (default `grinder_`), then retries with `g_`
       only if CID exceeds Binance 36-char limit.
     - Short symbols (e.g. `BTCUSDT`) keep existing `grinder_` behavior.
+  - **Non-ASCII sanitization (2026-04-13, ADR-182):**
+    - `normalize_symbol_for_cid()` added to `reconcile/identity.py`: ASCII symbols pass through unchanged; non-ASCII symbols are hashed via `SHA1(symbol.encode()).hexdigest().upper()` and prefixed with `X`, then truncated to available CID space.
+    - `generate_client_order_id()` raises `ValueError` if an ASCII symbol would be truncated (triggers `g_` prefix fallback). Non-ASCII hash tokens are truncated silently.
+    - `_resolve_symbol_for_order_id()` and grid_v2 adapter `parse_cid`/`is_ours` use `.startswith()` for reverse lookup since CID stores truncated hash, not full hash.
+    - Symbols like `币安人生USDT` previously leaked Chinese chars into the CID causing Binance -1100 rejects. Now sanitized safely.
   - **Strategy allowlist semantics:**
     - If `allowed_strategies` empty at init → defaults to `{strategy_id}`
     - Legacy orders (`__legacy__`) allowed only if `allow_legacy_format=True`
@@ -5245,3 +5250,19 @@ ACTIVE inference affects policy **only if ALL conditions are true**:
 - **Decision:** In `process_user_data_event`, at the moment an entry fill is accepted (both the success branch and the rejected-fill branch), pop the CID from `_grid_v2_pending_place_cids`, discard from `_grid_v2_fill_eligible_cids`, and pop from `_grid_v2_entry_reg_gen`. The last pop is the direct short-circuit: the bounded never-seen loop's condition `reg_gen is not None` now evaluates False for a consumed CID, so the fallback cannot fire on it. Mirrors the existing cleanup pattern in `_grid_v2_clean_failed_place`.
 - **Invariant:** A successful or rejected user-data fill terminates the pending-visibility lifecycle for that CID. The ADR-180 bounded never-seen fallback continues to fire on genuinely never-visible, never-filled entries after `_GRID_V2_NEVER_SEEN_MAX_GENS` sync cycles. `dict.pop(k, None)` / `set.discard(k)` are idempotent, so the new code is a no-op when the trackers were already cleared by the normal sync-visibility path.
 - **Consequences:** On fast-fill symbols, entries consumed by fills before first snapshot visibility can no longer be misclassified as "never seen" and cleaned as dead placements. The `place → clean → missing → place` churn loop observed on MAGMA/AKE is broken at the source. No changes to snapshot-diff fill path, the reconciler, stale-registry cleanup, or exit-topology repair — the fix is surgical and scoped to the user-data fill handler only.
+
+### ADR-182: Non-ASCII symbol sanitization in clientOrderId (2026-04-13)
+
+- **Problem:** Binance `newClientOrderId` must match `^[.A-Z:/a-z0-9_-]{1,36}$` (error -1100). Symbols with non-ASCII characters (e.g. `币安人生USDT`) were leaking directly into CID via the identity generation path (`grinder_d_币安人生USDT_1_...`), causing every order placement to be rejected with -1100.
+- **Root cause:** `generate_client_order_id()` in `reconcile/identity.py` passed the raw symbol to the CID template without sanitization. For ASCII symbols, this was fine. For non-ASCII, the resulting string violated Binance's ASCII-only constraint.
+- **Decision:** Add `normalize_symbol_for_cid(symbol, max_len)` to `reconcile/identity.py`:
+  - ASCII symbols (matching `[A-Z0-9]+`) pass through unchanged.
+  - Non-ASCII symbols are hashed: `X` + `SHA1(symbol.encode()).hexdigest().upper()`, then truncated to `max_len`.
+  - `generate_client_order_id()` raises `ValueError` when an ASCII symbol would need to be truncated (preserves identity; triggers the `g_` prefix fallback in `_generate_client_order_id_with_fallback`). Non-ASCII hash tokens are truncated silently since the truncated prefix still provides sufficient collision resistance.
+  - `_resolve_symbol_for_order_id()` (port) and adapter `parse_cid`/`is_ours` use `.startswith()` instead of `==` for reverse lookup, since the CID stores a truncated hash.
+- **Alternatives considered:**
+  - Replace all non-ASCII with ASCII slug — rejected: lossy, not reversible without whitelist, same prefix collision risk.
+  - Keep full hash, always 41 chars — rejected: exceeds Binance 36-char limit.
+  - Error out on non-ASCII symbols — rejected: live canary discovered real symbols with non-ASCII names in the market; must handle gracefully.
+- **Implementation:** `src/grinder/reconcile/identity.py`, `src/grinder/execution/binance_futures_port.py`, `src/grinder/grid_v2/adapter.py`.
+- **Tests:** `tests/unit/test_identity.py` (+3 new), `tests/unit/test_binance_futures_port.py` (+3 new). All gates green.
